@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-const base = "file:///C:/Users/EK/Documents/repos/co-tracker/editor/static/js/";
+const base = new URL("../static/js/", import.meta.url).href;
 const { Project } = await import(base + "project.js");
 const { ResultStore } = await import(base + "results.js");
 const { ChunkStore, CHUNK, evalKeyed } = await import(base + "chunks.js");
