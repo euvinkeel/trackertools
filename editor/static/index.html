@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CoTrack Editor</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='5' fill='none' stroke='%2322d3ee' stroke-width='2'/><circle cx='8' cy='8' r='1.5' fill='%2322d3ee'/></svg>">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <!-- Start screen -->
+  <div id="drop-screen">
+    <div class="drop-card">
+      <div class="logo">Co<span>Track</span> <small>editor</small></div>
+      <p class="tagline">Subject tracking for any editor — powered by CoTracker3, running on your GPU.</p>
+      <div id="drop-zone">
+        <div class="drop-icon">⬇</div>
+        <div><strong>Drop a video file here</strong></div>
+        <div class="muted">or <button id="btn-choose" class="link">choose a file</button></div>
+        <input type="file" id="file-input" accept="video/*,.mkv,.mov,.mp4,.webm" hidden>
+      </div>
+      <form id="path-form">
+        <input id="path-input" type="text" spellcheck="false"
+               placeholder="…or paste a file path on this PC (no copy — best for very large files)">
+        <button type="submit">Open</button>
+      </form>
+      <div id="recent-wrap" class="hidden">
+        <h3>Recent</h3>
+        <div id="recent"></div>
+      </div>
+      <div id="model-status" class="muted"></div>
+    </div>
+  </div>
+
+  <!-- Editor -->
+  <div id="editor" class="hidden">
+    <header id="topbar">
+      <div class="logo small">Co<span>Track</span></div>
+      <div id="file-info"></div>
+      <div id="import-status" class="hidden"><div class="bar"><div></div></div><span></span></div>
+      <div id="proxy-status" class="hidden"
+           title="Recordings with sparse keyframes step slowly in a browser. A lightweight 720p proxy with frequent keyframes is built on your GPU for smooth scrubbing; tracking always uses the original.">
+        <div class="bar"><div></div></div><span></span></div>
+      <div class="spacer"></div>
+      <button id="btn-source" class="hidden small"
+              title="Toggle between the fast-scrub proxy and the full-resolution original (tracking always uses the original)"></button>
+      <span id="save-status" class="muted"></span>
+      <button id="btn-undo" title="Undo (Ctrl+Z)">↶</button>
+      <button id="btn-redo" title="Redo (Ctrl+Shift+Z)">↷</button>
+      <button id="btn-export-json" title="Export tracks as JSON (open format)">Export JSON</button>
+      <button id="btn-export-csv" title="Export subject positions as CSV">CSV</button>
+      <button id="btn-export-norm" title="Export normalized (0–1) subject positions as CSV — handy for NLE scripts">Norm CSV</button>
+      <button id="btn-export-fusion" title="Export a DaVinci Resolve Fusion Tracker .setting (experimental — validate in Fusion)">Fusion</button>
+      <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
+      <button id="btn-close" title="Close video">✕</button>
+    </header>
+
+    <main id="workspace">
+      <aside id="left-panel">
+        <div class="panel-head">
+          <h2>Subjects</h2>
+          <button id="btn-add-subject" class="primary small" title="New subject (N)">+ Subject</button>
+        </div>
+        <div id="subject-list"></div>
+        <div id="point-panel"></div>
+        <div id="pattern-panel"></div>
+      </aside>
+
+      <section id="viewer">
+        <div id="stage"><video id="video" playsinline muted preload="auto"></video></div>
+        <canvas id="overlay"></canvas>
+        <div id="viewer-hint"></div>
+        <div id="viewer-zoom" class="muted"></div>
+        <div id="video-error" class="hidden"></div>
+      </section>
+
+      <aside id="right-panel">
+        <div class="card" id="tracker-card">
+          <div class="card-head">
+            <h2>Tracker</h2>
+            <span id="tracker-state" class="pill">idle</span>
+          </div>
+          <div class="tracker-actions">
+            <button id="btn-go" class="primary" title="Track every point that needs it, from the cursor (G)">▶ Go from cursor <kbd>G</kbd></button>
+            <button id="btn-go-sel" title="Track only the selected points — or the selected subject's points — from the cursor (Shift+G)">▶ Selected <kbd>⇧G</kbd></button>
+          </div>
+          <div class="progress"><div id="tracker-progress"></div></div>
+          <div id="tracker-stats" class="muted">Place points, then press Go. Tracking runs in the background.</div>
+          <div class="preview-wrap"><canvas id="tracker-preview"></canvas><div id="preview-label"></div></div>
+          <button id="btn-jump-tracker" class="link" disabled>Jump to tracker frame</button>
+        </div>
+        <div class="card grow" id="inspector-card">
+          <div class="card-head">
+            <h2>Inspector</h2>
+            <button id="btn-copy-frame" class="link small" title="Copy this frame's data as JSON">copy frame JSON</button>
+          </div>
+          <div id="inspector"></div>
+        </div>
+      </aside>
+    </main>
+
+    <footer id="bottom">
+      <div id="transport">
+        <button data-act="first" title="First frame (Home)">⏮</button>
+        <button data-act="prev" title="Previous frame (←)">◀</button>
+        <button data-act="play" id="btn-play" title="Play / pause (Space)">▶</button>
+        <button data-act="next" title="Next frame (→)">▶︎|</button>
+        <button data-act="last" title="Last frame (End)">⏭</button>
+        <label class="frame-field">Frame <input id="frame-input" type="number" min="0" step="1"></label>
+        <span id="frame-total" class="muted"></span>
+        <span id="timecode"></span>
+        <div class="spacer"></div>
+        <span class="legend">
+          <i class="lg-auto"></i>tracked <i class="lg-hidden"></i>hidden
+           <i class="lg-manual"></i>manual <i class="lg-off"></i>off-frame <i class="lg-pending"></i>needs tracking <i class="lg-lost"></i>not found <i class="lg-drifted"></i>drifted
+        </span>
+        <button data-act="mute" id="btn-mute" title="Toggle audio">🔇</button>
+        <button data-act="fit" title="Zoom timeline to fit (\)">Fit</button>
+      </div>
+      <canvas id="timeline"></canvas>
+    </footer>
+  </div>
+
+  <div id="help-overlay" class="hidden">
+    <div class="help-card">
+      <h2>Keyboard &amp; mouse</h2>
+      <div class="help-grid">
+        <div><kbd>←</kbd> <kbd>→</kbd></div><div>Previous / next frame (<kbd>Shift</kbd> ×10, <kbd>Alt</kbd> 1 second)</div>
+        <div><kbd>Space</kbd></div><div>Play / pause</div>
+        <div><kbd>Home</kbd> <kbd>End</kbd></div><div>First / last frame</div>
+        <div><kbd>G</kbd></div><div>Go: track every tracker that needs it, from the cursor / Halt</div>
+        <div><kbd>Shift</kbd>+<kbd>G</kbd></div><div>Track only the selected trackers (or the selected subject's)</div>
+        <div>Drag on frame</div><div>Box-select trackers · <kbd>Ctrl</kbd>+click adds/removes one · <kbd>A</kbd> selects the subject's trackers · <kbd>Esc</kbd> clears</div>
+        <div><kbd>Ctrl</kbd>+drag</div><div>End the selected subject's trackers <b>inside</b> the box from this frame on (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+drag: <b>outside</b>)</div>
+         <div><kbd>Shift</kbd>+drag</div><div>Draw a template box around a pattern; paint the mask and set a hotspot. With a template tracker selected, adds another look.</div>
+        <div>Drag subject ring</div><div>Offset the subject from the position its trackers pushed it to (auto-keys this frame) · <kbd>[</kbd> <kbd>]</kbd> jump offset keys</div>
+        <div><kbd>N</kbd></div><div>New subject</div>
+        <div><kbd>1</kbd>–<kbd>9</kbd></div><div>Select subject</div>
+        <div>Click frame</div><div>Add a CoTracker point to the selected subject on this frame (outside the frame → manual point)</div>
+        <div>Drag tracker</div><div>Move it: keyframe (manual) or re-anchor (auto); dragging off-frame switches to manual</div>
+        <div>Double-click tracker</div><div>End it from this frame on (deletes on its first frame)</div>
+        <div><kbd>M</kbd></div><div>Toggle manual animation for the selected tracker(s) from this frame</div>
+        <div><kbd>E</kbd></div><div>End selected tracker(s) here (later keys, ranges and results are <b>retained</b>)</div>
+        <div><kbd>U</kbd></div><div>Remove the end(s) of the selected tracker(s) — an automatic end stays off until re-enabled</div>
+        <div>Drag the timeline end marker</div><div>Move a tracker's end; <kbd>Del</kbd>/<kbd>Backspace</kbd> with the marker focused removes it (the tracker stays)</div>
+        <div><kbd>B</kbd></div><div>Bounds mode: move/resize the manual layer (changes fade over ±falloff; Alt+wheel adjusts), or draw one</div>
+        <div><kbd>P</kbd></div><div>Puppeteer pass: follow the subject at slowed playback; each pass is kept (refine levels, + Take averages). Esc/Space/click stops</div>
+        <div><kbd>R</kbd></div><div>Finetune layers: drag relatively to nudge the active layer (<kbd>Shift</kbd> 1/10, <kbd>Q</kbd> loupe, <kbd>←</kbd> <kbd>→</kbd> step and hold)</div>
+        <div>Shift+drag</div><div>Draw a template box; paint the mask/hotspot and optionally <b>Save to library</b> for reuse in any video</div>
+        <div>Patterns list</div><div>Use adds a saved pattern to the selected template tracker (or starts a new tracker); Export/Import shares the library</div>
+        <div>Automatic ending</div><div>Sidebar → subject: end trackers after a sustained escape from the bounds, or after motion disagreement (reversible)</div>
+        <div><kbd>Del</kbd></div><div>Delete selected tracker(s) entirely</div>
+        <div><kbd>[</kbd> <kbd>]</kbd></div><div>Jump to previous / next keyframe of the selected tracker (or offset key of the subject)</div>
+        <div><kbd>Ctrl</kbd>+<kbd>Z</kbd></div><div>Undo (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redo)</div>
+        <div>Viewer wheel</div><div>Zoom at mouse · middle/right-drag or <kbd>Space</kbd>+drag to pan · <kbd>F</kbd> fit</div>
+        <div>Timeline wheel</div><div>Zoom at mouse · <kbd>Shift</kbd>+wheel pan · wheel over names scrolls · <kbd>\</kbd> fit</div>
+      </div>
+      <button id="btn-help-close" class="primary">Got it</button>
+    </div>
+  </div>
+
+  <div id="drag-overlay" class="hidden"><div>Drop video to open</div></div>
+  <div id="template-editor" class="hidden">
+    <div class="template-card">
+      <div class="template-head"><h2>Template tracker</h2><button data-action="cancel" aria-label="Close">✕</button></div>
+      <p class="template-info muted"></p>
+      <div class="template-canvas-wrap"><canvas aria-label="Paint template mask and hotspot"></canvas><span class="template-wait"></span></div>
+      <div class="template-tools">
+        <label><input type="radio" name="tool" value="brush" checked> Brush</label>
+        <label><input type="radio" name="tool" value="eraser"> Eraser</label>
+        <label><input type="radio" name="tool" value="hotspot"> Hotspot</label>
+        <label>Size <input name="brush-size" type="range" min="1" max="60" value="5"></label>
+        <button data-action="fill">Fill</button><button data-action="clear">Clear</button>
+        <button data-action="auto" title="Select the object enclosed by the box border">Auto (from border)</button>
+        <label title="Color difference tolerated by the automatic border selection">Tolerance <input name="tolerance" type="range" min="5" max="90" value="28"></label>
+      </div>
+      <div class="template-foot"><span class="template-selected muted"></span><label class="muted"><input name="new-tracker" type="checkbox"> New tracker instead</label>
+        <label class="lib-save muted">Library <input name="lib-name" type="text" placeholder="Pattern name" maxlength="40">
+          <button data-action="save-lib" title="Save these pixels, mask and hotspot to the pattern library — reusable in any video">Save to library</button></label>
+        <button data-action="cancel">Cancel</button><button data-action="save" class="primary">Save <kbd>Enter</kbd></button></div>
+      <div class="muted small">Red pixels are excluded. An empty mask tracks the whole box. Right-click paints with the eraser. The hotspot snaps to pixel corners and centers; hold Shift to place it freely.</div>
+    </div>
+  </div>
+  <div id="toasts"></div>
+
+  <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

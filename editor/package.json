@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/test_project.mjs && node tests/test_templates.mjs && node tests/test_bounds.mjs && node tests/test_bounds_stack.mjs && node tests/test_position.mjs && node tests/test_motion.mjs && node tests/test_quality.mjs && node tests/test_patterns.mjs"
+  }
+}

@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Editor runtime data (uploaded videos, projects, proxies, metadata)
+editor/data/
+
+# Node (test runner only, no dependencies)
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

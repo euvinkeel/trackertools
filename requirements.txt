@@ -1,0 +1,21 @@
+# Runtime dependencies for the CoTrack editor (editor/).
+#
+# The CoTracker3 model code is vendored in ./cotracker and installed editable
+# from this repository (see README.md), so it is not listed here.
+#
+# Install into the repo venv:
+#   .venv\Scripts\python.exe -m pip install -e .
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# torch: use the CUDA build matching your driver. This is the build the repo was
+# developed against (CUDA 12.6 wheels):
+#   .venv\Scripts\python.exe -m pip install torch==2.14.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+
+anyio==4.15.1
+av==18.1.0
+fastapi==0.141.1
+imageio-ffmpeg==0.6.0
+numpy==2.5.2
+opencv-python==5.0.0.93
+torch==2.14.0+cu126
+uvicorn==0.53.0
