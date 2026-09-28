@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/tt_core", "crates/tt_media", "crates/tt_app", "xtask"]
+members = ["crates/tt_core", "crates/tt_media", "crates/tt_track", "crates/tt_app", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ rust-version = "1.95"
 [workspace.dependencies]
 tt_core = { path = "crates/tt_core" }
 tt_media = { path = "crates/tt_media" }
+tt_track = { path = "crates/tt_track" }
 bevy_ecs = { version = "=0.19.1", features = ["serialize"] }
 bevy_reflect = "=0.19.1"
 egui = "=0.36.2"

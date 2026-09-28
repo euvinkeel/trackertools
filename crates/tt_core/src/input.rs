@@ -51,6 +51,8 @@ pub enum Action {
     SelectAll,
     /// Rename the selected entity (the outliner edits the name).
     Rename,
+    /// Track the selected sketches from the playhead (re-seed selected trackers there).
+    Track,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -132,6 +134,7 @@ impl Default for Keymap {
                 (b(Key::Letter('d'), Mods::SHIFT, false), Duplicate),
                 (b(Key::Letter('a'), Mods::NONE, false), SelectAll),
                 (b(Key::F2, Mods::NONE, false), Rename),
+                (b(Key::Letter('t'), Mods::NONE, false), Track),
             ],
         }
     }

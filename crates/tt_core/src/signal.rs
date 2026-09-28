@@ -140,6 +140,16 @@ impl Signal {
         self.version += 1;
     }
 
+    /// Mark stale frames in `range` valid again (their inputs turned out unchanged).
+    pub fn mark_valid(&mut self, range: Range<FrameIndex>) {
+        self.for_each_present(range, |ch, i, _| {
+            if ch.state[i] == FrameState::Stale {
+                ch.state[i] = FrameState::Valid;
+            }
+        });
+        self.version += 1;
+    }
+
     /// Visit present frames in `range` mutably (touching only chunks that exist).
     fn for_each_present(&mut self, range: Range<FrameIndex>, mut f: impl FnMut(&mut Chunk, usize, FrameIndex)) {
         if range.is_empty() {

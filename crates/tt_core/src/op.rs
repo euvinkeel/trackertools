@@ -40,6 +40,11 @@ pub enum Footprint {
     AntiCausal,
     /// Every output frame depends on every input frame (fits, max-over-pass).
     Global,
+    /// Output spreads both ways from an anchor frame (a tracker running
+    /// forward and backward from where it was seeded): frames after the
+    /// anchor depend on inputs from the anchor up to them, frames before it
+    /// on inputs from them up to the anchor.
+    Radiating(FrameIndex),
 }
 
 impl Footprint {
@@ -52,6 +57,11 @@ impl Footprint {
             Footprint::Causal => dirty.start..extent.end,
             Footprint::AntiCausal => extent.start..dirty.end,
             Footprint::Global => extent.clone(),
+            Footprint::Radiating(anchor) => {
+                let start = if dirty.start <= anchor { extent.start } else { dirty.start };
+                let end = if dirty.end > anchor { extent.end } else { dirty.end };
+                start..end
+            }
         };
         r.start.max(extent.start)..r.end.min(extent.end)
     }
@@ -69,6 +79,12 @@ pub trait OperatorKind: Send + Sync + 'static {
     /// values, e.g. `out[range.start - 1]` for causal kinds). Frames with no
     /// result must be cleared. Ranges arrive front to back.
     fn evaluate(&self, ctx: &EvalCtx<'_>, range: Range<FrameIndex>, out: &mut Signal) -> anyhow::Result<()>;
+    /// Whether this kind is too slow to evaluate inline (a tracker reading
+    /// pixels): its dirty frames are left for a job system to take, and its
+    /// dependents run on whatever it has so far (stale-while-revalidate).
+    fn job(&self) -> bool {
+        false
+    }
 }
 
 /// What an operator sees while evaluating.
@@ -358,6 +374,9 @@ fn evaluate(world: &mut World) {
             continue;
         }
         let Some(kind) = world.get::<Operator>(op).and_then(|o| registry.get(&o.kind).cloned()) else { continue };
+        if kind.job() {
+            continue;
+        }
         let Some(out_id) = world.get::<Output>(op).map(|o| o.0) else { continue };
         // A global kind recomputes everything whatever the range, so it takes the whole hull in one call.
         let global = kind.footprint(world.entity(op)) == Footprint::Global;
