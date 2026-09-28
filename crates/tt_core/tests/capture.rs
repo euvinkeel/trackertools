@@ -134,14 +134,18 @@ fn the_wheel_sets_size_falloff_or_both_as_chosen() {
     use tt_core::capture::{SketchDefaults, WheelMode};
     let mut d = Driver::new();
     let stroke = |d: &Driver| d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.clone();
-    // Default: the wheel leaves the stroke alone (it zooms the view).
-    d.frame(circle, PRESS);
-    d.frame(circle, Input { wheel: 2.0, ..HOLD });
-    let s = stroke(&d);
-    assert!(s.scale == 1.0 && s.falloff == 0.0, "size ×{}, falloff {}", s.scale, s.falloff);
-    assert!(!d.core.world.resource::<tt_core::tool::PointerFrame>().wheel_taken, "the view gets the wheel");
-    d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
-    d.frame(circle, UP);
+    // Default: the wheel leaves the stroke alone, and the view too (it holds still).
+    // Zoom: the view gets it.
+    for (mode, taken) in [(WheelMode::Still, true), (WheelMode::Zoom, false)] {
+        d.core.world.resource_mut::<SketchDefaults>().wheel = mode;
+        d.frame(circle, PRESS);
+        d.frame(circle, Input { wheel: 2.0, ..HOLD });
+        let s = stroke(&d);
+        assert!(s.scale == 1.0 && s.falloff == 0.0, "{mode:?}: size ×{}, falloff {}", s.scale, s.falloff);
+        assert_eq!(d.core.world.resource::<tt_core::tool::PointerFrame>().wheel_taken, taken, "{mode:?}: the view doesn't zoom unless the wheel is set to");
+        d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
+        d.frame(circle, UP);
+    }
     d.core.world.resource_mut::<SketchDefaults>().stroke.falloff = 0.2;
     for (mode, scale, falloff) in [(WheelMode::Size, 1.25, 0.2), (WheelMode::Falloff, 1.0, 0.2 * 1.25), (WheelMode::Both, 1.25, 0.2 * 1.25)] {
         d.core.world.resource_mut::<SketchDefaults>().wheel = mode;
@@ -213,8 +217,9 @@ fn the_wheel_sets_the_falloff_and_esc_cancels() {
 fn the_wheel_on_a_move_only_stroke_sets_its_falloff_and_not_the_next_size() {
     use tt_core::capture::{SketchDefaults, WheelMode, wheel_target};
     let mut d = Driver::new();
-    assert_eq!(d.core.world.resource::<SketchDefaults>().wheel, WheelMode::Zoom, "by default the wheel zooms");
+    assert_eq!(d.core.world.resource::<SketchDefaults>().wheel, WheelMode::Still, "by default the wheel holds the view still");
     assert_eq!(wheel_target(WheelMode::Zoom, &tt_core::sketch::Stroke { size: 0.0, ..Default::default() }), WheelMode::Zoom);
+    assert_eq!(wheel_target(WheelMode::Still, &tt_core::sketch::Stroke { size: 0.0, ..Default::default() }), WheelMode::Still);
     {
         let mut defaults = d.core.world.resource_mut::<SketchDefaults>();
         defaults.wheel = WheelMode::Size;

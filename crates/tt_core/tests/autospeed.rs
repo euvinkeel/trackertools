@@ -25,6 +25,20 @@ fn auto_driver(rate: f64) -> Driver {
     d
 }
 
+/// Also reacting to the hand (the advanced mode; a new sketch has nothing to read ahead in).
+fn hand_driver(rate: f64) -> Driver {
+    let mut d = Driver::new();
+    {
+        let mut a = d.core.world.resource_mut::<AutoSpeed>();
+        a.enabled = true;
+        a.react_to_hand = true;
+    }
+    let mut t = d.core.world.resource_mut::<Transport>();
+    t.frame_count = 20_000;
+    t.rate = rate;
+    d
+}
+
 fn rate(d: &Driver) -> f64 {
     d.transport().rate
 }
@@ -50,7 +64,7 @@ fn goes_wild(t0: f64) -> impl Fn(f64) -> [f64; 2] + Copy {
 
 #[test]
 fn a_hand_that_suddenly_speeds_up_and_jiggles_slows_playback_at_once() {
-    let mut d = auto_driver(1.0);
+    let mut d = hand_driver(1.0);
     let t0 = d.now + 2.0;
     let hand = goes_wild(t0);
     start(&mut d, hand, 50, true);
@@ -76,7 +90,7 @@ fn a_hand_that_suddenly_speeds_up_and_jiggles_slows_playback_at_once() {
 
 #[test]
 fn a_still_hand_lets_playback_climb_toward_the_fastest() {
-    let mut d = auto_driver(0.25);
+    let mut d = hand_driver(0.25);
     let hand = still(400.0, 300.0);
     start(&mut d, hand, 50, true);
     let t0 = d.now;
@@ -91,14 +105,14 @@ fn a_still_hand_lets_playback_climb_toward_the_fastest() {
     println!("still hand from ×0.25: ×{:.2} after 0.5 s, ×{:.2} after 4 s (fastest ×{fastest})", at_half_second.unwrap(), rate(&d));
     assert!(at_half_second.unwrap() < 1.0, "it climbs slowly");
     assert!(rate(&d) > 0.9 * fastest, "×{:.2}", rate(&d));
-    assert_eq!(d.core.world.resource::<AutoSpeedState>().reason, "calm");
+    assert_eq!(d.core.world.resource::<AutoSpeedState>().reason, "your hand");
     d.frame(hand, UP);
 }
 
 #[test]
 fn the_release_restores_the_manual_rate() {
     for cancel in [false, true] {
-        let mut d = auto_driver(0.5);
+        let mut d = hand_driver(0.5);
         let t0 = d.now + 0.5;
         let hand = goes_wild(t0);
         start(&mut d, hand, 50, true);
@@ -116,30 +130,27 @@ fn the_release_restores_the_manual_rate() {
 }
 
 #[test]
-fn q_or_e_during_a_stroke_hands_the_rate_back_until_the_release() {
-    let mut d = auto_driver(1.0);
-    let t0 = d.now + 2.0;
-    let hand = goes_wild(t0);
-    start(&mut d, hand, 50, true);
-    d.frames(250, hand, HOLD); // calm: it speeds up past 1×
-    let auto = rate(&d);
-    assert!(auto > 1.0, "×{auto:.2}");
-    d.frame(hand, Input { action: Some(Action::SlowerPlayback), ..HOLD });
-    assert_eq!(rate(&d), 1.0, "Q steps down from the auto rate ×{auto:.2}");
-    assert!(!d.core.world.resource::<AutoSpeedState>().acting());
-    while d.now < t0 + 1.0 {
-        d.frame(hand, HOLD); // the hand races: auto speed would brake hard
-        assert_eq!(rate(&d), 1.0, "yours for the rest of the stroke");
-    }
-    d.frame(hand, UP);
-    assert_eq!(rate(&d), 1.0, "the release keeps your choice");
-    // The next stroke is driven again.
+fn q_and_e_multiply_what_it_picks_and_it_keeps_driving() {
+    let mut d = hand_driver(1.0);
     let hand = still(400.0, 300.0);
-    start(&mut d, hand, 200, true);
-    d.frames(200, hand, HOLD);
-    assert!(d.core.world.resource::<AutoSpeedState>().acting() && rate(&d) > 1.1, "×{:.2}", rate(&d));
+    start(&mut d, hand, 50, true);
+    d.frames(700, hand, HOLD); // calm: it climbs toward ×2
+    let auto = rate(&d);
+    assert!(auto > 1.8, "×{auto:.2}");
+    d.frame(hand, Input { action: Some(Action::SlowerPlayback), ..HOLD });
+    assert!(d.core.world.resource::<AutoSpeedState>().acting(), "still driving");
+    assert!((d.core.world.resource::<AutoSpeedState>().bias - 1.0 / 1.5).abs() < 1e-9);
+    d.frames(700, hand, HOLD);
+    let slower = rate(&d);
+    println!("calm ×{auto:.2}; after Q it settles at ×{slower:.2} (= its pick ×1/1.5)");
+    assert!((slower - 2.0 / 1.5).abs() < 0.05, "×{slower:.2}");
     d.frame(hand, UP);
-    assert_eq!(rate(&d), 1.0);
+    assert_eq!(rate(&d), 1.0, "the release restores your rate");
+    // The multiplier stays for the next stroke.
+    start(&mut d, hand, 300, true);
+    d.frames(900, hand, HOLD);
+    assert!((rate(&d) - 2.0 / 1.5).abs() < 0.05, "×{:.2}", rate(&d));
+    d.frame(hand, UP);
 }
 
 /// Record a stroke: the hand follows `subject` (source pixels at a frame) as
@@ -200,7 +211,7 @@ fn a_fast_stretch_ahead_in_the_sketch_being_edited_slows_playback_before_it_arri
     type Log = Vec<(f64, f64, &'static str)>;
     let log: Rc<RefCell<Log>> = Rc::default();
     let rec = log.clone();
-    let s2 = follow(&mut d, dash, 200, false, 900, move |d| {
+    let s2 = follow(&mut d, dash, 200, false, 5000, move |d| {
         rec.borrow_mut().push((d.transport().playhead, d.transport().rate, d.core.world.resource::<AutoSpeedState>().reason));
     });
     assert_eq!(s2, s, "the stroke edited the sketch");
@@ -213,9 +224,10 @@ fn a_fast_stretch_ahead_in_the_sketch_being_edited_slows_playback_before_it_arri
         "rate while the dash is still far ahead ×{early:.2}; at frame 295 (5 frames before it) ×{r295:.2} ({why}); at 300 ×{:.2}; frames 250–300 took {braking:.2} s",
         at(300.0).1
     );
-    assert!(early > 1.0, "not slowed while the dash is beyond the look-ahead: ×{early:.2}");
+    // (Ordinary stretches sit mid-range between the sketch's calm and busy percentiles.)
+    assert!(early > 3.0 * r295, "much faster while the dash is beyond the look-ahead: ×{early:.2} vs ×{r295:.2}");
     assert!(r295 < 0.5, "slowed before the dash arrives: ×{r295:.2}");
-    assert_eq!(why, "ahead", "because of what is ahead");
+    assert_eq!(why, "busy ahead", "because of what is ahead");
 }
 
 /// The sprite fixture's centre (source pixels) at a frame (as in tests/sketch.rs).
@@ -229,7 +241,7 @@ fn sprite(f: f64) -> [f64; 2] {
 
 #[test]
 fn a_sketch_recorded_under_auto_speed_is_still_accurate() {
-    let mut d = auto_driver(0.5);
+    let mut d = hand_driver(0.5);
     let (lo, hi) = (Rc::new(Cell::new(f64::INFINITY)), Rc::new(Cell::new(0.0f64)));
     let (l, h) = (lo.clone(), hi.clone());
     let s = follow(&mut d, sprite, 100, true, 1400, move |d| {
@@ -293,5 +305,5 @@ fn drawing_inside_a_view_slows_before_the_parents_erratic_stretch() {
     println!("inside the parent's view: ×{early:.2} while its erratic stretch is far ahead; ×{r295:.2} five frames before it ({why}); ×{:.2} on it", at(305.0).1);
     assert!(early > 1.0, "not slowed while the stretch is beyond the look-ahead: ×{early:.2}");
     assert!(r295 < 0.5, "slowed before the parent's erratic stretch: ×{r295:.2}");
-    assert_eq!(why, "ahead");
+    assert_eq!(why, "busy ahead");
 }

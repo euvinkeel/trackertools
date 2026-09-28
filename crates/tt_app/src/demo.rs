@@ -316,8 +316,9 @@ impl SketchDemo {
                     return false;
                 }
                 if !set {
-                    // A new sketch on the source, followed where the source shows it.
-                    world.resource_mut::<AutoSpeed>().enabled = true;
+                    // A new sketch on the source, followed where the source shows it:
+                    // nothing to read ahead in, so the hand drives it.
+                    *world.resource_mut::<AutoSpeed>() = AutoSpeed { react_to_hand: true, ..AutoSpeed::default() };
                     world.resource_mut::<ActiveView>().0 = None;
                     world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
                     self.in_view.clear();

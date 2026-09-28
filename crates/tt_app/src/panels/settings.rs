@@ -2,7 +2,7 @@
 //! session file) and every key, so nothing has to be memorized.
 
 use bevy_ecs::prelude::*;
-use tt_core::autospeed::{AutoSpeed, Foresight};
+use tt_core::autospeed::{AutoSpeed, AutoSpeedState, Foresight};
 use tt_core::input::{Action, Keymap};
 use tt_core::view::ViewDefaults;
 
@@ -87,40 +87,83 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     });
 }
 
-/// Anticipatory speed: the switch and its knobs (tt_core::autospeed).
+/// Anticipatory speed (tt_core::autospeed): the switch, the speed range and
+/// how far ahead it reads; the rest under Advanced.
 fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
     let mut a = world.resource::<AutoSpeed>().clone();
+    let (bias, comfort) = {
+        let s = world.resource::<AutoSpeedState>();
+        (s.bias, s.calibrated_comfort())
+    };
     ui.heading("Anticipatory speed");
-    ui.checkbox(&mut a.enabled, "Anticipatory speed: set the playback speed for me while I hold a stroke").on_hover_text(
-        "While you hold a stroke with the video playing, the speed follows the subject: slower when your hand has to move fast or starts to jiggle, \
-         or before a stretch that was fast or erratic in the parent sketch (the one whose view you're drawing in); faster through still parts. \
-         Q/E during a stroke takes the speed back until you release.",
+    ui.checkbox(&mut a.enabled, "Set the playback speed for me while I hold a stroke").on_hover_text(
+        "While you hold a stroke with the video playing, it reads ahead in the parent sketch (the one whose view you're drawing in):          where its box is bigger than usual for it, the subject was hard to follow, so playback slows before that arrives;          where it is as small as usual, it plays fast. It measures what \"usual\" is on the sketch itself (the 20th to 80th percentile of its box sizes).          Q/E during a stroke multiply its speed.",
     );
     ui.add_enabled_ui(a.enabled, |ui| {
         egui::Grid::new("auto-speed").num_columns(2).show(ui, |ui| {
-            let row = |ui: &mut egui::Ui, label: &str, tip: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, speed: f64, prefix: &str, suffix: &str| {
-                ui.label(label).on_hover_text(tip);
-                ui.add(egui::DragValue::new(value).range(range).speed(speed).prefix(prefix).suffix(suffix)).on_hover_text(tip);
+            ui.label("busy stretches at").on_hover_text("The speed where the sketch ahead was at its busiest (its box at or above its 80th percentile).");
+            ui.add(egui::Slider::new(&mut a.slowest, 0.02..=1.0).logarithmic(true).max_decimals(2).prefix("×"));
+            ui.end_row();
+            ui.label("calm stretches at").on_hover_text("The speed where the sketch ahead was as calm as it gets (its box at or below its 20th percentile). In between, the speed goes smoothly from one to the other.");
+            ui.add(egui::Slider::new(&mut a.fastest, 0.25..=4.0).logarithmic(true).max_decimals(2).prefix("×"));
+            ui.end_row();
+            ui.label("look ahead").on_hover_text("How far ahead it reads (seconds of video): the busiest moment in this window sets the speed, so it slows this long before a busy stretch.");
+            ui.add(egui::Slider::new(&mut a.look_ahead, 0.0..=5.0).max_decimals(2).suffix(" s"));
+            ui.end_row();
+        });
+        a.fastest = a.fastest.max(a.slowest);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Q/E while it drives: your multiplier ×{bias:.2}")).color(style::MUTED).small());
+            if ui.add_enabled((bias - 1.0).abs() > 1e-9, egui::Button::new("Reset").small()).clicked() {
+                world.resource_mut::<AutoSpeedState>().bias = 1.0;
+            }
+        });
+
+        egui::CollapsingHeader::new("Advanced").id_salt("auto-speed-advanced").show(ui, |ui| {
+            ui.label("Read ahead in");
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut a.foresight, Foresight::Parent, "the parent sketch").on_hover_text("The sketch whose view you're drawing in: its box shows where the subject was hard to follow. On the source, the sketch you're editing.");
+                ui.radio_value(&mut a.foresight, Foresight::Editing, "the sketch I'm editing");
+                ui.radio_value(&mut a.foresight, Foresight::Both, "both (the busier)");
+            });
+            ui.add_space(4.0);
+            ui.checkbox(&mut a.react_to_hand, "Also slow down when my hand races or starts to jiggle").on_hover_text(
+                "Reacts to your hand right now (it can't see ahead): slower while the subject moves faster on screen than your comfortable hand speed,                  or while your jiggle grows. Also drives the speed where there's nothing to read ahead.",
+            );
+            ui.add_enabled_ui(a.react_to_hand, |ui| {
+                egui::Grid::new("auto-speed-hand").num_columns(2).show(ui, |ui| {
+                    ui.label("comfortable hand speed").on_hover_text("How fast your hand follows comfortably, on screen. Calibrate sets it from your recent strokes.");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut a.comfort).range(20.0..=5000.0).speed(2.0).suffix(" pt/s"));
+                        let tip = match comfort {
+                            Some(c) => format!("Your hand moved at up to about {c:.0} pt/s (on screen, at 1×) in most of your recent strokes: use that."),
+                            None => "Hold a few strokes with the video playing first: it measures how fast your hand moves.".to_string(),
+                        };
+                        if ui.add_enabled(comfort.is_some(), egui::Button::new("Calibrate from my recent strokes")).on_hover_text(tip.clone()).on_disabled_hover_text(tip).clicked()
+                            && let Some(c) = comfort
+                        {
+                            a.comfort = c.round() as f32;
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("jiggle sensitivity").on_hover_text("How strongly your jiggle growing slows it. 0 ignores it; 1 halves the speed at three times its calm size.");
+                    ui.add(egui::Slider::new(&mut a.jiggle, 0.0..=4.0).max_decimals(2));
+                    ui.end_row();
+                });
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("auto-speed-smooth").num_columns(2).show(ui, |ui| {
+                ui.label("slow down within").on_hover_text("How quickly it slows down (real seconds): short, so it brakes in time.");
+                ui.add(egui::DragValue::new(&mut a.slow_down).range(0.01..=2.0).speed(0.005).suffix(" s"));
                 ui.end_row();
-            };
-            row(ui, "slowest", "The slowest it goes.", &mut a.slowest, 0.02..=1.0, 0.005, "×", "");
-            row(ui, "fastest", "The fastest it goes, through still parts.", &mut a.fastest, 0.5..=4.0, 0.01, "×", "");
-            row(ui, "comfortable hand speed", "The fastest your hand should have to move: a subject faster than this on screen slows playback until it isn't.", &mut a.comfort, 20.0..=3000.0, 2.0, "", " pt/s");
-            row(ui, "jiggle sensitivity", "How strongly the box growing past its recent calm size (you started to jiggle: the subject turned erratic) slows playback. 0 ignores it; 1 halves the speed at three times its calm size (up to 1.5× is ignored).", &mut a.jiggle, 0.0..=4.0, 0.01, "", "");
-            row(ui, "slow down within", "How quickly it slows down: short, so it brakes in time.", &mut a.slow_down, 0.01..=2.0, 0.005, "", " s");
-            row(ui, "speed up within", "How quickly it speeds back up: long, so it doesn't lurch.", &mut a.speed_up, 0.05..=10.0, 0.01, "", " s");
-            row(ui, "look ahead", "How far ahead the foresight sketch is read (video time), so playback slows before a fast or erratic stretch arrives. 0 = off.", &mut a.look_ahead, 0.0..=5.0, 0.01, "", " s");
-            row(ui, "erratic ahead", "How strongly a stretch ahead where the foresight sketch's box grows past its typical size (someone was unsure there) slows playback. At 2, three times its typical size runs at a quarter of the speed.", &mut a.erratic, 0.0..=6.0, 0.01, "", "");
+                ui.label("speed up within").on_hover_text("How quickly it speeds back up (real seconds): long, so it doesn't lurch.");
+                ui.add(egui::DragValue::new(&mut a.speed_up).range(0.05..=10.0).speed(0.01).suffix(" s"));
+                ui.end_row();
+            });
+            if ui.button("Defaults").on_hover_text("Put everything back (keeps it on or off)").clicked() {
+                a = AutoSpeed { enabled: a.enabled, ..AutoSpeed::default() };
+            }
         });
-        ui.label("Read ahead in");
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut a.foresight, Foresight::Parent, "the parent sketch").on_hover_text("The sketch whose view you're drawing in: its box shows where the subject was hard to follow. On the source, the sketch you're editing.");
-            ui.radio_value(&mut a.foresight, Foresight::Editing, "the sketch I'm editing");
-            ui.radio_value(&mut a.foresight, Foresight::Both, "both");
-        });
-        if ui.button("Defaults").on_hover_text("Put the knobs back (keeps it on or off)").clicked() {
-            a = AutoSpeed { enabled: a.enabled, ..AutoSpeed::default() };
-        }
     });
     if a != *world.resource::<AutoSpeed>() {
         *world.resource_mut::<AutoSpeed>() = a;

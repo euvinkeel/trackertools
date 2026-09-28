@@ -480,9 +480,9 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
     const FULL: f64 = 0.25;
     const FLASH: f64 = 0.55;
     let now = world.resource::<tt_core::time::WallClock>().now;
-    let (auto, wrote, reason) = {
+    let (auto, wrote, reason, bias, bias_changed) = {
         let a = world.resource::<AutoSpeedState>();
-        (a.acting(), a.wrote, a.reason)
+        (a.acting(), a.wrote, a.reason, a.bias, a.bias_changed)
     };
     let mut flash = world.resource_mut::<SpeedFlash>();
     if flash.rate != Some(rate) {
@@ -493,12 +493,19 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
         }
         flash.rate = Some(rate);
     }
-    let age = now - flash.changed_at;
-    let label = super::timeline::rate_label(rate);
-    let color = if (rate - 1.0).abs() < 1e-9 { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) };
+    // Q/E while auto speed drives: your multiplier flashes instead.
+    let yours = auto && bias_changed > flash.changed_at;
+    let age = now - if yours { bias_changed } else { flash.changed_at };
+    let label = if yours { format!("auto ×{bias:.2}") } else { super::timeline::rate_label(rate) };
+    let color = if (rate - 1.0).abs() < 1e-9 && !yours { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) };
 
-    // While auto speed drives it, the live rate and what limits it.
-    let (badge, color) = if auto { (format!("auto ×{rate:.2} · {reason}"), style::ACCENT) } else { (format!("{label} speed"), color) };
+    // While auto speed drives it, the live rate, what sets it and your multiplier.
+    let (badge, color) = if auto {
+        let mine = if (bias - 1.0).abs() > 1e-9 { format!(" · ×{bias:.2} yours") } else { String::new() };
+        (format!("auto ×{rate:.2} · {reason}{mine}"), style::ACCENT)
+    } else {
+        (format!("{label} speed"), color)
+    };
     let galley = painter.layout_no_wrap(badge, FontId::proportional(20.0), color);
     let r = Align2::RIGHT_TOP.anchor_size(rect.right_top() + Vec2::new(-10.0, 8.0), galley.size()).expand(5.0);
     painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));

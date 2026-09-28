@@ -20,7 +20,7 @@ use crate::panels::viewport::PointerView;
 
 const MAX_RECENT: usize = 10;
 /// The settings' layout version (see [`SettingsFile::apply`]).
-const SETTINGS_VERSION: u32 = 3;
+const SETTINGS_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
 struct SessionFile {
@@ -106,6 +106,11 @@ impl SettingsFile {
         if self.version >= 2 {
             d.wheel = self.wheel;
             d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
+        }
+        // Version 4 made the wheel hold still while holding a stroke: the old
+        // default (zoom) takes the new one; a wheel you chose stays.
+        if self.version < 4 && d.wheel == WheelMode::Zoom {
+            d.wheel = WheelMode::Still;
         }
         d.params = self.new_sketches.clone();
         {
@@ -291,6 +296,22 @@ mod tests {
         world.init_resource::<AutoSpeed>();
         serde_json::from_str::<SettingsFile>(text).unwrap().apply(&mut world);
         let d = world.resource::<SketchDefaults>();
-        assert_eq!((d.wheel, d.stroke.falloff, d.stroke.scale), (WheelMode::Zoom, 0.0, 2.0));
+        assert_eq!((d.wheel, d.stroke.falloff, d.stroke.scale), (WheelMode::Still, 0.0, 2.0));
+    }
+
+    #[test]
+    fn the_old_default_wheel_holds_still_and_a_chosen_one_stays() {
+        let read = |text: &str| {
+            let mut world = World::new();
+            world.init_resource::<SketchDefaults>();
+            world.init_resource::<ViewDefaults>();
+            world.init_resource::<PointerView>();
+            world.init_resource::<AutoSpeed>();
+            serde_json::from_str::<SettingsFile>(text).unwrap().apply(&mut world);
+            world.resource::<SketchDefaults>().wheel
+        };
+        assert_eq!(read(r#"{"version": 3, "wheel": "Zoom"}"#), WheelMode::Still);
+        assert_eq!(read(r#"{"version": 3, "wheel": "Falloff"}"#), WheelMode::Falloff);
+        assert_eq!(read(r#"{"version": 4, "wheel": "Zoom"}"#), WheelMode::Zoom);
     }
 }

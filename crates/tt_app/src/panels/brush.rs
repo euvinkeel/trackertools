@@ -46,6 +46,7 @@ fn next_stroke(ui: &mut egui::Ui, world: &mut World) {
     });
     ui.label("The mouse wheel while holding");
     ui.horizontal_wrapped(|ui| {
+        ui.radio_value(&mut d.wheel, WheelMode::Still, "does nothing: the view holds still").on_hover_text("A stray scroll while you follow the subject doesn't zoom the view under your hand.");
         ui.radio_value(&mut d.wheel, WheelMode::Zoom, "zooms the view");
         ui.radio_value(&mut d.wheel, WheelMode::Size, "sets the size");
         ui.radio_value(&mut d.wheel, WheelMode::Falloff, "the falloff");

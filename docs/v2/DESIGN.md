@@ -197,7 +197,7 @@ Results are document data written outside edits: `History::touch` marks them for
 - `guide`: a box producer, normally a sketch;
 - `space`: a view.
 
-Output: `[x, y, left, top, right, bottom, score]`.
+Output: `[x, y, left, top, right, bottom, score, flags]` (flags: §6.3).
 
 The rough pass is what makes it robust:
 - the tracker only searches the guide's box;
@@ -210,7 +210,7 @@ Strategies (template now; learned models later) sit behind the same operator and
 
 ### 6.3 Defining a tracker: looks, the Track tool, validity
 
-*(Planned after hands-on use: "I have no idea what point it's selecting… it just appears somewhere." A tracker's point came from the sketch and its pattern from a fraction of the sketch's box, and re-centring moved it again afterwards, so the user controlled none of it.)*
+*(Built after hands-on use: "I have no idea what point it's selecting… it just appears somewhere." A tracker's point came from the sketch and its pattern from a fraction of the sketch's box, and re-centring moved it again afterwards, so the user controlled none of it.)*
 
 A tracker is defined by what the user shows it. State stays flat, and every part stays re-tunable and removable:
 
@@ -222,15 +222,24 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 - **The first look is the seed.** Its frame is the anchor, and the tracker's point there is exactly its centre, where the user put it. Re-centring on the guide is off for placed trackers.
 - **Every look is a template.** The rectangle is resampled through the tracker's view. Weights are the mask where painted, the centre-weighting where not. On each frame the best-matching look wins, blended with the last frame's appearance (`adapt`). A cursor that changes icon is several looks on one tracker. The mask keeps the background behind the cursor from counting.
 - **Validity is a flag, never a deletion.** Output `[x, y, left, top, right, bottom, score, flags]`. `flags` marks *lost* (score below `min_score`) and *outside* (the point left the guide's box: the rough pass says the subject isn't there). Raw values stay. Consumers (views framed on the tracker, re-centring, export) skip flagged frames; the overlay and timeline draw them red. Changing the rule re-flags, it doesn't re-track.
-- **Unguided trackers** are allowed. Without a sketch, the search is around the last position and velocity, within `search` × the pattern's size. A sketch makes the search region and the prediction far better, and the tool says so.
+- **Unguided trackers** (planned). Without a sketch, the search would be around the last position and velocity, within `search` × the pattern's size. For now the tool asks for a sketch first ("Draw a sketch over the subject first (D)"): it makes the search region and the prediction far better.
 
 **The Track tool** (`T`; `T` or `Esc` leaves it):
 - **drag** a rectangle on the video: a new tracker with that look on the shown frame;
 - **click**: a point tracker with the brush-sized pattern (the wheel sizes it, a dashed box shows it);
 - `Shift`+drag with a tracker selected: another look for it, on this frame;
-- the guide is the selected sketch, else the smallest sketch whose box holds the rectangle on this frame, else none.
+- the guide is the selected sketch, else the smallest sketch whose box holds the rectangle's centre on this frame;
+- the tracker works in the guide's own view (created if needed), so the pattern is cut and matched where the subject sits still.
 
-**The Look editor** (a panel): the selected look's pixels, magnified. Paint the mask (left paints the subject, right erases); *fill* and *clear*.
+**The Look editor** (a panel): the selected look's pixels, magnified. Paint the mask (left paints the subject, right erases; a drag is one undo step); *Auto* (the cells that differ from the rectangle's border: a cursor on a plain background), *Fill*, *Invert*, *Clear* (back to centre-weighting). Editing a look re-tracks.
+
+Also: guide-seeded trackers (*Track its centre* on a sketch, `T`) keep re-centring on the guide; *Re-seed here* on a tracker adds a look where the tracker shows the subject on the playhead's frame and starts from it.
+
+Measured (`tests/sprite.rs`, `tests/masks.rs`, the in-app demo):
+- a placed look on the sprite fixture: median 0.08 px, max 0.20 against the truth, no re-centring;
+- the demo's Track tool (a 24 px square dragged on frame 340, inside a sketch ~2.6 px off): median 0.08 px, max 0.21;
+- a masked, antialiased cursor arrow crossing a changing background: worst score 0.77, error ≤ 0.53 px (unmasked, the score drops to 0.43: lost);
+- frames outside the guide are flagged, and their raw positions kept.
 
 Learned point trackers (CoTracker3 / TAPNext: click a point, the model predicts where it goes) sit behind the same entities as another `method`. Their seeds are the looks' centres, their search region is the guide, and they work through the same view.
 
@@ -292,7 +301,7 @@ Consequences:
   - frames a stroke visited take its value (blended by `influence`, like an NLA strip). Nothing else moves. The region around them re-derives from the new data (the motion union takes the retake in), so the box jumps and grows to include it, as if the recording had been that way. *(Changed after hands-on use: the falloff used to default to 0.2 s and dragged neighbouring frames' positions, which read as "ruining" them.)*
   - with a `falloff` (optional, 0 by default), frames within it of a visited run keep their own motion but move by the run's edge offset, with Blender's smooth falloff curve. Where several edits reach one frame, the weights are normalised, so the frames between two edits with the same offset move by exactly that offset (no overshoot);
   - where there is no path yet, a gap of at most twice the falloff between the stroke and another value is bridged linearly, so a path can be blocked out with holds on key frames;
-  - a stroke's **size** (a multiplier on its region), falloff and lag are set before drawing, in the **Brush** tab (§14). The mouse wheel zooms the view as always. As a setting, the wheel while holding can set the size, the falloff or both instead. Every stroke stays re-tunable, and removing one restores what was under it.
+  - a stroke's **size** (a multiplier on its region), falloff and lag are set before drawing, in the **Brush** tab (§14). While holding, the mouse wheel does nothing by default, so the view holds still under the hand (a stray scroll used to zoom it mid-stroke). As a setting, the wheel while holding can zoom, or set the size, the falloff or both. Every stroke stays re-tunable, and removing one restores what was under it.
 - **Live feedback:**
   - the raw hand trail;
   - the sketch with the stroke laid over it (path and region), computed by the same pipeline over the samples so far;
@@ -336,28 +345,32 @@ Measured (tests/retake.rs, and the in-app demo): a paused hold 60 px off lands w
 
 ### 8.4 Anticipatory speed
 
-*(The user's idea, after hands-on use: a box that suddenly grows after being small for a while foretells erratic motion; one that stays small and still means the subject is still and can be sped through.)* On by default (the Brush tab and Settings switch it), while a stroke records **and** the video plays, the playback rate is set for you, continuously (`tt_core::autospeed`):
+*(The user's idea, after hands-on use: a box that suddenly grows after being small for a while foretells erratic motion; one that stays small and still means the subject is still and can be sped through. Simplified after more use: "I don't like tweaking how anticipatory speed works… analyze how normally jittery the mouse is… the 20th to 80th percentiles… a range slider… maps how jiggly you were going to be in the next n seconds to that speed.")* On by default (the Brush tab and Settings switch it). While a stroke records **and** the video plays, the playback rate is set for you, continuously (`tt_core::autospeed`). It needs no numbers: it calibrates itself on the sketch it reads.
 
-- **Hand:** its velocity over the last 0.1 s (a least-squares line through the samples, in screen points), divided by the rate it was seeing `lag` earlier, is the subject's on-screen speed at 1×. The comfortable rate is `comfort` / that.
-- **Jiggle:** the samples' RMS spread around that line over the last `jiggle_window`, as a box side in screen points, against a *calm* size that follows a shrinking box within 0.3 s and a growing one within 3 s. Growth beyond 1.5× (tremor-sized boxes floored at 10 pt) multiplies the rate by (growth / 1.5)^−`jiggle`.
-- **Ahead (foresight):**
-  - **Which sketch:** by default the **parent**, the box the view you're drawing in frames. Whoever drew it already recorded how hard the subject was to follow: where its box grows past its typical size, they were unsure. A child drawn inside that view takes advantage of that foresight. *(Changed after hands-on use: it first read only the sketch being edited.)* On the source, or as a setting (`foresight`: Parent / Editing / Both), the sketch being edited is read.
-  - **What is read:** its output over the next `look_ahead` of video, through the shown view, in screen points.
-  - **Growth:** measured against the sketch's typical box around here (the lower quartile over the last 2 s and the window), so a box that is already large counts as erratic too, and it is weighted by `erratic`.
-  - `look_ahead()` / `look_ahead_from()` turn any box signal into a per-frame speed and growth, so tracker results can feed it too. Each frame's comfortable rate binds fully from a braking margin before it arrives (3 × `slow_down` at the current rate), ramping up to `fastest` at the window's end, so playback arrives slowed without crawling through the whole window.
-- **Target** = clamp(min(min(`fastest`, hand) × jiggle, ahead), `slowest`, `fastest`); a still, calm hand lets it rise toward `fastest`. The rate follows it exponentially in log-rate: within `slow_down` going down, `speed_up` going up.
-- The release (commit or cancel) restores the rate you had set. Any other rate change during the stroke (Q/E) hands the rate back to you until the release; Q/E step from the rate shown. The badge reads `auto ×0.35 · fast hand` (or `jiggle`, `ahead`, `calm`), and automatic changes never flash.
+- **What it reads:** by default the **parent** sketch, the box the view you're drawing in frames. Whoever drew it already recorded how hard the subject was to follow: its box grew where the hand jiggled or raced. On the source it reads the sketch being edited. As an advanced setting (`foresight`): Parent / Editing / Both (the busier).
+- **Calibration:** the 20th percentile of that sketch's box sizes (over all its frames) is *calm*, the 80th *busy*. It is recomputed when the sketch changes. A sketch that is about the same size everywhere still needs a clear step up to read as busy: the spread is at least half the calm size.
+- **Busyness ahead:** the biggest box in the next `look_ahead` seconds of video, placed between calm (0) and busy (1).
+- **Speed:** busyness picks a rate in the user's range, `fastest` at 0 and `slowest` at 1, even on a log scale in between (the middle is the geometric mean). So playback slows `look_ahead` before a busy stretch and speeds through calm ones.
+- **Q / E while it drives** multiply what it picks (×1.5 per press) instead of taking the rate back. The multiplier stays until changed, also in later strokes; Settings shows it with a Reset. Any other rate change while it drives (the speed menu) also becomes the multiplier. *(Changed after hands-on use: Q/E used to hand the rate back to you until the release.)*
+- **Your hand** (advanced, off by default): the older reactive limits also apply, and they drive the rate where there is nothing to read ahead.
+  - The hand's velocity over the last 0.1 s (a least-squares line, in screen points), divided by the rate it was seeing `lag` earlier, is the subject's on-screen speed at 1×; the rate that keeps it at `comfort` is the limit.
+  - `comfort` needs no guessing: **Calibrate from my recent strokes** sets it to the 80th percentile of how fast the hand moved (on screen, at 1×) over roughly the last minute of recording.
+  - Jiggle growing past its calm size slows it further (weighted by `jiggle`).
+- The rate follows the target exponentially in log-rate: within `slow_down` going down, `speed_up` going up. The release (commit or cancel) restores the rate you had set.
+- The badge reads `auto ×0.35 · busy ahead · ×1.5 yours` (or `calm ahead`, `your hand`, `nothing to read ahead`). Automatic changes never flash; a Q/E multiplier change flashes as `auto ×1.50`.
 - The ClockMap records every frame's playhead against wall time, so the pipeline needs nothing for a varying rate.
 
-| Knob | Default | Meaning |
-|---|---|---|
-| `slowest` / `fastest` | ×0.1 / ×2 | the range it moves in |
-| `comfort` | 300 pt/s | the fastest the hand should have to move on screen |
-| `jiggle` | 1.0 | how strongly box growth slows it (1: ×3 growth halves the rate; 0 = off) |
-| `slow_down` / `speed_up` | 0.1 s / 1.0 s | response times, real time |
-| `look_ahead` | 0.75 s | of video read ahead in the foresight sketch (0 = off) |
-| `foresight` | Parent | the sketch whose view you're drawing in (on the source: the one being edited), the one being edited, or both |
-| `erratic` | 2 | how strongly an erratic stretch ahead slows playback: a box 3× its typical size runs at ¼ speed |
+| Knob | Default | Where | Meaning |
+|---|---|---|---|
+| `slowest` / `fastest` | ×0.1 / ×2 | Settings | busy stretches play at `slowest`, calm ones at `fastest` |
+| `look_ahead` | 1 s | Settings | how far ahead it reads (video time) |
+| `foresight` | Parent | Advanced | the parent (on the source: the sketch being edited), the sketch being edited, or both |
+| `react_to_hand` | off | Advanced | also slow down for the hand's speed and jiggle |
+| `comfort` | 300 pt/s | Advanced | (with the hand) the on-screen speed the hand follows comfortably; *Calibrate* sets it |
+| `jiggle` | 1.0 | Advanced | (with the hand) how strongly jiggle growth slows it |
+| `slow_down` / `speed_up` | 0.1 s / 1.0 s | Advanced | response times, real time |
+
+Measured (`tests/autospeed.rs`): editing a sketch ahead of a busy stretch (a 20 px/frame dash) plays at ×1.35 while the stretch is beyond the look-ahead and ×0.10 just before it; reading the parent through a child's view does the same; a Q press while it drives turns its ×2 into ×1.33 (÷ 1.5), and it keeps driving.
 
 ---
 
@@ -528,7 +541,7 @@ Adopted from Rerun's proven design.
   - where the data folder is.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
   - `Space` play (also while holding the button: recording across frames);
-  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; arrow keys while holding retake frame by frame; the wheel zooms (or, as a setting, sets the stroke's size, falloff or both); `Esc` cancels the stroke or leaves the tool;
+  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; arrow keys while holding retake frame by frame; the wheel holds still while holding (or, as a setting, zooms or sets the stroke's size, falloff or both); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
   - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
   - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when you change it (fully for 0.25 s, then a 0.3 s fade; auto speed's changes don't flash, §8.4);

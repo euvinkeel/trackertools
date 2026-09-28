@@ -112,6 +112,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
                 if l.stroke.size == 0.0 { String::new() } else { format!("size ×{:.2} · ", l.stroke.scale) },
                 if l.stroke.falloff > 0.0 { format!("falloff {:.2} s ({:.0} frames) · ", l.stroke.falloff, l.stroke.falloff as f64 * fps) } else { String::new() },
                 match tt_core::capture::wheel_target(world.resource::<tt_core::capture::SketchDefaults>().wheel, &l.stroke) {
+                    tt_core::capture::WheelMode::Still => "off (the view holds still)",
                     tt_core::capture::WheelMode::Zoom => "zoom",
                     tt_core::capture::WheelMode::Size => "size",
                     tt_core::capture::WheelMode::Falloff => "falloff",

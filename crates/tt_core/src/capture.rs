@@ -12,8 +12,9 @@
 //!   replaces the frames it visited, and the region around them re-derives
 //!   from the new data (`sketch::layer_over`; an optional falloff pulls
 //!   neighbouring frames along too). The stroke's size, falloff and lag are
-//!   set beforehand (the Brush panel); the wheel zooms the view, or, as a
-//!   setting, sets the size, the falloff or both ([`WheelMode`]). With no
+//!   set beforehand (the Brush panel). While holding, the wheel does nothing
+//!   by default, so the view holds still under the hand; as a setting it
+//!   zooms, or sets the size, the falloff or both ([`WheelMode`]). With no
 //!   sketch selected, or with Shift held at the press, the stroke starts a
 //!   new sketch.
 //! - `Ctrl` at the press: move only (the stroke keeps the region's size).
@@ -107,9 +108,12 @@ pub struct SketchDefaults {
 /// What the mouse wheel changes while holding a stroke.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WheelMode {
-    /// Nothing on the stroke: the wheel zooms the view as always (the
-    /// stroke's size and falloff are set beforehand, in the Brush panel).
+    /// Nothing: the view holds still while you hold (a stray scroll doesn't
+    /// zoom it under your hand). The stroke's size and falloff are set
+    /// beforehand, in the Brush panel.
     #[default]
+    Still,
+    /// The wheel zooms the view as always.
     Zoom,
     /// The region's size around the point (`Stroke::scale`).
     Size,
@@ -122,7 +126,14 @@ pub enum WheelMode {
 /// What the wheel changes on `stroke`: a move-only stroke keeps the region's
 /// size, so there it always sets the falloff.
 pub fn wheel_target(mode: WheelMode, stroke: &Stroke) -> WheelMode {
-    if stroke.size == 0.0 && mode != WheelMode::Zoom { WheelMode::Falloff } else { mode }
+    if stroke.size == 0.0 && mode.turns_knob() { WheelMode::Falloff } else { mode }
+}
+
+impl WheelMode {
+    /// It changes the stroke (size, falloff or both), not the view.
+    pub fn turns_knob(self) -> bool {
+        matches!(self, WheelMode::Size | WheelMode::Falloff | WheelMode::Both)
+    }
 }
 
 /// Raw input only reports motion: a still pointer is extended to "now" once
@@ -253,7 +264,7 @@ pub fn sketch_tool(world: &mut World) {
         live.home = live.drawn_in;
         live.home_maps.clear();
     }
-    if pointer.wheel != 0.0 && wheel != WheelMode::Zoom {
+    if pointer.wheel != 0.0 && wheel.turns_knob() {
         live.knob.turn(pointer.wheel, wheel, &mut live.stroke);
     }
     let end = pointer.released.or((!pointer.down).then_some(now));
