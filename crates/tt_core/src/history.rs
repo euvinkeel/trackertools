@@ -74,6 +74,12 @@ impl History {
         self.revision
     }
 
+    /// The document changed outside an edit (results written by background
+    /// jobs): nothing to undo, but it needs saving.
+    pub fn touch(&mut self) {
+        self.revision += 1;
+    }
+
     /// Forget all history (a different document was loaded).
     pub fn clear(&mut self) {
         let revision = self.revision;
@@ -271,9 +277,17 @@ fn set_enabled(w: &mut World, e: Entity, enabled: bool) {
         entity.insert(Disabled);
     }
     // Consumers of this entity's output must recompute (it appeared or vanished).
+    // An operator coming back recomputes itself too: what it derived isn't in
+    // the history (a redo restores its output as it was when created, empty; a
+    // job operator lost its unfinished work when it was deleted).
     if w.get::<Output>(e).is_some() {
         let frames = crate::op::extent(w);
-        w.resource_mut::<Invalidations>().output_changed(e, frames);
+        let recompute = enabled && w.get::<crate::op::Operator>(e).is_some();
+        let mut inv = w.resource_mut::<Invalidations>();
+        inv.output_changed(e, frames.clone());
+        if recompute {
+            inv.recompute(e, frames);
+        }
     }
     w.resource_mut::<crate::op::OpGraph>().mark_stale();
 }
