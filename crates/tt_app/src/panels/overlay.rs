@@ -89,10 +89,11 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         }
     }
 
-    // The Sketch tool: a crosshair and what the keys do.
+    // The Sketch tool: a crosshair (none while holding, if so set) and what the keys do.
     if tool == Tool::Sketch || live.is_some() {
         if let Some(pos) = response.hover_pos() {
-            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            let hide = live.is_some() && world.resource::<super::viewport::PointerView>().hide_pointer;
+            ui.ctx().set_cursor_icon(if hide { CursorIcon::None } else { CursorIcon::Crosshair });
             painter.circle_stroke(pos, 7.0, Stroke::new(1.0, if live.is_some() { LIVE } else { style::TEXT }));
         }
         let t = world.resource::<Transport>();

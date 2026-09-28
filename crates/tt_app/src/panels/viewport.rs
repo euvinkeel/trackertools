@@ -123,6 +123,24 @@ fn ease_framing(world: &mut World, view: Option<Entity>, frame: tt_core::time::F
     shown
 }
 
+/// What the viewport does at the pointer while a stroke is held, so small
+/// targets stay in sight (user settings, remembered in the session file).
+#[derive(Resource, Debug, Clone, PartialEq)]
+pub struct PointerView {
+    /// Hide the OS pointer over the viewport while holding a stroke.
+    pub hide_pointer: bool,
+    /// Radius (points) of a clear window around the pointer while holding a
+    /// stroke: the video inside it is shown raw, with nothing drawn over it
+    /// (boxes, trails, HUD), and a thin ring at its edge. 0 = off.
+    pub clear_radius: f32,
+}
+
+impl Default for PointerView {
+    fn default() -> Self {
+        Self { hide_pointer: true, clear_radius: 24.0 }
+    }
+}
+
 /// Until when (wall seconds) the wheel is not the viewport's to zoom with.
 #[derive(Resource, Debug, Default)]
 pub struct WheelLock(pub f64);
@@ -165,6 +183,8 @@ impl Module for ViewportModule {
             .declare::<SpeedFlash>(Class::Derived)
             .init_resource::<SpeedFlash>()
             .declare::<FramingEase>(Class::Derived)
+            .declare::<PointerView>(Class::Session)
+            .init_resource::<PointerView>()
             .init_resource::<ViewMemory>()
             .init_resource::<FramingEase>()
             .init_resource::<WheelLock>()
@@ -262,6 +282,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let background = [bg.r() as f32 / 255.0, bg.g() as f32 / 255.0, bg.b() as f32 / 255.0, 1.0];
 
     let mut shown_source = None;
+    let mut video = None;
     if let Some((which, p, data)) = shown.clone() {
         let src = media.source(which).expect("shown source exists");
         shown_source = Some(which);
@@ -280,7 +301,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             background,
             nearest: (ppc / a) * (vw / src.index.width as f32) >= 3.0,
             color: media.color,
+            mask: None,
         };
+        video = Some(callback.clone());
         painter.add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
     } else {
         painter.rect_filled(rect, 0.0, style::BG);
@@ -362,6 +385,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     if let Some(probe) = world.get_resource::<crate::input_probe::InputProbe>() {
         hud(&painter, rect.center_top() + Vec2::new(0.0, 34.0), Align2::CENTER_TOP, &format!("input probe · {}", probe.summary), style::ACCENT);
     }
+    clear_window(&painter, world, &response, &mapping, active_view, video);
     let easing = world.resource::<FramingEase>().from.is_some_and(|(_, t0)| now - t0 < EASE_SECONDS);
     world.resource_mut::<WaitingForFrame>().0 = !exact || easing;
 }
@@ -417,10 +441,28 @@ fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Ent
     }
 }
 
+/// While a stroke is held: the video around the pointer once more, over
+/// everything drawn so far (overlays, HUD), inside a circle with a thin ring,
+/// so what the hand follows is never hidden. Centred on the stroke's latest
+/// pointer sample (what it records), or egui's pointer.
+fn clear_window(painter: &egui::Painter, world: &World, response: &egui::Response, mapping: &ViewportMapping, view: Option<Entity>, video: Option<VideoPaint>) {
+    let radius = world.resource::<PointerView>().clear_radius;
+    let Some(live) = world.resource::<tt_core::capture::LiveCapture>().0.as_ref() else { return };
+    let (Some(video), true) = (video, radius > 0.0) else { return };
+    let latest = live.samples.last().filter(|_| live.drawn_in == view).map(|s| mapping.to_screen([s[1], s[2]]));
+    let Some(at) = latest.or(response.hover_pos()).filter(|p| mapping.panel.contains(*p)) else { return };
+    let masked = VideoPaint { mask: Some((at, radius)), ..video };
+    painter.add(eframe::egui_wgpu::Callback::new_paint_callback(mapping.panel, masked));
+    painter.circle_stroke(at, radius + 0.5, egui::Stroke::new(1.0, Color32::from_black_alpha(90)));
+    painter.circle_stroke(at, radius - 0.5, egui::Stroke::new(1.0, super::overlay::LIVE.gamma_multiply(0.5)));
+}
+
 /// The playback speed, always in view (it is the capture speed of the next
 /// stroke): a badge top-right, and a big flash in the middle when it changes.
 fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
-    const FLASH: f64 = 1.2;
+    // The flash: fully visible this long, then fading out until FLASH (seconds).
+    const FULL: f64 = 0.25;
+    const FLASH: f64 = 0.55;
     let now = world.resource::<tt_core::time::WallClock>().now;
     let mut flash = world.resource_mut::<SpeedFlash>();
     if flash.rate != Some(rate) {
@@ -438,8 +480,7 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
     painter.galley(r.min + Vec2::splat(5.0), galley, color);
 
     if age < FLASH {
-        // Full for 0.6 s, then fading out.
-        let alpha = (1.0 - ((age - 0.6) / (FLASH - 0.6)).clamp(0.0, 1.0)) as f32;
+        let alpha = (1.0 - ((age - FULL) / (FLASH - FULL)).clamp(0.0, 1.0)) as f32;
         let galley = painter.layout_no_wrap(label, FontId::proportional(96.0), color.gamma_multiply(alpha));
         let r = Align2::CENTER_CENTER.anchor_size(rect.center(), galley.size()).expand(18.0);
         painter.rect_filled(r, 12.0, Color32::from_black_alpha((170.0 * alpha) as u8));

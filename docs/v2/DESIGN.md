@@ -257,7 +257,7 @@ Consequences:
 
   The ClockMap records every transport change, so all of it maps back to video frames.
 - **New sketch:** the `＋ New sketch` button (next to the Sketch tool), `Shift`+hold, a click on empty video, or `Alt+A` (deselect) all make the next stroke start a new sketch instead of editing the selected one.
-- **Strokes and sketches:** each press → release is a *stroke* (a Capture entity plus a `Stroke { falloff, influence, size }` component). It goes onto the **selected sketch**, so editing a rough path means: select it (a click on its box, its timeline lane, or the outliner), go to a frame, press and hold or drag. With nothing selected, or with `Shift` held at the press, the stroke starts a new sketch. `Alt+A` deselects.
+- **Strokes and sketches:** each press → release is a *stroke* (a Capture entity plus a `Stroke { falloff, influence, size, scale, lag }` component). It goes onto the **selected sketch**, so editing a rough path means: select it (a click on its box, its timeline lane, or the outliner), go to a frame, press and hold or drag. With nothing selected, or with `Shift` held at the press, the stroke starts a new sketch. `Alt+A` deselects.
 - **Clicks select, holds record:** a press shorter than 0.18 s that moves less than 4 screen points is a click, in any tool. It selects the sketch whose box is under it (the smallest where boxes overlap), or clears the selection on empty video, and never records. Only a hold or a drag edits, so a stray click can't change a path.
 - **Move only:** `Ctrl` at the press makes the stroke keep the box size that was there (`size = 0`). Without it, a hold also sets the size from its jiggle (§8.3), so a quiet hold makes the box tight. Both stay editable per stroke.
 - **Layering (proportional editing in time):** a sketch's strokes are laid over each other in order:
@@ -271,7 +271,7 @@ Consequences:
   - the other sketches, faint;
   - on the timeline, the frames the stroke visits and the frames its falloff moves.
 
-  The box outline follows After Effects' "Show Wireframe".
+  The box outline follows After Effects' "Show Wireframe". So that nothing hides a small target at the pointer while holding, the OS pointer is hidden over the viewport, and a **clear window** (radius 24 pt) around the stroke's latest sample shows the raw video: the frame is painted a second time after the overlays and HUD, with the same view transform, through a circular mask (soft 1.5 px edge, the rest discarded), with a thin ring at its edge. Both are settings (0 pt turns the window off).
 - **Takes and levels** carry over from v1 (to do):
   - "take again" at the same level averages robustly (weighted median centres, log-space sizes);
   - disagreement widens the box a little and marks those frames *uncertain*.
@@ -288,7 +288,7 @@ PointerStream (wall) ─► Lag ─► Smooth(center) ─► Resample(ClockMap) 
 
 | Stage | Parameters (defaults) | Source |
 |---|---|---|
-| **Lag** | `lag` 0.25 s wall; later an optional auto-estimate by cross-correlating against a tracker | v1 |
+| **Lag** | `lag` 0.25 s wall, **per stroke** (`Stroke::lag`: a new stroke takes its sketch's `lag`, and each stays editable). Being real time, it spans 2× the video frames at 2× playback and ½ at ½×; later an optional auto-estimate by cross-correlating against a tracker | v1 |
 | **Smooth (centre)** | **Steadiness** (One Euro `min_cutoff`, Hz) and **Responsiveness** (`beta`), tuned in that order; **Dead zone** (px, in the drawn-in view's space; ignores tremor); offline refinement is zero-phase (forward–backward), so it is lag-free and reverse-symmetric | One Euro filter (Casiez's tuning procedure), Blender lazy mouse, SciPy `filtfilt` |
 | **Jiggle → extent** | RMS spread of the hand around a *slow, non-adaptive* reference (the steadiness cutoff alone), window σ 0.25 s; **Gain** 1.0; **Pad** 12 px; **Min half-size** 16 px. *(M3: measuring against the responsive point path under-read a jiggle, by a different amount while paused than while playing, so an edit made while paused came out 2–3× smaller. Against the slow reference the same jiggle reads the same in both.)* Still to do: a critically damped spring for grow/shrink | v1 synthesis, Screen Studio-style springs |
 | **Resample** | how multiple samples on one frame (pauses, re-scrubs) combine: *last pass wins* (default) or *average* | ClockMap (§3) |
@@ -335,6 +335,7 @@ Each modifier is an operator entity in an ordered chain, with an enable toggle a
   - Outside the frames a sketch covers, its view holds the nearest framing, labelled in the breadcrumb.
   - A change of framing at the frame being looked at (an edit to the view's own sketch, a re-tune) eases in over 0.25 s instead of snapping.
 - **The region always fits:** `fit` wins over the parent's influence and the zoom limits.
+- **Zoom lock** (`lock_zoom`, on by default; the Settings tab sets it for new views): the crop keeps one size over the whole sketch, the widest the unlocked envelope (§10.1) reaches, `fit` included. It is still limited per frame by the parent's crop. A region that jitters in size then never makes the view zoom; panning is unchanged. Unlocked, the zoom follows the region through the envelope.
 - **Measured** (tests/view.rs and the in-app demo):
   - a root view keeps the sprite in its central 30% on 100% of frames;
   - three levels deep, the deepest view does too;
@@ -464,6 +465,8 @@ Adopted from Rerun's proven design.
   - what the wheel does while sketching;
   - the size and falloff the next stroke starts with;
   - the preset new sketches use;
+  - while holding a stroke: hide the pointer, and the clear window's radius (§8.1);
+  - whether new views keep a steady zoom (§10);
   - every key, generated from the keymap;
   - where the data folder is.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
@@ -471,7 +474,7 @@ Adopted from Rerun's proven design.
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel while holding sets the stroke's size, falloff or both (a setting; a move-only stroke's falloff); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
   - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
-  - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when it changes;
+  - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when it changes (fully for 0.25 s, then a 0.3 s fade);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;
   - `X` delete;

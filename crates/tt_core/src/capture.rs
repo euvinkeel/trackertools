@@ -204,8 +204,8 @@ pub fn sketch_tool(world: &mut World) {
         let target = selected.filter(|_| !mods.shift).and_then(|e| sketch_of(world, e));
         let defaults = world.resource::<SketchDefaults>().clone();
         let params = target.and_then(|t| world.get::<SketchParams>(t).cloned()).unwrap_or(defaults.params);
-        // Ctrl: move only, keeping the region's size.
-        let stroke = Stroke { size: if mods.ctrl { 0.0 } else { 1.0 }, ..defaults.stroke };
+        // Ctrl: move only, keeping the region's size. The hand's lag is the sketch's.
+        let stroke = Stroke { size: if mods.ctrl { 0.0 } else { 1.0 }, lag: params.lag, ..defaults.stroke };
         let fps = world.resource::<Transport>().fps.as_f64();
         let base = target.map(|t| compose(world, t, &params, fps)).unwrap_or_default();
         let drawn_in = world.resource::<ActiveView>().0;
@@ -291,7 +291,7 @@ pub fn sketch_tool(world: &mut World) {
         }
         t.fps.as_f64()
     };
-    live.boxes = stroke_frames(&live.samples, &live.clock, &live.stroke.sized(&live.params), fps).map(|(first, mut frames)| {
+    live.boxes = stroke_frames(&live.samples, &live.clock, &live.stroke.sized(&live.params), live.stroke.lag as f64, fps).map(|(first, mut frames)| {
         if live.drawn_in.is_some() {
             for (i, v) in frames.iter_mut().enumerate() {
                 *v = v.zip(live.through.get(&(first + i as FrameIndex))).map(|(b, m)| m.box_to_source(b));

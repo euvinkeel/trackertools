@@ -2,6 +2,10 @@
 //! and converted to RGB in a fragment shader, drawn through an egui_wgpu paint
 //! callback. The panel maps panel coordinates to video UVs with a uniform, so
 //! zoom and pan (and later, derived views) are just a different mapping.
+//!
+//! A second draw per frame may repeat the video inside a circle (the clear
+//! window around the pointer while sketching, painted over the overlays): it
+//! has its own uniforms, and discards everything outside the circle.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -19,6 +23,8 @@ struct U {
     bg: vec4<f32>,
     // x: nearest sampling, y: linearize output (sRGB target), z: full range, w: BT.601
     params: vec4<f32>,
+    // A circular mask, in framebuffer pixels: centre (x, y), radius (z; 0 = none), soft edge (w).
+    mask: vec4<f32>,
 };
 @group(0) @binding(0) var tex_y: texture_2d<f32>;
 @group(0) @binding(1) var tex_uv: texture_2d<f32>;
@@ -49,9 +55,18 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
+    // Premultiplied alpha: 1 everywhere, except at a mask's soft edge.
+    var a = 1.0;
+    if (u.mask.z > 0.0) {
+        let d = distance(in.pos.xy, u.mask.xy);
+        if (d > u.mask.z) {
+            discard;
+        }
+        a = clamp((u.mask.z - d) / max(u.mask.w, 0.001), 0.0, 1.0);
+    }
     let uv = in.p * u.scale + u.offset;
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
-        return u.bg;
+        return vec4<f32>(u.bg.rgb * a, a);
     }
     var y: f32;
     var c: vec2<f32>;
@@ -80,14 +95,15 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     if (u.params.y > 0.5) {
         rgb = srgb_to_linear(rgb);
     }
-    return vec4<f32>(rgb, 1.0);
+    return vec4<f32>(rgb * a, a);
 }
 "#;
 
 struct Planes {
     y: wgpu::Texture,
     uv: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    /// One per uniform slot (the plain draw, the masked one).
+    bind_groups: [wgpu::BindGroup; 2],
     width: u32,
     height: u32,
 }
@@ -98,7 +114,8 @@ pub struct VideoRenderer {
     layout: wgpu::BindGroupLayout,
     linear: wgpu::Sampler,
     nearest: wgpu::Sampler,
-    uniforms: wgpu::Buffer,
+    /// Slot 0: the video; slot 1: the masked repeat (both are prepared before either paints).
+    uniforms: [wgpu::Buffer; 2],
     planes: Option<Planes>,
     /// (media generation, presented frame) currently in the textures.
     shown: Option<(u64, usize)>,
@@ -171,7 +188,8 @@ impl VideoRenderer {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target,
-                    blend: None,
+                    // Opaque except at a mask's soft edge (alpha 1 replaces what is there).
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -191,11 +209,13 @@ impl VideoRenderer {
                 ..Default::default()
             })
         };
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("video uniforms"),
-            size: 48,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let uniforms = std::array::from_fn(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("video uniforms"),
+                size: 64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
         Self {
             pipeline,
@@ -228,18 +248,20 @@ impl VideoRenderer {
         let y = texture("video y", width, height, wgpu::TextureFormat::R8Unorm);
         let uv = texture("video uv", width.div_ceil(2), height.div_ceil(2), wgpu::TextureFormat::Rg8Unorm);
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("video nv12"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view(&y)) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view(&uv)) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.linear) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.nearest) },
-                wgpu::BindGroupEntry { binding: 4, resource: self.uniforms.as_entire_binding() },
-            ],
+        let bind_groups = std::array::from_fn(|slot| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("video nv12"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view(&y)) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view(&uv)) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.linear) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.nearest) },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.uniforms[slot].as_entire_binding() },
+                ],
+            })
         });
-        self.planes = Some(Planes { y, uv, bind_group, width, height });
+        self.planes = Some(Planes { y, uv, bind_groups, width, height });
         self.shown = None;
     }
 
@@ -267,6 +289,7 @@ impl VideoRenderer {
 }
 
 /// One frame's draw: which frame, and how panel coordinates map to video UVs.
+#[derive(Clone)]
 pub struct VideoPaint {
     /// (media generation, presented frame) identifying `data`.
     pub key: (u64, usize),
@@ -279,6 +302,15 @@ pub struct VideoPaint {
     pub background: [f32; 4],
     pub nearest: bool,
     pub color: ColorInfo,
+    /// Draw only inside this circle (centre and radius in points), with a soft
+    /// edge: the video repeated over what was painted on it. At most one per frame.
+    pub mask: Option<(egui::Pos2, f32)>,
+}
+
+impl VideoPaint {
+    fn slot(&self) -> usize {
+        usize::from(self.mask.is_some())
+    }
 }
 
 impl CallbackTrait for VideoPaint {
@@ -286,7 +318,7 @@ impl CallbackTrait for VideoPaint {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen: &egui_wgpu::ScreenDescriptor,
+        screen: &egui_wgpu::ScreenDescriptor,
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -304,13 +336,17 @@ impl CallbackTrait for VideoPaint {
             if self.color.full_range { 1.0 } else { 0.0 },
             if self.color.matrix == Matrix::Bt601 { 1.0 } else { 0.0 },
         ];
-        let values: [f32; 12] = [
+        // The mask in framebuffer pixels, with a 1.5 px soft edge.
+        let ppp = screen.pixels_per_point;
+        let mask = self.mask.map_or([0.0; 4], |(c, radius)| [c.x * ppp, c.y * ppp, radius * ppp, 1.5]);
+        let values: [f32; 16] = [
             self.scale[0], self.scale[1], self.offset[0], self.offset[1],
             self.background[0], self.background[1], self.background[2], self.background[3],
             params[0], params[1], params[2], params[3],
+            mask[0], mask[1], mask[2], mask[3],
         ];
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        queue.write_buffer(&r.uniforms, 0, &bytes);
+        queue.write_buffer(&r.uniforms[self.slot()], 0, &bytes);
         Vec::new()
     }
 
@@ -318,7 +354,7 @@ impl CallbackTrait for VideoPaint {
         let Some(r) = resources.get::<VideoRenderer>() else { return };
         let Some(p) = &r.planes else { return };
         pass.set_pipeline(&r.pipeline);
-        pass.set_bind_group(0, &p.bind_group, &[]);
+        pass.set_bind_group(0, &p.bind_groups[self.slot()], &[]);
         pass.draw(0..3, 0..1);
     }
 }
