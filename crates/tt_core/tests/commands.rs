@@ -7,6 +7,7 @@ use bevy_ecs::name::Name;
 use tt_core::commands::{delete, duplicate, rename, strokes_of};
 use tt_core::history::{self, History};
 use tt_core::input::Action;
+use tt_core::op::{Invalidations, Output};
 use tt_core::persist;
 use tt_core::selection::Selection;
 use tt_core::signal::{SignalId, SignalStore};
@@ -74,6 +75,10 @@ fn deleting_a_sketch_takes_its_strokes_and_view_and_undo_brings_them_back() {
     history::undo(&mut d.core.world);
     d.frames(2, still(0.0, 0.0), UP);
     assert!(!disabled(&d, s) && strokes.iter().all(|c| !disabled(&d, *c)) && !disabled(&d, view));
+    assert_eq!(strokes_of(&d.core.world, s), strokes, "its strokes are its inputs again");
+    // Delete never touched the sketch's output: recompute it from what undo restored.
+    d.core.world.resource_mut::<Invalidations>().recompute(s, 0..600);
+    d.frames(2, still(0.0, 0.0), UP);
     assert_eq!(values(&d, s), before, "undo restores the sketch exactly");
 }
 
@@ -83,7 +88,8 @@ fn deleting_a_stroke_re_derives_its_sketch_without_it() {
     let s = record(&mut d, false);
     let original = values(&d, s);
     edit_at_130(&mut d, s);
-    assert_ne!(values(&d, s), original, "the edit changed the path");
+    let edited = values(&d, s);
+    assert_ne!(edited, original, "the edit changed the path");
     let edit = strokes_of(&d.core.world, s)[1];
     assert_eq!(delete(&mut d.core.world, &[edit]), 1);
     d.frames(2, still(0.0, 0.0), UP);
@@ -93,6 +99,11 @@ fn deleting_a_stroke_re_derives_its_sketch_without_it() {
     history::undo(&mut d.core.world);
     d.frames(2, still(0.0, 0.0), UP);
     assert_eq!(strokes_of(&d.core.world, s).len(), 2, "undo puts the stroke back");
+    assert_eq!(values(&d, s), edited, "and its edit");
+    history::redo(&mut d.core.world);
+    d.frames(2, still(0.0, 0.0), UP);
+    assert_eq!(strokes_of(&d.core.world, s).len(), 1, "redo takes it out again");
+    assert_eq!(values(&d, s), original);
 }
 
 #[test]
@@ -167,16 +178,25 @@ fn a_nested_sketch_survives_its_parent_being_deleted() {
     let nested = record(&mut d, true);
     let before = values(&d, nested);
     assert!(before.iter().flatten().count() > 40);
+    let version = |d: &Driver| {
+        let w = &d.core.world;
+        w.resource::<SignalStore>().get(w.get::<Output>(nested).unwrap().0).unwrap().version()
+    };
+    let v0 = version(&d);
     delete(&mut d.core.world, &[parent]);
     d.frames(3, still(0.0, 0.0), UP);
     assert_eq!(d.core.world.resource::<ActiveView>().0, None, "the viewport fell back to the source");
+    assert!(version(&d) > v0, "its home view went, so it was derived again");
     let after = values(&d, nested);
     for (b, a) in before.iter().zip(&after) {
         if let (Some(b), Some(a)) = (b, a) {
             assert!((b[0] - a[0]).abs() < 1e-3 && (b[1] - a[1]).abs() < 1e-3, "the nested sketch's points stay");
         }
     }
-    assert_eq!(before.iter().flatten().count(), after.iter().flatten().count());
+    assert_eq!(before.iter().flatten().count(), after.iter().flatten().count(), "every frame is valid again");
+    // The region's motion is now measured in source pixels, where the subject moves (the view had followed it).
+    let widths: Vec<(f32, f32)> = before.iter().zip(&after).filter_map(|(b, a)| Some(((*b)?[4] - (*b)?[2], (*a)?[4] - (*a)?[2]))).collect();
+    assert!(widths.iter().any(|(b, a)| *a > b + 5.0), "the region was re-derived in the source: {widths:?}");
 }
 
 #[test]
@@ -256,11 +276,7 @@ fn select_all_rename_and_duplicate_keys() {
     let a = record(&mut d, false);
     let b = record(&mut d, true);
     d.frame(still(0.0, 0.0), Input { action: Some(Action::SelectAll), ..UP });
-    let mut sel = d.core.world.resource::<Selection>().entities.clone();
-    sel.sort();
-    let mut both = vec![a, b];
-    both.sort();
-    assert_eq!(sel, both);
+    assert_eq!(d.core.world.resource::<Selection>().entities, vec![a, b], "in creation order: the newest is the primary");
     d.frame(still(0.0, 0.0), Input { action: Some(Action::Duplicate), ..UP });
     assert_eq!(d.sketches().len(), 4, "both duplicated in one step");
     assert_eq!(d.core.world.resource::<History>().undo_label(), Some("Duplicate"));
