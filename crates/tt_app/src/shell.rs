@@ -232,6 +232,11 @@ impl eframe::App for Shell {
 
         self.core.run_pre_ui();
 
+        // Trackers: results arrive from background threads, and a re-plan may
+        // be waiting (inputs settling, a drag just ended). Keep frames coming.
+        if self.core.world.get_resource::<tt_track::runner::TrackJobs>().is_some_and(|j| j.active()) {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
         // Playing, or sketching while frozen: samples and the clock map keep flowing.
         if self.core.world.resource::<Transport>().playing || self.core.world.resource::<tt_core::capture::LiveCapture>().0.is_some() {
             ctx.request_repaint();
