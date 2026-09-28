@@ -28,7 +28,8 @@
 //!    `responsiveness` = beta, tuned in that order;
 //! 4. jiggle → size: RMS spread of the raw hand around a slow reference (the
 //!    steadiness cutoff alone, so it doesn't chase the jiggle) over
-//!    `jiggle_window`, × 2.2 × `gain` + `pad`, at least `min_half`;
+//!    `jiggle_window`, × 2.2 × `gain` + `pad`, at least `min_half`
+//!    (`min_half_y` vertically);
 //! 5. to video frames: each frame takes the path at the wall time it was
 //!    shown, shifted by the stroke's `lag` (the hand trails what it follows,
 //!    by the same real time at any playback rate); a paused
@@ -229,11 +230,11 @@ impl Default for Stroke {
 
 impl Stroke {
     /// `p` with the stroke's region size multiplied by `scale` (the jiggle
-    /// size's gain and pad; the floor only when growing), so a smaller size
-    /// never goes under `min_half`.
+    /// size's gain and pad; the smallest size only when growing), so a
+    /// smaller size never goes under the smallest box.
     pub fn sized(&self, p: &SketchParams) -> SketchParams {
         let k = self.scale.max(0.01);
-        SketchParams { gain: p.gain * k, pad: p.pad * k, min_half: p.min_half * k.max(1.0), ..p.clone() }
+        SketchParams { gain: p.gain * k, pad: p.pad * k, min_half: p.min_half * k.max(1.0), min_half_y: p.min_half_y * k.max(1.0), ..p.clone() }
     }
 }
 
@@ -255,10 +256,13 @@ pub struct SketchParams {
     pub jiggle_window: f32,
     /// Jiggle → box size multiplier.
     pub gain: f32,
-    /// Pixels added to every half-size.
+    /// Pixels added around the jiggle, on every side.
     pub pad: f32,
-    /// Smallest half-size (px).
+    /// The box is never narrower than twice this (px): a clamp, unlike `pad`.
     pub min_half: f32,
+    /// The box is never shorter than twice this (px).
+    #[reflect(default = "default_min_half")]
+    pub min_half_y: f32,
     /// The box includes motion from this long before … (s, video time)
     pub before: f32,
     /// … to this long after each frame (s, video time).
@@ -278,13 +282,18 @@ impl Default for SketchParams {
             jiggle_window: 0.25,
             gain: 1.0,
             pad: 12.0,
-            min_half: 16.0,
+            min_half: default_min_half(),
+            min_half_y: default_min_half(),
             before: 0.1,
             after: 0.15,
             smooth_position: 0.03,
             smooth_size: 0.2,
         }
     }
+}
+
+fn default_min_half() -> f32 {
+    16.0
 }
 
 impl SketchParams {
@@ -304,6 +313,7 @@ impl SketchParams {
                 gain: 0.8,
                 pad: 6.0,
                 min_half: 12.0,
+                min_half_y: 12.0,
                 before: 0.05,
                 after: 0.08,
                 smooth_size: 0.12,
@@ -319,6 +329,7 @@ impl SketchParams {
                 gain: 1.4,
                 pad: 24.0,
                 min_half: 28.0,
+                min_half_y: 28.0,
                 before: 0.15,
                 after: 0.3,
                 smooth_size: 0.35,
@@ -522,8 +533,8 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, l
         .iter()
         .zip(&var_y)
         .map(|(vx, vy)| {
-            let h = |v: f64| (p.gain as f64 * 2.2 * v.sqrt() + p.pad as f64).max(p.min_half as f64);
-            [h(*vx), h(*vy)]
+            let h = |v: f64| p.gain as f64 * 2.2 * v.sqrt() + p.pad as f64;
+            [h(*vx).max(p.min_half as f64), h(*vy).max(p.min_half_y as f64)]
         })
         .collect();
     let jiggle_box = |t: f64| -> [f64; 6] {
@@ -547,8 +558,8 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, l
         let c = [median(b, 0), median(b, 1)];
         let j = idx(from.max(to - p.jiggle_window as f64)).min(e);
         let spread = |k: usize| (raw[j..=e].iter().map(|r| (r[k] - c[k]).powi(2)).sum::<f64>() / (e - j + 1) as f64).sqrt();
-        let h = |s: f64| (p.gain as f64 * 2.2 * s + p.pad as f64).max(p.min_half as f64);
-        let (hx, hy) = (h(spread(0)), h(spread(1)));
+        let h = |s: f64| p.gain as f64 * 2.2 * s + p.pad as f64;
+        let (hx, hy) = (h(spread(0)).max(p.min_half as f64), h(spread(1)).max(p.min_half_y as f64));
         [c[0], c[1], c[0] - hx, c[1] - hy, c[0] + hx, c[1] + hy]
     };
 

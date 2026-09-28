@@ -75,7 +75,7 @@ fn box_settings(ui: &mut egui::Ui, world: &mut World) {
         Some(n) => format!("Box of {n}"),
         None => "Box of new sketches".to_string(),
     });
-    note(ui, "Half the box = your hand's jiggle × 2.2 × jiggle gain + padding, never below half the smallest box. A still hand gets the smallest box.");
+    note(ui, "Half the box = your hand's jiggle × 2.2 × jiggle gain + padding, then clamped to at least half the smallest box (per axis).");
     let mut drag = (false, false);
     let mut track = |r: egui::Response| {
         drag.0 |= r.drag_started();
@@ -86,9 +86,14 @@ fn box_settings(ui: &mut egui::Ui, world: &mut World) {
         track(ui.add(egui::DragValue::new(&mut p.pad).range(0.0..=500.0).speed(0.2).suffix(" px")).on_hover_text("Added around the jiggle, on every side."));
         ui.end_row();
         ui.label("Smallest box");
-        let mut smallest = 2.0 * p.min_half;
-        track(ui.add(egui::DragValue::new(&mut smallest).range(2.0..=2000.0).speed(0.5).suffix(" px")).on_hover_text("The box is never smaller than this across, however still your hand."));
-        p.min_half = smallest / 2.0;
+        let (mut w, mut h) = (2.0 * p.min_half, 2.0 * p.min_half_y);
+        ui.horizontal(|ui| {
+            let tip = "A clamp: the box is never narrower or shorter than this, however still your hand. (Padding adds; this only sets a floor.)";
+            track(ui.add(egui::DragValue::new(&mut w).range(2.0..=4000.0).speed(0.5).suffix(" px")).on_hover_text(tip));
+            ui.label("×");
+            track(ui.add(egui::DragValue::new(&mut h).range(2.0..=4000.0).speed(0.5).suffix(" px")).on_hover_text(tip));
+        });
+        (p.min_half, p.min_half_y) = (w / 2.0, h / 2.0);
         ui.end_row();
         ui.label("Jiggle gain");
         track(ui.add(egui::DragValue::new(&mut p.gain).range(0.0..=10.0).speed(0.01).prefix("×")).on_hover_text("How much your hand's jiggle grows the box."));
@@ -97,9 +102,9 @@ fn box_settings(ui: &mut egui::Ui, world: &mut World) {
         track(ui.add(egui::DragValue::new(&mut p.lag).range(0.0..=2.0).speed(0.005).suffix(" s")).on_hover_text("How far (real seconds) your hand trails what it follows. New strokes take this; each stroke keeps its own (Inspector)."));
         ui.end_row();
     });
-    let still = 2.0 * p.pad.max(p.min_half);
-    let jiggly = 2.0 * (p.gain * 2.2 * 5.0 + p.pad).max(p.min_half);
-    note(ui, &format!("A still hand: a {still:.0} px box. A hand jiggling ±5 px: {jiggly:.0} px. (Before the stroke's size ×.)"));
+    let size = |j: f32| (2.0 * (p.gain * 2.2 * j + p.pad).max(p.min_half), 2.0 * (p.gain * 2.2 * j + p.pad).max(p.min_half_y));
+    let (still, jiggly) = (size(0.0), size(5.0));
+    note(ui, &format!("A still hand: a {:.0}×{:.0} px box. A hand jiggling ±5 px: {:.0}×{:.0} px. (Before the stroke's size ×.)", still.0, still.1, jiggly.0, jiggly.1));
     note(ui, &units(world));
     if target.is_none() {
         ui.horizontal_wrapped(|ui| {

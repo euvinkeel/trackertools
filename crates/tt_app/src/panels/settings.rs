@@ -2,7 +2,7 @@
 //! session file) and every key, so nothing has to be memorized.
 
 use bevy_ecs::prelude::*;
-use tt_core::autospeed::AutoSpeed;
+use tt_core::autospeed::{AutoSpeed, Foresight};
 use tt_core::input::{Action, Keymap};
 use tt_core::view::ViewDefaults;
 
@@ -76,7 +76,8 @@ fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
     ui.heading("Anticipatory speed");
     ui.checkbox(&mut a.enabled, "Anticipatory speed: set the playback speed for me while I hold a stroke").on_hover_text(
         "While you hold a stroke with the video playing, the speed follows the subject: slower when your hand has to move fast or starts to jiggle, \
-         or before a fast stretch of the sketch you are editing; faster through still parts. Q/E during a stroke takes the speed back until you release.",
+         or before a stretch that was fast or erratic in the parent sketch (the one whose view you're drawing in); faster through still parts. \
+         Q/E during a stroke takes the speed back until you release.",
     );
     ui.add_enabled_ui(a.enabled, |ui| {
         egui::Grid::new("auto-speed").num_columns(2).show(ui, |ui| {
@@ -91,7 +92,14 @@ fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
             row(ui, "jiggle sensitivity", "How strongly the box growing past its recent calm size (you started to jiggle: the subject turned erratic) slows playback. 0 ignores it; 1 halves the speed at three times its calm size (up to 1.5× is ignored).", &mut a.jiggle, 0.0..=4.0, 0.01, "", "");
             row(ui, "slow down within", "How quickly it slows down: short, so it brakes in time.", &mut a.slow_down, 0.01..=2.0, 0.005, "", " s");
             row(ui, "speed up within", "How quickly it speeds back up: long, so it doesn't lurch.", &mut a.speed_up, 0.05..=10.0, 0.01, "", " s");
-            row(ui, "look ahead", "Editing an existing sketch: how far ahead its path is read (video time), so playback slows before a fast or erratic stretch arrives. 0 = off.", &mut a.look_ahead, 0.0..=5.0, 0.01, "", " s");
+            row(ui, "look ahead", "How far ahead the foresight sketch is read (video time), so playback slows before a fast or erratic stretch arrives. 0 = off.", &mut a.look_ahead, 0.0..=5.0, 0.01, "", " s");
+            row(ui, "erratic ahead", "How strongly a stretch ahead where the foresight sketch's box grows past its typical size (someone was unsure there) slows playback. At 2, three times its typical size runs at a quarter of the speed.", &mut a.erratic, 0.0..=6.0, 0.01, "", "");
+        });
+        ui.label("Read ahead in");
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut a.foresight, Foresight::Parent, "the parent sketch").on_hover_text("The sketch whose view you're drawing in: its box shows where the subject was hard to follow. On the source, the sketch you're editing.");
+            ui.radio_value(&mut a.foresight, Foresight::Editing, "the sketch I'm editing");
+            ui.radio_value(&mut a.foresight, Foresight::Both, "both");
         });
         if ui.button("Defaults").on_hover_text("Put the knobs back (keeps it on or off)").clicked() {
             a = AutoSpeed { enabled: a.enabled, ..AutoSpeed::default() };

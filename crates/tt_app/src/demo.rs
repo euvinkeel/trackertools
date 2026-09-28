@@ -203,6 +203,8 @@ impl SketchDemo {
         match self.phase {
             Phase::Wait => {
                 *frame = PointerFrame::default();
+                // The scripted strokes play at fixed rates; phase 5 turns auto speed on.
+                world.resource_mut::<AutoSpeed>().enabled = false;
                 if world.get_resource::<crate::media::Media>().is_none() || now < 1.5 {
                     return false;
                 }

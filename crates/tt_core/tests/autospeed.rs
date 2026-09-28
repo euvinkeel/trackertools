@@ -253,3 +253,45 @@ fn a_sketch_recorded_under_auto_speed_is_still_accurate() {
     assert!(q(0.5) < 2.0, "median {:.2} px", q(0.5));
     assert!(q(0.95) < 4.0, "p95 {:.2} px", q(0.95));
 }
+
+#[test]
+fn drawing_inside_a_view_slows_before_the_parents_erratic_stretch() {
+    use tt_core::op::Output;
+    use tt_core::signal::SignalStore;
+    use tt_core::sketch::BOX_CHANNELS;
+    use tt_core::view::{ActiveView, ensure_view};
+    let mut d = auto_driver(1.0);
+    // The parent: a steady subject whose box is 40 px, except 200 px over
+    // frames 300–330 (whoever drew it was unsure there).
+    let w = &mut d.core.world;
+    let sig = w.resource_mut::<SignalStore>().create(BOX_CHANNELS);
+    {
+        let mut store = w.resource_mut::<SignalStore>();
+        let s = store.get_mut(sig).expect("created");
+        for f in 0..1000 {
+            let (x, y, h) = (500.0 + 0.5 * f as f32, 400.0, if (300..=330).contains(&f) { 100.0 } else { 20.0 });
+            s.set(f, &[x, y, x - h, y - h, x + h, y + h]);
+        }
+    }
+    let parent = w.spawn(Output(sig)).id();
+    let view = ensure_view(w, parent);
+    w.resource_mut::<ActiveView>().0 = Some(view);
+    d.frames(3, still(300.0, 200.0), UP);
+    // A new sketch inside the view from frame 200, the hand calm.
+    type Log = Vec<(f64, f64, &'static str)>;
+    let mut log: Log = Vec::new();
+    let hand = still(300.0, 200.0);
+    start(&mut d, hand, 200, true);
+    while d.transport().playhead < 330.0 && d.now < 60.0 {
+        d.frame(hand, HOLD);
+        log.push((d.transport().playhead, rate(&d), d.core.world.resource::<AutoSpeedState>().reason));
+    }
+    d.frame(hand, UP);
+    let at = |f: f64| log.iter().find(|(p, _, _)| *p >= f).copied().expect("reached");
+    let early = log.iter().filter(|(p, _, _)| (210.0..250.0).contains(p)).map(|(_, r, _)| *r).fold(0.0, f64::max);
+    let (_, r295, why) = at(295.0);
+    println!("inside the parent's view: ×{early:.2} while its erratic stretch is far ahead; ×{r295:.2} five frames before it ({why}); ×{:.2} on it", at(305.0).1);
+    assert!(early > 1.0, "not slowed while the stretch is beyond the look-ahead: ×{early:.2}");
+    assert!(r295 < 0.5, "slowed before the parent's erratic stretch: ×{r295:.2}");
+    assert_eq!(why, "ahead");
+}

@@ -308,11 +308,15 @@ Measured (tests/retake.rs, and the in-app demo): a paused hold 60 px off lands w
 
 ### 8.4 Anticipatory speed
 
-*(The user's idea, after hands-on use: a box that suddenly grows after being small for a while foretells erratic motion; one that stays small and still means the subject is still and can be sped through.)* With the Settings switch on, while a stroke records **and** the video plays, the playback rate is set for you, continuously (`tt_core::autospeed`):
+*(The user's idea, after hands-on use: a box that suddenly grows after being small for a while foretells erratic motion; one that stays small and still means the subject is still and can be sped through.)* On by default (the Brush tab and Settings switch it), while a stroke records **and** the video plays, the playback rate is set for you, continuously (`tt_core::autospeed`):
 
 - **Hand:** its velocity over the last 0.1 s (a least-squares line through the samples, in screen points), divided by the rate it was seeing `lag` earlier, is the subject's on-screen speed at 1×. The comfortable rate is `comfort` / that.
 - **Jiggle:** the samples' RMS spread around that line over the last `jiggle_window`, as a box side in screen points, against a *calm* size that follows a shrinking box within 0.3 s and a growing one within 3 s. Growth beyond 1.5× (tremor-sized boxes floored at 10 pt) multiplies the rate by (growth / 1.5)^−`jiggle`.
-- **Ahead** (editing an existing sketch): its output over the next `look_ahead` of video, through the shown view, in screen points. `look_ahead()` turns any box signal into a per-frame speed and growth, so tracker results can feed it later. Each frame's comfortable rate binds fully from a braking margin before it arrives (3 × `slow_down` at the current rate), ramping up to `fastest` at the window's end, so playback arrives slowed without crawling through the whole window.
+- **Ahead (foresight):**
+  - **Which sketch:** by default the **parent**, the box the view you're drawing in frames. Whoever drew it already recorded how hard the subject was to follow: where its box grows past its typical size, they were unsure. A child drawn inside that view takes advantage of that foresight. *(Changed after hands-on use: it first read only the sketch being edited.)* On the source, or as a setting (`foresight`: Parent / Editing / Both), the sketch being edited is read.
+  - **What is read:** its output over the next `look_ahead` of video, through the shown view, in screen points.
+  - **Growth:** measured against the sketch's typical box around here (the lower quartile over the last 2 s and the window), so a box that is already large counts as erratic too, and it is weighted by `erratic`.
+  - `look_ahead()` / `look_ahead_from()` turn any box signal into a per-frame speed and growth, so tracker results can feed it too. Each frame's comfortable rate binds fully from a braking margin before it arrives (3 × `slow_down` at the current rate), ramping up to `fastest` at the window's end, so playback arrives slowed without crawling through the whole window.
 - **Target** = clamp(min(min(`fastest`, hand) × jiggle, ahead), `slowest`, `fastest`); a still, calm hand lets it rise toward `fastest`. The rate follows it exponentially in log-rate: within `slow_down` going down, `speed_up` going up.
 - The release (commit or cancel) restores the rate you had set. Any other rate change during the stroke (Q/E) hands the rate back to you until the release; Q/E step from the rate shown. The badge reads `auto ×0.35 · fast hand` (or `jiggle`, `ahead`, `calm`), and automatic changes never flash.
 - The ClockMap records every frame's playhead against wall time, so the pipeline needs nothing for a varying rate.
@@ -323,7 +327,9 @@ Measured (tests/retake.rs, and the in-app demo): a paused hold 60 px off lands w
 | `comfort` | 300 pt/s | the fastest the hand should have to move on screen |
 | `jiggle` | 1.0 | how strongly box growth slows it (1: ×3 growth halves the rate; 0 = off) |
 | `slow_down` / `speed_up` | 0.1 s / 1.0 s | response times, real time |
-| `look_ahead` | 0.75 s | of video read ahead in the sketch being edited (0 = off) |
+| `look_ahead` | 0.75 s | of video read ahead in the foresight sketch (0 = off) |
+| `foresight` | Parent | the sketch whose view you're drawing in (on the source: the one being edited), the one being edited, or both |
+| `erratic` | 2 | how strongly an erratic stretch ahead slows playback: a box 3× its typical size runs at ¼ speed |
 
 ---
 

@@ -185,8 +185,8 @@ fn a_smaller_size_never_goes_under_the_smallest_half_size() {
     hold_at(&mut d, 50, 300.0, 300.0, 60, HOLD);
     let s = d.core.world.resource::<Selection>().primary().unwrap();
     let v = d.value(s, 50).unwrap();
-    let min_half = SketchParams::default().min_half;
-    assert!(v[4] - v[2] >= 2.0 * min_half - 0.01 && v[5] - v[3] >= 2.0 * min_half - 0.01, "a still hand at ×0.25 still gets {min_half} px: {v:?}");
+    let (mx, my) = (SketchParams::default().min_half, SketchParams::default().min_half_y);
+    assert!(v[4] - v[2] >= 2.0 * mx - 0.01 && v[5] - v[3] >= 2.0 * my - 0.01, "a still hand at ×0.25 still gets {mx}×{my} px halves: {v:?}");
 }
 
 #[test]

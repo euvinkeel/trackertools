@@ -139,8 +139,8 @@ fn brush_outline(painter: &Painter, map: &ViewportMapping, world: &World, target
     let defaults = world.resource::<tt_core::capture::SketchDefaults>();
     let params = target.and_then(|e| world.get::<tt_core::sketch::SketchParams>(e)).unwrap_or(&defaults.params);
     let sized = defaults.stroke.sized(params);
-    let half = (sized.pad.max(sized.min_half) as f64 * map.points_per_canvas()) as f32;
-    let r = Rect::from_center_size(pos, Vec2::splat(2.0 * half));
+    let half = |m: f32| (sized.pad.max(m) as f64 * map.points_per_canvas()) as f32;
+    let r = Rect::from_center_size(pos, Vec2::new(2.0 * half(sized.min_half), 2.0 * half(sized.min_half_y)));
     let stroke = Stroke::new(1.0, Color32::from_white_alpha(90));
     for (a, b) in [(r.left_top(), r.right_top()), (r.right_top(), r.right_bottom()), (r.right_bottom(), r.left_bottom()), (r.left_bottom(), r.left_top())] {
         painter.add(Shape::dashed_line(&[a, b], stroke, 4.0, 4.0));

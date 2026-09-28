@@ -7,10 +7,14 @@
 //!   hand's jiggle box growing past its recent calm size (the subject turned
 //!   erratic) slows it further. A still, calm hand lets it rise toward the
 //!   fastest rate, slowly.
-//! - **Anticipatory:** a stroke over an existing sketch reads that sketch's
-//!   path just ahead of the playhead ([`look_ahead`], over any box signal, so
-//!   tracker results can feed it later) and slows down *before* a fast or
-//!   erratic stretch arrives.
+//! - **Anticipatory (foresight):** the sketch you're drawing inside (the
+//!   *parent*: the one whose view you're in) already recorded how hard the
+//!   subject was to follow, frame by frame: where its box grew past its
+//!   typical size, a human was unsure there. Its path just ahead of the
+//!   playhead ([`look_ahead`], over any box signal, so tracker results can
+//!   feed it too) slows playback *before* a fast or erratic stretch arrives.
+//!   Drawing on the source, or as a setting, the sketch being edited is read
+//!   instead (or both).
 //!
 //! The rate moves exponentially in log-rate: quickly down, slowly up. It acts
 //! only while a stroke is held and the transport plays. The release (commit
@@ -32,6 +36,19 @@ use crate::time::{FrameIndex, WallClock};
 use crate::tool::PointerFrame;
 use crate::transport::Transport;
 use crate::view::{ActiveView, map_at};
+
+/// Which sketch's future the look-ahead reads.
+#[derive(Reflect, Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Foresight {
+    /// The sketch whose view you're drawing in (its human uncertainty is the
+    /// foresight); drawing on the source, the sketch being edited.
+    #[default]
+    Parent,
+    /// The sketch the stroke edits.
+    Editing,
+    /// Both: whichever is more cautious.
+    Both,
+}
 
 /// The knobs (a user setting; the app remembers them).
 #[derive(Resource, Reflect, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -55,14 +72,31 @@ pub struct AutoSpeed {
     pub slow_down: f32,
     /// Seconds (real time) to speed back up: long, so it doesn't lurch.
     pub speed_up: f32,
-    /// Editing an existing sketch: how far ahead its path is read (seconds
-    /// of video), so playback slows before a fast or erratic stretch arrives.
+    /// How far ahead (seconds of video) the foresight sketch is read, so
+    /// playback slows before a fast or erratic stretch arrives.
     pub look_ahead: f32,
+    /// Which sketch the look-ahead reads.
+    pub foresight: Foresight,
+    /// How strongly an erratic stretch ahead (the box growing past its
+    /// typical size) slows playback: at 2, a box three times its typical
+    /// size runs at a quarter of the speed (growth up to 1.5× is ignored).
+    pub erratic: f32,
 }
 
 impl Default for AutoSpeed {
     fn default() -> Self {
-        Self { enabled: false, slowest: 0.1, fastest: 2.0, comfort: 300.0, jiggle: 1.0, slow_down: 0.1, speed_up: 1.0, look_ahead: 0.75 }
+        Self {
+            enabled: true,
+            slowest: 0.1,
+            fastest: 2.0,
+            comfort: 300.0,
+            jiggle: 1.0,
+            slow_down: 0.1,
+            speed_up: 1.0,
+            look_ahead: 0.75,
+            foresight: Foresight::Parent,
+            erratic: 2.0,
+        }
     }
 }
 
@@ -138,8 +172,19 @@ pub struct Ahead {
 /// value. Speeds are measured over about 50 ms of video, so per-frame noise
 /// doesn't read as speed.
 pub fn look_ahead(boxes: &[Option<[f64; 6]>], fps: f64) -> Vec<Ahead> {
-    let side = |b: &[f64; 6]| ((b[4] - b[2]) + (b[5] - b[3])) / 2.0;
-    let Some(now) = boxes.iter().flatten().next() else { return Vec::new() };
+    let now = boxes.iter().flatten().next().map(side);
+    look_ahead_from(boxes, now, fps)
+}
+
+/// A box's mean side.
+fn side(b: &[f64; 6]) -> f64 {
+    ((b[4] - b[2]) + (b[5] - b[3])) / 2.0
+}
+
+/// [`look_ahead`], with growth measured against `calm` (a typical box side,
+/// in the same points) instead of the box at the playhead.
+pub fn look_ahead_from(boxes: &[Option<[f64; 6]>], calm: Option<f64>, fps: f64) -> Vec<Ahead> {
+    let Some(calm) = calm else { return Vec::new() };
     let k = ((0.05 * fps).round() as usize).max(1);
     let dist = |a: [f64; 6], b: [f64; 6]| (b[0] - a[0]).hypot(b[1] - a[1]) * fps / k as f64;
     (0..boxes.len())
@@ -150,7 +195,7 @@ pub fn look_ahead(boxes: &[Option<[f64; 6]>], fps: f64) -> Vec<Ahead> {
                 (None, Some(prev)) => dist(prev, b),
                 _ => 0.0,
             };
-            Some(Ahead { frames: i, speed, growth: (side(&b) + JIGGLE_FLOOR) / (side(now) + JIGGLE_FLOOR) })
+            Some(Ahead { frames: i, speed, growth: (side(&b) + JIGGLE_FLOOR) / (calm + JIGGLE_FLOOR) })
         })
         .collect()
 }
@@ -241,31 +286,51 @@ fn limits(world: &World, live: &Live, knobs: &AutoSpeed, calm: &mut Option<f64>,
         let tau = if size < *c { CALM_FALL } else { CALM_RISE };
         *c += (size - *c) * (1.0 - (-dt / tau).exp());
     }
-    // Ahead: the sketch this stroke overwrites, as it will be on screen. Each
-    // frame's comfortable rate binds fully from a braking margin before its
-    // arrival (3 slow-down times at the current rate) and fades out toward the
-    // end of the look-ahead (a ramp up to the fastest rate), so playback
-    // arrives slowed, braking progressively instead of crawling for the whole window.
+    // Ahead: the foresight sketch (the parent, by default), as it will be on
+    // screen. Growth is against its typical size around here (the lower
+    // quartile over the last 2 s and the window), so a box that is large now
+    // counts as erratic too. Each frame's comfortable rate binds fully from a
+    // braking margin before its arrival (3 slow-down times at the current
+    // rate) and fades out toward the end of the look-ahead (a ramp up to the
+    // fastest rate), so playback arrives slowed, braking progressively
+    // instead of crawling for the whole window.
     let store = world.resource::<SignalStore>();
     let window = knobs.look_ahead.max(0.0) as f64;
     let margin = 3.0 * knobs.slow_down.max(0.0) as f64 * t.rate;
-    if let Some(sig) = live.target.filter(|_| window > 0.0).and_then(|s| store.get(world.get::<Output>(s)?.0)) {
-        let view = world.resource::<ActiveView>().0;
-        let f0 = t.frame();
-        let n = (window * fps).ceil() as FrameIndex;
-        let boxes: Vec<Option<[f64; 6]>> = (f0..=f0 + n)
+    let erratic = knobs.erratic.max(0.0) as f64;
+    let view = world.resource::<ActiveView>().0;
+    let (f0, n, past) = (t.frame(), (window * fps).ceil() as FrameIndex, (2.0 * fps) as FrameIndex);
+    for source in foresight_sources(world, live, knobs.foresight) {
+        let Some(sig) = world.get::<Output>(source).and_then(|o| store.get(o.0)).filter(|_| window > 0.0) else { continue };
+        let boxes: Vec<Option<[f64; 6]>> = (f0 - past..=f0 + n)
             .map(|f| {
                 let v = sig.get(f)?;
                 let b = map_at(world, view, f).box_from_source(std::array::from_fn(|c| v[c] as f64));
                 Some(b.map(|x| x * scale))
             })
             .collect();
-        for a in look_ahead(&boxes, fps) {
-            let wanted = (comfort / a.speed.max(1e-6)).min(fastest) * slow_for(a.growth, sensitivity);
+        let mut sides: Vec<f64> = boxes.iter().flatten().map(side).collect();
+        sides.sort_by(f64::total_cmp);
+        let calm = sides.get(sides.len() / 4).copied();
+        for a in look_ahead_from(&boxes[past as usize..], calm, fps) {
+            let wanted = (comfort / a.speed.max(1e-6)).min(fastest) * slow_for(a.growth, erratic);
             let reach = if window > margin { ((a.frames as f64 / fps - margin) / (window - margin)).clamp(0.0, 1.0) } else { 0.0 };
             out.ahead = out.ahead.min(wanted + (fastest - wanted).max(0.0) * reach);
         }
     }
+    out
+}
+
+/// The sketches whose future the look-ahead reads: the parent (the box the
+/// view being drawn in frames), and/or the sketch the stroke edits.
+fn foresight_sources(world: &World, live: &Live, foresight: Foresight) -> Vec<Entity> {
+    let parent = live.drawn_in.and_then(|v| crate::view::sketch_framed(world, v)).filter(|e| world.get::<bevy_ecs::entity_disabling::Disabled>(*e).is_none());
+    let mut out: Vec<Entity> = match foresight {
+        Foresight::Parent => parent.or(live.target).into_iter().collect(),
+        Foresight::Editing => live.target.into_iter().collect(),
+        Foresight::Both => parent.into_iter().chain(live.target).collect(),
+    };
+    out.dedup();
     out
 }
 
@@ -334,6 +399,7 @@ pub struct AutoSpeedModule;
 impl Module for AutoSpeedModule {
     fn build(&self, app: &mut AppBuilder) {
         app.resource_type::<AutoSpeed>(Class::Session)
+            .register_type::<Foresight>()
             .declare::<AutoSpeedState>(Class::Derived)
             .init_resource::<AutoSpeed>()
             .init_resource::<AutoSpeedState>()

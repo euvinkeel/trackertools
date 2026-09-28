@@ -20,7 +20,7 @@ use crate::panels::viewport::PointerView;
 
 const MAX_RECENT: usize = 10;
 /// The settings' layout version (see [`SettingsFile::apply`]).
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
 struct SessionFile {
@@ -107,7 +107,8 @@ impl SettingsFile {
         d.params = self.new_sketches.clone();
         world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
-        *world.resource_mut::<AutoSpeed>() = self.auto_speed.clone();
+        // Version 3 turned anticipatory speed on by default.
+        *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };
     }
 }
 

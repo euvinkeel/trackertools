@@ -40,6 +40,8 @@ impl Driver {
         *core.world.resource_mut::<Transport>() =
             Transport { fps: Rational::new(60, 1), frame_count: 600, rate: 0.5, ..Transport::default() };
         core.world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
+        // Tests set playback rates themselves; the ones about auto speed turn it on.
+        core.world.resource_mut::<tt_core::autospeed::AutoSpeed>().enabled = false;
         Self { core, now: 1.0 }
     }
 
