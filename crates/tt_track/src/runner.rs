@@ -246,6 +246,7 @@ impl Plan {
             && Arc::ptr_eq(&self.video, &old.video)
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && p.matching == q.matching
+            && p.method == q.method
             && self.looks == old.looks
             && self.seed == old.seed;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
@@ -571,6 +572,7 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         looks: plan.looks.clone(),
         seed: plan.seed,
         fuse: p.fuse,
+        method: p.method,
     };
     let shared = Arc::new(Shared::new(catch_up_limit(world, op, side), from));
     let (tx, rx) = channel();
@@ -789,7 +791,7 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         put(x);
     }
     let m = &p.matching;
-    for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64] {
+    for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64, p.method as u8 as f64] {
         put(x);
     }
     for x in [lo as f64, hi as f64, original.width as f64, original.height as f64, original.frames.len() as f64] {

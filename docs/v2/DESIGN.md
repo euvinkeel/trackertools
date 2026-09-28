@@ -219,7 +219,7 @@ The rough pass is what makes it robust:
 
 It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)`. A saved hash of its inputs, set only on complete results, lets a reopened project keep them instead of re-tracking.
 
-Strategies (template now; learned models later) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. A Python worker for CoTracker3, TAPNext or SAM 2.1 slots in as another job backend.
+Strategies (templates, and CoTracker3 in a Python worker: §6.3) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. TAPNext or SAM 2.1 would slot in as further workers.
 
 ### 6.3 Defining a tracker: looks, the Track tool, validity
 
@@ -296,7 +296,15 @@ Measured (`tests/sprite.rs`, `tests/masks.rs`, `tests/template.rs`, the in-app d
 - a masked, antialiased cursor arrow crossing a changing background: worst score 0.77, error ≤ 0.53 px (unmasked, the score drops to 0.43: lost);
 - frames outside the guide are flagged, and their raw positions kept. With the wider search, a sprite 30 or 36 px outside a wrong guide's box is kept (flagged *outside*); 120 px off, it is lost.
 
-Learned point trackers (CoTracker3 / TAPNext: click a point, the model predicts where it goes) sit behind the same entities as another `method`. Their seeds are the looks' centres, their search region is the guide, and they work through the same view.
+**Learned point trackers** sit behind the same entities as another `method` (`Tracker::method`: *Template* or *CoTracker*). CoTracker3 (v1's original tracker type; Meta's `scaled_online.pth`, CC-BY-NC, not in the repository) is built:
+- The job is the same one: the runner, the plan, spans, catch-up, the looks and their alignment, pins, the output and its flags are shared. Only the per-frame work differs (`job/learned.rs`).
+- **Frames in Rust.** The job decodes as always and resamples each frame through the tracker's view into the model's input: a 512 × 384 RGB crop (luma and the NV12 chroma, BT.709 for HD, BT.601 below, limited range). The crop has one scale for the job, so the guide's box (× `search`, the largest on the job's frames) fits with a margin, and is centred on the guide's point on every frame. The rough pass stabilizes what the model sees.
+- **Direction is the frame source's.** A backward job decodes keyframe-aligned segments and sends them reversed; the model only ever runs forward.
+- **Seeds** are the looks' aligned points, each queried on its own frame; the start is the anchor's look, or where the tracker was when a job resumes. On each frame the latest seed behind it answers (a fresher seed has drifted less), and a look's own frame is pinned where the user put it. The score is the model's visibility × confidence; below `min_score` a frame is flagged lost, keeping the model's estimate.
+- **The model runs in a Python worker** (`editor/cotracker_worker.py`, one process per job). It reuses v1's online engine (`editor/engine.py`: the rolling window, CUDA graphs on a GPU) and speaks JSON lines plus raw frames over stdin/stdout. Python is `TT_PYTHON`, else the repository's `.venv` (as v1 set it up), else `python3`/`python`. The weights are `TT_COTRACKER_WEIGHTS`, else torch hub's cache, where v1 downloaded them.
+- Catch-up works, but the model finalizes frames half a window (8) at a time, so the last few before the playhead wait for more.
+- Measured on a CPU (the cloud; the user's RTX 4090 is far faster): the sprite fixture tracked both ways over frames 590–650 from a look at 600, through a guide ~5 px off, median 0.26 px, max 0.99, none flagged, at ~1.2 fps including two model loads (`tests/cotracker.rs`); a blob in the worker alone, median 0.58 px (`editor/tests/test_cotracker_worker.py`). Both skip without torch or the weights.
+- **On the cursor fixture it is no match for the templates** (`TT_COTRACKER=1`, CPU, ~1 fps). Changing stripes and bright scenery: 100% within 3 px but a median of 0.7–1.2 px (templates 0.08); icons 73%; from the flicks on, 0–2%, and it never comes back. Two reasons. The crop's one scale per job comes from the largest guide box, so on a flick's big box the 12 px cursor shrinks to a few model pixels. And a point tracker never re-detects: only a look re-seeds it. Next: a scale per stretch, and letting the template method re-seed it where it loses the subject (a Target combining both, M7).
 
 **Result caching** (planned for after M4): results keyed by `(kind, params hash, input chunk versions)` in a content-addressed store. Undo and redo then re-link earlier results instead of recomputing, and A/B-ing parameters becomes free.
 

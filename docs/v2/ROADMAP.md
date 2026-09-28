@@ -410,12 +410,18 @@ Findings on the way:
 - Tried and not offered: an edges (gradient magnitude) channel; no gain, 2.5× slower.
 - Old saves load with the defaults (`Tracker` gains `fuse` and `matching`).
 
+**CoTracker3 as a tracker method** (DESIGN §6.3; v1's original tracker type, back):
+- `Tracker::method`: *Template* or *CoTracker*. The job resamples frames through the view into 512 × 384 RGB crops that follow the guide, backward jobs send them reversed, and a Python worker (`editor/cotracker_worker.py`) runs v1's online engine over them. The seeds are the looks' aligned points, and looks pin their frames.
+- `tests/cotracker.rs` (sprite, both ways, CPU): median 0.26 px, max 0.99. The worker alone: `editor/tests/test_cotracker_worker.py`. Both skip without torch or the weights.
+- On the cursor fixture it loses the cursor at the flicks and doesn't recover (39% within 3 px overall, templates 94–99%): one crop scale per job, and no re-detection. ⏳ a scale per stretch; templates re-seeding it where it loses the subject.
+- ⏳ one worker per job (the model loads for each; a pooled worker would save that), and TAPNext / SAM 2.1 behind the same worker protocol.
+
 **Next:**
 - run `tests/real_footage.rs` on the user's footage with the new tracker (baseline: 100.0% on the cursor, ~90 fps);
 - Tab into a tracker's view (stabilization);
 - unguided trackers (search around the last position and velocity);
 - tracker results feeding anticipatory speed's look-ahead;
-- learned trackers (CoTracker3 / TAPNext worker, SAM 2.1) behind the same operator and job protocol.
+- more learned trackers (TAPNext, SAM 2.1) behind the same worker protocol.
 
 ---
 

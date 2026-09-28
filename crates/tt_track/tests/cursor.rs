@@ -172,7 +172,7 @@ pub fn track(patches: &[usize], setup: impl FnOnce(&mut Tracker)) -> Option<(Tru
         core.run_pre_ui();
     }
     while !settled(&core.world, op) {
-        assert!(start.elapsed() < Duration::from_secs(600), "still tracking");
+        assert!(start.elapsed() < Duration::from_secs(3000), "still tracking");
         core.run_pre_ui();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -282,4 +282,16 @@ fn matching_options_fix_their_stretches() {
             assert!(share(run, stretch) >= share("default", stretch), "{run} is worse than the default on {stretch}");
         }
     }
+}
+
+/// CoTracker3 (`Method::CoTracker`) on the whole fixture, beside the
+/// templates: `TT_COTRACKER=1` (it needs the Python worker and its weights,
+/// and takes minutes on a CPU).
+#[test]
+fn cotracker_on_the_cursor_fixture() {
+    if std::env::var_os("TT_COTRACKER").is_none() {
+        return;
+    }
+    let Some((t, out, secs)) = track(&[], |p| p.method = tt_track::Method::CoTracker) else { return };
+    report("CoTracker3", &t, &out, secs);
 }

@@ -29,7 +29,11 @@ use tt_media::{DecodeOptions, FrameStream, VideoIndex};
 use crate::image::{Grid, Luma, Patch, chroma_planes, resample_xy, with_colour};
 use crate::ncc::best_match;
 use crate::template::{Estimate, LookTemplate, Settings, TEMPLATE_R, TemplateTracker, fuse, off_box};
-use crate::{LOST, OUTSIDE, TRACK_CHANNELS};
+use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
+
+mod learned;
+
+pub use learned::worker_command;
 
 /// A look, as a job reads it: a frame, a rectangle there (source px), a mask.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +116,8 @@ pub struct JobSpec {
     pub seed: Option<[f64; 2]>,
     /// Track each stretch between pins from both ends ([`template::fuse`](crate::template::fuse)).
     pub fuse: bool,
+    /// Templates, or a learned point tracker ([`learned`]).
+    pub method: Method,
 }
 
 /// State shared between a job and the runner.
@@ -176,7 +182,10 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                 stretch: Vec::new(),
                 stretch_bytes: Some(0),
             };
-            let result = worker.run();
+            let result = match worker.spec.method {
+                Method::Template => worker.run(),
+                Method::CoTracker => worker.run_learned(),
+            };
             worker.flush();
             let _ = tx.send(match result {
                 Ok(()) => Msg::Finished,

@@ -68,6 +68,17 @@ pub enum Direction {
     Backward,
 }
 
+/// How a tracker follows its subject between its looks.
+#[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Method {
+    /// Its looks as templates, matched on every frame (built in).
+    #[default]
+    Template,
+    /// CoTracker3 (Meta's learned point tracker, CC-BY-NC weights): seeded at
+    /// the looks' points, run by a Python worker on the job's frames.
+    CoTracker,
+}
+
 /// Which copy of the video a tracker reads.
 #[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Rendition {
@@ -108,6 +119,9 @@ pub struct Tracker {
     /// How alike a place must look to count as one of its looks.
     #[reflect(default)]
     pub matching: Matching,
+    /// Templates (built in), or CoTracker3 (a Python worker; see `job::learned`).
+    #[reflect(default)]
+    pub method: Method,
 }
 
 /// How alike a place must look to count as one of a tracker's looks
@@ -148,7 +162,7 @@ fn yes() -> bool {
 
 impl Tracker {
     pub fn at(anchor: FrameIndex) -> Self {
-        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false, fuse: true, matching: Matching::default() }
+        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false, fuse: true, matching: Matching::default(), method: Method::Template }
     }
 }
 
@@ -400,6 +414,7 @@ impl Module for TrackModule {
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .register_type::<Matching>()
+            .register_type::<Method>()
             .declare::<TrackStatus>(Class::Derived)
             .declare::<runner::TrackJobs>(Class::Derived)
             .declare::<Footage>(Class::Derived)
