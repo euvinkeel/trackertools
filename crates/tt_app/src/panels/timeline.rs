@@ -1,8 +1,15 @@
 //! Timeline: transport controls, a zoomable ruler you scrub on, a strip
 //! showing which frames the decode service holds in its cache, and below
-//! them one lane per sketch (the frames it covers; under a selected sketch, a
-//! tick per stroke). The visible range and lane scroll are session state.
+//! them one lane per timeline object: each sketch (the frames it covers;
+//! under a selected sketch, a tick per stroke), its view, and its trackers
+//! (their score, flagged frames and job progress). The visible range and
+//! lane scroll are session state.
 //!
+//! - Every lane's ends are its lifetime (`tt_core::span`): drag either end to
+//!   say when the object begins and ends. Nothing is deleted: frames outside
+//!   are drawn faint, and dragging back out brings them back. With snapping
+//!   on, an end snaps to the playhead and to other objects' ends. One undo
+//!   step per drag.
 //! - Scrub by dragging on the ruler. On the lanes, a click selects (Ctrl
 //!   toggles, Shift adds), a drag draws a box that selects what it touches
 //!   (past the top or bottom it scrolls the lanes; Esc drops it), a
@@ -25,7 +32,10 @@ use tt_core::selection::Selection;
 use tt_core::signal::{FrameState, SignalStore};
 use tt_core::sketch::{ClockMap, sketch_of};
 
-use super::{menu, overlay};
+use tt_core::span::{Edge, extent_of, span_of};
+use tt_track::runner::TrackStatus;
+
+use super::{menu, overlay, tracks};
 use crate::media::{ActiveSource, Media};
 use crate::style;
 
@@ -245,21 +255,57 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let live = world.resource::<LiveCapture>().0.is_some();
     let stroke_started = live && !ui_state.live;
     ui_state.live = live;
-    let hits = lanes(&painter, world, &scale, lanes_area, &mut lane_scroll, ui_state.marquee.zip(pointer), stroke_started);
+    let hot = ui_state.edge.or(ui_state.hover_edge);
+    let hits = lanes(&painter, world, &scale, lanes_area, &mut lane_scroll, ui_state.marquee.zip(pointer), stroke_started, hot, &mut ui_state.columns);
     let fitted = span >= count * 0.999 && start.abs() < 1.0;
     *world.resource_mut::<TimelineView>() =
         if fitted { TimelineView { lane_scroll, ..TimelineView::default() } } else { TimelineView { start, span: Some(span), lane_scroll } };
 
     ui_state.lanes_area = Some(lanes_area);
     let in_lanes = origin.is_some_and(|o| lanes_area.contains(o));
+    ui_state.hover_edge = response.hover_pos().filter(|p| lanes_area.contains(*p)).and_then(|p| hits.edge_at(p));
+    if ui_state.hover_edge.is_some() || ui_state.edge.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
     if in_lanes
         && response.drag_started_by(egui::PointerButton::Primary)
         && let Some(o) = origin
     {
-        // Kept in content coordinates, so it stays on its lane while the lanes scroll.
-        ui_state.marquee = Some(Pos2::new(o.x, o.y + lane_scroll));
+        match hits.edge_at(o) {
+            // On the end of a lifetime: drag it (one undo step).
+            Some((e, edge)) => {
+                ui_state.edge = Some((e, edge));
+                tt_core::span::begin_drag(world, e);
+            }
+            // Kept in content coordinates, so it stays on its lane while the lanes scroll.
+            None => ui_state.marquee = Some(Pos2::new(o.x, o.y + lane_scroll)),
+        }
     }
-    if let Some(m) = hits.marquee {
+    if let Some((e, edge)) = ui_state.edge {
+        if ui.input(|i| i.pointer.primary_down())
+            && let Some(p) = pointer
+        {
+            // The frame the end lands on, snapped (N; Ctrl inverts) to the playhead and the other objects' ends.
+            let snapping = world.resource::<tt_core::commands::TimeSnap>().enabled != mods.ctrl;
+            let under = scale.frame_at(p.x).round() as FrameIndex;
+            let f = if edge == Edge::First { under } else { under - 1 };
+            let f = if snapping {
+                let mut points = tt_core::commands::snap_points_except(world, Some(e));
+                points.push(t.frame());
+                points.sort_unstable();
+                let reach = ((8.0 / scale.px_per_frame().max(1e-6)).round() as FrameIndex).max(1);
+                tt_core::commands::snap(&points, f, reach).unwrap_or(f)
+            } else {
+                f
+            };
+            tt_core::span::move_edge(world, e, edge, f.clamp(0, t.last_frame()));
+            let what = if edge == Edge::First { "starts" } else { "ends" };
+            response.clone().on_hover_text_at_pointer(format!("{what} at frame {}  ·  {}", f.clamp(0, t.last_frame()), timecode(f.clamp(0, t.last_frame()), t.fps)));
+        } else {
+            tt_core::span::end_drag(world);
+            ui_state.edge = None;
+        }
+    } else if let Some(m) = hits.marquee {
         painter.with_clip_rect(lanes_area).rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
         let down = ui.input(|i| i.pointer.primary_down());
         if response.drag_stopped() || !down {
@@ -356,22 +402,53 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 }
 
 const LANE_H: f32 = 18.0;
+/// A lane's end can be grabbed this close (points).
+const EDGE_GRAB: f32 = 5.0;
+
+/// What a lane shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneKind {
+    Sketch,
+    View,
+    Tracker,
+}
+
+/// The lanes, top to bottom: each sketch in the outliner's tree order, then
+/// its view and its trackers (indented), then the sketches nested in its
+/// view; trackers following something else come last.
+pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
+    let tree = super::outliner::sketch_tree(world);
+    let mut out = Vec::new();
+    for (s, depth) in tree {
+        out.push((s, depth, LaneKind::Sketch));
+        if let Some(v) = tt_core::view::view_of(world, s).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
+            out.push((v, depth + 1, LaneKind::View));
+        }
+        out.extend(tt_track::trackers_of(world, s).into_iter().map(|t| (t, depth + 1, LaneKind::Tracker)));
+    }
+    let mut rest: Vec<Entity> = tracks::list(world).into_iter().map(|(e, _)| e).filter(|e| !out.iter().any(|(l, _, _)| l == e)).collect();
+    tt_core::meta::creation_order(world, &mut rest);
+    out.extend(rest.into_iter().map(|t| (t, 0, LaneKind::Tracker)));
+    out
+}
 
 /// What the lanes put where (screen), for clicks and box selection. Clicks
 /// only count inside the lanes area (lanes are clipped to it); a box's far
 /// corner stays inside it, but its anchor may have scrolled away.
 #[derive(Default)]
 struct Hits {
-    /// `(sketch, its lane (clipped), its label area, its coverage bars)`.
+    /// `(entity, its lane (clipped), its label area, its coverage bars)`.
     lanes: Vec<(Entity, Rect, Rect, Vec<Rect>)>,
     /// `(stroke, its tick)`, under selected sketches.
     ticks: Vec<(Entity, Rect)>,
+    /// `(entity, which end, its x, its lane)`: the ends of lifetimes, to drag.
+    edges: Vec<(Entity, Edge, f32, Rect)>,
     /// The box being dragged, as drawn this frame.
     marquee: Option<Rect>,
 }
 
 impl Hits {
-    /// The stroke tick or sketch lane at `p`.
+    /// The stroke tick or lane at `p`.
     fn at(&self, p: Pos2) -> Option<Entity> {
         if let Some((e, _)) = self.ticks.iter().find(|(_, r)| r.expand(1.0).contains(p)) {
             return Some(*e);
@@ -379,7 +456,16 @@ impl Hits {
         self.lanes.iter().find(|(_, lane, _, _)| lane.contains(p)).map(|(e, _, _, _)| *e)
     }
 
-    /// Everything a box touches: sketches by their label or coverage, strokes by their ticks.
+    /// The end of a lifetime under `p` (the nearer one if both are close).
+    fn edge_at(&self, p: Pos2) -> Option<(Entity, Edge)> {
+        self.edges
+            .iter()
+            .filter(|(_, _, x, lane)| lane.y_range().contains(p.y) && (p.x - x).abs() <= EDGE_GRAB)
+            .min_by(|a, b| (p.x - a.2).abs().total_cmp(&(p.x - b.2).abs()))
+            .map(|(e, edge, _, _)| (*e, *edge))
+    }
+
+    /// Everything a box touches: lanes by their label or coverage, strokes by their ticks.
     fn in_box(&self, m: Rect) -> Vec<Entity> {
         let mut out: Vec<Entity> = self.lanes.iter().filter(|(_, _, label, bars)| label.intersects(m) || bars.iter().any(|b| b.intersects(m))).map(|(e, _, _, _)| *e).collect();
         out.extend(self.ticks.iter().filter(|(_, r)| r.intersects(m)).map(|(e, _)| *e));
@@ -387,23 +473,67 @@ impl Hits {
     }
 }
 
-/// One lane per sketch, in the outliner's tree order (nested sketches
-/// indented): its path's coverage (valid solid, stale dim) and, under a
-/// selected sketch, a tick per stroke. A stroke in progress shows on the lane
-/// of the sketch it edits (visited frames solid, frames its falloff moves
-/// dim), or on a lane of its own for a new sketch. The lanes scroll
-/// vertically under the fixed ruler; `scroll` is clamped here, and brought to
-/// the live stroke's lane when `stroke_started`. `marquee`: a box's anchor (in
-/// content coordinates) and the pointer.
-fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, scroll: &mut f32, marquee: Option<(Pos2, Pos2)>, stroke_started: bool) -> Hits {
-    let tree = super::outliner::sketch_tree(world);
+/// Per pixel column of a tracker's lane: its lowest score and whether any
+/// frame there is flagged, over frames inside its span. Cached per lane
+/// until the output, the span or the visible range changes.
+type Columns = Vec<Option<(f32, bool)>>;
+
+fn tracker_columns(cache: &mut std::collections::HashMap<Entity, (u64, Columns)>, e: Entity, sig: &tt_core::signal::Signal, span: std::ops::Range<FrameIndex>, scale: &Scale) -> Columns {
+    let width = scale.rect.width().max(1.0) as usize;
+    let key = [sig.version(), span.start as u64, span.end as u64, scale.start.to_bits(), scale.span.to_bits(), width as u64]
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, v| (h ^ v).wrapping_mul(0x0100_0000_01b3));
+    if let Some((k, c)) = cache.get(&e)
+        && *k == key
+    {
+        return c.clone();
+    }
+    let mut cols: Columns = vec![None; width];
+    let first = (scale.start.floor() as FrameIndex).max(span.start);
+    let last = ((scale.start + scale.span).ceil() as FrameIndex).min(span.end);
+    for (r, _) in sig.runs(first..last) {
+        for f in r {
+            let Some(v) = sig.get(f) else { continue };
+            let i = ((scale.x(f as f64 + 0.5) - scale.rect.min.x) as usize).min(width - 1);
+            let (score, flagged) = (v.get(6).copied().unwrap_or(1.0), tt_track::flags(v) != 0);
+            cols[i] = Some(cols[i].map_or((score, flagged), |(s, fl)| (s.min(score), fl || flagged)));
+        }
+    }
+    cache.insert(e, (key, cols.clone()));
+    cols
+}
+
+/// The lanes ([`lane_list`]): each object's frames (valid solid, stale
+/// dim, outside its lifetime faint) with its lifetime's ends to drag; under a
+/// selected sketch, a tick per stroke; on a tracker's, its score (a line
+/// along the bottom, low is down), its flagged frames (red) and its jobs
+/// (what is left to track, and where they are). A stroke in progress shows
+/// on the lane of the sketch it edits (visited frames solid, frames its
+/// falloff moves dim), or on a lane of its own for a new sketch. The lanes
+/// scroll vertically under the fixed ruler; `scroll` is clamped here, and
+/// brought to the live stroke's lane when `stroke_started`. `marquee`: a
+/// box's anchor (in content coordinates) and the pointer. `hot`: the end
+/// being dragged or under the pointer.
+#[allow(clippy::too_many_arguments)]
+fn lanes(
+    painter: &egui::Painter,
+    world: &mut World,
+    scale: &Scale,
+    area: Rect,
+    scroll: &mut f32,
+    marquee: Option<(Pos2, Pos2)>,
+    stroke_started: bool,
+    hot: Option<(Entity, Edge)>,
+    cache: &mut std::collections::HashMap<Entity, (u64, Columns)>,
+) -> Hits {
+    let tree = lane_list(world);
     let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
     let live = world.resource::<LiveCapture>().0.as_ref();
     let new_lane = live.is_some_and(|l| l.target.is_none());
     let content_h = (tree.len() + usize::from(new_lane)) as f32 * LANE_H + 6.0;
     if stroke_started && let Some(l) = live {
-        let i = l.target.and_then(|t| tree.iter().position(|(e, _)| *e == t)).unwrap_or(tree.len());
+        let i = l.target.and_then(|t| tree.iter().position(|(e, _, _)| *e == t)).unwrap_or(tree.len());
         let y = i as f32 * LANE_H;
         *scroll = scroll.max(y + LANE_H - area.height()).min(y);
     }
@@ -449,36 +579,95 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, 
             }
         }
     };
-    for (i, (e, depth)) in tree.iter().enumerate() {
+    for (i, (e, depth, kind)) in tree.iter().copied().enumerate() {
         let y = area.min.y + i as f32 * LANE_H - *scroll;
         let lane = Rect::from_min_size(Pos2::new(area.min.x, y), Vec2::new(area.width(), LANE_H));
         // Off screen, a lane only matters to a box that swept it before the lanes scrolled.
         if (lane.max.y < area.min.y || lane.min.y > area.max.y) && marquee.is_none() {
             continue;
         }
-        let name = world.get::<Name>(*e).map_or("sketch".into(), |n| n.to_string());
-        let label_pos = Pos2::new(lane.min.x + 6.0 + *depth as f32 * 10.0, y + 7.0);
+        let name = world.get::<Name>(e).map_or("item".into(), |n| n.to_string());
+        let name = match kind {
+            LaneKind::Sketch => name,
+            LaneKind::View => format!("▭ {name}"),
+            LaneKind::Tracker => format!("⌖ {name}"),
+        };
+        let label_pos = Pos2::new(lane.min.x + 6.0 + depth as f32 * 10.0, y + 7.0);
         let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
         let label = Rect::from_min_size(label_pos - Vec2::new(0.0, galley.size().y / 2.0), galley.size()).expand(2.0);
-        let mut bars = Vec::new();
-        if let Some(sig) = world.get::<Output>(*e).and_then(|o| store.get(o.0)) {
+        let span = span_of(world, e);
+        let alive = span.range();
+        let (y0, y1) = if kind == LaneKind::View { (y + 4.0, y + 9.0) } else { (y + 2.0, y + 11.0) };
+        // (bar, state, inside its lifetime)
+        let mut bars: Vec<(Rect, FrameState, bool)> = Vec::new();
+        if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
             for (r, state) in sig.runs(visible.clone()) {
-                if state != FrameState::Absent
-                    && let Some(b) = bar(y + 2.0, y + 11.0, r.start, r.end)
-                {
-                    bars.push((b, state));
+                let inside = r.start.max(alive.start)..r.end.min(alive.end);
+                for (part, alive) in [(r.start..inside.start.min(r.end), false), (inside.clone(), true), (inside.end.max(r.start)..r.end, false)] {
+                    if !part.is_empty()
+                        && let Some(b) = bar(y0, y1, part.start, part.end)
+                    {
+                        bars.push((b, state, alive));
+                    }
                 }
             }
         }
-        let strokes = tt_core::commands::strokes_of(world, *e);
-        let selected = selection.is_selected(*e);
-        let previewed = marquee.is_some_and(|m| label.intersects(m) || bars.iter().any(|(b, _)| b.intersects(m)));
+        let strokes = if kind == LaneKind::Sketch { tt_core::commands::strokes_of(world, e) } else { Vec::new() };
+        let selected = selection.is_selected(e);
+        let previewed = marquee.is_some_and(|m| label.intersects(m) || bars.iter().any(|(b, _, _)| b.intersects(m)));
         if selected || previewed {
             painter.rect_filled(lane, 0.0, style::ACCENT.gamma_multiply(if selected { 0.10 } else { 0.05 }));
         }
-        let color = if selected || previewed { style::ACCENT } else { style::MUTED };
-        for (b, state) in &bars {
-            painter.rect_filled(*b, 1.5, color.gamma_multiply(if *state == FrameState::Valid { 0.7 } else { 0.25 }));
+        let base = if kind == LaneKind::Tracker { tracks::TRACK } else { style::ACCENT };
+        let color = if selected || previewed { base } else if kind == LaneKind::Tracker { tracks::TRACK.gamma_multiply(0.6) } else { style::MUTED };
+        for (b, state, alive) in &bars {
+            let alpha = match (alive, *state == FrameState::Valid) {
+                (false, _) => 0.10,
+                (true, true) => 0.7,
+                (true, false) => 0.25,
+            };
+            painter.rect_filled(*b, 1.5, color.gamma_multiply(alpha));
+        }
+        if kind == LaneKind::Tracker
+            && let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0))
+        {
+            // Flagged frames red, and the score along the bottom (1 at the top of the band).
+            let cols = tracker_columns(cache, e, sig, alive.clone(), scale);
+            let x0 = scale.rect.min.x;
+            let mut line: Vec<Pos2> = Vec::new();
+            let flush = |line: &mut Vec<Pos2>| {
+                if line.len() > 1 {
+                    painter.add(egui::Shape::line(std::mem::take(line), Stroke::new(1.0, style::TEXT.gamma_multiply(0.55))));
+                }
+                line.clear();
+            };
+            for (i, c) in cols.iter().enumerate() {
+                let x = x0 + i as f32 + 0.5;
+                match c {
+                    Some((score, flagged)) => {
+                        if *flagged {
+                            painter.rect_filled(Rect::from_x_y_ranges(x - 0.5..=x + 0.5, y0..=y1), 0.0, tracks::LOST.gamma_multiply(0.85));
+                        }
+                        line.push(Pos2::new(x, y + 16.5 - 4.5 * score.clamp(0.0, 1.0)));
+                    }
+                    None => flush(&mut line),
+                }
+            }
+            flush(&mut line);
+            // Its jobs: what is left to track (outlined) and where each is.
+            if let Some(st) = world.get::<TrackStatus>(e) {
+                for s in [st.forward, st.backward].into_iter().flatten() {
+                    let (a, b) = if s.to >= s.at { (s.at + 1, s.to + 1) } else { (s.to, s.at) };
+                    let c = if s.waiting { style::MUTED } else { tracks::TRACK };
+                    if b > a
+                        && let Some(r) = bar(y0, y1, a, b)
+                    {
+                        painter.rect_stroke(r, 1.5, Stroke::new(1.0, c.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                    }
+                    let x = scale.x(s.at as f64 + 0.5);
+                    painter.line_segment([Pos2::new(x, y + 1.0), Pos2::new(x, y + LANE_H - 1.0)], Stroke::new(2.0, c));
+                }
+            }
         }
         // A tick per stroke under a selected sketch (or one whose stroke is selected).
         if selected || strokes.iter().any(|c| selection.is_selected(*c)) {
@@ -492,11 +681,27 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, 
                 }
             }
         }
-        if let Some(l) = live.filter(|l| l.target == Some(*e)) {
+        if let Some(l) = live.filter(|l| l.target == Some(e)) {
             live_bars(y, l);
         }
+        // Its lifetime's ends: brackets where trimmed, grabbable either way.
+        if let Some((a, b)) = extent_of(world, e).and_then(|x| span.trim(x)) {
+            for (edge, f, trimmed) in [(Edge::First, a, span.first.is_some()), (Edge::Last, b + 1, span.last.is_some())] {
+                let x = scale.x(f as f64);
+                let lit = hot == Some((e, edge));
+                if trimmed || lit {
+                    let c = if lit { style::TEXT } else { color };
+                    let dx = if edge == Edge::First { 3.0 } else { -3.0 };
+                    let s = Stroke::new(if lit { 2.0 } else { 1.5 }, c);
+                    painter.line_segment([Pos2::new(x, y + 1.0), Pos2::new(x, y + LANE_H - 1.0)], s);
+                    painter.line_segment([Pos2::new(x, y + 1.0), Pos2::new(x + dx, y + 1.0)], s);
+                    painter.line_segment([Pos2::new(x, y + LANE_H - 1.0), Pos2::new(x + dx, y + LANE_H - 1.0)], s);
+                }
+                hits.edges.push((e, edge, x, lane.intersect(area)));
+            }
+        }
         painter.galley(label.min + Vec2::splat(2.0), galley, if selected { style::TEXT } else { style::MUTED });
-        hits.lanes.push((*e, lane.intersect(area), label, bars.into_iter().map(|(b, _)| b).collect()));
+        hits.lanes.push((e, lane.intersect(area), label, bars.into_iter().map(|(b, _, _)| b).collect()));
     }
     let y = area.min.y + tree.len() as f32 * LANE_H - *scroll;
     if let Some(l) = live.filter(|l| l.target.is_none()) {
@@ -514,11 +719,17 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, 
     hits
 }
 
-/// Timeline pointer state (a box being dragged over the lanes).
+/// Timeline pointer state (a box being dragged over the lanes, an end of a
+/// lifetime being dragged) and what the lanes cache.
 #[derive(Resource, Debug, Default)]
 pub struct TimelineUi {
     /// The box's anchor, in content coordinates (screen y + lane scroll).
     marquee: Option<Pos2>,
+    /// The end of a lifetime being dragged, and the one under the pointer.
+    edge: Option<(Entity, Edge)>,
+    hover_edge: Option<(Entity, Edge)>,
+    /// Tracker lanes' per-column summaries.
+    columns: std::collections::HashMap<Entity, (u64, Columns)>,
     /// A stroke was in progress last frame.
     live: bool,
     /// Where the lanes were drawn (the demo aims at it).
@@ -552,5 +763,69 @@ fn tick_label(f: FrameIndex, fps: Rational, step: FrameIndex) -> String {
     } else {
         let s = fps.frame_to_seconds(f).round() as i64;
         if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, RawInput};
+    use tt_core::history::{History, undo};
+    use tt_core::op::Operator;
+    use tt_core::span::{Span, live_span};
+    use tt_core::{AppBuilder, CoreModules};
+
+    /// The timeline alone, in a 1000 × 300 pt window: one sketch over frames
+    /// 100..=499 of a 600-frame clip (a box signal; no strokes to recompute it).
+    fn setup() -> (World, Entity) {
+        let mut app = AppBuilder::new();
+        app.add_module(CoreModules).add_module(tt_track::TrackModule).add_module(TimelineModule);
+        let mut world = app.build().world;
+        world.resource_mut::<Transport>().frame_count = 600;
+        let sig = world.resource_mut::<SignalStore>().create(6);
+        world.resource_mut::<SignalStore>().get_mut(sig).expect("signal").write(100, &[10.0; 6 * 400]);
+        let sketch = world.spawn((Name::new("Sketch 1"), Operator { kind: "sketch".into() }, Output(sig))).id();
+        (world, sketch)
+    }
+
+    fn frame(ctx: &egui::Context, world: &mut World, events: Vec<Event>) {
+        let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 300.0))), events, ..RawInput::default() };
+        ctx.run_ui(input, |ui| super::ui(ui, world)).drop_without_applying_deltas();
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    /// Dragging a lane's end trims its lifetime, snapping to the playhead,
+    /// as one undo step; the data stays.
+    #[test]
+    fn dragging_a_lanes_end_trims_it_in_one_undo_step() {
+        let (mut world, sketch) = setup();
+        world.resource_mut::<Transport>().seek(320);
+        world.resource_mut::<tt_core::commands::TimeSnap>().enabled = true;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut world, Vec::new());
+        frame(&ctx, &mut world, Vec::new());
+        let lanes = world.resource::<TimelineUi>().lanes_area.expect("lanes drawn");
+        // Fitted, the lanes span the clip's 600 frames: the sketch ends at frame 500.
+        let x_of = |f: f64| lanes.min.x + (f / 600.0) as f32 * lanes.width();
+        let y = lanes.min.y + LANE_H / 2.0;
+        let (from, to) = (Pos2::new(x_of(500.0), y), Pos2::new(x_of(322.0), y));
+        frame(&ctx, &mut world, vec![Event::PointerMoved(from)]);
+        frame(&ctx, &mut world, vec![button(from, true)]);
+        for i in 1..=8 {
+            let p = from + (to - from) * (i as f32 / 8.0);
+            frame(&ctx, &mut world, vec![Event::PointerMoved(p)]);
+        }
+        frame(&ctx, &mut world, vec![button(to, false)]);
+        frame(&ctx, &mut world, Vec::new());
+        assert_eq!(world.get::<Span>(sketch).copied(), Some(Span { first: None, last: Some(320) }), "snapped to the playhead");
+        assert_eq!(live_span(&world, sketch), Some((100, 320)));
+        assert!(world.resource::<Selection>().entities.is_empty(), "a drag on an end is no box selection");
+        assert_eq!(world.resource::<History>().undo_label(), Some("Trim Sketch 1"));
+        undo(&mut world);
+        assert_eq!(world.get::<Span>(sketch), None, "one undo takes the whole drag back");
+        assert!(!world.resource::<History>().can_undo());
     }
 }

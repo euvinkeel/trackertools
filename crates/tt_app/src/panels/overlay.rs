@@ -48,7 +48,9 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
 
     for (e, signal) in &sketches {
         let Some(sig) = store.get(*signal) else { continue };
-        let own = |f: FrameIndex| sig.get(f).map(|v| std::array::from_fn::<f64, 6, _>(|c| v[c] as f64));
+        // Only within its lifetime (its span on the timeline).
+        let span = tt_core::span::span_of(world, *e);
+        let own = |f: FrameIndex| sig.get(f).filter(|_| span.contains(f)).map(|v| std::array::from_fn::<f64, 6, _>(|c| v[c] as f64));
         let value = |f: FrameIndex| if editing == Some(*e) { live.and_then(|l| l.preview_at(f)).or_else(|| own(f)) } else { own(f) };
         let color = if editing == Some(*e) {
             LIVE

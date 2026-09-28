@@ -47,8 +47,10 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         let lit = selected.contains(&e) || looks.iter().any(|l| selected.contains(l));
         let base = if lit { TRACK } else { TRACK.gamma_multiply(0.55) };
         let reach = if lit { PATH_FRAMES } else { SHORT_PATH };
+        // Only within its lifetime (its span on the timeline).
+        let span = tt_core::span::span_of(world, e);
         let at = |f: FrameIndex| {
-            sig.get(f).map(|v| {
+            sig.get(f).filter(|_| span.contains(f)).map(|v| {
                 let [x, y] = space(f).from_source([v[0] as f64, v[1] as f64]);
                 (map.to_screen([x, y]), tt_track::flags(v) != 0)
             })
@@ -100,7 +102,7 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             }
         }
 
-        let Some(v) = sig.get(frame) else { continue };
+        let Some(v) = sig.get(frame).filter(|_| span.contains(frame)) else { continue };
         let b = space(frame).box_from_source(std::array::from_fn(|c| v[c] as f64));
         let flags = tt_track::flags(v);
         let lost = flags != 0;

@@ -211,8 +211,12 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
     let mut out: Option<f64> = None;
     for source in foresight_sources(world, live, knobs.foresight) {
         let Some(sig) = world.get::<Output>(source).and_then(|o| store.get(o.0)) else { continue };
+        // Only the frames the sketch is alive on (its span) count, for its normal and ahead.
+        let span = crate::span::span_of(world, source);
+        let sig = crate::span::clip(sig, span);
+        let key = sig.version() ^ (span.range().start as u64).rotate_left(17) ^ (span.range().end as u64).rotate_left(41);
         let (calm, busy) = match refs.get(&source) {
-            Some((v, c, b)) if *v == sig.version() => (*c, *b),
+            Some((v, c, b)) if *v == key => (*c, *b),
             _ => {
                 let Some((lo, hi)) = sig.present_hull() else { continue };
                 let mut sides: Vec<f64> = (lo..=hi).filter_map(|f| sig.get(f)).map(side).collect();
@@ -220,7 +224,7 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
                     continue;
                 }
                 let (c, b) = percentiles(&mut sides);
-                refs.insert(source, (sig.version(), c, b));
+                refs.insert(source, (key, c, b));
                 (c, b)
             }
         };

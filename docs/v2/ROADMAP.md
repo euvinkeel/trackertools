@@ -389,8 +389,13 @@ Findings on the way:
 - Deleting or restoring a look re-tracks.
 - On the user's footage (frames 37619–40235): on the cursor 84.6% → 100.0%, at ~90 fps (DESIGN §6.3 table).
 
+**Lifetimes on the timeline** (DESIGN §5.1, after hands-on use: "sorely missing"):
+- A `Span { first, last }` component (`tt_core::span`) on any timeline object; readers see its output through it (`span::output`, `EvalCtx::input`), the data itself never changes. Views, overlays, snapping, anticipatory speed and trackers' guides respect it.
+- Trackers have lanes (frames, score, flagged frames, job progress), and so do views. Drag a lane's end to trim or extend it: one undo step per drag, snapping to the playhead and other ends. The right-click menu: *Starts here*, *Ends here*, *Untrim*.
+- Tracker jobs stop at the span's edges (they still start at the anchor). Trimmed results stay; extending brings back what it had without tracking, and resumes from the nearest result where it had nothing (tests/span.rs: extending 800 → 1000 resumes at 801).
+
 **Next:**
-- trackers in the timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);
+- Tab into a tracker's view (stabilization);
 - unguided trackers (search around the last position and velocity);
 - tracker results feeding anticipatory speed's look-ahead;
 - a Lucas–Kanade refinement for hard-edged features (NCC peaks lean toward whole pixels);

@@ -114,6 +114,19 @@ Big data lives in the `SignalStore` resource, outside the ECS archetypes. Compon
 - **Coverage and staleness.** Each output signal records per frame: *absent*, *valid* or *stale*. Stale means an input changed and the value is kept for display (drawn with stale styling) until recomputed: stale-while-revalidate. Expensive results (trackers) are never deleted just because something upstream moved.
 - **Summaries.** For the timeline, each signal maintains a multi-resolution pyramid of per-block summaries (coverage, min/max, worst status per 2^k frames). This fixes v1's aliasing, where one sample per pixel column on a 69k-frame clip hid short failures.
 
+### 5.1 Lifetimes (spans)
+
+*(Built after hands-on use: lifetimes on the timeline were "sorely missing".)* Any timeline object (a tracker, a sketch, a view) can be told when it begins and ends. That is a **`Span { first, last }`** component on the entity (`tt_core::span`), each edge optional: an untrimmed edge follows the data, so a sketch that gets a stroke past its end still grows there.
+
+- **Non-destructive.** The span never touches the entity's signal. Readers see the output through it (`span::output`, and `EvalCtx::input` for operators: a cheap copy that shares every chunk but the two at the edges), so nothing outside the span reaches a view, an overlay, snapping, anticipatory speed, a tracker reading its guide, or (later) export. Extending the span brings the frames back as they were.
+- **Edits** are ordinary document edits: one undo step each, a timeline drag one gesture. A changed span re-derives what reads the entity, like any change to its output.
+- **Trackers** don't spend jobs outside their span. Jobs still start at the anchor (the path depends on where it began), so an anchor before the span tracks up to it as a lead-in; nothing past the far edges is tracked. Trimmed results stay (hidden); extended again, the frames it already had come back without tracking, and frames it never had are tracked from the nearest result. The tracker's `Reach` (derived: its guide's frames in the directions it runs) is how far its ends can be dragged; dragging an end onto its reach, or onto the end of a sketch's data, untrims that side.
+- **A trimmed guide** guides only where it lives: its tracker plans over the trimmed frames.
+- **A trimmed view** holds its nearest framing outside its span, as outside its sketch.
+- **On the timeline** every lane's ends are its span's (§14). The frames outside are drawn faint; the right-click menu has *Starts here* / *Ends here* (at the playhead) and *Untrim*.
+
+Measured (`tt_core/tests/span.rs`, `tt_track/tests/span.rs`, the timeline's headless egui test): a sketch trimmed at both ends leaves its own signal chunk-for-chunk identical while its view re-derives over exactly the trimmed frames; a tracker spanned 400–800 around an anchor at 600 tracks exactly 401 frames, extending the end to 1000 resumes the forward job at 801 (not at the anchor) and leaves frames 400–800 bit-identical, and trimming it back to 700 and undoing starts no job and restores every frame valid; a drag on a lane's end snaps to the playhead and undoes in one step.
+
 ---
 
 ## 6. Operators
@@ -544,7 +557,9 @@ Adopted from Rerun's proven design.
   - Each command is one undo step (`tt_core::commands`).
   - A box keeps its start on the content: dragged past the edge it scrolls the list, and what it swept stays in it. Esc drops it.
   - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and unfolds and scrolls to what is selected elsewhere (only when it is out of view).
-  - The Timeline scrubs from the ruler (a click seeks). With snapping on (`N`, or the header's "snap"; Ctrl while scrubbing inverts it), the playhead snaps within 8 points to the first and last frame of every sketch, stroke, view and tracker, marked on the ruler. The right-click menu can send the playhead to the selected thing's start or end. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
+  - The Timeline scrubs from the ruler (a click seeks). With snapping on (`N`, or the header's "snap"; Ctrl while scrubbing inverts it), the playhead snaps within 8 points to the first and last frame of every sketch, stroke, view and tracker (their lifetimes' ends, §5.1), marked on the ruler. The right-click menu can send the playhead to the selected thing's start or end. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
+  - **Lanes:** each sketch, then its view and its trackers (indented), then the sketches nested in its view. A tracker's lane shows its frames, its score as a line along the bottom (per pixel column, the lowest score there, so a one-frame dip shows on a long clip), its flagged frames in red, and each running job: an outline over what it still has to track and a mark where it is (grey while it waits for the playhead).
+  - **Lifetimes:** drag either end of a lane to say when that object begins and ends (§5.1); the pointer turns into a resize arrow within 5 points of an end. With snapping on, an end snaps to the playhead and to the other objects' ends. One undo step per drag; frames outside the lifetime stay, drawn faint.
 - **Settings tab** (beside the Inspector), remembered in the session file (scripted runs, the demo and benchmarks, neither use nor save it):
   - the **Brush** tab: the next stroke's size and falloff, what the wheel does, anticipatory speed on/off, and the box of the selected sketch (or of new sketches): padding and smallest box in px of the space drawn on (video pixels on the source, view pixels inside a view, with the conversion shown), jiggle gain, hand lag, presets. Before a stroke, a dashed outline at the cursor shows the box a still hand would get;
   - the size and falloff the next stroke starts with;
