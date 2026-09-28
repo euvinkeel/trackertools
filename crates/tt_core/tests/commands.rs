@@ -180,6 +180,28 @@ fn a_nested_sketch_survives_its_parent_being_deleted() {
 }
 
 #[test]
+fn deleting_nested_views_hands_the_viewport_to_the_nearest_live_one() {
+    let mut d = Driver::new();
+    let enter = |d: &mut Driver, s: Entity| {
+        d.core.world.resource_mut::<Selection>().select_only(s);
+        d.frame(still(0.0, 0.0), Input { action: Some(Action::EnterView), ..UP });
+        d.frames(2, still(0.0, 0.0), UP);
+    };
+    // A's view holds B, B's view holds C; the viewport is in C's view.
+    let a = record(&mut d, false);
+    enter(&mut d, a);
+    let b = record(&mut d, true);
+    enter(&mut d, b);
+    let c = record(&mut d, true);
+    enter(&mut d, c);
+    let (view_a, view_c) = (view_of(&mut d.core.world, a), view_of(&mut d.core.world, c));
+    assert_eq!(d.core.world.resource::<ActiveView>().0, view_c);
+    delete(&mut d.core.world, &[b, c]);
+    d.frames(2, still(0.0, 0.0), UP);
+    assert_eq!(d.core.world.resource::<ActiveView>().0, view_a, "A's view, not the source");
+}
+
+#[test]
 fn a_save_after_a_delete_leaves_the_deleted_signals_out() {
     let mut d = Driver::new();
     let parent = record(&mut d, false);

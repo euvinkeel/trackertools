@@ -422,14 +422,19 @@ fn prune_active_view(world: &mut World) {
     if is_live(world, v) && is_view(world, v) {
         return;
     }
-    // Walk up through the (possibly disabled) chain to the first live view.
-    let mut up = parent_of(world, v);
-    while let Some(u) = up {
-        if is_live(world, u) {
-            break;
+    // Walk up through the (possibly deleted) chain to the first live view.
+    let raw_parent = |v: Entity| {
+        let sketch = sketch_framed(world, v)?;
+        world.get::<Inputs>(sketch)?.0.iter().find(|(s, _)| s == "space").map(|(_, e)| *e)
+    };
+    let mut up = raw_parent(v);
+    for _ in 0..64 {
+        match up {
+            Some(u) if !(is_live(world, u) && is_view(world, u)) => up = raw_parent(u),
+            _ => break,
         }
-        up = parent_of(world, u);
     }
+    let up = up.filter(|u| is_live(world, *u) && is_view(world, *u));
     world.resource_mut::<ActiveView>().0 = up;
 }
 
