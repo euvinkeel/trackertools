@@ -1,7 +1,7 @@
 //! Timeline: transport controls and a zoomable, scrubbable ruler. The visible
 //! range is session state in the world. A thin strip under the ruler shows
-//! which frames the decode service holds in its cache. Lanes arrive with
-//! captures (M3).
+//! which frames the decode service holds in its cache; below it, one lane per
+//! sketch shows the frames it covers (click a lane to select the sketch).
 
 use bevy_ecs::prelude::*;
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
@@ -9,6 +9,12 @@ use tt_core::input::{Action, Keymap, PendingActions};
 use tt_core::time::{FrameIndex, Rational, timecode};
 use tt_core::transport::{RATES, Transport};
 use tt_core::{AppBuilder, Class, Module};
+
+use bevy_ecs::name::Name;
+use tt_core::capture::LiveCapture;
+use tt_core::op::{Operator, Output};
+use tt_core::selection::Selection;
+use tt_core::signal::{FrameState, SignalId, SignalStore};
 
 use crate::media::{ActiveSource, Media};
 use crate::style;
@@ -166,13 +172,10 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             }
         }
     }
-    painter.text(
-        Pos2::new(rect.min.x + 8.0, strip.max.y + 10.0),
-        Align2::LEFT_TOP,
-        "lanes for captures and trackers arrive in M3",
-        FontId::proportional(11.0),
-        style::MUTED,
-    );
+    let clicked_lane = lanes(&painter, world, &scale, Pos2::new(rect.min.x, strip.max.y + 4.0), response.clicked().then(|| response.interact_pointer_pos()).flatten());
+    if let Some(e) = clicked_lane {
+        world.resource_mut::<Selection>().select_only(e);
+    }
 
     // Playhead: a frame-wide band when frames are wide enough to see, else a line.
     let shown = t.frame() as f64;
@@ -198,6 +201,70 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
 
     world.resource_mut::<PendingActions>().0.extend(actions);
+}
+
+const LANE_H: f32 = 16.0;
+
+/// One lane per sketch (coverage: valid solid, stale dim) plus the capture in
+/// progress. Returns the sketch whose lane was clicked.
+fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, top: Pos2, click: Option<Pos2>) -> Option<Entity> {
+    let selection = world.resource::<Selection>().clone();
+    let mut q = world.query::<(Entity, &Operator, &Output, Option<&Name>)>();
+    let mut rows: Vec<(Entity, String, SignalId)> =
+        q.iter(world).filter(|(_, o, _, _)| o.kind == "sketch").map(|(e, _, out, n)| (e, n.map_or("sketch".into(), |n| n.to_string()), out.0)).collect();
+    rows.sort_by_key(|r| r.0);
+    let visible = (scale.start.floor() as FrameIndex).max(0)..(scale.start + scale.span).ceil() as FrameIndex;
+    let store = world.resource::<SignalStore>();
+    let mut clicked = None;
+    let mut y = top.y;
+    let bar = |y: f32, a: FrameIndex, b: FrameIndex, color: egui::Color32| {
+        let (x0, x1) = (scale.x(a as f64).max(scale.rect.min.x), scale.x(b as f64).min(scale.rect.max.x));
+        if x1 > x0 {
+            painter.rect_filled(Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), (y + 3.0)..=(y + LANE_H - 3.0)), 2.0, color);
+        }
+    };
+    for (e, name, signal) in &rows {
+        let lane = Rect::from_min_size(Pos2::new(top.x, y), Vec2::new(scale.rect.width(), LANE_H));
+        let selected = selection.is_selected(*e);
+        if selected {
+            painter.rect_filled(lane, 0.0, style::ACCENT.gamma_multiply(0.08));
+        }
+        let color = if selected { style::ACCENT } else { style::MUTED };
+        if let Some(sig) = store.get(*signal) {
+            for (r, state) in sig.runs(visible.clone()) {
+                match state {
+                    FrameState::Valid => bar(y, r.start, r.end, color.gamma_multiply(0.7)),
+                    FrameState::Stale => bar(y, r.start, r.end, color.gamma_multiply(0.25)),
+                    FrameState::Absent => {}
+                }
+            }
+        }
+        painter.text(Pos2::new(lane.min.x + 6.0, lane.center().y), Align2::LEFT_CENTER, name, FontId::proportional(11.0), if selected { style::TEXT } else { style::MUTED });
+        if click.is_some_and(|p| lane.contains(p)) {
+            clicked = Some(*e);
+        }
+        y += LANE_H;
+    }
+    if let Some(live) = &world.resource::<LiveCapture>().0
+        && let Some((first, boxes)) = &live.preview
+    {
+        let mut i = 0;
+        while i < boxes.len() {
+            if boxes[i].is_none() {
+                i += 1;
+                continue;
+            }
+            let a = i;
+            while i < boxes.len() && boxes[i].is_some() {
+                i += 1;
+            }
+            bar(y, first + a as FrameIndex, first + i as FrameIndex, egui::Color32::from_rgb(0xfb, 0xbf, 0x24));
+        }
+        painter.text(Pos2::new(top.x + 6.0, y + LANE_H / 2.0), Align2::LEFT_CENTER, "● sketching", FontId::proportional(11.0), style::TEXT);
+    } else if rows.is_empty() {
+        painter.text(Pos2::new(top.x + 8.0, y + 6.0), Align2::LEFT_TOP, "no sketches yet · D arms the Sketch tool, then press and hold on the video", FontId::proportional(11.0), style::MUTED);
+    }
+    clicked
 }
 
 fn rate_label(rate: f64) -> String {

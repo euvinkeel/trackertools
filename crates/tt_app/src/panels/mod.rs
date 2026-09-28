@@ -3,12 +3,14 @@
 
 mod inspector;
 pub mod outliner;
+mod overlay;
 pub mod timeline;
 pub mod viewport;
 
 use bevy_ecs::prelude::*;
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::timecode;
+use tt_core::tool::{ActiveTool, Tool};
 use tt_core::transport::Transport;
 
 use crate::layout::{Layout, Pane};
@@ -33,7 +35,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let t = world.resource::<Transport>();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
-        ui.label(egui::RichText::new("v2 · M1").weak());
+        ui.label(egui::RichText::new("v2 · M3").weak());
         ui.separator();
         open = ui.button("Open…").on_hover_text("Open a video (Ctrl+O), or drop a file on the window").clicked();
         let recent = world.resource::<Session>().recent();
@@ -83,6 +85,16 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         }
         if ui.add_enabled(history.can_redo(), egui::Button::new("↷")).on_hover_text(redo_tip).on_disabled_hover_text("Nothing to redo").clicked() {
             history_action = Some(Action::Redo);
+        }
+        ui.separator();
+        let sketching = world.resource::<ActiveTool>().0 == Tool::Sketch;
+        let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Sketch)).unwrap_or_default();
+        if ui
+            .selectable_label(sketching, "✏ Sketch")
+            .on_hover_text(format!("Sketch tool ({chord}): press and hold on the video to follow something"))
+            .clicked()
+        {
+            history_action = Some(Action::Tool(Tool::Sketch));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // egui repaints on demand, so frame time only means something while playing.

@@ -9,6 +9,7 @@ use bevy_ecs::prelude::*;
 
 use crate::app::{AppBuilder, Module};
 use crate::time::FrameIndex;
+use crate::tool::Tool;
 
 /// Something the user asked for — from a key, a button or a panel gesture.
 /// Features add variants as they arrive. Payload variants (e.g. `Seek`) are
@@ -32,6 +33,10 @@ pub enum Action {
     OpenFile,
     Undo,
     Redo,
+    /// Switch to a tool, or back to Select if it is already active.
+    Tool(Tool),
+    /// Abandon the gesture in progress (Esc); with none, return to Select.
+    Cancel,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -44,6 +49,7 @@ pub enum Key {
     ArrowDown,
     Home,
     End,
+    Escape,
     Letter(char),
 }
 
@@ -72,6 +78,9 @@ pub struct Binding {
 #[derive(Resource, Debug, Clone)]
 pub struct Keymap {
     pub bindings: Vec<(Binding, Action)>,
+    /// Held during a sketch: freeze on the current frame (hold-to-simulate).
+    /// With the Sketch tool active, a tap still plays/pauses.
+    pub simulate: Key,
 }
 
 impl Default for Keymap {
@@ -94,7 +103,11 @@ impl Default for Keymap {
                 (b(Key::Letter('z'), Mods::CTRL, true), Undo),
                 (b(Key::Letter('z'), Mods { ctrl: true, shift: true, alt: false }, true), Redo),
                 (b(Key::Letter('y'), Mods::CTRL, true), Redo),
+                // Blender: D + drag draws (annotate); here it arms the Sketch tool.
+                (b(Key::Letter('d'), Mods::NONE, false), Tool(crate::tool::Tool::Sketch)),
+                (b(Key::Escape, Mods::NONE, false), Cancel),
             ],
+            simulate: Key::Space,
         }
     }
 }
@@ -129,9 +142,20 @@ impl Keymap {
             Key::ArrowDown => "↓".into(),
             Key::Home => "Home".into(),
             Key::End => "End".into(),
+            Key::Escape => "Esc".into(),
             Key::Letter(c) => c.to_ascii_uppercase().to_string(),
         });
         Some(s)
+    }
+}
+
+/// Keys held down right now (the host refreshes it every app frame).
+#[derive(Resource, Debug, Default, Clone)]
+pub struct KeysHeld(pub Vec<Key>);
+
+impl KeysHeld {
+    pub fn contains(&self, key: Key) -> bool {
+        self.0.contains(&key)
     }
 }
 
@@ -156,7 +180,12 @@ pub struct InputModule;
 
 impl Module for InputModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.init_resource::<Keymap>().init_resource::<PendingActions>();
+        app.declare::<Keymap>(crate::Class::Session)
+            .declare::<KeysHeld>(crate::Class::Derived)
+            .declare::<PendingActions>(crate::Class::Derived)
+            .init_resource::<Keymap>()
+            .init_resource::<KeysHeld>()
+            .init_resource::<PendingActions>();
     }
 }
 

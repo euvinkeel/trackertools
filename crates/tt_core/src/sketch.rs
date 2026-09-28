@@ -27,7 +27,9 @@
 //!    shown, shifted by `lag` (the hand trails what it follows); a paused
 //!    stretch maps to one frame and keeps the state at the end of the hold;
 //! 6. union of the boxes over [f − before, f + after] (motion blur of the
-//!    hand), then light position/size smoothing.
+//!    hand), then light smoothing of the point and of the region's extents
+//!    around it. Frames shown in the last `lag` before the release get no
+//!    result: the hand never reached them.
 
 use std::ops::Range;
 
@@ -184,6 +186,48 @@ impl Default for SketchParams {
     }
 }
 
+impl SketchParams {
+    /// Named starting points over the numbers (as in Premiere's Auto Reframe);
+    /// every value stays editable afterwards.
+    pub const PRESETS: [&'static str; 3] = ["Tight", "Default", "Loose"];
+
+    pub fn preset(name: &str) -> Option<Self> {
+        let d = Self::default();
+        Some(match name {
+            // Follows closely with a snug region: steady subjects, careful hands.
+            "Tight" => Self {
+                steadiness: 2.0,
+                responsiveness: 0.02,
+                dead_zone: 1.0,
+                jiggle_window: 0.2,
+                gain: 0.8,
+                pad: 6.0,
+                min_half: 12.0,
+                before: 0.05,
+                after: 0.08,
+                smooth_size: 0.12,
+                ..d
+            },
+            "Default" => d,
+            // Steadier path and a generous region: erratic subjects, quick passes.
+            "Loose" => Self {
+                steadiness: 0.5,
+                responsiveness: 0.005,
+                dead_zone: 2.5,
+                jiggle_window: 0.35,
+                gain: 1.4,
+                pad: 24.0,
+                min_half: 28.0,
+                before: 0.15,
+                after: 0.3,
+                smooth_size: 0.35,
+                ..d
+            },
+            _ => return None,
+        })
+    }
+}
+
 // ---- building blocks (pure) --------------------------------------------------------------
 
 /// Samples `(t, x, y)` resampled onto a uniform grid (linear interpolation).
@@ -257,11 +301,25 @@ fn one_euro(p: &[[f64; 2]], hz: f64, min_cutoff: f64, beta: f64) -> Vec<[f64; 2]
 }
 
 /// One Euro forward, then backward over the result: zero-phase (no lag).
+/// Both ends are padded with an odd reflection first (SciPy `filtfilt`'s
+/// default), so the ends continue their trend instead of starting from a
+/// lagged state.
 fn one_euro_zero_phase(p: &[[f64; 2]], hz: f64, min_cutoff: f64, beta: f64) -> Vec<[f64; 2]> {
-    let fwd = one_euro(p, hz, min_cutoff, beta);
+    let pad = ((0.5 * hz) as usize).min(p.len() - 1);
+    let (a, z) = (p[0], p[p.len() - 1]);
+    let mut padded: Vec<[f64; 2]> = Vec::with_capacity(p.len() + 2 * pad);
+    padded.extend((1..=pad).rev().map(|k| [2.0 * a[0] - p[k][0], 2.0 * a[1] - p[k][1]]));
+    padded.extend_from_slice(p);
+    padded.extend((1..=pad).map(|k| {
+        let q = p[p.len() - 1 - k];
+        [2.0 * z[0] - q[0], 2.0 * z[1] - q[1]]
+    }));
+    let fwd = one_euro(&padded, hz, min_cutoff, beta);
     let rev: Vec<[f64; 2]> = fwd.into_iter().rev().collect();
     let mut back = one_euro(&rev, hz, min_cutoff, beta);
     back.reverse();
+    back.drain(..pad);
+    back.truncate(p.len());
     back
 }
 
@@ -289,6 +347,25 @@ pub fn gauss(v: &[f64], sigma: f64) -> Vec<f64> {
         std::mem::swap(&mut a, &mut b);
     }
     a
+}
+
+/// [`gauss`] for a signal with a trend (a moving point): the ends are padded
+/// with an odd reflection so a run's first and last values aren't pulled
+/// toward their only-one-sided neighbours.
+fn gauss_trend(v: &[f64], sigma: f64) -> Vec<f64> {
+    if sigma < 0.5 || v.len() < 2 {
+        return v.to_vec();
+    }
+    let pad = ((3.0 * sigma).ceil() as usize).min(v.len() - 1);
+    let (a, z) = (v[0], v[v.len() - 1]);
+    let mut padded = Vec::with_capacity(v.len() + 2 * pad);
+    padded.extend((1..=pad).rev().map(|k| 2.0 * a - v[k]));
+    padded.extend_from_slice(v);
+    padded.extend((1..=pad).map(|k| 2.0 * z - v[v.len() - 1 - k]));
+    let mut out = gauss(&padded, sigma);
+    out.drain(..pad);
+    out.truncate(v.len());
+    out
 }
 
 /// Linear interpolation into a grid series at time `t` (clamped).
@@ -325,10 +402,12 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
 
     // To video frames: the path at the moment each frame was shown, plus the lag.
     let (first, times) = clock.frame_times()?;
+    // A frame shown in the last `lag` before the release was never reached by the hand: no result.
     let lag = p.lag as f64;
+    let reached = samples[0][0]..=samples[samples.len() - 1][0];
     let raw_frames: Vec<Option<([f64; 2], [f64; 2])>> = times
         .iter()
-        .map(|t| t.is_finite().then(|| (at(&center, t0, hz, t + lag), at(&half, t0, hz, t + lag))))
+        .map(|t| reached.contains(&(t + lag)).then(|| (at(&center, t0, hz, t + lag), at(&half, t0, hz, t + lag))))
         .collect();
 
     // Region: union of the jiggle boxes over [f − before, f + after] (video time).
@@ -358,15 +437,17 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
         while i < n && frames[i].is_some() {
             i += 1;
         }
+        // The region is smoothed as extents around the point, so smoothing its
+        // size never drags it behind a moving subject.
         let run: Vec<[f64; 6]> = frames[start..i].iter().map(|b| b.unwrap()).collect();
-        let ch = |k: usize, s: f64| gauss(&run.iter().map(|b| b[k]).collect::<Vec<_>>(), s * fps);
-        let sp = p.smooth_position as f64;
-        let ss = p.smooth_size as f64;
-        let cols = [ch(0, sp), ch(1, sp), ch(2, ss), ch(3, ss), ch(4, ss), ch(5, ss)];
+        let extents: Vec<[f64; 4]> = run.iter().map(|b| [b[0] - b[2], b[1] - b[3], b[4] - b[0], b[5] - b[1]]).collect();
+        let (sp, ss) = (p.smooth_position as f64 * fps, p.smooth_size as f64 * fps);
+        let point = |k: usize| gauss_trend(&run.iter().map(|b| b[k]).collect::<Vec<_>>(), sp);
+        let extent = |k: usize| gauss(&extents.iter().map(|e| e[k]).collect::<Vec<_>>(), ss);
+        let (x, y) = (point(0), point(1));
+        let e = [extent(0), extent(1), extent(2), extent(3)];
         for k in 0..run.len() {
-            // Smoothing must never shrink the region off the point.
-            let (x, y) = (cols[0][k], cols[1][k]);
-            out[start + k] = Some([x, y, cols[2][k].min(x), cols[3][k].min(y), cols[4][k].max(x), cols[5][k].max(y)]);
+            out[start + k] = Some([x[k], y[k], x[k] - e[0][k], y[k] - e[1][k], x[k] + e[2][k], y[k] + e[3][k]]);
         }
     }
     Some((first, out))

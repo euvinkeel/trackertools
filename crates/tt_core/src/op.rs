@@ -359,8 +359,11 @@ fn evaluate(world: &mut World) {
         }
         let Some(kind) = world.get::<Operator>(op).and_then(|o| registry.get(&o.kind).cloned()) else { continue };
         let Some(out_id) = world.get::<Output>(op).map(|o| o.0) else { continue };
+        // A global kind recomputes everything whatever the range, so it takes the whole hull in one call.
+        let global = kind.footprint(world.entity(op)) == Footprint::Global;
         while start.elapsed().as_secs_f64() * 1e3 < budget.millis {
-            let Some(range) = world.get_mut::<Dirty>(op).and_then(|mut d| d.0.take_front(budget.step_frames)) else { break };
+            let take = |mut d: Mut<Dirty>| if global { d.0.hull().inspect(|_| d.0 = RangeSet::default()) } else { d.0.take_front(budget.step_frames) };
+            let Some(range) = world.get_mut::<Dirty>(op).and_then(take) else { break };
             let range = range.start.max(extent.start)..range.end.min(extent.end);
             if range.is_empty() {
                 continue;

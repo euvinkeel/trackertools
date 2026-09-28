@@ -7,26 +7,34 @@
 
 use std::time::{Duration, Instant};
 
-use tt_core::input::{Keymap, PendingActions};
+use tt_core::input::{Keymap, KeysHeld, PendingActions};
+use tt_core::tool::PointerFrame;
 use tt_core::time::WallClock;
 use tt_core::transport::Transport;
 use tt_core::{AppBuilder, Core, CoreModules};
 
 use crate::media::{MediaModule, OpenRequest};
+use crate::pointer::PointerService;
 use crate::session::{Session, SessionModule};
 use crate::panels::timeline::TimelineModule;
-use crate::panels::viewport::{ViewportModule, WaitingForFrame};
+use crate::panels::viewport::{ViewportMapping, ViewportModule, WaitingForFrame};
 use crate::{keys, layout, panels, style, video};
 
 pub struct Shell {
     core: Core,
     epoch: Instant,
+    pointer: PointerService,
+    /// Time of the last pointer sample handed to the world.
+    pointer_read: f64,
     /// Dev/benchmark: `TT_AUTOPLAY_SECS=N` plays N seconds once the video is
     /// open, logs the playback probe, and quits (spike S2 measurements).
     autoplay: Option<(f64, Option<f64>)>,
     /// Dev/benchmark: `TT_BENCH_STEPS=1` times seeks and frame steps until the
     /// exact frame is on screen, logs a summary, and quits (M1 acceptance).
     bench: Option<StepBench>,
+    /// Dev/benchmark: `TT_SKETCH_DEMO=<sprite_truth.json>` sketches the sprite
+    /// fixture with a scripted hand, logs the error, and quits (demo.rs).
+    sketch_demo: Option<crate::demo::SketchDemo>,
 }
 
 /// Seek to a few far-apart frames, then step backward and forward, timing each
@@ -101,7 +109,10 @@ impl Shell {
         }
         let autoplay = std::env::var("TT_AUTOPLAY_SECS").ok().and_then(|s| s.parse().ok()).map(|s| (s, None));
         let bench = std::env::var_os("TT_BENCH_STEPS").map(|_| StepBench::new());
-        Self { core, epoch: Instant::now(), autoplay, bench }
+        let epoch = Instant::now();
+        let pointer = PointerService::start(epoch);
+        let sketch_demo = crate::demo::SketchDemo::start();
+        Self { core, epoch, pointer, pointer_read: 0.0, autoplay, bench, sketch_demo }
     }
 
     fn drive_bench(&mut self, ctx: &egui::Context, now: f64) {
@@ -164,21 +175,39 @@ impl eframe::App for Shell {
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.core.world.resource_mut::<OpenRequest>().0 = Some(path);
         }
-        if !ctx.egui_wants_keyboard_input() {
+        let typing = ctx.egui_wants_keyboard_input();
+        if !typing {
             let actions = ctx.input(|i| keys::actions(i, self.core.world.resource::<Keymap>()));
             self.core.world.resource_mut::<PendingActions>().0.extend(actions);
         }
+        let mut held = if typing { Vec::new() } else { ctx.input(keys::held) };
+        let mut frame = crate::pointer::frame(ctx, &self.pointer, &mut self.pointer_read, now, self.core.world.resource::<ViewportMapping>());
+        if let Some(demo) = &mut self.sketch_demo {
+            ctx.request_repaint();
+            if demo.drive(&mut self.core.world, now, &mut frame, &mut held) {
+                self.sketch_demo = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        self.core.world.resource_mut::<KeysHeld>().0 = held;
+        *self.core.world.resource_mut::<PointerFrame>() = frame;
         self.drive_autoplay(ctx, now);
         self.drive_bench(ctx, now);
         if let Some(mut probe) = self.core.world.get_resource_mut::<crate::input_probe::InputProbe>() {
             let moves = ctx.input(|i| i.events.iter().filter(|e| matches!(e, egui::Event::PointerMoved(_))).count());
-            probe.frame(now, moves as u32);
+            let ppp = ctx.pixels_per_point();
+            let mapping = ctx.input(|i| i.viewport().inner_rect.zip(i.pointer.latest_pos())).and_then(|(inner, egui_pos)| {
+                let s = *self.pointer.recent(0.0).last()?;
+                Some(egui::pos2(s.x as f32 / ppp - inner.min.x, s.y as f32 / ppp - inner.min.y) - egui_pos)
+            });
+            probe.frame(now, moves as u32, &self.pointer, mapping);
             ctx.request_repaint();
         }
 
         self.core.run_pre_ui();
 
-        if self.core.world.resource::<Transport>().playing {
+        // Playing, or sketching while frozen: samples and the clock map keep flowing.
+        if self.core.world.resource::<Transport>().playing || self.core.world.resource::<tt_core::capture::LiveCapture>().0.is_some() {
             ctx.request_repaint();
         }
     }

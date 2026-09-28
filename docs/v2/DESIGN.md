@@ -220,7 +220,7 @@ Consequences:
 
 ### 8.1 Capture
 
-- **Tool:** *Sketch* (default key to be decided; `S` belongs to Blender's scale, see §18). Press and hold on a viewport to begin. The capture records every pointer event, not one per UI frame:
+- **Tool:** *Sketch*, default key `D` (Blender's draw/annotate key; `S` belongs to Blender's scale, see §18). Press and hold on a viewport to begin. The capture records every pointer event, not one per UI frame:
   - egui's input abstraction yields one pointer sample per frame, built from OS cursor events;
   - we tap winit below eframe for all `CursorMoved` events with timestamps, and optionally `DeviceEvent::MouseMotion` for raw deltas;
   - this is milestone spike M1-S3.
@@ -240,7 +240,7 @@ Consequences:
   - a new capture over an existing one becomes a refinement *level*;
   - "take again" at the same level averages robustly (weighted median centres, log-space sizes);
   - disagreement widens the box a little and marks those frames *uncertain*.
-- **Release:** the capture ends. A **catch-up** at the end (Krita's "finish line", Photoshop's "catch-up") ramps the smoothed position to the last raw position over a short window, so no permanent lag offset remains.
+- **Release:** the capture ends. Frames shown in the last `lag` before the release get no result: the hand never reached them, and a catch-up (Krita's "finish line") would invent positions for them. Because the smoothing is zero-phase with padded ends, no lag offset remains to catch up elsewhere. *(Changed from a planned catch-up after the first measurements, M3.)*
 
 ### 8.2 The sketch pipeline (all operators, all re-tunable)
 
@@ -397,9 +397,11 @@ Adopted from Rerun's proven design.
   - **Outliner:** media → views tree → captures / trackers / targets.
   - **Jobs/status.**
   - Later: **Curve editor**, **Operator graph** (egui-snarl).
-- **Tools** (Select, Sketch, Adjust, Pan/Zoom) are state machines in the `Tools` set. An in-progress gesture is a world entity, so overlays draw it and undo can name it.
+- **Tools** (Select, Sketch, Adjust, Pan/Zoom) are state machines in the `Tools` set, fed by a `PointerFrame` resource (every timestamped sample since the last frame, in source pixels) and `KeysHeld`, so they run headless in tests. An in-progress gesture is world state (the Sketch tool's `LiveCapture`), so overlays draw it; on commit it becomes document entities in one transaction.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
-  - `Space` play;
+  - `Space` play; while sketching, hold `Space` to freeze (hold-to-simulate);
+  - `D` Sketch tool, `Esc` cancels the gesture or leaves the tool;
+  - `[` / `]` playback rate (= capture speed);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;
   - `X` delete;

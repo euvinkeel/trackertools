@@ -211,7 +211,28 @@ The original plan follows.
 
 ---
 
-## M3 · Motion sketch & smoothing (flagship, ≈2 weeks)
+## M3 · Motion sketch & smoothing (flagship): in progress
+
+**Status (as built, 2026-09-27):**
+
+| Item | Status |
+|---|---|
+| Sketch tool | ✅ `D` arms it; press and hold on the video to follow at the transport rate (the capture speed, `[` / `]`); the video pauses at the last frame instead of looping; Esc cancels; release commits a Capture + `sketch` operator as **one undo step** and selects it |
+| Pointer input | ✅ a raw-input service thread (1 kHz, QPC timestamps mapped exactly onto the app clock); button transitions timed from the raw reports; screen px → window points → source px through the viewport as last drawn. The input probe (`TT_INPUT_PROBE=1`) shows the mapping offset against egui's pointer |
+| Pipeline | ✅ one `sketch` operator (Global footprint, evaluated in one call): 240 Hz grid → dead zone → zero-phase One Euro (odd-reflection padded ends) → jiggle → size → lag-compensated resampling through the ClockMap → union window → smoothing of the point (trend-preserving ends) and of the region *as extents around the point*. Frames shown in the last `lag` before the release get no result: the hand never reached them (replaces the planned catch-up, which would invent positions) |
+| Hold-to-simulate | ✅ hold Space during a capture to freeze on the frame (steps and scrubs while frozen are recorded); hold Space *then* press to start frozen. With the Sketch tool active a tap of Space still plays/pauses, decided when the key comes up |
+| Live feedback | ✅ raw hand trail (0.5 s), the live path and region from the same pipeline over the samples so far, existing sketches faint, the selected one bright with its path ±90 frames, crosshair and key hints |
+| Re-tuning | ✅ every parameter in the Inspector (drag = one undo step); presets Tight / Default / Loose; "use for new sketches". ⏳ raw vs smoothed trail toggle |
+| Timeline lanes | ✅ one lane per sketch (valid / stale coverage), the live capture's lane, click to select. ⏳ summaries, uncertainty |
+| Takes and levels, modifier stacks | ⏳ next |
+
+**Measured:**
+- Scripted noisy hand at ¼× (tremor, 250 ms lag) over the sprite path, every frame counted including the first and last: point error median 1.10 px, p95 1.95 px, the sprite inside the region on 100% of frames (`tests/sketch.rs`, held as the regression bar: median < 1.5, p95 < 3.0, ≥ 99.5%).
+- The same through the running app (`TT_SKETCH_DEMO=fixtures/sprite_truth.json`, with a 1 s freeze mid-capture): median 1.46 px, p95 2.25 px, 100% containment over 116 frames.
+- Hold-to-simulate: holding still settles to the minimum box (32 × 32); jiggling grows it 3.5×.
+- Re-tuning a 60 s capture: 2.1 ms at 1× (3,600 frames), 1.7 ms at ¼× (release build).
+
+The original plan follows.
 
 **Goal:** follow something with the mouse, get a clean, adjustable path and box, and keep tuning it forever.
 

@@ -15,6 +15,11 @@ pub fn actions(input: &egui::InputState, keymap: &Keymap) -> Vec<Action> {
     out
 }
 
+/// Keys held right now (hold bindings such as the simulate key).
+pub fn held(input: &egui::InputState) -> Vec<Key> {
+    input.keys_down.iter().filter_map(|k| map_key(*k)).collect()
+}
+
 fn map_key(key: egui::Key) -> Option<Key> {
     use egui::Key as E;
     Some(match key {
@@ -25,6 +30,7 @@ fn map_key(key: egui::Key) -> Option<Key> {
         E::ArrowDown => Key::ArrowDown,
         E::Home => Key::Home,
         E::End => Key::End,
+        E::Escape => Key::Escape,
         E::OpenBracket => Key::Letter('['),
         E::CloseBracket => Key::Letter(']'),
         other => {

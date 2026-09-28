@@ -5,9 +5,11 @@
 use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_reflect::PartialReflect;
+use tt_core::capture::SketchDefaults;
 use tt_core::history::{History, edit};
 use tt_core::meta::{Class, ComponentMetas};
 use tt_core::selection::Selection;
+use tt_core::sketch::SketchParams;
 use tt_core::time::WallClock;
 use tt_core::transport::Transport;
 
@@ -33,6 +35,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
 fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.heading(crate::panels::outliner::label(world, e));
+    if world.get::<SketchParams>(e).is_some() {
+        sketch_presets(ui, world, e);
+    }
     // Editable copies of each reflected document/session component on the entity.
     let mut components: Vec<(String, String, Box<dyn PartialReflect>, Class)> = {
         let registry = world.resource::<AppTypeRegistry>().read();
@@ -87,6 +92,34 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     }
     if r.drag_stopped {
         world.resource_mut::<History>().end();
+    }
+}
+
+/// Preset buttons over a sketch's numbers, and "use for new sketches".
+fn sketch_presets(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    let current = world.get::<SketchParams>(e).cloned().unwrap_or_default();
+    let mut chosen = None;
+    let mut make_default = false;
+    ui.horizontal(|ui| {
+        ui.label("Preset");
+        for name in SketchParams::PRESETS {
+            let preset = SketchParams::preset(name).expect("listed preset");
+            if ui.selectable_label(preset == current, name).clicked() && preset != current {
+                chosen = Some((name, preset));
+            }
+        }
+        let is_default = world.resource::<SketchDefaults>().0 == current;
+        make_default = ui
+            .add_enabled(!is_default, egui::Button::new("Use for new sketches").small())
+            .on_hover_text("New captures start with these numbers")
+            .on_disabled_hover_text("New captures already start with these numbers")
+            .clicked();
+    });
+    if let Some((name, preset)) = chosen {
+        edit(world, &format!("Preset {name}"), |tx| tx.insert(e, preset));
+    }
+    if make_default {
+        world.resource_mut::<SketchDefaults>().0 = current;
     }
 }
 

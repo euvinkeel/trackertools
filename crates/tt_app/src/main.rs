@@ -1,10 +1,12 @@
 //! trackertools v2 desktop app. See docs/v2/DESIGN.md.
 
+mod demo;
 mod input_probe;
 mod keys;
 mod layout;
 mod media;
 mod panels;
+mod pointer;
 mod project;
 mod session;
 mod reflect_ui;

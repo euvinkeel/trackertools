@@ -6,6 +6,7 @@
 //! all of it is testable with `cargo test`. See docs/v2/DESIGN.md.
 
 pub mod app;
+pub mod capture;
 pub mod history;
 pub mod input;
 pub mod meta;
@@ -16,6 +17,7 @@ pub mod selection;
 pub mod signal;
 pub mod sketch;
 pub mod time;
+pub mod tool;
 pub mod transport;
 
 pub use app::{AppBuilder, Core, Module, PostSet, PostUi, PreUi, Set};
@@ -34,6 +36,8 @@ impl Module for CoreModules {
             .add_module(selection::SelectionModule)
             .add_module(NamesModule)
             .add_module(sketch::SketchModule)
+            .add_module(tool::ToolModule)
+            .add_module(capture::CaptureModule)
             .add_module(persist::PersistModule);
     }
 }

@@ -28,6 +28,44 @@ impl Default for ViewportView {
     }
 }
 
+/// Where the viewport and the video were drawn in the last UI pass (egui
+/// points), so the next frame's pointer samples map into source pixels.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct ViewportMapping {
+    pub panel: Rect,
+    pub video: Rect,
+    /// Source frame size (pixels).
+    pub source: Vec2,
+}
+
+impl Default for ViewportMapping {
+    fn default() -> Self {
+        Self { panel: Rect::NOTHING, video: Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), source: Vec2::splat(1.0) }
+    }
+}
+
+impl ViewportMapping {
+    fn scale(self) -> f64 {
+        self.video.width() as f64 / self.source.x as f64
+    }
+
+    pub fn to_source(self, p: Pos2) -> [f64; 2] {
+        let s = self.scale();
+        [(p.x - self.video.min.x) as f64 / s, (p.y - self.video.min.y) as f64 / s]
+    }
+
+    /// `[t, x, y]` for a timestamped sample.
+    pub fn to_source_at(self, t: f64, p: Pos2) -> [f64; 3] {
+        let [x, y] = self.to_source(p);
+        [t, x, y]
+    }
+
+    pub fn to_screen(self, src: [f64; 2]) -> Pos2 {
+        let s = self.scale();
+        Pos2::new(self.video.min.x + (src[0] * s) as f32, self.video.min.y + (src[1] * s) as f32)
+    }
+}
+
 /// Set while the viewport shows a stand-in for a frame still decoding, so the
 /// shell keeps repainting until the exact frame arrives.
 #[derive(Resource, Default, Debug)]
@@ -60,6 +98,8 @@ impl Module for ViewportModule {
         app.declare::<ViewportView>(Class::Session)
             .declare::<PlaybackProbe>(Class::Derived)
             .declare::<WaitingForFrame>(Class::Derived)
+            .declare::<ViewportMapping>(Class::Derived)
+            .init_resource::<ViewportMapping>()
             .init_resource::<ViewportView>()
             .init_resource::<PlaybackProbe>()
             .init_resource::<WaitingForFrame>()
@@ -111,6 +151,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
     let vr = video_rect(&view);
     let px_per_source = vr.width() / vw;
+    let mapping = ViewportMapping { panel: rect, video: vr, source: Vec2::new(vw, vh) };
+    *world.resource_mut::<ViewportMapping>() = mapping;
     let shown_grid = t.frame();
 
     // Show the proxy unless it would be magnified: past its resolution, the original.
@@ -157,6 +199,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         None => format!("frame {shown_grid} · decoding…"),
     };
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
+    super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid);
+    let media = world.resource::<Media>();
     if let Some(pos) = response.hover_pos() {
         let src = (pos - vr.min) / px_per_source;
         hud(&painter, rect.right_top() + Vec2::new(-10.0, 8.0), Align2::RIGHT_TOP, &format!("{:.1}, {:.1} px · {:.0}%", src.x, src.y, px_per_source * 100.0), style::MUTED);

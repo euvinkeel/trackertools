@@ -62,9 +62,8 @@ fn slow_motion_sketch_recovers_the_subject() {
     let params = SketchParams::default(); // lag 0.25 s matches the hand
     let (first, frames) = sketch_boxes(&samples, &clock, &params, FPS).expect("result");
     let (mut errors, mut inside, mut total) = (Vec::new(), 0, 0);
-    // Skip the first/last lag of the capture (the hand hadn't started / had stopped).
-    let trim = (0.25 * 0.25 * FPS) as usize + 2;
-    for (i, f) in frames.iter().enumerate().skip(trim).take(frames.len().saturating_sub(2 * trim)) {
+    // Every frame counts, the capture's first and last included.
+    for (i, f) in frames.iter().enumerate() {
         let Some(b) = f else { continue };
         let truth = subject((first + i as i64) as f64 / FPS);
         errors.push(((b[0] - truth[0]).powi(2) + (b[1] - truth[1]).powi(2)).sqrt());
@@ -76,9 +75,15 @@ fn slow_motion_sketch_recovers_the_subject() {
     let (median, p95) = (quantile(errors.clone(), 0.5), quantile(errors, 0.95));
     let containment = inside as f64 / total as f64;
     println!("frames {total}: point error median {median:.2} px, p95 {p95:.2} px; subject inside region {:.2}%", containment * 100.0);
-    assert!(total > 250, "most of the 300 covered frames have results");
-    assert!(median < 1.5, "median point error {median:.2} px (measured 1.11 when set)");
-    assert!(p95 < 3.0, "p95 point error {p95:.2} px (measured 1.97 when set)");
+    // The frames shown in the last `lag` before the release (0.25 s × ¼ × 60 fps ≈ 4) are
+    // never reached by the hand and have no result; every other visited frame does.
+    let with_result: Vec<i64> = frames.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| first + i as i64).collect();
+    let (a, z) = (with_result[0], *with_result.last().unwrap());
+    assert_eq!(a, 120, "results start at the first frame");
+    assert!((120 + 300 - 6..=120 + 300 - 3).contains(&z), "results end at frame {z}");
+    assert_eq!(with_result.len() as i64, z - a + 1, "no gaps");
+    assert!(median < 1.5, "median point error {median:.2} px (measured 1.10 when set)");
+    assert!(p95 < 3.0, "p95 point error {p95:.2} px (measured 1.95 when set)");
     assert!(containment >= 0.995, "subject inside the region on {:.2}% of frames", containment * 100.0);
 }
 
@@ -176,5 +181,47 @@ fn perfect_hand() {
         let along: Vec<f64> = signed.iter().map(|s| s.0).collect();
         let err: Vec<f64> = signed.iter().map(|s| s.1).collect();
         println!("true lag {lag_true}: error median {:.2} px; offset along motion median {:+.3} frames", quantile(err, 0.5), quantile(along, 0.5));
+    }
+}
+
+/// Diagnostic: the first and last frames of a capture.
+#[test]
+#[ignore]
+fn edges() {
+    let (samples, clock) = follow(0.25, 2.0, 8.0, 0.25, 2.0, 7);
+    let (first, frames) = sketch_boxes(&samples, &clock, &SketchParams::default(), FPS).unwrap();
+    let n = frames.len();
+    for i in (0..8).chain(n - 8..n) {
+        let Some(b) = frames[i] else { continue };
+        let t = subject((first + i as i64) as f64 / FPS);
+        println!(
+            "frame {:>4}: point err ({:+6.1}, {:+6.1})  box x {:+6.1}..{:+6.1} y {:+6.1}..{:+6.1} (relative to truth)",
+            first + i as i64,
+            b[0] - t[0],
+            b[1] - t[1],
+            b[2] - t[0],
+            b[4] - t[0],
+            b[3] - t[1],
+            b[5] - t[1]
+        );
+    }
+}
+
+/// Re-tuning speed (ROADMAP M3: a 60 s capture re-derives in ≤ 5 ms):
+/// `cargo test --release -p tt_core --test sketch retune_speed -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn retune_speed() {
+    for rate in [1.0, 0.25] {
+        let (samples, clock) = follow(rate, 2.0, 60.0, 0.25, 2.0, 7);
+        let p = SketchParams::default();
+        let _ = sketch_boxes(&samples, &clock, &p, FPS);
+        let runs = 20;
+        let t = std::time::Instant::now();
+        let mut frames = 0;
+        for _ in 0..runs {
+            frames = sketch_boxes(&samples, &clock, &p, FPS).unwrap().1.len();
+        }
+        println!("60 s capture at {rate}× ({} samples, {frames} frames): {:.2} ms per re-derive", samples.len(), t.elapsed().as_secs_f64() * 1e3 / runs as f64);
     }
 }

@@ -32,6 +32,9 @@ impl Edited {
 }
 
 /// Editable view of `value` (modified in place).
+/// Lists longer than this show their length instead of every element.
+const MAX_LIST: usize = 16;
+
 pub fn edit(ui: &mut egui::Ui, value: &mut dyn PartialReflect) -> Edited {
     let mut out = Edited::default();
     if edit_leaf(ui, value, &mut out) {
@@ -71,6 +74,10 @@ pub fn edit(ui: &mut egui::Ui, value: &mut dyn PartialReflect) -> Edited {
                     }
                 }
             });
+        }
+        // Long lists (a capture's clock map) are data, not settings: summarised.
+        ReflectMut::List(l) if l.len() > MAX_LIST => {
+            ui.label(egui::RichText::new(format!("{} items", l.len())).weak());
         }
         ReflectMut::List(l) => {
             ui.vertical(|ui| {
