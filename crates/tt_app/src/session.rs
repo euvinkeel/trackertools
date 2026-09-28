@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
+use tt_core::autospeed::AutoSpeed;
 use tt_core::capture::{SketchDefaults, WheelMode};
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::{FrameIndex, WallClock};
@@ -39,6 +40,8 @@ struct SettingsFile {
     /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
     hide_pointer: bool,
     clear_radius: f32,
+    /// Anticipatory speed: on/off and its knobs.
+    auto_speed: AutoSpeed,
 }
 
 impl Default for SettingsFile {
@@ -52,12 +55,13 @@ impl Default for SettingsFile {
             view_lock_zoom: v.params.lock_zoom,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
+            auto_speed: AutoSpeed::default(),
         }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView) -> Self {
+    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed) -> Self {
         Self {
             wheel: d.wheel,
             stroke_scale: d.stroke.scale,
@@ -65,6 +69,7 @@ impl SettingsFile {
             view_lock_zoom: v.params.lock_zoom,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
+            auto_speed: a.clone(),
         }
     }
 
@@ -75,6 +80,7 @@ impl SettingsFile {
         d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
         world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
+        *world.resource_mut::<AutoSpeed>() = self.auto_speed.clone();
     }
 }
 
@@ -131,8 +137,8 @@ impl Session {
 }
 
 /// The Settings tab's values, kept in the session file.
-fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, mut session: ResMut<Session>) {
-    let settings = SettingsFile::of(&defaults, &views, &pointer);
+fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, auto: Res<AutoSpeed>, mut session: ResMut<Session>) {
+    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto);
     if session.file.settings != settings {
         session.file.settings = settings;
     }

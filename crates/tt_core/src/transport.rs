@@ -73,10 +73,15 @@ impl Transport {
         self.playing = !self.playing;
     }
 
+    /// The next rate in [`RATES`] up or down from the current one (which auto
+    /// speed may have set anywhere in between).
     pub fn change_rate(&mut self, faster: bool) {
-        let i = RATES.iter().position(|r| (*r - self.rate).abs() < 1e-9).unwrap_or(3);
-        let j = if faster { (i + 1).min(RATES.len() - 1) } else { i.saturating_sub(1) };
-        self.rate = RATES[j];
+        let r = self.rate;
+        self.rate = if faster {
+            RATES.iter().copied().find(|x| *x > r + 1e-9).unwrap_or(RATES[RATES.len() - 1])
+        } else {
+            RATES.iter().rev().copied().find(|x| *x < r - 1e-9).unwrap_or(RATES[0])
+        };
     }
 
     /// Advance by `dt` seconds of wall time.
@@ -211,5 +216,12 @@ mod tests {
             t.change_rate(false);
         }
         assert_eq!(t.rate, 0.1);
+        // From a rate between the steps (auto speed), the next step either way.
+        t.rate = 0.35;
+        t.change_rate(true);
+        assert_eq!(t.rate, 0.5);
+        t.rate = 0.35;
+        t.change_rate(false);
+        assert_eq!(t.rate, 0.25);
     }
 }

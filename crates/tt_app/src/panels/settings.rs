@@ -2,6 +2,7 @@
 //! session file) and every key, so nothing has to be memorized.
 
 use bevy_ecs::prelude::*;
+use tt_core::autospeed::AutoSpeed;
 use tt_core::capture::{SCALE_RANGE, SketchDefaults, WheelMode};
 use tt_core::input::{Action, Keymap};
 use tt_core::sketch::SketchParams;
@@ -60,6 +61,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
 
         ui.separator();
+        auto_speed(ui, world);
+
+        ui.separator();
         ui.heading("Views");
         let mut lock = world.resource::<ViewDefaults>().params.lock_zoom;
         if ui
@@ -98,6 +102,38 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             }
         }
     });
+}
+
+/// Anticipatory speed: the switch and its knobs (tt_core::autospeed).
+fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
+    let mut a = world.resource::<AutoSpeed>().clone();
+    ui.heading("Anticipatory speed");
+    ui.checkbox(&mut a.enabled, "Anticipatory speed: set the playback speed for me while I hold a stroke").on_hover_text(
+        "While you hold a stroke with the video playing, the speed follows the subject: slower when your hand has to move fast or starts to jiggle, \
+         or before a fast stretch of the sketch you are editing; faster through still parts. Q/E during a stroke takes the speed back until you release.",
+    );
+    ui.add_enabled_ui(a.enabled, |ui| {
+        egui::Grid::new("auto-speed").num_columns(2).show(ui, |ui| {
+            let row = |ui: &mut egui::Ui, label: &str, tip: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, speed: f64, prefix: &str, suffix: &str| {
+                ui.label(label).on_hover_text(tip);
+                ui.add(egui::DragValue::new(value).range(range).speed(speed).prefix(prefix).suffix(suffix)).on_hover_text(tip);
+                ui.end_row();
+            };
+            row(ui, "slowest", "The slowest it goes.", &mut a.slowest, 0.02..=1.0, 0.005, "×", "");
+            row(ui, "fastest", "The fastest it goes, through still parts.", &mut a.fastest, 0.5..=4.0, 0.01, "×", "");
+            row(ui, "comfortable hand speed", "The fastest your hand should have to move: a subject faster than this on screen slows playback until it isn't.", &mut a.comfort, 20.0..=3000.0, 2.0, "", " pt/s");
+            row(ui, "jiggle sensitivity", "How strongly the box growing past its recent calm size (you started to jiggle: the subject turned erratic) slows playback. 0 ignores it; 1 halves the speed at three times its calm size (up to 1.5× is ignored).", &mut a.jiggle, 0.0..=4.0, 0.01, "", "");
+            row(ui, "slow down within", "How quickly it slows down: short, so it brakes in time.", &mut a.slow_down, 0.01..=2.0, 0.005, "", " s");
+            row(ui, "speed up within", "How quickly it speeds back up: long, so it doesn't lurch.", &mut a.speed_up, 0.05..=10.0, 0.01, "", " s");
+            row(ui, "look ahead", "Editing an existing sketch: how far ahead its path is read (video time), so playback slows before a fast or erratic stretch arrives. 0 = off.", &mut a.look_ahead, 0.0..=5.0, 0.01, "", " s");
+        });
+        if ui.button("Defaults").on_hover_text("Put the knobs back (keeps it on or off)").clicked() {
+            a = AutoSpeed { enabled: a.enabled, ..AutoSpeed::default() };
+        }
+    });
+    if a != *world.resource::<AutoSpeed>() {
+        *world.resource_mut::<AutoSpeed>() = a;
+    }
 }
 
 /// What an action does, for the key list.

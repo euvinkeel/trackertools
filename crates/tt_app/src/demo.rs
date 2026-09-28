@@ -11,13 +11,17 @@
 //! 4. drives the UI through egui itself (injected pointer events): duplicates
 //!    the sketches until the timeline's lanes overflow, box-selects in the
 //!    timeline, middle-drags its lanes, right-clicks an outliner row, and
-//!    box-selects in the outliner.
+//!    box-selects in the outliner;
+//! 5. records one more sketch (from frame 300, from ¼×) with anticipatory
+//!    speed on, pointer distances in real screen points.
 //!
 //! It logs the error against the truth, the edit's falloff, how central the
-//! sprite stays in the view, the nested sketch's error and what the UI steps
-//! selected, then quits. Screenshots go to `<data dir>/screens/`.
+//! sprite stays in the view, the nested sketch's error, what the UI steps
+//! selected and the rates auto speed chose, then quits. Screenshots go to
+//! `<data dir>/screens/`.
 
 use bevy_ecs::prelude::*;
+use tt_core::autospeed::{AutoSpeed, AutoSpeedState};
 use tt_core::input::{Action, PendingActions};
 use tt_core::op::{Inputs, Output};
 use tt_core::selection::Selection;
@@ -43,6 +47,11 @@ const NEST_FRAME: i64 = 130;
 /// Wall seconds from the nested press: Space taps (play, pause), release.
 const NEST_TAPS: [f64; 2] = [0.05, 6.0];
 const NEST_RELEASE: f64 = 6.4;
+/// Anticipatory speed: a new sketch from this frame, from ¼×; wall seconds from
+/// the press: Space taps (play, pause), release.
+const AUTO_FRAME: i64 = 300;
+const AUTO_TAPS: [f64; 2] = [0.05, 6.0];
+const AUTO_RELEASE: f64 = 6.4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -58,6 +67,10 @@ enum Phase {
     Nest { t0: f64, taps: usize },
     NestSettle { t0: f64 },
     Ui { t0: f64, step: usize },
+    /// Auto speed on, on the start frame; the hand settles on the sprite before pressing.
+    AutoReady { since: f64, set: bool },
+    Auto { t0: f64, taps: usize },
+    AutoSettle { t0: f64 },
     Finish { at: f64 },
 }
 
@@ -79,6 +92,9 @@ pub struct SketchDemo {
     pub shot: Option<&'static str>,
     /// Input events for egui's next frame (the UI script).
     pub inject: Vec<egui::Event>,
+    /// While recording with auto speed: the slowest and fastest rate, and what limited it (app frames).
+    auto_rates: (f64, f64),
+    auto_reasons: Vec<(&'static str, usize)>,
 }
 
 impl SketchDemo {
@@ -87,7 +103,7 @@ impl SketchDemo {
         let text = std::fs::read_to_string(&path).map_err(|e| tracing::error!("sketch demo: {e}")).ok()?;
         let json: serde_json::Value = serde_json::from_str(&text).ok()?;
         let truth = json["centers"].as_array()?.iter().filter_map(|c| Some([c[0].as_f64()?, c[1].as_f64()?])).collect();
-        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None, inject: Vec::new() })
+        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None, inject: Vec::new(), auto_rates: (f64::INFINITY, 0.0), auto_reasons: Vec::new() })
     }
 
     fn normal(&mut self) -> f64 {
@@ -129,7 +145,11 @@ impl SketchDemo {
             self.shot = Some(self.shots.remove(i).0);
         }
         let t = world.resource::<Transport>().clone();
-        self.shown.push((now, t.frame()));
+        // What this app frame presents: the transport after its advance (the
+        // state now is what the previous frame showed, one app frame earlier).
+        let mut presented = t.clone();
+        presented.advance(world.resource::<tt_core::time::WallClock>().dt);
+        self.shown.push((now, presented.frame()));
         // The edit's hand is on its target from the press on.
         if let Phase::Settle { t0 } = self.phase
             && now - t0 > 0.5
@@ -264,8 +284,69 @@ impl SketchDemo {
                 if now >= t0 + 0.15 * step as f64 {
                     match self.ui_step(world, step) {
                         true => self.phase = Phase::Ui { t0, step: step + 1 },
-                        false => self.phase = Phase::Finish { at: now + 0.8 }, // let the last screenshot arrive
+                        false => self.phase = Phase::AutoReady { since: now + 0.8, set: false }, // let the last screenshot arrive
                     }
+                }
+            }
+            Phase::AutoReady { since, set } => {
+                *frame = PointerFrame::default();
+                if now < since {
+                    return false;
+                }
+                if !set {
+                    // A new sketch on the source, followed where the source shows it.
+                    world.resource_mut::<AutoSpeed>().enabled = true;
+                    world.resource_mut::<ActiveView>().0 = None;
+                    world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
+                    self.in_view.clear();
+                    push(world, Action::DeselectAll);
+                    push(world, Action::Seek(AUTO_FRAME));
+                    push(world, Action::SetRate(1)); // 0.25×
+                    self.phase = Phase::AutoReady { since: now, set: true };
+                } else if now - since > LAG + 0.5 && t.frame() == AUTO_FRAME && !t.playing {
+                    *frame = PointerFrame { scale: world.resource::<crate::panels::viewport::ViewportMapping>().points_per_canvas(), ..hold(samples, Some(now - 0.002), None) };
+                    self.phase = Phase::Auto { t0: now, taps: 0 };
+                    self.shots.push(("11-auto-speed", now + 2.5));
+                    tracing::info!("sketch demo: recording with anticipatory speed from frame {AUTO_FRAME}, from ×{:.2}", t.rate);
+                }
+            }
+            Phase::Auto { t0, taps } => {
+                let el = now - t0;
+                if taps < AUTO_TAPS.len() && el >= AUTO_TAPS[taps] {
+                    push(world, Action::TogglePlay);
+                    self.phase = Phase::Auto { t0, taps: taps + 1 };
+                }
+                if t.playing {
+                    self.auto_rates = (self.auto_rates.0.min(t.rate), self.auto_rates.1.max(t.rate));
+                    let reason = world.resource::<AutoSpeedState>().reason;
+                    match self.auto_reasons.iter_mut().find(|(r, _)| *r == reason) {
+                        Some((_, n)) => *n += 1,
+                        None => self.auto_reasons.push((reason, 1)),
+                    }
+                }
+                let release = el >= AUTO_RELEASE;
+                // Pointer distances in real screen points (the knobs are in points).
+                let scale = world.resource::<crate::panels::viewport::ViewportMapping>().points_per_canvas();
+                *frame = PointerFrame { scale, ..hold(samples, None, release.then_some(now - 0.001)) };
+                if release {
+                    self.phase = Phase::AutoSettle { t0: now };
+                }
+            }
+            Phase::AutoSettle { t0 } => {
+                *frame = PointerFrame::default();
+                if now - t0 > 0.3 {
+                    let total: usize = self.auto_reasons.iter().map(|(_, n)| n).sum();
+                    let reasons: Vec<String> = self.auto_reasons.iter().map(|(r, n)| format!("{r} {:.0}%", *n as f64 * 100.0 / total.max(1) as f64)).collect();
+                    tracing::info!(
+                        "sketch demo: anticipatory speed chose ×{:.2}–×{:.2} while playing (limited by: {}); ×{:.2} again after the release",
+                        self.auto_rates.0,
+                        self.auto_rates.1,
+                        reasons.join(", "),
+                        t.rate
+                    );
+                    self.report_recording(world);
+                    world.resource_mut::<AutoSpeed>().enabled = false;
+                    self.phase = Phase::Finish { at: now + 0.3 };
                 }
             }
             Phase::Finish { at } => {

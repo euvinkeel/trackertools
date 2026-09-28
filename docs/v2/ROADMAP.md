@@ -227,6 +227,7 @@ The original plan follows.
 | Re-tuning | ✅ every parameter in the Inspector (drag = one undo step); presets Tight / Default / Loose; "use for new sketches". ⏳ raw vs smoothed trail toggle |
 | Timeline lanes | ✅ one lane per sketch in tree order (valid / stale coverage), with each stroke's span under selected sketches. The live stroke shows its visited frames and the frames its falloff moves. ⏳ summaries, uncertainty |
 | Selecting and commands | ✅ box selection in the Outliner and Timeline; click / Ctrl / Shift selection; a shared right-click menu (enter view, rename, duplicate, delete, select strokes / sketch, select all); keys `X`/`Delete`, `Shift+D`, `A`, `F2`. The Outliner is a tree with filtering. The Timeline scrolls its lanes (wheel, middle-drag, scrollbar) under a fixed ruler you scrub on. Each command is one undo step and tested (`tests/commands.rs`); the demo drives the UI with injected pointer events and checks each step |
+| Anticipatory speed | ✅ (the user's idea) a Settings switch, off by default, with knobs (`tt_core::autospeed::AutoSpeed`, remembered): while a stroke records and the video plays, the rate follows the hand's speed on screen, its jiggle against a calm baseline, and, over an existing sketch, the stretch ahead (a braking ramp); quickly down, slowly up. The release restores your rate; Q/E hands it back to you for the stroke. The badge shows `auto ×… · <what limits it>`; no flash. DESIGN §8.4 |
 | Takes and levels, modifier stacks | ⏳ next |
 
 **Measured:**
@@ -236,6 +237,14 @@ The original plan follows.
 - An adversarial review of the stroke model (4 reviewers + skeptics) confirmed 7 issues, all fixed with tests: writes into a sketch undone mid-stroke, clicks committing edits, quiet holds shrinking the box (now Ctrl = move only), text focus swallowing Space/Shift/Esc during a stroke, one wheel notch both setting falloff and zooming, Alt+A applied after the tool read the selection, and bridging reach rounded up for sub-frame falloffs.
 - Dev runs use `TT_DATA_DIR=<scratch>` and `--target-dir target/bench`, so they never touch the user's projects or the release build they are running.
 - Hold-to-simulate: holding still settles to the minimum box (32 × 32); jiggling grows it 3.5×.
+- Anticipatory speed (`tests/autospeed.rs`, 1 canvas px = 1 pt, default knobs):
+  - a still hand, then racing at 1500 pt/s with a ±30 pt jiggle: ×1.68 while calm, below ×0.5 in 0.074 s, down to ×0.10;
+  - a still hand from ×0.25: ×0.55 after 0.5 s, ×1.83 after 4 s;
+  - editing a sketch with a 20 px/frame dash at frames 300–330: ×1.26 while it is beyond the look-ahead, ×0.27 five frames before it, ×0.21 on arrival; frames 250–300 took 1.39 s;
+  - the release (commit or Esc) restores the manual rate exactly; Q mid-stroke steps down from the auto rate and holds it for the stroke;
+  - the sprite recorded under auto speed (×0.27–×0.77): median 1.55 px, p95 2.28 px (1.51 px median at a fixed ½×).
+  - In the app (demo phase 5, from ¼×, the viewport at 0.54 pt per source px; two runs): ×0.25–×1.30 (limited by the hand's speed 62% of the time, calm 34%, jiggle 4–5%), back to ×0.25 after the release, no flash; ~325 frames, median 2.8 px, p95 5.8 px, max 12–15 px at a sharp turn passed at ~1.3× (the ¼× recording: 1.16 px). `comfort` sets that trade. Screenshot `11-auto-speed`.
+- The demo's scripted hand saw each frame one app frame late (it logged the frame shown before that frame's advance). Harmless at ¼×, it cost several pixels at 1×; fixed. The ¼× recording went from ≈ 1.5 px to 1.16 px median (p95 2.0 px, max 2.2 px), the nested sketch 0.47–0.50 px.
 - Per-stroke lag in real time (`tests/capture.rs`, the hand 0.25 s late at the playback rate, through the tool): median point error 2.33 px at 2× (481 frames) and 1.51 px at ½× (121 frames). Counted as 0.25 s of *video* instead, the same strokes would be off by 109 px and 57 px. Changing one stroke's lag leaves the other stroke's frames bit-identical.
 - Re-tuning a 60 s capture: 2.1 ms at 1× (3,600 frames), 1.7 ms at ¼× (release build).
 
