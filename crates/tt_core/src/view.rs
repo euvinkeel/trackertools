@@ -181,12 +181,13 @@ pub fn ensure_view(world: &mut World, sketch: Entity) -> Entity {
     }
     let name = world.get::<Name>(sketch).map_or("sketch".to_string(), |n| n.to_string());
     let home = home_of(world, sketch);
+    let params = world.get_resource::<ViewDefaults>().map(|d| d.params.clone()).unwrap_or_default();
     let mut view = None;
     edit(world, &format!("View of {name}"), |tx| {
         let out = tx.create_signal(VIEW_CHANNELS);
         let mut inputs = vec![("box".to_string(), sketch)];
         inputs.extend(home.map(|h| ("parent".to_string(), h)));
-        view = Some(tx.spawn((Name::new(format!("{name} view")), Operator { kind: "frame".into() }, Inputs(inputs), Output(out), FrameParams::default())));
+        view = Some(tx.spawn((Name::new(format!("{name} view")), Operator { kind: "frame".into() }, Inputs(inputs), Output(out), params)));
     });
     view.expect("view created")
 }
@@ -221,16 +222,32 @@ pub struct FrameParams {
     /// region always fits, so it wins where the limits would crop it.
     pub min_zoom: f32,
     pub max_zoom: f32,
+    /// Keep one zoom over the whole sketch: the widest crop it needs at any
+    /// frame, so a region that jitters in size never makes the view zoom.
+    /// (Still limited by the parent's crop, as always. Off: the zoom follows
+    /// the region, smoothed by `lead`, `hold` and `zoom_damping`.)
+    #[reflect(default = "yes")]
+    pub lock_zoom: bool,
 }
 
 impl Default for FrameParams {
     fn default() -> Self {
-        Self { fit: 0.6, hold: 1.0, lead: default_lead(), pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0 }
+        Self { fit: 0.6, hold: 1.0, lead: default_lead(), pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0, lock_zoom: true }
     }
 }
 
 fn default_lead() -> f32 {
     0.25
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// What new views start with (a user setting; the app remembers it).
+#[derive(Resource, Debug, Clone, Default)]
+pub struct ViewDefaults {
+    pub params: FrameParams,
 }
 
 /// `frame`: a sketch (input "box") and optionally its parent view (input
@@ -289,9 +306,14 @@ pub fn frame_views(sketch: &Signal, parent: Option<&Signal>, p: &FrameParams, fp
     fill_gaps(&mut known);
     let pts: Vec<[f64; 4]> = known.into_iter().map(|v| v.expect("filled")).collect();
 
-    // Zoom: the crop height the region needs, as an envelope that never dips below it.
+    // Zoom: the crop height the region needs, as an envelope that never dips below it
+    // (locked: its widest, on every frame).
     let need: Vec<f64> = pts.iter().map(|v| (2.0 * v[3]).max(2.0 * v[2] / aspect).max(1.0) / p.fit.clamp(0.05, 1.0) as f64).collect();
     let mut crop_h: Vec<f64> = zoom_envelope(&need, p, fps);
+    if p.lock_zoom {
+        let widest = crop_h.iter().copied().fold(1.0, f64::max);
+        crop_h.fill(widest);
+    }
 
     // Centre: the point, through a dead zone (both ways, so no lag) and zero-phase damping.
     let radius: Vec<f64> = crop_h.iter().map(|h| p.dead_zone.max(0.0) as f64 * h / 2.0).collect();
@@ -439,8 +461,10 @@ impl Module for ViewModule {
     fn build(&self, app: &mut AppBuilder) {
         app.declare::<ActiveView>(Class::Session)
             .declare::<SourceSize>(Class::Session)
+            .declare::<ViewDefaults>(Class::Session)
             .init_resource::<ActiveView>()
             .init_resource::<SourceSize>()
+            .init_resource::<ViewDefaults>()
             .operator(FrameKind)
             .operator_params::<FrameParams>()
             .add_systems(apply_view_actions.in_set(Set::Intents))
@@ -465,11 +489,13 @@ mod tests {
         // A parent zoomed in to a 100 px tall crop; the child's region needs 400 px.
         let parent = signal(&(0..10).map(|f| (f, [500.0, 300.0, 177.8, 100.0, 1920.0, 1080.0])).collect::<Vec<_>>());
         let sketch = signal(&(0..10).map(|f| (f, [500.0, 300.0, 400.0, 180.0, 600.0, 420.0])).collect::<Vec<_>>());
-        let p = FrameParams::default();
-        let (_, frames) = frame_views(&sketch, Some(&parent), &p, 60.0, &SourceSize::default()).unwrap();
-        for v in frames {
-            let (crop_w, crop_h) = (v[2], v[3]);
-            assert!(crop_h >= 240.0 && crop_w >= 200.0, "the 200×240 region fits: crop {crop_w:.0}×{crop_h:.0}");
+        for lock_zoom in [false, true] {
+            let p = FrameParams { lock_zoom, ..FrameParams::default() };
+            let (_, frames) = frame_views(&sketch, Some(&parent), &p, 60.0, &SourceSize::default()).unwrap();
+            for v in frames {
+                let (crop_w, crop_h) = (v[2], v[3]);
+                assert!(crop_h >= 240.0 && crop_w >= 200.0, "the 200×240 region fits: crop {crop_w:.0}×{crop_h:.0}");
+            }
         }
     }
 

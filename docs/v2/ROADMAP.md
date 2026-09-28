@@ -278,7 +278,7 @@ The original plan follows.
 
 | Item | Status |
 |---|---|
-| `frame` operator | ✅ fit, hold (a decaying max, zero-phase), zoom and pan damping (zero-phase), dead zone, follow/zoom influence against the parent, zoom limits relative to the parent; the canvas is the widest crop. ⏳ causal mode, reference frame, a soft zone |
+| `frame` operator | ✅ fit, hold (a decaying max, zero-phase), zoom and pan damping (zero-phase), dead zone, follow/zoom influence against the parent, zoom limits relative to the parent; the canvas is the widest crop. Zoom lock (default on): one crop size over the whole sketch. ⏳ causal mode, reference frame, a soft zone |
 | Views and nesting | ✅ every view maps straight to the source. A stroke drawn in a view records the view's mapping per frame and lives in source pixels, so re-tuning a parent never moves a child (a deliberate change from "children re-derive"). A nested sketch's motion union is measured in its home view |
 | Viewport | ✅ `Tab` / `Shift+Tab`, a clickable breadcrumb, rendering through the view (original when magnified, nearest framing outside the sketch), overlays and pointer in view pixels, the view's settings in the Inspector under the sketch. ⏳ an off-frame pattern (off-frame is the background colour) |
 | Side by side | ⏳ two viewports with a synced playhead |
@@ -288,6 +288,7 @@ The original plan follows.
 - Zoom from a jittery region (after hands-on use): the crop had been clamped to the raw need after smoothing, so the zoom snapped wherever the region poked out. Now it zooms out ahead (`lead`), back in slowly (`hold`, halving time), and is smoothed by a max filter plus an inner Gaussian that provably covers the need.
   - On the demo's sketch the region's height changes by a median 1.69% (max 7.27%) per frame; the view's zoom by 0.22% (max 0.79%).
   - Synthetic ±25% jitter: 0.03% per frame, the region inside on every frame.
+- Zoom lock (after hands-on use: the zoom still wandered with an erratic hand). `FrameParams::lock_zoom`, on by default and for old saves, with a Settings default for new views. `tests/view.rs`: over a region jittering between 50 and 150 px half-height, the locked crop is one size (888 × 499, the unlocked envelope's widest), the region inside on every frame, and a narrower parent still limits it per frame. Nested sketch error (drawn in view 1): median 0.84 px locked vs 0.76 px unlocked, since the locked view magnifies less on most frames.
 - A review of M4 (4 reviewers + skeptics) confirmed 6 issues, all fixed with tests where testable:
   - Tab-then-hold re-edited the parent instead of nesting (Tab now clears the selection);
   - a tight parent's zoom limit could crop a child's region (fit now always wins);

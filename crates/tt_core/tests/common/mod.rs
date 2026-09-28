@@ -111,3 +111,20 @@ pub fn circle(t: f64) -> [f64; 2] {
     [500.0 + 100.0 * t.cos(), 300.0 + 100.0 * t.sin()]
 }
 
+/// A component read the way `persist::load` reads it from a project file
+/// (RON through reflection), e.g. one saved before a field existed.
+pub fn load_component<T: bevy_ecs::component::Component + Clone>(world: &mut bevy_ecs::world::World, ron_text: &str) -> T {
+    use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
+    use serde::de::DeserializeSeed;
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    let registration = registry.get(std::any::TypeId::of::<T>()).expect("registered type");
+    let mut de = ron::Deserializer::from_str(ron_text).expect("ron");
+    let value = bevy_reflect::serde::TypedReflectDeserializer::new(registration, &registry).deserialize(&mut de).expect("deserialize");
+    let e = world.spawn_empty().id();
+    registration.data::<ReflectComponent>().expect("a component").insert(&mut world.entity_mut(e), value.as_ref(), &registry);
+    let out = world.get::<T>(e).expect("inserted").clone();
+    world.despawn(e);
+    out
+}
+

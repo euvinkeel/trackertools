@@ -5,6 +5,7 @@ use bevy_ecs::prelude::*;
 use tt_core::capture::{SCALE_RANGE, SketchDefaults, WheelMode};
 use tt_core::input::{Action, Keymap};
 use tt_core::sketch::SketchParams;
+use tt_core::view::ViewDefaults;
 
 use crate::style;
 
@@ -43,6 +44,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
         if d.wheel != before.wheel || d.stroke != before.stroke || d.params != before.params {
             *world.resource_mut::<SketchDefaults>() = d;
+        }
+
+        ui.separator();
+        ui.heading("Views");
+        let mut lock = world.resource::<ViewDefaults>().params.lock_zoom;
+        if ui
+            .checkbox(&mut lock, "New views keep a steady zoom (the widest the sketch needs)")
+            .on_hover_text("Off: the view zooms with the region, smoothed. Each view has its own \"lock zoom\" in the Inspector.")
+            .changed()
+        {
+            world.resource_mut::<ViewDefaults>().params.lock_zoom = lock;
         }
 
         ui.separator();

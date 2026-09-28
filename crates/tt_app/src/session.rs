@@ -10,6 +10,7 @@ use tt_core::capture::{SketchDefaults, WheelMode};
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::{FrameIndex, WallClock};
 use tt_core::transport::Transport;
+use tt_core::view::ViewDefaults;
 use tt_core::{AppBuilder, Class, Module, Set};
 
 use crate::media::{Media, OpenRequest};
@@ -32,24 +33,29 @@ struct SettingsFile {
     wheel: WheelMode,
     stroke_scale: f32,
     stroke_falloff: f32,
+    /// New views keep a steady zoom (`FrameParams::lock_zoom`).
+    view_lock_zoom: bool,
 }
 
 impl Default for SettingsFile {
     fn default() -> Self {
         let s = tt_core::sketch::Stroke::default();
-        Self { wheel: WheelMode::default(), stroke_scale: s.scale, stroke_falloff: s.falloff }
+        let v = ViewDefaults::default();
+        Self { wheel: WheelMode::default(), stroke_scale: s.scale, stroke_falloff: s.falloff, view_lock_zoom: v.params.lock_zoom }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults) -> Self {
-        Self { wheel: d.wheel, stroke_scale: d.stroke.scale, stroke_falloff: d.stroke.falloff }
+    fn of(d: &SketchDefaults, v: &ViewDefaults) -> Self {
+        Self { wheel: d.wheel, stroke_scale: d.stroke.scale, stroke_falloff: d.stroke.falloff, view_lock_zoom: v.params.lock_zoom }
     }
 
-    fn apply(&self, d: &mut SketchDefaults) {
+    fn apply(&self, world: &mut World) {
+        let mut d = world.resource_mut::<SketchDefaults>();
         d.wheel = self.wheel;
         d.stroke.scale = self.stroke_scale.clamp(tt_core::capture::SCALE_RANGE.0, tt_core::capture::SCALE_RANGE.1);
         d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
+        world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
     }
 }
 
@@ -110,10 +116,11 @@ fn track_session(
     transport: Res<Transport>,
     clock: Res<WallClock>,
     defaults: Res<SketchDefaults>,
+    views: Res<ViewDefaults>,
     mut session: ResMut<Session>,
     mut actions: ResMut<PendingActions>,
 ) {
-    let settings = SettingsFile::of(&defaults);
+    let settings = SettingsFile::of(&defaults, &views);
     if session.file.settings != settings {
         session.file.settings = settings;
     }
@@ -153,7 +160,7 @@ impl Module for SessionModule {
     fn build(&self, app: &mut AppBuilder) {
         let session = Session::load();
         // The remembered settings replace the built-in defaults.
-        session.file.settings.apply(&mut app.world_mut().resource_mut::<SketchDefaults>());
+        session.file.settings.apply(app.world_mut());
         app.declare::<Session>(Class::Session).insert_resource(session).add_systems(track_session.in_set(Set::Prepare));
     }
 }

@@ -308,6 +308,7 @@ Each modifier is an operator entity in an ordered chain, with an enable toggle a
   - Outside the frames a sketch covers, its view holds the nearest framing, labelled in the breadcrumb.
   - A change of framing at the frame being looked at (an edit to the view's own sketch, a re-tune) eases in over 0.25 s instead of snapping.
 - **The region always fits:** `fit` wins over the parent's influence and the zoom limits.
+- **Zoom lock** (`lock_zoom`, on by default; the Settings tab sets it for new views): the crop keeps one size over the whole sketch, the widest the unlocked envelope (§10.1) reaches, `fit` included. It is still limited per frame by the parent's crop. A region that jitters in size then never makes the view zoom; panning is unchanged. Unlocked, the zoom follows the region through the envelope.
 - **Measured** (tests/view.rs and the in-app demo):
   - a root view keeps the sprite in its central 30% on 100% of frames;
   - three levels deep, the deepest view does too;
@@ -435,6 +436,7 @@ Adopted from Rerun's proven design.
   - what the wheel does while sketching;
   - the size and falloff the next stroke starts with;
   - the preset new sketches use;
+  - whether new views keep a steady zoom (§10);
   - every key, generated from the keymap;
   - where the data folder is.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
