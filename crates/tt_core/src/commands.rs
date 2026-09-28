@@ -13,9 +13,10 @@ use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 
 use crate::app::{AppBuilder, Module, Set};
+use crate::capture::LiveCapture;
 use crate::history::edit;
 use crate::input::{Action, PendingActions};
-use crate::meta::Class;
+use crate::meta::{Class, creation_order};
 use crate::op::{Inputs, Operator, Output};
 use crate::selection::Selection;
 use crate::signal::{Signal, SignalStore};
@@ -93,8 +94,16 @@ struct StrokeCopy {
 /// Duplicate the sketches among `targets` (a stroke counts as its sketch),
 /// with copies of all their strokes, as one undo step. The copies are selected.
 pub fn duplicate(world: &mut World, targets: &[Entity]) -> Vec<Entity> {
-    let mut sketches: Vec<Entity> = targets.iter().filter_map(|e| sketch_of(world, *e)).collect();
-    sketches.dedup();
+    // Each sketch once, in the order first seen (a sketch and its strokes may both be selected).
+    let mut sketches: Vec<Entity> = Vec::new();
+    for &e in targets {
+        if is_live(world, e)
+            && let Some(s) = sketch_of(world, e)
+            && !sketches.contains(&s)
+        {
+            sketches.push(s);
+        }
+    }
     let store = world.resource::<SignalStore>();
     let signal = |id: crate::signal::SignalId| store.get(id).cloned();
     let mut copies = Vec::new();
@@ -118,12 +127,7 @@ pub fn duplicate(world: &mut World, targets: &[Entity]) -> Vec<Entity> {
     if copies.is_empty() {
         return Vec::new();
     }
-    let (mut names, mut n_strokes) = {
-        let mut q = world.query::<&Name>();
-        let names: Vec<String> = q.iter(world).map(|n| n.to_string()).collect();
-        let mut captures = world.query::<&Capture>();
-        (names, captures.iter(world).count())
-    };
+    let (mut names, n_strokes) = (live_names(world), world.query::<&Capture>().iter(world).count());
     let mut made = Vec::new();
     edit(world, "Duplicate", |tx| {
         for (name, params, space, strokes) in copies {
@@ -131,8 +135,9 @@ pub fn duplicate(world: &mut World, targets: &[Entity]) -> Vec<Entity> {
             for st in strokes {
                 let stream = tx.create_signal(st.stream.channels());
                 *tx.signal(stream) = st.stream;
-                n_strokes += 1;
-                let c = tx.spawn((Name::new(format!("Stroke {n_strokes}")), st.capture, st.clock, st.stroke, Output(stream)));
+                let stroke_name = numbered(&names, "Stroke", n_strokes + 1);
+                names.push(stroke_name.clone());
+                let c = tx.spawn((Name::new(stroke_name), st.capture, st.clock, st.stroke, Output(stream)));
                 if let Some(t) = st.through {
                     let id = tx.create_signal(t.channels());
                     *tx.signal(id) = t;
@@ -156,7 +161,18 @@ fn unique(taken: &[String], base: &str) -> String {
     if !taken.iter().any(|t| t == base) {
         return base.to_string();
     }
-    (2..).map(|i| format!("{base} {i}")).find(|n| !taken.iter().any(|t| t == n)).expect("some name is free")
+    numbered(taken, base, 2)
+}
+
+/// `prefix n` for the first `n` from `from` on that isn't taken (after a
+/// delete, counting what is left would name a new one like an old one).
+pub(crate) fn numbered(taken: &[String], prefix: &str, from: usize) -> String {
+    (from..).map(|i| format!("{prefix} {i}")).find(|n| !taken.iter().any(|t| t == n)).expect("some name is free")
+}
+
+/// The names of all live entities.
+pub(crate) fn live_names(world: &mut World) -> Vec<String> {
+    world.query::<&Name>().iter(world).map(|n| n.to_string()).collect()
 }
 
 /// Rename an entity (one undo step). Returns whether it changed.
@@ -168,19 +184,22 @@ pub fn rename(world: &mut World, e: Entity, name: &str) -> bool {
     edit(world, &format!("Rename to {name}"), |tx| tx.insert(e, Name::new(name.to_string())))
 }
 
-/// Select every sketch.
+/// Select every sketch, in creation order (the newest is the primary).
 pub fn select_all(world: &mut World) {
     let mut q = world.query::<(Entity, &Operator)>();
     let mut all: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "sketch").map(|(e, _)| e).collect();
-    all.sort();
+    creation_order(world, &mut all);
     world.resource_mut::<Selection>().entities = all;
 }
 
 fn apply_command_actions(world: &mut World) {
     let actions = world.resource_mut::<PendingActions>().take(|a| matches!(a, Action::Delete | Action::Duplicate | Action::SelectAll | Action::Rename));
+    // A stroke in progress keeps its sketch and view (the menu greys these out too).
+    let busy = world.resource::<LiveCapture>().0.is_some();
     for a in actions {
         let selected = world.resource::<Selection>().entities.clone();
         match a {
+            Action::Delete | Action::Duplicate if busy => tracing::info!("{a:?} ignored: a stroke is in progress"),
             Action::Delete => {
                 delete(world, &selected);
             }

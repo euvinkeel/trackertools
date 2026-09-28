@@ -10,8 +10,9 @@
 //!
 //! 4. drives the UI through egui itself (injected pointer events): duplicates
 //!    the sketches until the timeline's lanes overflow, box-selects in the
-//!    timeline, middle-drags its lanes, right-clicks an outliner row, and
-//!    box-selects in the outliner.
+//!    timeline, middle-drags its lanes, right-clicks an outliner row,
+//!    box-selects in the outliner, then clicks the ruler, clicks a lane and
+//!    double-clicks it.
 //!
 //! It logs the error against the truth, the edit's falloff, how central the
 //! sprite stays in the view, the nested sketch's error and what the UI steps
@@ -347,6 +348,37 @@ impl SketchDemo {
                 self.inject.extend([moved(p), button(p, PointerButton::Primary, true), button(p, PointerButton::Primary, false)]);
             }
             33 => self.shot = Some("10-settings"),
+            // Clicks on the timeline: the ruler seeks, a lane selects, a double-click enters its view.
+            34 => {
+                tracing::info!("sketch demo · UI: the playhead is on frame {}", world.resource::<Transport>().frame());
+                let p = Pos2::new(lanes.min.x + 400.0, lanes.min.y - 20.0);
+                self.inject.extend([moved(p), button(p, PointerButton::Primary, true), button(p, PointerButton::Primary, false)]);
+            }
+            35 => tracing::info!("sketch demo · UI: a click on the ruler moved it to frame {}", world.resource::<Transport>().frame()),
+            36 => {
+                world.resource_mut::<Selection>().clear();
+                let p = Pos2::new(lanes.min.x + 300.0, lanes.min.y + 9.0);
+                self.inject.extend([moved(p), button(p, PointerButton::Primary, true), button(p, PointerButton::Primary, false)]);
+            }
+            37 => {
+                let primary = world.resource::<Selection>().primary().map(|e| crate::panels::outliner::label(world, e));
+                tracing::info!("sketch demo · UI: a click on a lane selected {} ({primary:?})", selected(world));
+            }
+            // (Long enough after that click for egui not to count a triple click.)
+            38..=41 => {}
+            42 => {
+                let p = Pos2::new(lanes.min.x + 300.0, lanes.min.y + 9.0);
+                let click = [button(p, PointerButton::Primary, true), button(p, PointerButton::Primary, false)];
+                self.inject.push(moved(p));
+                self.inject.extend(click.clone());
+                self.inject.extend(click);
+            }
+            43 => {}
+            44 => {
+                let view = world.resource::<ActiveView>().0.map(|v| crate::panels::outliner::label(world, v));
+                tracing::info!("sketch demo · UI: a double-click on that lane entered {view:?}");
+                self.shot = Some("11-lane-double-click");
+            }
             _ => return false,
         }
         true

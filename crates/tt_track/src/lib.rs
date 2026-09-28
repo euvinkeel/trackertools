@@ -129,7 +129,7 @@ pub fn trackers_of(world: &mut World, guide: Entity) -> Vec<Entity> {
     let mut q = world.query_filtered::<(Entity, &Operator, &Inputs), Without<Disabled>>();
     let mut out: Vec<Entity> =
         q.iter(world).filter(|(_, o, i)| o.kind == "track" && i.0.iter().any(|(s, p)| s == "guide" && *p == guide)).map(|(e, _, _)| e).collect();
-    out.sort_by_key(|e| e.index_u32());
+    tt_core::meta::creation_order(world, &mut out);
     out
 }
 

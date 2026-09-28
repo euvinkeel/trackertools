@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
+use tt_core::commands::select_all;
+use tt_core::meta::Created;
 use tt_core::op::{EvalBudget, EvalCtx, Footprint, Inputs, Operator, OperatorKind, Output, spawn_op};
-use tt_core::persist::{ProjectMeta, load, save};
+use tt_core::persist::{ProjectMeta, clear_document, load, save};
+use tt_core::selection::Selection;
 use tt_core::signal::{Signal, SignalStore};
 use tt_core::time::FrameIndex;
 use tt_core::transport::Transport;
@@ -159,6 +162,66 @@ fn newer_format_is_refused() {
     let mut b = core();
     let err = load(&mut b.world, &path).unwrap_err().to_string();
     assert!(err.contains("newer version"), "{err}");
+    let _ = std::fs::remove_file(path);
+}
+
+fn sketch(w: &mut World, name: &str) -> Entity {
+    let out = w.resource_mut::<SignalStore>().create(6);
+    w.spawn((Name::new(name.to_string()), Operator { kind: "sketch".into() }, Inputs::default(), Output(out))).id()
+}
+
+/// The sketches' names in Select All's order (creation order).
+fn listed(w: &mut World) -> Vec<String> {
+    select_all(w);
+    w.resource::<Selection>().entities.iter().map(|e| w.get::<Name>(*e).unwrap().to_string()).collect()
+}
+
+fn names(prefix: &str, n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{prefix}{i}")).collect()
+}
+
+#[test]
+fn creation_order_survives_clear_document_and_reload() {
+    let mut a = core();
+    // A big document, then a video switch clears it: bevy hands the freed ids out again, last freed first.
+    for i in 0..300 {
+        sketch(&mut a.world, &format!("old {i}"));
+    }
+    clear_document(&mut a.world);
+    let made: Vec<Entity> = (0..6).map(|i| sketch(&mut a.world, &format!("S{i}"))).collect();
+    assert!(made.windows(2).any(|w| w[0].index_u32() > w[1].index_u32()), "(precondition) the new ids don't ascend");
+    assert_eq!(listed(&mut a.world), names("S", 6));
+
+    // Save, switch away and back: the order holds, and a new sketch comes last.
+    let path = temp_project();
+    save(&mut a.world, &path).unwrap();
+    clear_document(&mut a.world);
+    for i in 0..200 {
+        sketch(&mut a.world, &format!("other video {i}"));
+    }
+    clear_document(&mut a.world);
+    load(&mut a.world, &path).unwrap();
+    sketch(&mut a.world, "S6");
+    assert_eq!(listed(&mut a.world), names("S", 7));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_file_from_before_creation_order_keeps_its_saved_order() {
+    let mut a = core();
+    for i in 0..4 {
+        sketch(&mut a.world, &format!("T{i}"));
+    }
+    let path = temp_project();
+    save(&mut a.world, &path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM components WHERE type = ?1", [<Created as bevy_reflect::TypePath>::type_path()]).unwrap();
+    drop(conn);
+    let mut b = core();
+    load(&mut b.world, &path).unwrap();
+    assert_eq!(listed(&mut b.world), names("T", 4));
+    let sel = b.world.resource::<Selection>().entities.clone();
+    assert!(sel.iter().all(|e| b.world.get::<Created>(*e).is_some()), "stamped on load");
     let _ = std::fs::remove_file(path);
 }
 

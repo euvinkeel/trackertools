@@ -29,6 +29,8 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
             layout.tree.ui(&mut behavior, ui);
         });
     });
+    // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
+    world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
 }
 
 fn top_bar(ui: &mut egui::Ui, world: &mut World) {
