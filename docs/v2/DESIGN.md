@@ -389,7 +389,8 @@ Each modifier is an operator entity in an ordered chain, with an enable toggle a
   - Each view keeps its own zoom and pan.
   - Outside the frames a sketch covers, its view holds the nearest framing, labelled in the breadcrumb.
   - A change of framing at the frame being looked at (an edit to the view's own sketch, a re-tune) eases in over 0.25 s instead of snapping.
-- **The region always fits:** `fit` wins over the parent's influence and the zoom limits.
+- **Pan only (the default since hands-on use):** a view follows the subject and keeps it centred at its parent's scale (the source's, for a view of the source). It never zooms with the sketch; how close you look is the viewport's zoom, the wheel. Entering a view for the first time keeps the on-screen scale you had (screen points per video pixel), centred on the subject. The other modes, per view (`pan_only` off): a steady zoom, the widest the sketch needs (`lock_zoom`), or zooming with the region's size, smoothed. *(Changed after hands-on use: "when I'm viewing through a sketch my camera still goes wild with the box's size in zoom… just maintain what the user currently has".)*
+- **The region always fits** (zooming modes): `fit` wins over the parent's influence and the zoom limits.
 - **Zoom lock** (`lock_zoom`, on by default; the Settings tab sets it for new views): the crop keeps one size over the whole sketch, the widest the unlocked envelope (§10.1) reaches, `fit` included. It is still limited per frame by the parent's crop. A region that jitters in size then never makes the view zoom; panning is unchanged. Unlocked, the zoom follows the region through the envelope.
 - **Measured** (tests/view.rs and the in-app demo):
   - a root view keeps the sprite in its central 30% on 100% of frames;

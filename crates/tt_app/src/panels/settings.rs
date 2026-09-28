@@ -31,13 +31,30 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
         ui.separator();
         ui.heading("Views");
-        let mut lock = world.resource::<ViewDefaults>().params.lock_zoom;
-        if ui
-            .checkbox(&mut lock, "New views keep a steady zoom (the widest the sketch needs)")
-            .on_hover_text("Off: the view zooms with the region, smoothed. Each view has its own \"lock zoom\" in the Inspector.")
-            .changed()
-        {
-            world.resource_mut::<ViewDefaults>().params.lock_zoom = lock;
+        ui.label("New views (Tab into a sketch)");
+        let (pan, lock) = {
+            let p = &world.resource::<ViewDefaults>().params;
+            (p.pan_only, p.lock_zoom)
+        };
+        let mut mode = if pan { 0 } else if lock { 1 } else { 2 };
+        ui.radio_value(&mut mode, 0, "only pan: follow the subject; the zoom is yours (the wheel)");
+        ui.radio_value(&mut mode, 1, "steady zoom: the widest the sketch needs");
+        ui.radio_value(&mut mode, 2, "zoom with the sketch's size (smoothed)");
+        if mode != if pan { 0 } else if lock { 1 } else { 2 } {
+            let mut d = world.resource_mut::<ViewDefaults>();
+            (d.params.pan_only, d.params.lock_zoom) = (mode == 0, mode != 2);
+        }
+        ui.label(egui::RichText::new("Each view has its own \"pan only\" and \"lock zoom\" in the Inspector.").color(style::MUTED).small());
+        let views: Vec<Entity> = {
+            let mut q = world.query_filtered::<(Entity, &tt_core::view::FrameParams), bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
+            q.iter(world).filter(|(_, p)| !p.pan_only).map(|(e, _)| e).collect()
+        };
+        if ui.add_enabled(!views.is_empty(), egui::Button::new(format!("Make the {} zooming view(s) in this project only pan", views.len()))).clicked() {
+            tt_core::history::edit(world, "Views only pan", |tx| {
+                for v in views {
+                    tx.modify::<tt_core::view::FrameParams>(v, |p| p.pan_only = true);
+                }
+            });
         }
 
         ui.separator();

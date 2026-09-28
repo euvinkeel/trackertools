@@ -228,11 +228,18 @@ pub struct FrameParams {
     /// the region, smoothed by `lead`, `hold` and `zoom_damping`.)
     #[reflect(default = "yes")]
     pub lock_zoom: bool,
+    /// The view only pans: it keeps the subject centred at its parent's
+    /// scale (the source's, for a view of the source) and never zooms with
+    /// the sketch; how close you look is the viewport's zoom (the wheel).
+    /// Off: the zoom comes from the sketch (steady with `lock_zoom`, else
+    /// following its size).
+    #[reflect(default = "yes")]
+    pub pan_only: bool,
 }
 
 impl Default for FrameParams {
     fn default() -> Self {
-        Self { fit: 0.6, hold: 1.0, lead: default_lead(), pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0, lock_zoom: true }
+        Self { fit: 0.6, hold: 1.0, lead: default_lead(), pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0, lock_zoom: true, pan_only: true }
     }
 }
 
@@ -349,6 +356,11 @@ pub fn frame_views(sketch: &Signal, parent: Option<&Signal>, p: &FrameParams, fp
         };
         let follow = p.follow.clamp(0.0, 1.0) as f64;
         centre.push([pc[0] + follow * (cx[i] - pc[0]), pc[1] + follow * (cy[i] - pc[1])]);
+        if p.pan_only {
+            // Pan only: the parent's crop, recentred.
+            crop_h[i] = ph;
+            continue;
+        }
         let zoom = p.zoom.clamp(0.0, 1.0) as f64;
         let h = (ph.ln() + zoom * (crop_h[i].ln() - ph.ln())).exp();
         let (lo, hi) = (ph / p.max_zoom.max(1e-3) as f64, ph / p.min_zoom.max(1e-3) as f64);
@@ -495,7 +507,7 @@ mod tests {
         let parent = signal(&(0..10).map(|f| (f, [500.0, 300.0, 177.8, 100.0, 1920.0, 1080.0])).collect::<Vec<_>>());
         let sketch = signal(&(0..10).map(|f| (f, [500.0, 300.0, 400.0, 180.0, 600.0, 420.0])).collect::<Vec<_>>());
         for lock_zoom in [false, true] {
-            let p = FrameParams { lock_zoom, ..FrameParams::default() };
+            let p = FrameParams { lock_zoom, pan_only: false, ..FrameParams::default() };
             let (_, frames) = frame_views(&sketch, Some(&parent), &p, 60.0, &SourceSize::default()).unwrap();
             for v in frames {
                 let (crop_w, crop_h) = (v[2], v[3]);

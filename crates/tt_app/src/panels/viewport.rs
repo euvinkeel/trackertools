@@ -210,12 +210,18 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let t = world.resource::<Transport>().clone();
     let active_view = world.resource::<ActiveView>().0;
     let mut view = *world.resource::<ViewportView>();
-    if view.for_view != active_view {
-        // Each view keeps its own zoom/pan: stepping back restores it.
+    let switched_from = (view.for_view != active_view).then_some(view.for_view);
+    if let Some(old) = switched_from {
+        // Each view keeps its own zoom/pan: stepping back restores it. A view
+        // seen for the first time keeps the scale you were looking at (screen
+        // points per video pixel), centred on its subject.
         let mut memory = world.resource_mut::<ViewMemory>();
-        memory.0.insert(view.for_view, (view.zoom, view.center));
-        let (zoom, center) = memory.0.get(&active_view).copied().unwrap_or((1.0, [0.5, 0.5]));
-        view = ViewportView { zoom, center, for_view: active_view };
+        memory.0.insert(old, (view.zoom, view.center));
+        let remembered = memory.0.get(&active_view).copied();
+        view = match remembered {
+            Some((zoom, center)) => ViewportView { zoom, center, for_view: active_view },
+            None => ViewportView { zoom: f32::NAN, center: [0.5, 0.5], for_view: active_view },
+        };
     }
     let (vw, vh) = {
         let m = world.resource::<Media>();
@@ -227,6 +233,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
     // Zoom about the cursor, pan with the secondary/middle button.
     let fit = (rect.width() / cw).min(rect.height() / ch);
+    if view.zoom.is_nan() {
+        // First time in this view: the scale from before the switch.
+        let before = *world.resource::<ViewportMapping>();
+        let old_a = map_at(world, switched_from.flatten(), t.frame()).a;
+        let points_per_source = before.video.width() as f64 / before.canvas.x.max(1.0) as f64 / old_a;
+        let wanted = (points_per_source * space.a) as f32; // screen points per canvas pixel
+        view.zoom = if wanted.is_finite() && wanted > 0.0 { (wanted / fit).clamp(0.1, 64.0) } else { 1.0 };
+    }
     let video_rect = |view: &ViewportView| {
         let size = Vec2::new(cw, ch) * fit * view.zoom;
         let min = rect.center() - Vec2::new(view.center[0] * size.x, view.center[1] * size.y);

@@ -53,8 +53,9 @@ struct SettingsFile {
     stroke_falloff: f32,
     /// What new sketches start with (a preset, or a sketch's "Use for new sketches").
     new_sketches: SketchParams,
-    /// New views keep a steady zoom (`FrameParams::lock_zoom`).
+    /// New views keep a steady zoom (`FrameParams::lock_zoom`), or only pan (`pan_only`).
     view_lock_zoom: bool,
+    view_pan_only: bool,
     /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
     hide_pointer: bool,
     clear_radius: f32,
@@ -73,6 +74,7 @@ impl Default for SettingsFile {
             stroke_falloff: s.falloff,
             new_sketches: SketchParams::default(),
             view_lock_zoom: v.params.lock_zoom,
+            view_pan_only: v.params.pan_only,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
             auto_speed: AutoSpeed::default(),
@@ -89,6 +91,7 @@ impl SettingsFile {
             stroke_falloff: d.stroke.falloff,
             new_sketches: d.params.clone(),
             view_lock_zoom: v.params.lock_zoom,
+            view_pan_only: v.params.pan_only,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
             auto_speed: a.clone(),
@@ -105,7 +108,11 @@ impl SettingsFile {
             d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
         }
         d.params = self.new_sketches.clone();
-        world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
+        {
+            let mut v = world.resource_mut::<ViewDefaults>();
+            v.params.lock_zoom = self.view_lock_zoom;
+            v.params.pan_only = self.view_pan_only;
+        }
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
         // Version 3 turned anticipatory speed on by default.
         *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };

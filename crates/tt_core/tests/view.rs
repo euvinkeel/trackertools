@@ -248,7 +248,7 @@ fn region_fits(sketch: &Signal, first: i64, frames: &[[f64; 6]]) -> bool {
 fn a_locked_view_keeps_one_zoom_over_a_jittery_region() {
     let sketch = jittery_sketch();
     let size = SourceSize::default();
-    let p = FrameParams::default();
+    let p = FrameParams { pan_only: false, ..FrameParams::default() };
     assert!(p.lock_zoom, "views lock their zoom by default");
     let (first, locked) = frame_views(&sketch, None, &p, FPS, &size).unwrap();
     let (w0, h0) = (locked[0][2], locked[0][3]);
@@ -275,7 +275,7 @@ fn a_locked_view_is_still_limited_by_its_parent() {
         let h = parent_h(f);
         parent.set(f, &[900.0, 500.0, h * 16.0 / 9.0, h, 1920.0, 1080.0].map(|v| v as f32));
     }
-    let p = FrameParams::default();
+    let p = FrameParams { pan_only: false, ..FrameParams::default() };
     let (first, frames) = frame_views(&sketch, Some(&parent), &p, FPS, &SourceSize::default()).unwrap();
     let (_, alone) = frame_views(&sketch, None, &p, FPS, &SourceSize::default()).unwrap();
     let locked = alone[0][3];
@@ -316,7 +316,7 @@ fn new_views_take_the_zoom_lock_setting() {
 #[test]
 fn an_unlocked_view_follows_the_region_size_smoothly() {
     let sketch = jittery_sketch();
-    let p = FrameParams { lock_zoom: false, ..FrameParams::default() };
+    let p = FrameParams { lock_zoom: false, pan_only: false, ..FrameParams::default() };
     let (first, frames) = frame_views(&sketch, None, &p, FPS, &SourceSize::default()).unwrap();
     assert!(region_fits(&sketch, first, &frames), "the region always fits");
     let heights: Vec<f64> = frames.iter().map(|v| v[3]).collect();
@@ -339,4 +339,32 @@ fn a_jump_while_drawing_in_a_view_records_only_where_it_lands() {
     let n = d.core.world.resource::<tt_core::capture::LiveCapture>().0.as_ref().unwrap().through.len();
     assert!(n <= 3, "a 440-frame jump recorded {n} framings (only the frames shown count)");
     d.frame(still(300.0, 200.0), UP);
+}
+
+#[test]
+fn a_pan_only_view_follows_the_subject_at_its_parents_scale() {
+    let sketch = jittery_sketch();
+    let size = SourceSize::default();
+    let p = FrameParams::default();
+    assert!(p.pan_only, "views only pan by default");
+    let (first, frames) = frame_views(&sketch, None, &p, FPS, &size).unwrap();
+    assert!(frames.iter().all(|v| v[3] == size.height && v[5] == size.height), "the source's scale on every frame: no zoom from the sketch");
+    // The centre still follows the point (smoothed).
+    let off: Vec<f64> = frames.iter().enumerate().map(|(i, v)| {
+        let b = sketch.get(first + i as i64).unwrap();
+        (v[0] - b[0] as f64).hypot(v[1] - b[1] as f64)
+    }).collect();
+    let worst = off.iter().copied().fold(0.0, f64::max);
+    assert!(worst < 40.0, "centred on the subject (within {worst:.1} px)");
+    // Under a parent, the parent's crop.
+    let mut parent = Signal::new(6);
+    for f in 0..600i64 {
+        let h = if f < 300 { 300.0 } else { 800.0 };
+        parent.set(f, &[900.0, 500.0, h * 16.0 / 9.0, h, 1920.0, 1080.0].map(|v| v as f32));
+    }
+    let (first, nested) = frame_views(&sketch, Some(&parent), &p, FPS, &size).unwrap();
+    for (i, v) in nested.iter().enumerate() {
+        let f = first + i as i64;
+        assert_eq!(v[3], if f < 300 { 300.0 } else { 800.0 }, "frame {f}: the parent's scale");
+    }
 }
