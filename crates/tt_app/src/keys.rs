@@ -2,9 +2,9 @@
 
 use tt_core::input::{Action, Key, Keymap, KeysHeld, Mods};
 
-pub fn actions(input: &egui::InputState, keymap: &Keymap) -> Vec<Action> {
+pub fn actions(events: &[egui::Event], keymap: &Keymap) -> Vec<Action> {
     let mut out = Vec::new();
-    for event in &input.events {
+    for event in events {
         let egui::Event::Key { key, pressed: true, repeat, modifiers, .. } = event else { continue };
         let Some(k) = map_key(*key) else { continue };
         let mods = Mods { ctrl: modifiers.ctrl || modifiers.command, shift: modifiers.shift, alt: modifiers.alt };
@@ -13,6 +13,23 @@ pub fn actions(input: &egui::InputState, keymap: &Keymap) -> Vec<Action> {
         }
     }
     out
+}
+
+/// egui walks keyboard focus through widgets with Tab (and a focused button
+/// then also takes Space/Enter). This app is driven by its own keymap, so Tab
+/// is taken out of egui's input and kept for the keymap, except while a text
+/// field has focus (Tab moves between fields there).
+pub fn take_tab(ctx: &egui::Context, raw: &mut egui::RawInput, taken: &mut Vec<egui::Event>) {
+    if ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    raw.events.retain(|e| {
+        let tab = matches!(e, egui::Event::Key { key: egui::Key::Tab, .. });
+        if tab {
+            taken.push(e.clone());
+        }
+        !tab
+    });
 }
 
 /// Keys and modifiers held right now.

@@ -26,6 +26,8 @@ pub struct Shell {
     pointer: PointerService,
     /// Time of the last pointer sample handed to the world.
     pointer_read: f64,
+    /// Key events kept from egui (Tab: see keys::take_tab), for the keymap.
+    taken_keys: Vec<egui::Event>,
     /// Dev/benchmark: `TT_AUTOPLAY_SECS=N` plays N seconds once the video is
     /// open, logs the playback probe, and quits (spike S2 measurements).
     autoplay: Option<(f64, Option<f64>)>,
@@ -112,7 +114,7 @@ impl Shell {
         let epoch = Instant::now();
         let pointer = PointerService::start(epoch);
         let sketch_demo = crate::demo::SketchDemo::start();
-        Self { core, epoch, pointer, pointer_read: 0.0, autoplay, bench, sketch_demo }
+        Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), autoplay, bench, sketch_demo }
     }
 
     fn drive_bench(&mut self, ctx: &egui::Context, now: f64) {
@@ -186,8 +188,11 @@ impl eframe::App for Shell {
             });
         }
         let typing = ctx.egui_wants_keyboard_input();
+        let taken = std::mem::take(&mut self.taken_keys);
         if !typing {
-            let actions = ctx.input(|i| keys::actions(i, self.core.world.resource::<Keymap>()));
+            let keymap = self.core.world.resource::<Keymap>();
+            let mut actions = ctx.input(|i| keys::actions(&i.events, keymap));
+            actions.extend(keys::actions(&taken, keymap));
             self.core.world.resource_mut::<PendingActions>().0.extend(actions);
         }
         let held = if typing { KeysHeld::default() } else { ctx.input(keys::held) };
@@ -224,6 +229,10 @@ impl eframe::App for Shell {
         if self.core.world.resource::<Transport>().playing || self.core.world.resource::<tt_core::capture::LiveCapture>().0.is_some() {
             ctx.request_repaint();
         }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        keys::take_tab(ctx, raw_input, &mut self.taken_keys);
     }
 
     fn on_exit(&mut self) {
