@@ -4,13 +4,15 @@
 //!
 //! - Forward jobs read the video in order.
 //! - Backward jobs decode it in keyframe-aligned segments, keep the patches
-//!   (small: only the guide's region), and track each segment in reverse.
-//!   Any strategy runs backward this way, however long the source's GOPs.
+//!   (small: only the guide's region; at most [`MAX_PATCHES`] at a time), and
+//!   track each segment in reverse. Any strategy runs backward this way,
+//!   however long the source's GOPs.
 //! - Both stop at a *limit* the runner moves (catch-up-to-playhead mode) and
 //!   stop at once when cancelled (an input changed; the runner restarts them).
+//!   Held at the limit for a while, a job lets go of its decoder (*parked*).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -33,6 +35,11 @@ pub enum Side {
 
 /// Frames decoded per backward segment, at least (then back to a keyframe).
 const SEGMENT: FrameIndex = 64;
+/// Patches a backward job keeps at once: a longer GOP is decoded again from
+/// its keyframe for each next batch, so memory doesn't grow with the GOP.
+pub const MAX_PATCHES: FrameIndex = 256;
+/// Held at the limit this long, a job closes its decoder (reopened on resume).
+const PARK_AFTER: Duration = Duration::from_millis(1000);
 /// Largest patch half-size, patch pixels.
 const MAX_HALF: f64 = 200.0;
 /// Results are sent every this many frames or this often.
@@ -48,8 +55,9 @@ pub struct JobSpec {
     pub from: FrameIndex,
     pub to: FrameIndex,
     /// Where the tracker was (source px) on the frame before `from` in the
-    /// job's direction: resume there instead of starting at the anchor.
-    pub resume: Option<[f64; 2]>,
+    /// job's direction, and its score there: resume there instead of
+    /// starting at the anchor.
+    pub resume: Option<([f64; 2], f32)>,
     /// The tracked range starts here; `guide` and `maps` cover it frame by frame.
     pub lo: FrameIndex,
     /// The guide's boxes `[x, y, left, top, right, bottom]`, source px, gaps filled.
@@ -61,9 +69,9 @@ pub struct JobSpec {
     /// Searched region, as a multiple of the guide's box.
     pub search: f64,
     pub settings: Settings,
-    /// The rendition decoded, and its size relative to the source.
+    /// The rendition decoded, and its size relative to the source per axis.
     pub video: Arc<VideoIndex>,
-    pub k: f64,
+    pub k: [f64; 2],
     /// The source's index (the frame grid).
     pub grid: Arc<VideoIndex>,
     pub decode: DecodeOptions,
@@ -79,11 +87,19 @@ pub struct Shared {
     pub at: AtomicI64,
     /// Waiting at the limit.
     pub waiting: AtomicBool,
+    /// Waiting long enough to have let go of its decoder: not using a job slot.
+    pub parked: AtomicBool,
 }
 
 impl Shared {
     pub fn new(limit: FrameIndex, at: FrameIndex) -> Self {
-        Self { cancel: AtomicBool::new(false), limit: AtomicI64::new(limit), at: AtomicI64::new(at), waiting: AtomicBool::new(false) }
+        Self {
+            cancel: AtomicBool::new(false),
+            limit: AtomicI64::new(limit),
+            at: AtomicI64::new(at),
+            waiting: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+        }
     }
 }
 
@@ -93,10 +109,24 @@ pub enum Msg {
     Failed(String),
 }
 
-pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>) -> JoinHandle<()> {
+/// Counted in `threads` until the thread exits (cancelled jobs included:
+/// they hold an ffmpeg until they notice).
+struct Alive(Arc<AtomicUsize>);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Start a job's thread, counted in `threads` while it lives.
+pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<AtomicUsize>) -> JoinHandle<()> {
+    threads.fetch_add(1, Ordering::Relaxed);
+    let alive = Alive(threads.clone());
     std::thread::Builder::new()
         .name(format!("tracker {:?}", spec.side))
         .spawn(move || {
+            let _alive = alive;
             let mut worker = Worker { spec, shared, tx: tx.clone(), out: Vec::new(), flushed: Instant::now() };
             let result = worker.run();
             worker.flush();
@@ -190,8 +220,10 @@ impl Worker {
         self.flushed = Instant::now();
     }
 
-    /// Wait until frame `f` is within the limit. False if cancelled.
-    fn wait_for(&mut self, f: FrameIndex) -> bool {
+    /// Wait until frame `f` is within the limit. False if cancelled. A long
+    /// wait calls `park` once (to let go of the decoder) and marks the job parked.
+    fn wait_for(&mut self, f: FrameIndex, mut park: impl FnMut()) -> bool {
+        let mut since: Option<Instant> = None;
         loop {
             if self.cancelled() {
                 return false;
@@ -203,10 +235,16 @@ impl Worker {
             };
             if allowed {
                 self.shared.waiting.store(false, Ordering::Relaxed);
+                self.shared.parked.store(false, Ordering::Relaxed);
                 return true;
             }
             if !self.shared.waiting.swap(true, Ordering::Relaxed) {
                 self.flush();
+            }
+            let since = *since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= PARK_AFTER && !self.shared.parked.load(Ordering::Relaxed) {
+                park();
+                self.shared.parked.store(true, Ordering::Relaxed);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -219,23 +257,29 @@ impl Worker {
 
         // Seed on the anchor frame: its appearance defines the tracked point.
         let seed = self.guide_point(anchor);
+        let frame = self.decode_one(anchor)?;
+        if self.cancelled() {
+            return Ok(());
+        }
         let mut tracker = {
-            let frame = self.decode_one(anchor)?;
             let (grid, patch) = self.patch(&frame, anchor);
             TemplateTracker::seed(&patch, grid, seed, settings)
                 .context("the guide's point at the anchor frame has no detail to follow (flat)")?
         };
         let start = match self.spec.resume {
-            Some(src) => {
+            Some((src, score)) => {
                 let f = self.spec.from - dir;
                 let frame = self.decode_one(f)?;
+                if self.cancelled() {
+                    return Ok(());
+                }
                 let (grid, patch) = self.patch(&frame, f);
                 let pos = self.map(f).from_source(src);
-                tracker.resume(&patch, grid, pos, self.guide_point(f));
+                tracker.resume(&patch, grid, pos, self.guide_point(f), score);
                 self.spec.from
             }
             None if self.spec.side == Side::Forward => {
-                if self.wait_for(anchor) {
+                if self.wait_for(anchor, || {}) {
                     self.emit(anchor, seed, 1.0);
                 }
                 anchor + 1
@@ -253,16 +297,18 @@ impl Worker {
 
     fn forward(&mut self, tracker: &mut TemplateTracker, start: FrameIndex) -> Result<()> {
         let to = self.spec.to;
-        if start > to {
-            return Ok(());
-        }
-        let mut stream = FrameStream::start(&self.spec.video, self.presented(start), &self.spec.decode)?;
+        let mut stream: Option<FrameStream> = None;
         let (mut held, mut buf) = (None, Vec::new());
         for f in start..=to {
-            if !self.wait_for(f) {
+            // Parked at the playhead: the decoder closes, and reopens here.
+            if !self.wait_for(f, || stream = None) {
                 return Ok(());
             }
-            self.read_to(&mut stream, &mut held, &mut buf, f)?;
+            if stream.is_none() {
+                held = None;
+                stream = Some(FrameStream::start(&self.spec.video, self.presented(f), &self.spec.decode)?);
+            }
+            self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
             let (grid, patch) = self.patch(&buf, f);
             let step = tracker.step(&patch, grid, self.guide_point(f));
             self.emit(f, step.pos, step.score);
@@ -274,10 +320,11 @@ impl Worker {
         let to = self.spec.to;
         let mut hi = start;
         while hi >= to {
-            // A segment of at least SEGMENT frames that starts on a keyframe.
+            // A segment of at least SEGMENT frames that starts on a keyframe,
+            // or the last MAX_PATCHES frames before `hi` (ffmpeg skips to them).
             let want = (hi - SEGMENT + 1).max(to);
             let key = self.spec.video.group_start(self.presented(want));
-            let lo = self.spec.grid.grid_of.get(key).copied().unwrap_or(want).clamp(to, want);
+            let lo = self.spec.grid.grid_of.get(key).copied().unwrap_or(want).clamp(to, want).max(hi + 1 - MAX_PATCHES);
             let mut stream = FrameStream::start(&self.spec.video, self.presented(lo), &self.spec.decode)?;
             let (mut held, mut buf) = (None, Vec::new());
             let mut patches = Vec::with_capacity((hi - lo + 1) as usize);
@@ -290,7 +337,7 @@ impl Worker {
             }
             drop(stream);
             for f in (lo..=hi).rev() {
-                if !self.wait_for(f) {
+                if !self.wait_for(f, || {}) {
                     return Ok(());
                 }
                 let (grid, patch) = &patches[(f - lo) as usize];

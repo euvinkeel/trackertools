@@ -59,9 +59,11 @@ impl TemplateTracker {
     }
 
     /// Continue from a known position on a frame other than the anchor
-    /// (resuming a job): that frame's look becomes the last appearance.
-    pub fn resume(&mut self, patch: &Patch, grid: Grid, pos: [f64; 2], guide: [f64; 2]) {
-        self.last = Template::cut(patch, grid.from_view(pos), TEMPLATE_R);
+    /// (resuming a job), where the match scored `score`: that frame's look
+    /// becomes the last appearance if it was a good match (a lost frame's
+    /// position is only the guide's prediction: its look may be anything).
+    pub fn resume(&mut self, patch: &Patch, grid: Grid, pos: [f64; 2], guide: [f64; 2], score: f32) {
+        self.last = if score >= REFRESH_SCORE { Template::cut(patch, grid.from_view(pos), TEMPLATE_R) } else { None };
         self.offset = [pos[0] - guide[0], pos[1] - guide[1]];
     }
 
