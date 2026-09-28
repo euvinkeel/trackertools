@@ -144,8 +144,10 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     if fit {
         view = TimelineView { lane_scroll: view.lane_scroll, ..TimelineView::default() };
     }
-    let min_span = (rect.width() as f64 / 40.0).max(4.0); // at most 40 px per frame
-    let mut span = view.span.unwrap_or(count).clamp(min_span, count * 1.05);
+    // At most 40 px per frame, unless the clip is shorter than that.
+    let max_span = count * 1.05;
+    let min_span = (rect.width() as f64 / 40.0).max(4.0).min(max_span);
+    let mut span = view.span.unwrap_or(count).clamp(min_span, max_span);
     let mut start = if view.span.is_none() { 0.0 } else { view.start };
     let mut lane_scroll = view.lane_scroll;
     if let Some(pos) = response.hover_pos() {
@@ -159,7 +161,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
         if (factor - 1.0).abs() > 1e-9 {
             let under = Scale { rect, start, span }.frame_at(pos.x);
-            let new_span = (span / factor).clamp(min_span, count * 1.05);
+            let new_span = (span / factor).clamp(min_span, max_span);
             start = under - (under - start) * new_span / span;
             span = new_span;
         }
@@ -209,7 +211,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
 
     // Lanes, and what the pointer does on them.
-    let origin = ui.input(|i| i.pointer.press_origin());
+    // Where the press began. egui forgets it on the release frame, which is when
+    // clicks register; a click's release is where it was pressed, near enough.
+    let origin = ui.input(|i| i.pointer.press_origin()).or_else(|| response.interact_pointer_pos());
     let mods = ui.input(|i| i.modifiers);
     let mut ui_state = std::mem::take(&mut *world.resource_mut::<TimelineUi>());
     let marquee = ui_state.marquee.zip(ui.input(|i| i.pointer.interact_pos())).map(|(a, b)| Rect::from_two_pos(a, b));
