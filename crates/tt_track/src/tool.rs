@@ -3,7 +3,8 @@
 //! - **Drag** a rectangle on the video: a new tracker whose first look is that
 //!   pattern, on the shown frame.
 //! - **Click**: a point tracker, its pattern the brush's size around the
-//!   click (the wheel sizes the brush; the overlay shows it dashed).
+//!   click (the overlay shows it dashed; Ctrl+wheel sizes it, the wheel
+//!   zooms as always).
 //! - With a **tracker selected**, a drag or click *patches* it instead:
 //!   another look, on this frame, where the subject really is (the tracker
 //!   is pinned there and goes on from it; a cursor that changed icon is
@@ -31,7 +32,7 @@ use crate::{add_look, add_tracker_with_look, guide_of, is_tracker, reseed_with_l
 
 #[derive(Resource, Debug, Clone)]
 pub struct TrackTool {
-    /// A click's pattern: half-size in screen points.
+    /// A click's pattern: half-size in screen points (a drag makes its own).
     pub brush: f32,
     /// A press in progress: where (shown space's pixels), on which frame, with Shift.
     pub drag: Option<([f64; 2], FrameIndex, bool)>,
@@ -79,7 +80,8 @@ pub fn track_tool(world: &mut World) {
     let frame = world.resource::<Transport>().frame();
     let shift = world.resource::<KeysHeld>().mods.shift;
     let mut tool = world.resource::<TrackTool>().clone();
-    if p.wheel != 0.0 && tool.drag.is_none() {
+    // Ctrl+wheel sizes the click's pattern; the plain wheel stays the viewport's zoom.
+    if p.wheel != 0.0 && tool.drag.is_none() && world.resource::<KeysHeld>().mods.ctrl {
         tool.brush = (tool.brush * 1.15f32.powf(p.wheel)).clamp(3.0, 400.0);
         world.resource_mut::<PointerFrame>().wheel_taken = true;
     }

@@ -230,7 +230,7 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 
 **The Track tool** (`T`; `T` or `Esc` leaves it):
 - **drag** a rectangle on the video: a new tracker with that look on the shown frame;
-- **click**: a point tracker with the brush-sized pattern (the wheel sizes it, a dashed box shows it);
+- **click**: a point tracker with the brush-sized pattern (a dashed box shows it, 28 pt by default; Ctrl+wheel sizes it, the plain wheel zooms as always);
 - with a **tracker selected**, a drag or click **patches** it: another look, on this frame, where the subject really is (the path is pinned there; a new icon is learned too). `Shift` makes a new tracker instead. *(Changed after hands-on use: "my workflow is to just kinda patch wherever it seems to miss".)*
 - the guide is the selected sketch (or the selected tracker's guide), else the smallest sketch whose box holds the rectangle's centre on this frame;
 - the tracker works in the guide's own view (created if needed), so the pattern is cut and matched where the subject sits still.

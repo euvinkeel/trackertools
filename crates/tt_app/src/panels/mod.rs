@@ -124,7 +124,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             .on_hover_text(format!(
                 "Track tool ({track_chord})
                  • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
-                 • click: a point, with a pattern the dashed box's size (the wheel sizes it)
+                 • click: a point, with a pattern the dashed box's size (Ctrl+wheel sizes it; the wheel zooms)
                  • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
                  • select a look (Outliner, Inspector) to paint which of its pixels are the subject"
             ))

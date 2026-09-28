@@ -176,3 +176,23 @@ fn the_track_tool_patches_the_selected_tracker_with_auto_masked_looks() {
     let last = *looks_of(&core.world, t2).last().expect("look");
     assert!(core.world.get::<Look>(last).expect("look").painted().is_none());
 }
+
+#[test]
+fn the_wheel_zooms_in_the_track_tool_and_ctrl_wheel_sizes_the_click() {
+    let mut app = AppBuilder::new();
+    app.add_module(CoreModules).add_module(TrackModule);
+    let mut core = app.build();
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Track;
+    let brush = |core: &Core| core.world.resource::<TrackTool>().brush;
+    let before = brush(&core);
+    let turn = |core: &mut Core, ctrl: bool| {
+        core.world.resource_mut::<tt_core::input::KeysHeld>().mods.ctrl = ctrl;
+        *core.world.resource_mut::<PointerFrame>() = PointerFrame { wheel: 2.0, hover: Some([50.0, 50.0]), scale: 1.0, ..Default::default() };
+        core.run_pre_ui();
+        core.world.resource::<PointerFrame>().wheel_taken
+    };
+    assert!(!turn(&mut core, false), "the wheel stays the viewport's zoom");
+    assert_eq!(brush(&core), before);
+    assert!(turn(&mut core, true), "Ctrl+wheel is the tool's");
+    assert!(brush(&core) > before);
+}

@@ -177,7 +177,7 @@ pub fn draw_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, wo
     let text = match (selected, tool.reseed) {
         (Some(t), Some(r)) if t == r => format!("TRACK · drag around the subject on this frame: {name} starts again from it · T/Esc exits"),
         (Some(_), _) => format!("TRACK · drag around the subject where {name} missed it: a new look, pinned here · Shift+drag: a new tracker · T/Esc exits"),
-        _ => "TRACK · drag around what to follow (its pattern) · click: a point, the dashed box's size (wheel) · T/Esc exits".to_string(),
+        _ => "TRACK · drag around what to follow (its pattern) · click: a point, the dashed box's size (Ctrl+wheel) · T/Esc exits".to_string(),
     };
     let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), TRACK);
     let r = Align2::LEFT_TOP.anchor_size(map.panel.left_top() + Vec2::new(15.0, 65.0), galley.size()).expand(5.0);
