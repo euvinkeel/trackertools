@@ -92,6 +92,13 @@ impl EvalCtx<'_> {
         self.store.get(out.0)
     }
 
+    /// The producer entity connected to input `slot` (None if disconnected or deleted).
+    pub fn input_entity(&self, slot: &str) -> Option<Entity> {
+        let inputs = self.world.get::<Inputs>(self.entity)?;
+        let (_, producer) = inputs.0.iter().find(|(s, _)| s == slot)?;
+        (self.world.get::<bevy_ecs::entity_disabling::Disabled>(*producer).is_none()).then_some(*producer)
+    }
+
     pub fn params<P: Component>(&self) -> Option<&P> {
         self.world.get::<P>(self.entity)
     }

@@ -14,6 +14,7 @@ pub mod persist;
 pub mod ranges;
 pub mod selection;
 pub mod signal;
+pub mod sketch;
 pub mod time;
 pub mod transport;
 
@@ -32,6 +33,7 @@ impl Module for CoreModules {
             .add_module(history::HistoryModule)
             .add_module(selection::SelectionModule)
             .add_module(NamesModule)
+            .add_module(sketch::SketchModule)
             .add_module(persist::PersistModule);
     }
 }
