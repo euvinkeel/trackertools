@@ -2,7 +2,7 @@
 //! queue actions/intents; they never own state or mutate the document directly.
 
 mod inspector;
-mod outliner;
+pub mod outliner;
 pub mod timeline;
 pub mod viewport;
 

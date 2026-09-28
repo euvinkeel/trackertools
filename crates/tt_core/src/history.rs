@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::prelude::*;
+use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
+use bevy_reflect::PartialReflect;
 
 use crate::app::{AppBuilder, Module, Set};
 use crate::input::{Action, PendingActions};
@@ -57,15 +59,27 @@ pub struct History {
     redo: Vec<Transaction>,
     open: Option<Transaction>,
     pub limit: usize,
+    /// Bumped by every edit, undo and redo: "the document changed" (autosave).
+    revision: u64,
 }
 
 impl Default for History {
     fn default() -> Self {
-        Self { undo: Vec::new(), redo: Vec::new(), open: None, limit: 500 }
+        Self { undo: Vec::new(), redo: Vec::new(), open: None, limit: 500, revision: 0 }
     }
 }
 
 impl History {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Forget all history (a different document was loaded).
+    pub fn clear(&mut self) {
+        let revision = self.revision;
+        *self = Self { revision, ..Self::default() };
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -151,6 +165,37 @@ impl Tx<'_> {
             undo: Arc::new(move |w| restore(w, e, Some(before.clone()))),
             redo: Arc::new(move |w| restore::<C>(w, e, None)),
         });
+    }
+
+    /// Set a component to a reflected value — the generic inspector's edit,
+    /// for any registered component type, with no per-type code. Returns
+    /// false if the entity lacks the component or the type isn't registered.
+    pub fn set_reflected(&mut self, e: Entity, type_path: &str, value: &dyn PartialReflect) -> bool {
+        let rc = {
+            let registry = self.world.resource::<AppTypeRegistry>().read();
+            let Some(rc) = registry.get_with_type_path(type_path).and_then(|r| r.data::<ReflectComponent>()) else {
+                return false;
+            };
+            rc.clone()
+        };
+        let Ok(entity) = self.world.get_entity(e) else { return false };
+        let Some(before) = rc.reflect(entity).map(|v| Arc::<dyn PartialReflect>::from(v.to_dynamic())) else { return false };
+        rc.apply(self.world.entity_mut(e), value);
+        let after: Arc<dyn PartialReflect> = rc.reflect(self.world.entity(e)).unwrap().to_dynamic().into();
+        let (rc_undo, rc_redo) = (rc.clone(), rc);
+        self.steps.push(Step {
+            undo: Arc::new(move |w| {
+                if let Ok(entity) = w.get_entity_mut(e) {
+                    rc_undo.apply(entity, before.as_ref());
+                }
+            }),
+            redo: Arc::new(move |w| {
+                if let Ok(entity) = w.get_entity_mut(e) {
+                    rc_redo.apply(entity, after.as_ref());
+                }
+            }),
+        });
+        true
     }
 
     /// Spawn a document entity. Undo disables it; redo re-enables the same id.
@@ -272,6 +317,7 @@ pub fn edit(world: &mut World, label: &str, f: impl FnOnce(&mut Tx<'_>)) -> bool
         return false;
     }
     let mut history = world.resource_mut::<History>();
+    history.revision += 1;
     match &mut history.open {
         Some(open) => open.steps.extend(steps),
         None => {
@@ -290,7 +336,9 @@ pub fn undo(world: &mut World) -> Option<String> {
     };
     t.undo(world);
     let label = t.label.clone();
-    world.resource_mut::<History>().redo.push(t);
+    let mut h = world.resource_mut::<History>();
+    h.redo.push(t);
+    h.revision += 1;
     Some(label)
 }
 
@@ -298,7 +346,9 @@ pub fn redo(world: &mut World) -> Option<String> {
     let t = world.resource_mut::<History>().redo.pop()?;
     t.redo(world);
     let label = t.label.clone();
-    world.resource_mut::<History>().undo.push(t);
+    let mut h = world.resource_mut::<History>();
+    h.undo.push(t);
+    h.revision += 1;
     Some(label)
 }
 

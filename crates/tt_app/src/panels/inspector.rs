@@ -1,8 +1,13 @@
-//! Inspector for M0: generic reflection views of core resources. M2 turns this
-//! into registry-driven editing of any Document component, through transactions.
+//! Inspector: every reflected component of the selected entity, editable with
+//! generic widgets. Edits go through transactions (undoable); a drag is one
+//! undo step. Below, read-only views of core resources.
 
 use bevy_ecs::prelude::*;
+use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_reflect::PartialReflect;
+use tt_core::history::{History, edit};
+use tt_core::meta::{Class, ComponentMetas};
+use tt_core::selection::Selection;
 use tt_core::time::WallClock;
 use tt_core::transport::Transport;
 
@@ -10,11 +15,80 @@ use crate::reflect_ui;
 
 pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        section(ui, "Transport", world.resource::<Transport>().as_partial_reflect());
-        section(ui, "Wall clock", world.resource::<WallClock>().as_partial_reflect());
+        match world.resource::<Selection>().primary() {
+            Some(e) => entity_section(ui, world, e),
+            None => {
+                ui.label(egui::RichText::new("Nothing selected. Select something in the Outliner.").weak());
+            }
+        }
+        ui.separator();
+        egui::CollapsingHeader::new("Transport").default_open(false).show(ui, |ui| {
+            reflect_ui::show(ui, world.resource::<Transport>().as_partial_reflect())
+        });
+        egui::CollapsingHeader::new("Wall clock").default_open(false).show(ui, |ui| {
+            reflect_ui::show(ui, world.resource::<WallClock>().as_partial_reflect())
+        });
     });
 }
 
-fn section(ui: &mut egui::Ui, title: &str, value: &dyn PartialReflect) {
-    egui::CollapsingHeader::new(title).default_open(true).show(ui, |ui| reflect_ui::show(ui, value));
+fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    ui.heading(crate::panels::outliner::label(world, e));
+    // Editable copies of each reflected document/session component on the entity.
+    let mut components: Vec<(String, String, Box<dyn PartialReflect>, Class)> = {
+        let registry = world.resource::<AppTypeRegistry>().read();
+        let metas = world.resource::<ComponentMetas>();
+        let Ok(entity) = world.get_entity(e) else { return };
+        registry
+            .iter()
+            .filter_map(|r| {
+                let class = metas.get(r.type_id())?.class;
+                if class == Class::Derived {
+                    return None;
+                }
+                let rc = r.data::<ReflectComponent>()?;
+                let value = rc.reflect(entity)?;
+                let info = r.type_info().type_path_table();
+                Some((info.path().to_string(), info.short_path().to_string(), value.to_dynamic(), class))
+            })
+            .collect()
+    };
+    components.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let mut pending: Option<PendingEdit> = None;
+    for (path, short, mut value, class) in components {
+        egui::CollapsingHeader::new(&short).id_salt(&path).default_open(true).show(ui, |ui| {
+            if class == Class::Session {
+                ui.label(egui::RichText::new("session (not undoable)").weak().small());
+            }
+            let r = reflect_ui::edit(ui, value.as_mut());
+            if r.changed || r.drag_started || r.drag_stopped {
+                pending = Some((path.clone(), short.clone(), value, r, class));
+            }
+        });
+    }
+
+    let Some((path, short, value, r, class)) = pending else { return };
+    if class == Class::Session {
+        // Session state applies directly: not part of the undo history.
+        let rc = world.resource::<AppTypeRegistry>().read().get_with_type_path(&path).and_then(|t| t.data::<ReflectComponent>().cloned());
+        if let (Some(rc), true) = (rc, r.changed) {
+            rc.apply(world.entity_mut(e), value.as_ref());
+        }
+        return;
+    }
+    // A drag is one undo step: open a gesture on drag start, close it on release.
+    if r.drag_started {
+        world.resource_mut::<History>().begin(format!("Edit {short}"));
+    }
+    if r.changed {
+        edit(world, &format!("Edit {short}"), |tx| {
+            tx.set_reflected(e, &path, value.as_ref());
+        });
+    }
+    if r.drag_stopped {
+        world.resource_mut::<History>().end();
+    }
 }
+
+/// An edit made this frame: (type path, short name, new value, what happened, class).
+type PendingEdit = (String, String, Box<dyn PartialReflect>, reflect_ui::Edited, Class);

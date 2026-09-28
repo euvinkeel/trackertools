@@ -81,7 +81,8 @@ impl Shell {
             .add_module(MediaModule)
             .add_module(ViewportModule)
             .add_module(TimelineModule)
-            .add_module(SessionModule);
+            .add_module(SessionModule)
+            .add_module(crate::project::ProjectModule);
         let mut core = app.build();
 
         // Until a video is open, a one-minute demo clock keeps the transport live.
@@ -183,6 +184,7 @@ impl eframe::App for Shell {
     }
 
     fn on_exit(&mut self) {
+        crate::project::save_if_dirty(&mut self.core.world);
         self.core.world.resource_mut::<Session>().save();
     }
 

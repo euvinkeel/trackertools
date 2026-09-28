@@ -153,7 +153,22 @@ The proxy (item 6) exists for the step-back tail and for seeks.
   - a randomized 200-edit undo-all / redo-all test.
 - **Keys and UI:** Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y), plus top-bar buttons with labels.
 
-**Remaining:** `.ttproj` persistence, the reflection inspector (editing through transactions), the outliner, and summary pyramids.
+**Also done:**
+- **`.ttproj` persistence** (SQLite):
+  - generic reflection (RON) for every document component;
+  - entity references remapped on load by a reflection walk;
+  - content-addressed LZ4 signal chunks (a one-frame edit writes 1 chunk; identical chunks dedupe);
+  - deleted entities skipped;
+  - format version guard.
+
+  Tested in `tests/persist.rs`.
+- **Per-video project autosave:** in `%LOCALAPPDATA%\trackertools\projects`, keyed like the proxy. Loads on open, saves 1.5 s after edits settle, before switching videos, and on exit.
+- **Reflected edits (`Tx::set_reflected`):** any registered component is editable and undoable by type path. Tested.
+- **Selection** (session).
+- **Outliner:** named document entities, click / Ctrl+click.
+- **Generic Inspector:** editable widgets for numbers, booleans, text and enums, with nested structs. Drags are one undo step; session components apply without undo.
+
+**Moved to M3:** timeline summary pyramids (they belong with the lanes).
 
 The original plan follows.
 

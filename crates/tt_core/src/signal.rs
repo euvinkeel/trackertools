@@ -213,6 +213,44 @@ impl Signal {
         out
     }
 
+    /// Serialized chunks `(index, bytes)`: CHUNK state bytes, then the f32
+    /// values little-endian. Used by the project file (content-addressed).
+    pub fn chunk_bytes(&self) -> Vec<(i64, Vec<u8>)> {
+        self.chunks
+            .iter()
+            .map(|(k, ch)| {
+                let mut b = Vec::with_capacity(CHUNK + ch.data.len() * 4);
+                b.extend(ch.state.iter().map(|s| *s as u8));
+                for v in ch.data.iter() {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                (*k, b)
+            })
+            .collect()
+    }
+
+    /// Rebuild a signal from [`Signal::chunk_bytes`] output.
+    pub fn from_chunk_bytes<'a>(channels: usize, chunks: impl IntoIterator<Item = (i64, &'a [u8])>) -> anyhow::Result<Signal> {
+        let mut s = Signal::new(channels);
+        let expected = CHUNK + CHUNK * channels * 4;
+        for (k, b) in chunks {
+            anyhow::ensure!(b.len() == expected, "chunk {k}: {} bytes, expected {expected}", b.len());
+            let mut ch = Chunk::new(channels);
+            for (i, st) in b[..CHUNK].iter().enumerate() {
+                ch.state[i] = match st {
+                    1 => FrameState::Valid,
+                    2 => FrameState::Stale,
+                    _ => FrameState::Absent,
+                };
+            }
+            for (i, v) in b[CHUNK..].chunks_exact(4).enumerate() {
+                ch.data[i] = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            }
+            s.chunks.insert(k, Arc::new(ch));
+        }
+        Ok(s)
+    }
+
     /// Number of chunk allocations shared with `other` (for tests and memory stats).
     pub fn shared_chunks_with(&self, other: &Signal) -> usize {
         self.chunks.iter().filter(|(k, v)| other.chunks.get(k).is_some_and(|w| Arc::ptr_eq(v, w))).count()

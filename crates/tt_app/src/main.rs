@@ -5,6 +5,7 @@ mod keys;
 mod layout;
 mod media;
 mod panels;
+mod project;
 mod session;
 mod reflect_ui;
 mod shell;

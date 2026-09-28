@@ -97,9 +97,11 @@ impl EvalCtx<'_> {
     }
 }
 
-/// Marks an operator entity and names its kind.
+/// Marks an operator entity and names its kind. Every operator carries a
+/// [`Dirty`] set (required component), including ones restored from a file.
 #[derive(Component, Reflect, Debug, Clone)]
 #[reflect(Component)]
+#[require(Dirty)]
 pub struct Operator {
     pub kind: String,
 }

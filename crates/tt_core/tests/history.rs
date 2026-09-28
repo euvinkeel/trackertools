@@ -144,6 +144,41 @@ fn signal_edits_ripple_through_operators_and_back() {
 }
 
 #[test]
+fn reflected_edits_are_undoable_and_recompute() {
+    let mut c = core();
+    let src_sig = c.world.resource_mut::<SignalStore>().create(1);
+    c.world.resource_mut::<SignalStore>().get_mut(src_sig).unwrap().write(0, &vec![1.0; N as usize]);
+    let src = c.world.spawn(Output(src_sig)).id();
+    let off = spawn_op(&mut c.world, "offset", vec![("in", src)], Offset { k: 10.0 });
+    c.run_pre_ui();
+    let out = |c: &Core, f| {
+        let id = c.world.get::<Output>(off).unwrap().0;
+        c.world.resource::<SignalStore>().get(id).unwrap().get_valid(f).map(|v| v[0])
+    };
+
+    // The inspector's path: a reflected value for a type it only knows by name.
+    let new_value = Offset { k: -4.0 };
+    let type_path = <Offset as bevy_reflect::TypePath>::type_path();
+    assert!(edit(&mut c.world, "k", |tx| {
+        assert!(tx.set_reflected(off, type_path, &new_value));
+    }));
+    c.run_pre_ui();
+    assert_eq!(c.world.get::<Offset>(off), Some(&Offset { k: -4.0 }));
+    assert_eq!(out(&c, 3), Some(-3.0), "a reflected edit triggers recomputation");
+    undo(&mut c.world);
+    c.run_pre_ui();
+    assert_eq!(c.world.get::<Offset>(off), Some(&Offset { k: 10.0 }));
+    assert_eq!(out(&c, 3), Some(11.0));
+    redo(&mut c.world);
+    assert_eq!(c.world.get::<Offset>(off), Some(&Offset { k: -4.0 }));
+    // Unknown types and missing components are refused, not recorded.
+    assert!(!edit(&mut c.world, "bad", |tx| {
+        assert!(!tx.set_reflected(off, "no::such::Type", &new_value));
+        assert!(!tx.set_reflected(src, type_path, &new_value));
+    }));
+}
+
+#[test]
 fn gesture_is_one_undo_step() {
     let mut c = core();
     let e = c.world.spawn(Val(0)).id();

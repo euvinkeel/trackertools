@@ -22,15 +22,24 @@ use crate::index::VideoIndex;
 pub const PROXY_HEIGHT: u32 = 720;
 pub const PROXY_GOP: u32 = 12;
 
-/// Where a source's scrub proxy lives: a per-user cache keyed by the source's
-/// path, size and modification time (a changed source gets a new proxy).
-pub fn proxy_path(source: &Path) -> Result<PathBuf> {
+/// A stable key for a source video: its canonical path, size and modification
+/// time (a changed file gets a new key). Names per-video cache files.
+pub fn source_key(source: &Path) -> Result<String> {
     let meta = std::fs::metadata(source)?;
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     let key = format!("{}|{}|{}", source.canonicalize()?.display(), meta.len(), mtime);
     let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)); // FNV-1a
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    Ok(base.join("trackertools").join("proxies").join(format!("{hash:016x}.mp4")))
+    Ok(format!("{hash:016x}"))
+}
+
+/// The per-user data directory (`%LOCALAPPDATA%\trackertools`).
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("trackertools")
+}
+
+/// Where a source's scrub proxy lives.
+pub fn proxy_path(source: &Path) -> Result<PathBuf> {
+    Ok(data_dir().join("proxies").join(format!("{}.mp4", source_key(source)?)))
 }
 
 /// Open an existing proxy if it matches the source frame for frame.
