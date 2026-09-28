@@ -180,6 +180,20 @@ fn a_nested_sketch_survives_its_parent_being_deleted() {
 }
 
 #[test]
+fn new_names_never_repeat_a_live_one_after_a_delete() {
+    let mut d = Driver::new();
+    let name = |d: &Driver, e: Entity| d.core.world.get::<Name>(e).unwrap().to_string();
+    let a = record(&mut d, false);
+    let b = record(&mut d, true);
+    assert_eq!((name(&d, b), name(&d, strokes_of(&d.core.world, b)[0])), ("Sketch 2".into(), "Stroke 2".into()));
+    delete(&mut d.core.world, &[a]);
+    let c = record(&mut d, true);
+    assert_eq!((name(&d, c), name(&d, strokes_of(&d.core.world, c)[0])), ("Sketch 3".into(), "Stroke 3".into()));
+    let copy = duplicate(&mut d.core.world, &[b])[0];
+    assert_eq!(name(&d, strokes_of(&d.core.world, copy)[0]), "Stroke 4", "a copied stroke too");
+}
+
+#[test]
 fn deleting_nested_views_hands_the_viewport_to_the_nearest_live_one() {
     let mut d = Driver::new();
     let enter = |d: &mut Driver, s: Entity| {

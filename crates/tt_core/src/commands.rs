@@ -127,12 +127,7 @@ pub fn duplicate(world: &mut World, targets: &[Entity]) -> Vec<Entity> {
     if copies.is_empty() {
         return Vec::new();
     }
-    let (mut names, mut n_strokes) = {
-        let mut q = world.query::<&Name>();
-        let names: Vec<String> = q.iter(world).map(|n| n.to_string()).collect();
-        let mut captures = world.query::<&Capture>();
-        (names, captures.iter(world).count())
-    };
+    let (mut names, n_strokes) = (live_names(world), world.query::<&Capture>().iter(world).count());
     let mut made = Vec::new();
     edit(world, "Duplicate", |tx| {
         for (name, params, space, strokes) in copies {
@@ -140,8 +135,9 @@ pub fn duplicate(world: &mut World, targets: &[Entity]) -> Vec<Entity> {
             for st in strokes {
                 let stream = tx.create_signal(st.stream.channels());
                 *tx.signal(stream) = st.stream;
-                n_strokes += 1;
-                let c = tx.spawn((Name::new(format!("Stroke {n_strokes}")), st.capture, st.clock, st.stroke, Output(stream)));
+                let stroke_name = numbered(&names, "Stroke", n_strokes + 1);
+                names.push(stroke_name.clone());
+                let c = tx.spawn((Name::new(stroke_name), st.capture, st.clock, st.stroke, Output(stream)));
                 if let Some(t) = st.through {
                     let id = tx.create_signal(t.channels());
                     *tx.signal(id) = t;
@@ -165,7 +161,18 @@ fn unique(taken: &[String], base: &str) -> String {
     if !taken.iter().any(|t| t == base) {
         return base.to_string();
     }
-    (2..).map(|i| format!("{base} {i}")).find(|n| !taken.iter().any(|t| t == n)).expect("some name is free")
+    numbered(taken, base, 2)
+}
+
+/// `prefix n` for the first `n` from `from` on that isn't taken (after a
+/// delete, counting what is left would name a new one like an old one).
+pub(crate) fn numbered(taken: &[String], prefix: &str, from: usize) -> String {
+    (from..).map(|i| format!("{prefix} {i}")).find(|n| !taken.iter().any(|t| t == n)).expect("some name is free")
+}
+
+/// The names of all live entities.
+pub(crate) fn live_names(world: &mut World) -> Vec<String> {
+    world.query::<&Name>().iter(world).map(|n| n.to_string()).collect()
 }
 
 /// Rename an entity (one undo step). Returns whether it changed.

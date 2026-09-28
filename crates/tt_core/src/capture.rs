@@ -27,6 +27,7 @@ use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 
 use crate::app::{AppBuilder, Module};
+use crate::commands::{live_names, numbered};
 use crate::history::edit;
 use crate::input::{Action, KeysHeld, PendingActions};
 use crate::meta::Class;
@@ -343,11 +344,13 @@ fn commit(world: &mut World, live: Live) {
     if live.boxes.as_ref().is_none_or(|(_, b)| b.iter().all(Option::is_none)) {
         return; // nothing visited
     }
-    let (sketches, strokes) = {
+    let (sketch_name, stroke_name) = {
         let mut ops = world.query::<&Operator>();
         let sketches = ops.iter(world).filter(|o| o.kind == "sketch").count();
         let mut captures = world.query::<&Capture>();
-        (sketches, captures.iter(world).count())
+        let strokes = captures.iter(world).count();
+        let names = live_names(world);
+        (numbered(&names, "Sketch", sketches + 1), numbered(&names, "Stroke", strokes + 1))
     };
     let target = live.target.filter(|t| is_live_sketch(world, *t));
     let label = match target.and_then(|t| world.get::<Name>(t)) {
@@ -360,7 +363,7 @@ fn commit(world: &mut World, live: Live) {
         let flat: Vec<f32> = live.samples.iter().flat_map(|s| s.map(|v| v as f32)).collect();
         tx.signal(stream).write(0, &flat);
         let capture = tx.spawn((
-            Name::new(format!("Stroke {}", strokes + 1)),
+            Name::new(stroke_name),
             Capture { rate: live.rate, samples: live.samples.len() as u32 },
             live.clock.clone(),
             live.stroke.clone(),
@@ -381,7 +384,7 @@ fn commit(world: &mut World, live: Live) {
                 let mut inputs = vec![("stroke".to_string(), capture)];
                 inputs.extend(live.drawn_in.map(|v| ("space".to_string(), v)));
                 sketch = Some(tx.spawn((
-                    Name::new(format!("Sketch {}", sketches + 1)),
+                    Name::new(sketch_name),
                     Operator { kind: "sketch".into() },
                     Inputs(inputs),
                     Output(out),
