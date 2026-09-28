@@ -13,6 +13,7 @@ use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 
 use crate::app::{AppBuilder, Module, Set};
+use crate::capture::LiveCapture;
 use crate::history::edit;
 use crate::input::{Action, PendingActions};
 use crate::meta::Class;
@@ -93,8 +94,16 @@ struct StrokeCopy {
 /// Duplicate the sketches among `targets` (a stroke counts as its sketch),
 /// with copies of all their strokes, as one undo step. The copies are selected.
 pub fn duplicate(world: &mut World, targets: &[Entity]) -> Vec<Entity> {
-    let mut sketches: Vec<Entity> = targets.iter().filter_map(|e| sketch_of(world, *e)).collect();
-    sketches.dedup();
+    // Each sketch once, in the order first seen (a sketch and its strokes may both be selected).
+    let mut sketches: Vec<Entity> = Vec::new();
+    for &e in targets {
+        if is_live(world, e)
+            && let Some(s) = sketch_of(world, e)
+            && !sketches.contains(&s)
+        {
+            sketches.push(s);
+        }
+    }
     let store = world.resource::<SignalStore>();
     let signal = |id: crate::signal::SignalId| store.get(id).cloned();
     let mut copies = Vec::new();
@@ -178,9 +187,12 @@ pub fn select_all(world: &mut World) {
 
 fn apply_command_actions(world: &mut World) {
     let actions = world.resource_mut::<PendingActions>().take(|a| matches!(a, Action::Delete | Action::Duplicate | Action::SelectAll | Action::Rename));
+    // A stroke in progress keeps its sketch and view (the menu greys these out too).
+    let busy = world.resource::<LiveCapture>().0.is_some();
     for a in actions {
         let selected = world.resource::<Selection>().entities.clone();
         match a {
+            Action::Delete | Action::Duplicate if busy => tracing::info!("{a:?} ignored: a stroke is in progress"),
             Action::Delete => {
                 delete(world, &selected);
             }

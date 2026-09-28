@@ -120,6 +120,42 @@ fn duplicate_copies_a_sketch_with_its_strokes_independently() {
 }
 
 #[test]
+fn duplicating_a_sketch_with_its_own_stroke_selected_copies_it_once() {
+    let mut d = Driver::new();
+    let a = record(&mut d, false);
+    let b = record(&mut d, true);
+    let stroke_of_a = strokes_of(&d.core.world, a)[0];
+    // Box selection lists lanes before ticks: [A, B, a stroke of A].
+    let copies = duplicate(&mut d.core.world, &[a, b, stroke_of_a]);
+    assert_eq!(copies.len(), 2, "one copy of A and one of B");
+    assert_eq!(d.sketches().len(), 4);
+    let names: Vec<String> = copies.iter().map(|c| d.core.world.get::<Name>(*c).unwrap().to_string()).collect();
+    assert_eq!(names, ["Sketch 1 copy", "Sketch 2 copy"], "in the order first selected");
+}
+
+#[test]
+fn delete_and_duplicate_wait_for_the_stroke_to_end() {
+    let mut d = Driver::new();
+    let s = record(&mut d, false);
+    let strokes = strokes_of(&d.core.world, s).len();
+    // Hold a stroke on the selected sketch and press X, then Shift+D.
+    d.core.world.resource_mut::<Selection>().select_only(s);
+    d.frame(circle, PRESS);
+    d.frames(5, circle, HOLD);
+    d.frame(circle, Input { action: Some(Action::Delete), ..HOLD });
+    d.frame(circle, Input { action: Some(Action::Duplicate), ..HOLD });
+    assert!(!disabled(&d, s), "the sketch being drawn on stays");
+    assert_eq!(d.sketches().len(), 1, "nothing was duplicated");
+    d.frames(5, circle, HOLD);
+    d.frame(circle, UP);
+    assert_eq!(strokes_of(&d.core.world, s).len(), strokes + 1, "the stroke landed on its sketch");
+    assert_eq!(d.core.world.resource::<History>().undo_label(), Some("Stroke on Sketch 1"));
+    // Afterwards the keys work again.
+    d.frame(still(0.0, 0.0), Input { action: Some(Action::Delete), ..UP });
+    assert!(disabled(&d, s));
+}
+
+#[test]
 fn a_nested_sketch_survives_its_parent_being_deleted() {
     let mut d = Driver::new();
     let parent = record(&mut d, false);
