@@ -1,5 +1,6 @@
-//! Trackers in the panels: their points and paths over the video, their
-//! progress in the top bar and the inspector, and the Track command.
+//! Trackers in the panels: their points, paths and looks over the video, the
+//! Track tool's preview and hints, their progress in the top bar, and the
+//! inspector (looks and their masks).
 
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
@@ -12,8 +13,11 @@ use tt_core::signal::{FrameState, SignalId, SignalStore};
 use tt_core::time::FrameIndex;
 use tt_core::transport::Transport;
 use tt_core::view::SpaceMap;
+use tt_core::tool::{ActiveTool, Tool};
+use tt_track::look::{Look, looks_of};
 use tt_track::runner::{SideStatus, TrackStatus};
-use tt_track::{Tracker, guide_of, is_tracker, trackers_of};
+use tt_track::tool::TrackTool;
+use tt_track::{LOST as LOST_FLAG, guide_of, is_tracker, trackers_of};
 
 use super::viewport::ViewportMapping;
 use crate::style;
@@ -30,22 +34,23 @@ pub fn list(world: &mut World) -> Vec<(Entity, SignalId)> {
     q.iter(world).filter(|(_, o, _)| o.kind == "track").map(|(e, _, o)| (e, o.0)).collect()
 }
 
-/// Every tracker's point at the playhead (the feature's box around it), and
-/// its path: selected trackers ±90 frames, others a short tail. Frames below
-/// the tracker's score threshold (lost: following the guide) are red.
+/// Every tracker's point at the playhead (its pattern's box around it), and
+/// its path: selected trackers ±90 frames, others a short tail. Flagged
+/// frames (lost, or outside the guide's box) are red. A selected tracker's
+/// looks show on their own frames.
 pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(Entity, SignalId)], frame: FrameIndex, space: &dyn Fn(FrameIndex) -> SpaceMap) {
     let selected = &world.resource::<Selection>().entities;
     let store = world.resource::<SignalStore>();
     for &(e, id) in list {
         let Some(sig) = store.get(id) else { continue };
-        let lit = selected.contains(&e);
-        let min_score = world.get::<Tracker>(e).map_or(0.5, |t| t.min_score);
+        let looks = looks_of(world, e);
+        let lit = selected.contains(&e) || looks.iter().any(|l| selected.contains(l));
         let base = if lit { TRACK } else { TRACK.gamma_multiply(0.55) };
         let reach = if lit { PATH_FRAMES } else { SHORT_PATH };
         let at = |f: FrameIndex| {
             sig.get(f).map(|v| {
                 let [x, y] = space(f).from_source([v[0] as f64, v[1] as f64]);
-                (map.to_screen([x, y]), v[6] < min_score)
+                (map.to_screen([x, y]), tt_track::flags(v) != 0)
             })
         };
         // The path, split where it breaks, turns lost, or passes the playhead (ahead is fainter).
@@ -83,9 +88,22 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             line(&run, k);
         }
 
+        // Its looks on this frame: the patterns it follows, as drawn.
+        if lit {
+            for l in looks.iter().filter_map(|l| Some((*l, world.get::<Look>(*l)?))).filter(|(_, l)| l.frame == frame) {
+                let b = space(frame).box_from_source(l.1.rect());
+                let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
+                let chosen = selected.contains(&l.0);
+                painter.rect_stroke(r, 0.0, Stroke::new(if chosen { 2.0 } else { 1.0 }, Color32::WHITE.gamma_multiply(0.8)), StrokeKind::Outside);
+                let name = world.get::<Name>(l.0).map_or("look".to_string(), |n| n.to_string());
+                painter.text(r.left_bottom() + Vec2::new(0.0, 2.0), Align2::LEFT_TOP, name, FontId::proportional(10.0), Color32::WHITE.gamma_multiply(0.8));
+            }
+        }
+
         let Some(v) = sig.get(frame) else { continue };
         let b = space(frame).box_from_source(std::array::from_fn(|c| v[c] as f64));
-        let lost = v[6] < min_score;
+        let flags = tt_track::flags(v);
+        let lost = flags != 0;
         let stale = sig.state(frame) == FrameState::Stale;
         let color = if lost { LOST } else { base }.gamma_multiply(if stale { 0.5 } else { 1.0 });
         let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
@@ -96,7 +114,11 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         painter.line_segment([p - Vec2::new(0.0, 3.0), p + Vec2::new(0.0, 3.0)], stroke);
         if lit {
             let name = world.get::<Name>(e).map_or("Tracker".to_string(), |n| n.to_string());
-            let text = if lost { format!("{name} · lost ({:.2})", v[6]) } else { format!("{name} · {:.2}", v[6]) };
+            let text = match flags {
+                0 => format!("{name} · {:.2}", v[6]),
+                f if f & LOST_FLAG != 0 => format!("{name} · lost ({:.2})", v[6]),
+                _ => format!("{name} · outside the sketch ({:.2})", v[6]),
+            };
             painter.text(r.right_top() + Vec2::new(4.0, 0.0), Align2::LEFT_TOP, text, FontId::proportional(11.0), color);
         }
     }
@@ -129,12 +151,49 @@ pub fn summary(world: &mut World) -> Option<(String, String)> {
     Some((text, tip.join("\n")))
 }
 
-/// Frames a tracker covers, and how many of them are lost: counted again only
-/// when its output or its threshold changes (not on every repaint).
+/// The Track tool on the video: its pattern (dashed: the brush at the
+/// pointer, or the rectangle being dragged) and a row of hints.
+pub fn draw_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: &mut World, map: &ViewportMapping) {
+    if world.resource::<ActiveTool>().0 != Tool::Track {
+        return;
+    }
+    let tool = world.resource::<TrackTool>().clone();
+    let dashed = |r: Rect, c: Color32| {
+        let s = Stroke::new(1.0, c);
+        for (a, b) in [(r.left_top(), r.right_top()), (r.right_top(), r.right_bottom()), (r.right_bottom(), r.left_bottom()), (r.left_bottom(), r.left_top())] {
+            painter.add(Shape::dashed_line(&[a, b], s, 4.0, 3.0));
+        }
+    };
+    if let Some(pos) = response.hover_pos() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        match tool.drag {
+            Some((start, _, _)) => dashed(Rect::from_two_pos(map.to_screen(start), pos), TRACK),
+            None => dashed(Rect::from_center_size(pos, Vec2::splat(2.0 * tool.brush)), TRACK.gamma_multiply(0.7)),
+        }
+    }
+    let world_ref: &World = world;
+    let adding = world_ref.resource::<Selection>().primary().is_some_and(|e| is_tracker(world_ref, e));
+    let text = format!(
+        "TRACK · drag around what to follow (its pattern) · click: a point, the dashed box's size (wheel) · {}· T/Esc exits",
+        if adding { "Shift+drag: another look for the selected tracker " } else { "" }
+    );
+    let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), TRACK);
+    let r = Align2::LEFT_TOP.anchor_size(map.panel.left_top() + Vec2::new(15.0, 65.0), galley.size()).expand(5.0);
+    painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
+    painter.galley(r.min + Vec2::splat(5.0), galley, TRACK);
+    if let Some(why) = &tool.refused {
+        let g = painter.layout_no_wrap(why.clone(), FontId::proportional(13.0), LOST);
+        let r2 = Align2::LEFT_TOP.anchor_size(r.left_bottom() + Vec2::new(5.0, 8.0), g.size()).expand(5.0);
+        painter.rect_filled(r2, 4.0, Color32::from_black_alpha(190));
+        painter.galley(r2.min + Vec2::splat(5.0), g, LOST);
+    }
+}
+
+/// Frames a tracker covers, and how many of them are flagged: counted again
+/// only when its output changes (not on every repaint).
 fn counts(ui: &egui::Ui, world: &World, e: Entity) -> (usize, usize) {
     let Some(sig) = world.get::<Output>(e).and_then(|o| world.resource::<SignalStore>().get(o.0)) else { return (0, 0) };
-    let min = world.get::<Tracker>(e).map_or(0.5, |t| t.min_score);
-    let key = (sig.version(), min.to_bits());
+    let key = (sig.version(), 0u32);
     let id = egui::Id::new(("tracker counts", e));
     if let Some((k, c)) = ui.data(|d| d.get_temp::<((u64, u32), (usize, usize))>(id))
         && k == key
@@ -142,22 +201,46 @@ fn counts(ui: &egui::Ui, world: &World, e: Entity) -> (usize, usize) {
         return c;
     }
     let n = world.resource::<Transport>().frame_count;
-    let c = (0..n).filter_map(|f| sig.get(f)).fold((0, 0), |(c, l), v| (c + 1, l + (v[6] < min) as usize));
+    let c = (0..n).filter_map(|f| sig.get(f)).fold((0, 0), |(c, l), v| (c + 1, l + (tt_track::flags(v) != 0) as usize));
     ui.data_mut(|d| d.insert_temp(id, (key, c)));
     c
 }
 
-/// Inspector: a tracker's progress and errors; a sketch's Track button and trackers.
+/// Inspector: a tracker's progress, errors and looks; a look's mask; a sketch's Track buttons.
 pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    if world.get::<Look>(e).is_some() {
+        ui.label(egui::RichText::new("A look: what the tracker's subject looks like here. Paint which pixels are the subject.").color(style::MUTED));
+        super::look_editor::ui(ui, world, e);
+        ui.separator();
+        return;
+    }
     if is_tracker(world, e) {
         if let Some(err) = world.get::<OpError>(e) {
             ui.colored_label(LOST, format!("⚠ {}", err.0));
         }
         let guide = guide_of(world, e).and_then(|g| world.get::<Name>(g)).map(|n| n.to_string());
-        ui.label(egui::RichText::new(format!("follows {} · T re-seeds it at the playhead", guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
+        ui.label(egui::RichText::new(format!("searches inside {} · Track tool + Shift: another look · \"Re-seed here\" starts it again from the playhead", guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
         let status = world.get::<TrackStatus>(e).cloned().unwrap_or_default();
         let (covered, lost) = counts(ui, world, e);
-        ui.label(format!("{covered} frames tracked · {lost} lost (followed the guide){}", if status.rendition.is_empty() { String::new() } else { format!(" · reads the {}", status.rendition) }));
+        ui.label(format!("{covered} frames tracked · {lost} flagged (lost, or outside the sketch){}", if status.rendition.is_empty() { String::new() } else { format!(" · reads the {}", status.rendition) }));
+        // Its looks: select one to paint its mask.
+        let looks = looks_of(world, e);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Looks:");
+            for l in &looks {
+                let Some(look) = world.get::<Look>(*l) else { continue };
+                let painted = if look.painted().is_some() { " · masked" } else { "" };
+                let label = format!("frame {} · {:.0}×{:.0}{painted}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h);
+                if ui.button(label).on_hover_text("Select it to paint which pixels are the subject; the playhead goes to its frame").clicked() {
+                    let f = look.frame;
+                    world.resource_mut::<Selection>().select_only(*l);
+                    world.resource_mut::<PendingActions>().push(Action::Seek(f));
+                }
+            }
+        });
+        if ui.button("Re-seed here").on_hover_text("Start it again from the playhead: a new look where it shows the subject now").clicked() {
+            world.resource_mut::<PendingActions>().push(Action::Track);
+        }
         for (s, forward) in [(status.forward, true), (status.backward, false)] {
             let Some(s) = s else { continue };
             // (The anchor as tracked: moved into the guide's frames.)
@@ -171,10 +254,13 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if !tt_core::sketch::is_sketch(world, e) {
         return;
     }
-    let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Track).unwrap_or_default();
+    let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Track)).unwrap_or_default();
     let existing = trackers_of(world, e);
     ui.horizontal(|ui| {
-        if ui.button(format!("⌖ Track from here ({chord})")).on_hover_text("A tracker that follows this sketch's subject pixel by pixel, forward and backward from the playhead, in the view you're looking at. The sketch tells it where to look.").clicked() {
+        if ui.button(format!("⌖ Track tool ({chord})")).on_hover_text("Drag a rectangle around what to follow in this sketch (or click a point). The tracker searches inside this sketch's box, in its view.").clicked() {
+            world.resource_mut::<ActiveTool>().0 = Tool::Track;
+        }
+        if ui.button("Track its centre").on_hover_text("A quick tracker on this sketch's own point at the playhead (a square of its box); re-centred on the sketch when done").clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }
         if !existing.is_empty() {

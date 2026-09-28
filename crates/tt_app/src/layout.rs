@@ -67,6 +67,8 @@ impl Module for LayoutModule {
         app.declare::<Layout>(Class::Session)
             .init_resource::<Layout>()
             .declare::<crate::panels::outliner::OutlinerState>(Class::Session)
-            .init_resource::<crate::panels::outliner::OutlinerState>();
+            .init_resource::<crate::panels::outliner::OutlinerState>()
+            .declare::<crate::panels::look_editor::LookBrush>(Class::Session)
+            .init_resource::<crate::panels::look_editor::LookBrush>();
     }
 }

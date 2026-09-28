@@ -15,7 +15,8 @@
 //!    double-clicks it;
 //! 5. records one more sketch (from frame 300, from ¼×) with anticipatory
 //!    speed on, pointer distances in real screen points;
-//! 6. tracks that sketch (T) from its middle and waits for the tracker;
+//! 6. tracks the sprite with the Track tool (a square dragged around it on
+//!    frame 340, searching inside that sketch) and waits for the tracker;
 //! 7. retakes three of its frames one by one: holds 30 px right of the
 //!    sprite, steps forward while holding, releases.
 //!
@@ -375,14 +376,20 @@ impl SketchDemo {
             Phase::Track { since, started } => {
                 *frame = PointerFrame::default();
                 if !started {
+                    // The Track tool: drag a 24 px square around the sprite (the demo's canvas is the source).
                     if t.frame() == TRACK_FRAME && now - since > 0.2 {
-                        push(world, Action::Track);
+                        world.resource_mut::<ActiveTool>().0 = Tool::Track;
+                        let c = self.truth_at(TRACK_FRAME);
+                        let (a, b) = ([c[0] - 12.0, c[1] - 12.0], [c[0] + 12.0, c[1] + 12.0]);
+                        let samples = vec![[now - 0.03, a[0], a[1]], [now - 0.02, (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0], [now - 0.01, b[0], b[1]]];
+                        *frame = PointerFrame { samples, hover: Some(b), pressed: Some(now - 0.03), down: false, released: Some(now - 0.005), scale: 1.0, ..PointerFrame::default() };
                         self.phase = Phase::Track { since: now, started: true };
                     }
                     return false;
                 }
                 let busy = world.resource::<tt_track::runner::TrackJobs>().busy() > 0;
                 if now - since > 0.5 && !busy {
+                    world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
                     self.report_tracker(world);
                     self.shots.push(("12-tracker", now + 0.1));
                     push(world, Action::Seek(RETAKE_FRAME));
@@ -551,7 +558,7 @@ impl SketchDemo {
             let Some(v) = sig.get(f) else { continue };
             let t = self.truth[f as usize];
             e.push((v[0] as f64 - t[0]).hypot(v[1] as f64 - t[1]));
-            lost += (v[6] < 0.5) as usize;
+            lost += (tt_track::flags(v) != 0) as usize;
             if let Some(gv) = guide.and_then(|s| s.get(f)) {
                 g.push((gv[0] as f64 - t[0]).hypot(gv[1] as f64 - t[1]));
             }
@@ -562,7 +569,7 @@ impl SketchDemo {
         };
         let (n, m, p95, max) = (e.len(), q(&mut e, 0.5), q(&mut e, 0.95), q(&mut e, 1.0));
         tracing::info!(
-            "sketch demo: tracker from frame {TRACK_FRAME}: {n} frames · error median {m:.2} px, p95 {p95:.2} px, max {max:.2} px · {lost} lost · its sketch alone: median {:.2} px",
+            "sketch demo: tracker from a square dragged around the sprite on frame {TRACK_FRAME}: {n} frames · error median {m:.2} px, p95 {p95:.2} px, max {max:.2} px · {lost} flagged · its sketch alone: median {:.2} px",
             q(&mut g, 0.5)
         );
     }

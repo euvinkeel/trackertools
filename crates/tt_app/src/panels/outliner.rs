@@ -106,6 +106,21 @@ fn parent_sketch(world: &World, s: Entity) -> Option<Entity> {
 
 /// Unfold what hides `e`'s row: a stroke's list of strokes, and every sketch it is nested under.
 fn reveal(world: &mut World, st: &mut OutlinerState, e: Entity) {
+    // A look: its tracker; a tracker: its guide sketch.
+    let mut e = e;
+    if world.get::<tt_track::look::Look>(e).is_some() {
+        let mut q = world.query::<(Entity, &tt_core::op::Inputs)>();
+        if let Some(t) = q.iter(world).find(|(_, i)| i.0.iter().any(|(s, p)| s == "look" && *p == e)).map(|(t, _)| t) {
+            st.folded.remove(&t);
+            e = t;
+        }
+    }
+    if tt_track::is_tracker(world, e)
+        && let Some(g) = tt_track::guide_of(world, e)
+    {
+        e = g;
+        st.folded.remove(&g);
+    }
     let mut s = Some(e);
     if world.get::<Capture>(e).is_some() {
         s = sketch_of(world, e);
@@ -157,7 +172,8 @@ fn rows(world: &mut World, st: &OutlinerState) -> Vec<Row> {
             }
         }
         let open = !filter.is_empty() || !st.folded.contains(&s);
-        let has_children = !strokes.is_empty() || tree.get(i + 1).is_some_and(|(_, d)| *d > depth);
+        let trackers = tt_track::trackers_of(world, s);
+        let has_children = !strokes.is_empty() || !trackers.is_empty() || tree.get(i + 1).is_some_and(|(_, d)| *d > depth);
         out.push(Row::Entity { e: s, depth, fold: has_children.then_some(open) });
         if !open {
             hidden_below = Some(depth);
@@ -171,6 +187,19 @@ fn rows(world: &mut World, st: &OutlinerState) -> Vec<Row> {
                 if strokes_open {
                     out.extend(shown.into_iter().map(|c| Row::Entity { e: c, depth: depth + 2, fold: None }));
                 }
+            }
+        }
+        // Its trackers, each with its looks.
+        for tr in trackers {
+            let looks = tt_track::look::looks_of(world, tr);
+            let show = filter.is_empty() || matches(world, tr) || matches(world, s) || looks.iter().any(|l| matches(world, *l));
+            if !show {
+                continue;
+            }
+            let tr_open = !filter.is_empty() || !st.folded.contains(&tr);
+            out.push(Row::Entity { e: tr, depth: depth + 1, fold: (!looks.is_empty()).then_some(tr_open) });
+            if tr_open {
+                out.extend(looks.into_iter().map(|l| Row::Entity { e: l, depth: depth + 2, fold: None }));
             }
         }
         // (Nested sketches follow in tree order at depth + 1.)
@@ -453,8 +482,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 /// Enabled document entities (every one carries [`Created`]) that aren't
 /// sketches, strokes or views.
 fn other_entities(world: &mut World) -> Vec<Entity> {
-    let mut q = world.query_filtered::<(Entity, Option<&Operator>), (With<Created>, Without<Capture>, Without<Disabled>)>();
-    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame")).map(|(e, _)| e).collect();
+    let mut q = world.query_filtered::<(Entity, Option<&Operator>), (With<Created>, Without<Capture>, Without<tt_track::look::Look>, Without<Disabled>)>();
+    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame" || o.kind == "track")).map(|(e, _)| e).collect();
     creation_order(world, &mut out);
     out
 }

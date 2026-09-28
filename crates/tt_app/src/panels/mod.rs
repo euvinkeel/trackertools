@@ -3,6 +3,7 @@
 
 mod brush;
 mod inspector;
+pub mod look_editor;
 mod menu;
 pub mod outliner;
 mod settings;
@@ -115,6 +116,21 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             .clicked()
         {
             history_action = Some(Action::Tool(Tool::Sketch));
+        }
+        let tracking_tool = world.resource::<ActiveTool>().0 == Tool::Track;
+        let track_chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Track)).unwrap_or_default();
+        if ui
+            .selectable_label(tracking_tool, "⌖ Track")
+            .on_hover_text(format!(
+                "Track tool ({track_chord})
+                 • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
+                 • click: a point, with a pattern the dashed box's size (the wheel sizes it)
+                 • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
+                 • select a look (Outliner, Inspector) to paint which of its pixels are the subject"
+            ))
+            .clicked()
+        {
+            history_action = Some(Action::Tool(Tool::Track));
         }
         let sketch_selected = world.resource::<tt_core::selection::Selection>().primary().is_some_and(|e| tt_core::sketch::is_sketch(world, e));
         if ui

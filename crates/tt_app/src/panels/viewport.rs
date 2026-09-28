@@ -332,6 +332,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     };
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
     super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid, active_view, eased);
+    super::tracks::draw_tool(ui, &painter, &response, world, &mapping);
     breadcrumb(ui, world, rect.left_top() + Vec2::new(10.0, 34.0), active_view, shown_grid);
     // Right-click: select the sketch under the pointer (if any), then the entity menu.
     if response.secondary_clicked()
