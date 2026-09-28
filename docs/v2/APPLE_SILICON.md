@@ -4,7 +4,7 @@ Status: 2026-09-28. v2 was built and measured on Windows (an RTX 4090 desktop). 
 
 ## Running it today
 
-The whole workspace compiles for `aarch64-apple-darwin` (checked with `cargo check --workspace --all-targets --target aarch64-apple-darwin`). A GitHub Actions job (`.github/workflows/macos.yml`) builds it, runs clippy and runs every test on GitHub's Apple Silicon runner (macos-15, arm64) for each pull request. The window draws through wgpu, which uses Metal on a Mac.
+The whole workspace compiles for `aarch64-apple-darwin` (checked with `cargo check --workspace --all-targets --target aarch64-apple-darwin`). A GitHub Actions job (`.github/workflows/macos.yml`) builds it, runs clippy and runs every test on GitHub's Apple Silicon runner (macos-15, arm64), started by hand from the Actions tab (the account's first automatic runs stopped within seconds, before any step: runner minutes). `cargo xtask fixtures` works with an ffmpeg that lacks the drawtext filter (the counter clips then have no visible number; tests read the barcode), and it keeps making the other clips when one fails. The window draws through wgpu, which uses Metal on a Mac.
 
 ```sh
 xcode-select --install                                    # C compiler and SDK (SQLite and a few crates build C)

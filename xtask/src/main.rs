@@ -134,13 +134,23 @@ fn fixtures(force: bool) -> Result<()> {
         clip("counter_hevc_gop250.mp4", "hevc", frames, 250, 3, false, vec![], "HEVC long GOP"),
     ];
 
+    // The burned-in frame number needs ffmpeg's drawtext (built with
+    // freetype), which some builds lack (Homebrew's, at times): without it
+    // the clips have no visible number, and tests (which read the barcode)
+    // are unaffected.
+    let text = has_filter("drawtext");
+    if !text {
+        println!("note  this ffmpeg has no drawtext filter: the counter clips get no visible frame number");
+    }
+    // A clip that fails is reported, and the rest are still made.
+    let mut failed = Vec::new();
     for c in &clips {
         let path = out.join(&c.file);
         if path.exists() && !force {
             println!("skip  {} (exists)", c.file);
             continue;
         }
-        let mut graph = counter_graph(c.grid_frames);
+        let mut graph = counter_graph(c.grid_frames, text);
         let mut extra: Vec<String> = Vec::new();
         if !c.dropped.is_empty() {
             graph.push_str(",select='not(eq(mod(n\\,7)\\,3))'");
@@ -148,8 +158,11 @@ fn fixtures(force: bool) -> Result<()> {
         }
         graph.push_str("[out]");
         let enc = if c.codec == "hevc" { x265(c.gop, c.bframes) } else { x264(c.gop, c.bframes, c.open_gop) };
-        encode(&graph, &enc, &extra, &path)?;
-        check_packets(&path, c.encoded_frames)?;
+        if let Err(e) = encode(&graph, &enc, &extra, &path).and_then(|()| check_packets(&path, c.encoded_frames)) {
+            println!("FAIL  {}: {e:#}", c.file);
+            let _ = std::fs::remove_file(&path);
+            failed.push(c.file.clone());
+        }
     }
 
     // Moving sprite with analytic ground truth (M3 sketch accuracy tests).
@@ -169,8 +182,11 @@ fn fixtures(force: bool) -> Result<()> {
             bx = BARCODE.x,
             by = BARCODE.y,
         );
-        encode(&graph, &x264(250, 3, false), &[], &sprite_path)?;
-        check_packets(&sprite_path, sprite_frames)?;
+        if let Err(e) = encode(&graph, &x264(250, 3, false), &[], &sprite_path).and_then(|()| check_packets(&sprite_path, sprite_frames)) {
+            println!("FAIL  {sprite_file}: {e:#}");
+            let _ = std::fs::remove_file(&sprite_path);
+            failed.push(sprite_file.to_string());
+        }
     } else {
         println!("skip  {sprite_file} (exists)");
     }
@@ -189,7 +205,11 @@ fn fixtures(force: bool) -> Result<()> {
     clips.push(clip(sprite_file, "h264", sprite_frames, 250, 3, false, vec![], "sprite over blurred testsrc2; see sprite_truth.json"));
 
     // A mouse cursor over footage that makes trackers miss (tt_track's accuracy tests).
-    cursor::make(&out, &ffmpeg(), force)?;
+    if let Err(e) = cursor::make(&out, &ffmpeg(), force) {
+        println!("FAIL  cursor fixture: {e:#}");
+        failed.push("cursor_540p60.mp4".into());
+    }
+    clips.retain(|c| !failed.contains(&c.file));
     let manifest = Manifest {
         generator: "cargo xtask fixtures",
         ffmpeg: version,
@@ -204,7 +224,18 @@ fn fixtures(force: bool) -> Result<()> {
     };
     std::fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
     println!("wrote {}", out.join("manifest.json").display());
+    if !failed.is_empty() {
+        bail!("{} fixture(s) failed: {}", failed.len(), failed.join(", "));
+    }
     Ok(())
+}
+
+/// Whether this ffmpeg has the filter `name` (`ffmpeg -filters`).
+fn has_filter(name: &str) -> bool {
+    Command::new(ffmpeg())
+        .args(["-hide_banner", "-filters"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l.split_whitespace().nth(1) == Some(name)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -237,18 +268,22 @@ fn barcode_source(frames: u32) -> String {
     )
 }
 
-/// testsrc2 + barcode + burned-in frame number, without the trailing `[out]`.
-fn counter_graph(frames: u32) -> String {
+/// testsrc2 + barcode + (with `text`) burned-in frame number, without the trailing `[out]`.
+fn counter_graph(frames: u32, text: bool) -> String {
     let d = frames as f64 / FPS as f64;
-    format!(
-        "testsrc2=s={W}x{H}:r={FPS}:d={d},format=yuv420p[bg];{code}[code];\
-         [bg][code]overlay=x={bx}:y={by}:shortest=1,\
-         drawtext={font}:text='%{{frame_num}}':start_number=0:x=40:y=40:fontsize=96:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
+    let mut graph = format!(
+        "testsrc2=s={W}x{H}:r={FPS}:d={d},format=yuv420p[bg];{code}[code];[bg][code]overlay=x={bx}:y={by}:shortest=1",
         code = barcode_source(frames),
         bx = BARCODE.x,
         by = BARCODE.y,
-        font = counter_font(),
-    )
+    );
+    if text {
+        graph.push_str(&format!(
+            ",drawtext={font}:text='%{{frame_num}}':start_number=0:x=40:y=40:fontsize=96:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
+            font = counter_font(),
+        ));
+    }
+    graph
 }
 
 /// The burned-in counter's font (only for looking at the clips: tests read the barcode).

@@ -73,6 +73,10 @@ app() {  # app <what> <env...>: the app on the sprite clip, stopped after 3 minu
   wait "$pid"; echo "(exit $?)" >> "$OUT"
   kill "$guard" 2>/dev/null
 }
+if [ ! -f fixtures/sprite_1080p60.mp4 ]; then
+  say "app: skipped, the test clips weren't made (see 'cargo xtask fixtures' above)"
+  app() { :; }
+fi
 echo ">>> The app's window will open and close by itself 3 times. Don't touch it."
 app "plays 10 s and logs frame pacing" TT_AUTOPLAY_SECS=10
 app "times seeks and frame steps" TT_BENCH_STEPS=1

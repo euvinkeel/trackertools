@@ -1,12 +1,12 @@
 # Builds and tests v2 on an Apple Silicon Mac (GitHub's macos-15 runner:
 # arm64, macOS 15). The fixtures are generated there with Homebrew's ffmpeg.
 # Timings on the runner (a shared 3-core VM) are printed, not asserted.
+# Started by hand (Actions > macOS > Run workflow): macOS runner minutes
+# aren't available to this repository's account automatically (the first
+# runs stopped within seconds, before any step).
 name: macOS
 
 on:
-  pull_request:
-  push:
-    branches: [cloud/all]
   workflow_dispatch:
 
 jobs:
