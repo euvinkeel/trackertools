@@ -105,6 +105,41 @@ pub struct Tracker {
     /// frames before it too). Off: each side tracks one way.
     #[reflect(default = "yes")]
     pub fuse: bool,
+    /// How alike a place must look to count as one of its looks.
+    #[reflect(default)]
+    pub matching: Matching,
+}
+
+/// How alike a place must look to count as one of a tracker's looks
+/// (`ncc::Tolerance`). The defaults are how trackers matched before these
+/// options existed.
+#[derive(Reflect, Clone, Debug, PartialEq)]
+pub struct Matching {
+    /// Its contrast may differ from a look's by this factor either way for
+    /// free (2: half or double); beyond, the score falls in proportion.
+    /// Raise it where the whole picture dims or brightens (a menu's backdrop).
+    pub contrast: f32,
+    /// A painted look's brightness may differ by this many of its spreads
+    /// for free; the score is gone two spreads further.
+    pub brightness: f32,
+    /// Compare the colour too, not only brightness: a white cursor and a
+    /// yellow marker of the same shape are nearly twins in brightness.
+    pub colour: bool,
+    /// With `colour`: how far the colour may differ for free (chroma levels,
+    /// 0–255); the score is gone at twice this.
+    pub colour_slack: f32,
+}
+
+impl Default for Matching {
+    fn default() -> Self {
+        Self { contrast: 2.0, brightness: 1.0, colour: false, colour_slack: 20.0 }
+    }
+}
+
+impl Matching {
+    pub fn tolerance(&self) -> ncc::Tolerance {
+        ncc::Tolerance { contrast: self.contrast.max(1.0), brightness: self.brightness.max(0.0), colour: self.colour.then_some(self.colour_slack.max(0.5)) }
+    }
 }
 
 fn yes() -> bool {
@@ -113,7 +148,7 @@ fn yes() -> bool {
 
 impl Tracker {
     pub fn at(anchor: FrameIndex) -> Self {
-        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false, fuse: true }
+        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false, fuse: true, matching: Matching::default() }
     }
 }
 
@@ -364,6 +399,7 @@ impl Module for TrackModule {
             .init_resource::<look::LookMasker>()
             .register_type::<Direction>()
             .register_type::<Rendition>()
+            .register_type::<Matching>()
             .declare::<TrackStatus>(Class::Derived)
             .declare::<runner::TrackJobs>(Class::Derived)
             .declare::<Footage>(Class::Derived)

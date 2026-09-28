@@ -221,10 +221,16 @@ fn tracks_the_cursor_through_everything() {
     for (name, med, _, max, on, _) in &rows {
         match name.as_str() {
             // (It rests on a look-alike, then flicks off it: see below.)
-            "decoy" | "all" => assert!(*on > 0.97, "{name}: on the cursor on {:.1}% of frames", on * 100.0),
+            "decoy" => assert!(*on > 0.97, "{name}: on the cursor on {:.1}% of frames", on * 100.0),
+            // What the matching options are for (see below): a yellow twin
+            // takes a frame; dimmed to 30%, the cursor is too unlike its look.
+            "colour" => assert!(*on > 0.99, "{name}: {:.1}%", on * 100.0),
+            "dimmed" | "all" => {}
             _ => assert!(*on == 1.0 && *max < 0.5, "{name}: {:.1}% within 3 px, max {max:.2} px", on * 100.0),
         }
-        assert!(*med < 0.15, "{name}: median {med:.2} px");
+        if name != "dimmed" {
+            assert!(*med < 0.15, "{name}: median {med:.2} px");
+        }
     }
 }
 
@@ -246,4 +252,34 @@ fn a_look_where_it_slipped_mends_the_frames_before_it() {
     assert!(decoy(&after).4 >= 0.98);
     let off = |out: &[Frame], f: usize| out[f].map_or(f64::INFINITY, |(p, _, _)| (p[0] - t.point(f)[0]).hypot(p[1] - t.point(f)[1]));
     assert!(off(&one_way, 643) > 100.0 && off(&both, 643) < 1.0, "frame 643: one way {:.1} px off, both ways {:.2}", off(&one_way, 643), off(&both, 643));
+}
+
+/// The tracker's matching options (`Tracker::matching`), each on the
+/// stretch it is for, and nowhere worse: comparing colour keeps it off the
+/// yellow twin; a looser contrast slack follows the cursor into the dimmed
+/// picture. `TT_MATCHING=1` also prints other settings side by side.
+#[test]
+fn matching_options_fix_their_stretches() {
+    type Setup = fn(&mut Tracker);
+    let mut runs: Vec<(&str, Setup)> = vec![("default", |_| {}), ("colour", |p| p.matching.colour = true), ("contrast 3x", |p| p.matching.contrast = 3.0)];
+    if std::env::var_os("TT_MATCHING").is_some() {
+        runs.extend([
+            ("colour 12", (|p| (p.matching.colour, p.matching.colour_slack) = (true, 12.0)) as Setup),
+            ("contrast 4x", |p| p.matching.contrast = 4.0),
+            ("brightness 2", |p| p.matching.brightness = 2.0),
+        ]);
+    }
+    let mut on: Vec<(&str, Vec<(String, f64)>)> = Vec::new();
+    for (name, setup) in runs {
+        let Some((t, out, secs)) = track(&[], setup) else { return };
+        on.push((name, report(name, &t, &out, secs).into_iter().map(|r| (r.0, r.4)).collect()));
+    }
+    let share = |run: &str, stretch: &str| on.iter().find(|(n, _)| *n == run).and_then(|(_, rows)| rows.iter().find(|(s, _)| s == stretch)).map_or(0.0, |(_, v)| *v);
+    assert_eq!(share("colour", "colour"), 1.0, "colour keeps it off the yellow twin");
+    assert_eq!(share("contrast 3x", "dimmed"), 1.0, "a looser contrast slack follows the dimmed cursor");
+    for stretch in ["changing", "bright", "icons", "flicks", "decoy", "colour", "dimmed"] {
+        for run in ["colour", "contrast 3x"] {
+            assert!(share(run, stretch) >= share("default", stretch), "{run} is worse than the default on {stretch}");
+        }
+    }
 }

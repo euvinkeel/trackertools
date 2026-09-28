@@ -14,7 +14,12 @@
 //!   flicks across the screen in 3–5 frames (up to ~190 px per frame);
 //! - `decoy` (600–749): a flat desktop with a second, static arrow on it (a
 //!   look-alike, like an icon in the scenery): the cursor comes to rest
-//!   exactly on it (620–639), then flicks away and wanders off.
+//!   exactly on it (620–639), then flicks away and wanders off;
+//! - `colour` (750–899): the bright scenery again, with a static *yellow*
+//!   arrow on it (a waypoint marker): in luma nearly the cursor's twin. The
+//!   cursor rests on it (780–799), then flicks away;
+//! - `dimmed` (900–1049): the floor, and the cursor with it, dimmed to 30%
+//!   for 930–1019 (a pause menu's backdrop over a game's own cursor).
 
 use std::io::Write;
 use std::path::Path;
@@ -26,9 +31,13 @@ use serde::Serialize;
 pub const W: usize = 960;
 pub const H: usize = 540;
 pub const FPS: u32 = 60;
-pub const FRAMES: usize = 750;
+pub const FRAMES: usize = 1050;
 /// The static look-alike arrow's hotspot (the `decoy` stretch).
 pub const DECOY: [f64; 2] = [420.0, 250.0];
+/// The yellow look-alike's hotspot (the `colour` stretch).
+pub const YELLOW: [f64; 2] = [560.0, 220.0];
+/// The `dimmed` stretch's dimmed frames and how bright they stay.
+pub const DIM: (usize, usize, f64) = (930, 1020, 0.3);
 
 /// The hotspot's path: minimum-jerk moves between these `(frame, x, y)`.
 /// Moves a few frames long are flicks.
@@ -63,6 +72,14 @@ const WAYPOINTS: &[(f64, f64, f64)] = &[
     (680.0, 760.0, 240.0),
     (715.0, 610.0, 420.0),
     (749.0, 520.0, 380.0),
+    (780.0, YELLOW[0], YELLOW[1]),
+    (800.0, YELLOW[0], YELLOW[1]),
+    (804.0, 300.0, 380.0),
+    (850.0, 420.0, 300.0),
+    (899.0, 380.0, 200.0),
+    (960.0, 560.0, 300.0),
+    (1000.0, 460.0, 380.0),
+    (1049.0, 600.0, 330.0),
 ];
 
 /// The hotspot at (continuous) frame `f`.
@@ -165,7 +182,7 @@ pub fn background(x: f64, y: f64, f: usize) -> [f64; 3] {
             let v = 128.0 + 95.0 * ((a * x + (1.0 - a) * y) * 0.35 + b).sin();
             [v * 0.95 + 6.0, v, v * 0.9 + 12.0]
         }
-        1 => {
+        1 | 5 => {
             // Pale sky over pale sand, with slow bright clouds.
             let sky = [196.0, 222.0, 250.0];
             let sand = [246.0, 232.0, 176.0];
@@ -185,7 +202,7 @@ pub fn background(x: f64, y: f64, f: usize) -> [f64; 3] {
             let grid = ((x / 48.0).fract() < 0.03 || (y / 48.0).fract() < 0.03) as u8 as f64;
             std::array::from_fn(|c| panel[c] - 14.0 * grid)
         }
-        _ => {
+        3 | 6 => {
             // A game-like floor: bricks with mortar, coloured, panning.
             let (px, py) = (x + 40.0 * t, y + 12.0 * t);
             let row = (py / 18.0).floor();
@@ -194,6 +211,7 @@ pub fn background(x: f64, y: f64, f: usize) -> [f64; 3] {
             let shade = 0.75 + 0.25 * hash(bx.floor() as i64, row as i64, 9) + 0.1 * noise(px, py, 4.0, 13);
             if mortar { [70.0, 66.0, 60.0] } else { [150.0 * shade, 82.0 * shade, 58.0 * shade] }
         }
+        _ => unreachable!("{FRAMES} frames"),
     }
 }
 
@@ -201,17 +219,23 @@ pub fn background(x: f64, y: f64, f: usize) -> [f64; 3] {
 pub fn render(f: usize) -> Vec<u8> {
     let c = hotspot(f as f64);
     let ic = icon(f);
-    // The look-alike, under the cursor.
-    let decoy = f / 150 == 4;
-    let scene = |x: f64, y: f64| {
-        let d = [x - DECOY[0], y - DECOY[1]];
-        decoy.then(|| cursor_at(Icon::Arrow, d)).flatten().unwrap_or_else(|| background(x, y, f))
+    // The look-alikes, under the cursor: the arrow's twin, and a yellow one.
+    let decoy = match f / 150 {
+        4 => Some((DECOY, [252.0; 3])),
+        5 => Some((YELLOW, [250.0, 214.0, 40.0])),
+        _ => None,
     };
+    let scene = |x: f64, y: f64| {
+        let lookalike = decoy.and_then(|(at, body)| cursor_at(Icon::Arrow, [x - at[0], y - at[1]]).map(|c| if c[0] > 128.0 { body } else { c }));
+        lookalike.unwrap_or_else(|| background(x, y, f))
+    };
+    // A pause menu's backdrop dims everything, the cursor too.
+    let dim = if (DIM.0..DIM.1).contains(&f) { DIM.2 } else { 1.0 };
     let mut out = vec![0u8; W * H * 3];
     for y in 0..H {
         for x in 0..W {
             let near_to = |c: [f64; 2]| (x as f64 + 0.5 - c[0]).abs() < 24.0 && (y as f64 + 0.5 - c[1]).abs() < 30.0;
-            let near = near_to(c) || (decoy && near_to(DECOY));
+            let near = near_to(c) || decoy.is_some_and(|(at, _)| near_to(at));
             let px: [f64; 3] = if near {
                 let mut acc = [0.0; 3];
                 for k in 0..16 {
@@ -224,7 +248,7 @@ pub fn render(f: usize) -> Vec<u8> {
                 background(x as f64 + 0.5, y as f64 + 0.5, f)
             };
             for i in 0..3 {
-                out[(y * W + x) * 3 + i] = px[i].round().clamp(0.0, 255.0) as u8;
+                out[(y * W + x) * 3 + i] = (px[i] * dim).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -281,7 +305,7 @@ pub fn make(out: &Path, ffmpeg: &str, force: bool) -> Result<()> {
         fps: FPS,
         hotspot: (0..FRAMES).map(|f| hotspot(f as f64)).collect(),
         icon: (0..FRAMES).map(icon).collect(),
-        stretches: vec![("changing", 0, 150), ("bright", 150, 300), ("icons", 300, 450), ("flicks", 450, 600), ("decoy", 600, 750)],
+        stretches: vec![("changing", 0, 150), ("bright", 150, 300), ("icons", 300, 450), ("flicks", 450, 600), ("decoy", 600, 750), ("colour", 750, 900), ("dimmed", 900, 1050)],
         decoy: DECOY,
         shapes: [Icon::Arrow, Icon::Hand, Icon::Ibeam].into_iter().map(|i| (i, shape(i).0.to_vec(), shape(i).1)).collect(),
         rim: RIM,

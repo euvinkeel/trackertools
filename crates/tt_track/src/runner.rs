@@ -245,6 +245,7 @@ impl Plan {
             && close(self.scale, old.scale)
             && Arc::ptr_eq(&self.video, &old.video)
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
+            && p.matching == q.matching
             && self.looks == old.looks
             && self.seed == old.seed;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
@@ -562,7 +563,7 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         maps: plan.maps.clone(),
         scale: plan.scale,
         search: p.search.max(0.1) as f64,
-        settings: Settings { adapt: p.adapt.clamp(0.0, 1.0), min_score: p.min_score.clamp(-1.0, 1.0) },
+        settings: Settings { adapt: p.adapt.clamp(0.0, 1.0), min_score: p.min_score.clamp(-1.0, 1.0), tolerance: p.matching.tolerance() },
         video: plan.video.clone(),
         k: plan.k,
         grid: footage.original.clone(),
@@ -785,6 +786,10 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     };
     let p = &params;
     for x in [ALGO_VERSION as f64, anchor as f64, p.direction as u8 as f64, p.rendition as u8 as f64, p.feature as f64, p.search as f64, p.adapt as f64, p.min_score as f64, p.fuse as u8 as f64] {
+        put(x);
+    }
+    let m = &p.matching;
+    for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64] {
         put(x);
     }
     for x in [lo as f64, hi as f64, original.width as f64, original.height as f64, original.frames.len() as f64] {

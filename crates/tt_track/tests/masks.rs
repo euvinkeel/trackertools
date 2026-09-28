@@ -127,3 +127,70 @@ fn a_dim_look_alike_does_not_score_like_the_bright_cursor() {
     assert_eq!(photometric(&masked, masked.mean, masked.sd * 2.0), 1.0);
     assert!(photometric(&masked, masked.mean, masked.sd * 0.1) < 0.25);
 }
+
+/// A white cursor and a yellow twin of the same shape, side by side on
+/// bright scenery: in brightness they are nearly alike (the yellow's body
+/// is 209 against 252), so a luma-only look scores both high; comparing
+/// the colour too (`Tolerance::colour`) keeps only the white one.
+#[test]
+fn colour_tells_a_white_cursor_from_a_yellow_twin() {
+    use tt_track::ncc::Tolerance;
+    let (white, yellow) = ([40.0, 40.0], [130.0, 60.0]);
+    // Luma and chroma (U, V around 128) per pixel.
+    let mut planes = [vec![225.0f32; W * H], vec![118.0f32; W * H], vec![134.0f32; W * H]];
+    for y in 0..H {
+        for x in 0..W {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            for (tip, body) in [(white, [252.0, 128.0, 128.0]), (yellow, [209.0, 40.0, 146.0])] {
+                if in_arrow(px, py, tip) {
+                    let inner = [tip[0] + 1.3, tip[1] + 2.6];
+                    let v = if (py - inner[1]) < 13.0 && in_arrow(px, py, inner) { body } else { [15.0, 128.0, 128.0] };
+                    (0..3).for_each(|c| planes[c][y * W + x] = v[c]);
+                }
+            }
+        }
+    }
+    let [luma, u, v] = planes;
+    let patch = Patch { colour: Some(Box::new([u, v])), ..Patch::new(W, H, luma) };
+    let cells = arrow_mask(32);
+    let mask = Some(Mask { cells: &cells, w: 32, h: 32 });
+    let at = |tip: [f64; 2]| [tip[0] + 6.5, tip[1] + 9.5];
+    let around = |c: [f64; 2]| [[c[0] - 3.0, c[1] - 3.0], [c[0] + 3.0, c[1] + 3.0]];
+    for (name, tolerance) in [("luma", Tolerance::default()), ("colour", Tolerance { colour: Some(20.0), ..Tolerance::default() })] {
+        let t = Template::cut_with(&patch, at(white), [8, 11], mask, tolerance).expect("textured");
+        let score = |tip| best_match(&patch, &t, around(at(tip)), None).expect("placed").score;
+        let (w, y) = (score(white), score(yellow));
+        println!("{name}: the white cursor scores {w:.2}, its yellow twin {y:.2}");
+        assert!(w > 0.95, "{name}: {w:.2}");
+        if tolerance.colour.is_some() {
+            // (The black rim is neutral in both, so their mean colours differ by less than their bodies'.)
+            assert!(y < 0.5, "{name}: the yellow twin scores {y:.2}, below a tracker's min_score");
+        } else {
+            assert!(y > 0.8, "{name}: luma alone can't tell them apart ({y:.2})");
+        }
+    }
+}
+
+/// The whole picture dimmed to 25%, the cursor with it (a menu's
+/// backdrop over a game's own cursor): the contrast is a quarter of the
+/// look's, beyond the default 2× slack, so the score drops below a
+/// tracker's `min_score`; with a 4× slack it is the cursor again.
+#[test]
+fn a_looser_contrast_slack_follows_a_dimmed_cursor() {
+    use tt_track::ncc::Tolerance;
+    let tip = [60.0, 50.0];
+    let frame = render(tip, 0);
+    let dimmed: Vec<u8> = frame.iter().map(|v| (*v as f32 * 0.25).round() as u8).collect();
+    let (grid, bright) = patch_of(&frame);
+    let (_, dark) = patch_of(&dimmed);
+    let cells = arrow_mask(32);
+    let c = grid.from_view([tip[0] + 6.0, tip[1] + 9.0]);
+    let window = [[c[0] - 3.0, c[1] - 3.0], [c[0] + 3.0, c[1] + 3.0]];
+    let score = |contrast: f32| {
+        let t = Template::cut_with(&bright, c, [8, 11], Some(Mask { cells: &cells, w: 32, h: 32 }), Tolerance { contrast, brightness: 3.0, ..Tolerance::default() }).expect("textured");
+        best_match(&dark, &t, window, None).expect("placed").score
+    };
+    let (default, loose) = (score(2.0), score(4.0));
+    println!("dimmed to 25%: {default:.2} with the default 2x contrast slack, {loose:.2} with 4x");
+    assert!(default < 0.55 && loose > 0.85, "{default:.2}, {loose:.2}");
+}

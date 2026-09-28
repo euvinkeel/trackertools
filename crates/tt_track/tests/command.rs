@@ -196,3 +196,28 @@ fn the_wheel_zooms_in_the_track_tool_and_ctrl_wheel_sizes_the_click() {
     assert!(turn(&mut core, true), "Ctrl+wheel is the tool's");
     assert!(brush(&core) > before);
 }
+
+/// A tracker saved before `fuse` and `matching` existed loads with them at
+/// their defaults (both ways on; matching as before).
+#[test]
+fn a_tracker_saved_before_fuse_and_matching_still_loads() {
+    use bevy_ecs::reflect::AppTypeRegistry;
+    use bevy_reflect::FromReflect;
+    use bevy_reflect::serde::TypedReflectDeserializer;
+    use serde::de::DeserializeSeed;
+    use tt_track::{Matching, Tracker};
+
+    let mut app = tt_core::AppBuilder::new();
+    app.add_module(tt_core::CoreModules).add_module(tt_track::TrackModule);
+    let core = app.build();
+    let registry = core.world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    let registration = registry.get_with_type_path(std::any::type_name::<Tracker>()).expect("registered");
+    let old = "(anchor: 600, direction: Both, follow_playhead: false, feature: 0.4, search: 1.5, adapt: 0.25, min_score: 0.6, rendition: Auto, center_on_guide: false)";
+    let mut de = ron::Deserializer::from_str(old).expect("ron");
+    let value = TypedReflectDeserializer::new(registration, &registry).deserialize(&mut de).expect("an old save deserializes");
+    let t = Tracker::from_reflect(value.as_ref()).expect("and converts");
+    assert_eq!((t.anchor, t.search), (600, 1.5), "saved values kept");
+    assert!(t.fuse);
+    assert_eq!(t.matching, Matching::default());
+}

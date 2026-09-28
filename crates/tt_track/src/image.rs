@@ -50,15 +50,40 @@ impl Grid {
     }
 }
 
-/// A float image, row-major.
+/// A float image, row-major: luma, and when a tracker asks for it, the
+/// colour (chroma U and V, same grid).
 #[derive(Clone, Debug)]
 pub struct Patch {
     pub w: usize,
     pub h: usize,
     pub data: Vec<f32>,
+    pub colour: Option<Box<[Vec<f32>; 2]>>,
 }
 
 impl Patch {
+    /// Luma only.
+    pub fn new(w: usize, h: usize, data: Vec<f32>) -> Self {
+        Self { w, h, data, colour: None }
+    }
+
+    /// Bytes held (for memory budgets).
+    pub fn bytes(&self) -> usize {
+        4 * self.data.len() * (1 + 2 * usize::from(self.colour.is_some()))
+    }
+
+    /// Bilinear sample of plane `v` (one of this patch's, same size) at a continuous patch point.
+    pub fn sample_plane(&self, v: &[f32], x: f64, y: f64) -> f32 {
+        let fx = (x - 0.5).clamp(0.0, (self.w - 1) as f64);
+        let fy = (y - 0.5).clamp(0.0, (self.h - 1) as f64);
+        let (x0, y0) = (fx as usize, fy as usize);
+        let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+        let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
+        let p = |x: usize, y: usize| v[y * self.w + x];
+        let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * tx;
+        let bottom = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * tx;
+        top + (bottom - top) * ty
+    }
+
     pub fn at(&self, x: usize, y: usize) -> f32 {
         self.data[y * self.w + x]
     }
@@ -113,5 +138,25 @@ pub fn resample_xy(luma: &Luma, k: [f64; 2], map: &SpaceMap, grid: Grid, w: usiz
             data.push(acc * norm);
         }
     }
-    Patch { w, h, data }
+    Patch::new(w, h, data)
+}
+
+/// A decoded NV12 frame's two chroma planes (U and V, each half the size
+/// each way), split out so they resample like luma.
+pub fn chroma_planes(frame: &[u8], width: usize, height: usize) -> [Vec<u8>; 2] {
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    let uv = &frame[width * height..width * height + 2 * cw * ch];
+    [uv.iter().step_by(2).copied().collect(), uv.iter().skip(1).step_by(2).copied().collect()]
+}
+
+/// `patch` with its colour: the chroma planes (of a frame `width × height`,
+/// from [`chroma_planes`]) resampled on the same grid. Chroma pixels are
+/// twice the size of luma's each way; the same corner-origin convention
+/// holds, so a luma point `p` is chroma point `p / 2`.
+pub fn with_colour(mut patch: Patch, planes: &[Vec<u8>; 2], width: usize, height: usize, k: [f64; 2], map: &SpaceMap, grid: Grid) -> Patch {
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    let kc = [k[0] * cw as f64 / width as f64, k[1] * ch as f64 / height as f64];
+    let [u, v] = planes.each_ref().map(|p| resample_xy(&Luma { data: p, width: cw, height: ch }, kc, map, grid, patch.w, patch.h).data);
+    patch.colour = Some(Box::new([u, v]));
+    patch
 }

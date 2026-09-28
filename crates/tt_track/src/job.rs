@@ -26,7 +26,7 @@ use tt_core::time::FrameIndex;
 use tt_core::view::SpaceMap;
 use tt_media::{DecodeOptions, FrameStream, VideoIndex};
 
-use crate::image::{Grid, Luma, Patch, resample_xy};
+use crate::image::{Grid, Luma, Patch, chroma_planes, resample_xy, with_colour};
 use crate::ncc::best_match;
 use crate::template::{Estimate, LookTemplate, Settings, TEMPLATE_R, TemplateTracker, fuse, off_box};
 use crate::{LOST, OUTSIDE, TRACK_CHANNELS};
@@ -249,7 +249,7 @@ impl Worker {
                 if self.spec.fuse
                     && let Some(bytes) = self.stretch_bytes
                 {
-                    let bytes = bytes + patch.data.len() * 4;
+                    let bytes = bytes + patch.bytes();
                     if bytes > MAX_STRETCH_BYTES {
                         (self.stretch, self.stretch_bytes) = (Vec::new(), None);
                     } else {
@@ -342,7 +342,18 @@ impl Worker {
         let grid = Grid { origin: [c[0] - w as f64 / 2.0 / s.scale, c[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
         let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
-        (grid, resample_xy(&luma, s.k, map, grid, w, h))
+        (grid, self.dress(frame, map, grid, resample_xy(&luma, s.k, map, grid, w, h)))
+    }
+
+    /// `patch` (luma, resampled from `frame` on `grid`) with what the
+    /// tracker's tolerance also compares: the colour.
+    fn dress(&self, frame: &[u8], map: &SpaceMap, grid: Grid, patch: Patch) -> Patch {
+        let (s, tolerance) = (&self.spec, self.spec.settings.tolerance);
+        let (vw, vh) = (s.video.width as usize, s.video.height as usize);
+        match tolerance.colour {
+            Some(_) => with_colour(patch, &chroma_planes(frame, vw, vh), vw, vh, s.k, map, grid),
+            None => patch,
+        }
     }
 
     /// A patch just big enough for a template of half-size `r`, around view point `c` on frame `f`.
@@ -352,7 +363,7 @@ impl Worker {
         let grid = Grid { origin: [c[0] - w as f64 / 2.0 / s.scale, c[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
         let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
-        (grid, resample_xy(&luma, s.k, map, grid, w, h))
+        (grid, self.dress(frame, map, grid, resample_xy(&luma, s.k, map, grid, w, h)))
     }
 
     /// The looks' templates, each cut from its own frame through the view,
@@ -387,7 +398,7 @@ impl Worker {
             let r = [look.half[0], look.half[1]].map(|h| ((h / map.a * self.spec.scale).round() as usize).max(2));
             let reach = r[0].max(r[1]);
             let (grid, patch) = self.patch_around(frame, look.frame, c, [r[0] + reach, r[1] + reach]);
-            let Some(mut t) = LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone()) else {
+            let Some(mut t) = LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone(), self.spec.settings.tolerance) else {
                 tracing::warn!("a look on frame {} has no detail to follow (flat or an empty mask); skipped", look.frame);
                 continue;
             };

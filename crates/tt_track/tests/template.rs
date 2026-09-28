@@ -88,7 +88,7 @@ fn patches_through_a_view_and_an_unevenly_scaled_proxy_show_the_scene() {
     let at = map.from_source(c);
     let grid = Grid { origin: [at[0] - 40.0, at[1] - 40.0], scale: 1.0 };
     // What the view shows there, straight from the scene (no rendition, no rounding).
-    let ideal = Patch { w: 80, h: 80, data: (0..80 * 80).map(|i| scene(map.to_source(grid.to_view([(i % 80) as f64 + 0.5, (i / 80) as f64 + 0.5])), c) as f32).collect() };
+    let ideal = Patch::new(80, 80, (0..80 * 80).map(|i| scene(map.to_source(grid.to_view([(i % 80) as f64 + 0.5, (i / 80) as f64 + 0.5])), c) as f32).collect());
     let t = Template::cut(&ideal, grid.from_view(at), TEMPLATE_R).expect("textured");
     let want = grid.from_view(at);
     for (name, frame, w, h, k) in [("original", render(c), W, H, [1.0, 1.0]), ("proxy", render_sized(c, pw, ph), pw, ph, k)] {
@@ -111,7 +111,7 @@ fn flat_patches_are_not_trackable() {
 /// errors (px) after removing the anchor's offset, which the tracker inherits
 /// by definition.
 fn track(scale: f64) -> Vec<f64> {
-    let settings = Settings { adapt: 0.25, min_score: 0.5 };
+    let settings = Settings { adapt: 0.25, min_score: 0.5, tolerance: Default::default() };
     let frame0 = render(truth(0));
     let (grid, patch) = patch_at(&frame0, guide(0), 30.0, scale);
     let mut tracker = TemplateTracker::seed(&patch, grid, guide(0), settings).expect("seeded");
@@ -160,7 +160,7 @@ fn both_subpixel_estimates_find_hard_edges_between_pixels() {
                 (40.0 + 180.0 * cover(x, x + 1.0, c[0] - 4.5, c[0] + 4.5) * cover(y, y + 1.0, c[1] - 4.5, c[1] + 4.5)) as f32
             })
             .collect();
-        Patch { w: 60, h: 60, data }
+        Patch::new(60, 60, data)
     };
     let t = Template::cut(&square([30.0, 30.0]), [30.0, 30.0], 8).expect("textured");
     let (mut ncc, mut lk) = (0.0f64, 0.0f64);

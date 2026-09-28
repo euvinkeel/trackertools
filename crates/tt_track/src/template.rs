@@ -34,7 +34,7 @@
 //!   ends and keeps, frame by frame, the better of the two ([`fuse`]).
 
 use crate::image::{Grid, Patch};
-use crate::ncc::{Mask, Prior, Template, best_match};
+use crate::ncc::{Mask, Prior, Template, Tolerance, best_match};
 
 /// An older tracker's template half-size, patch pixels (a 21 × 21 template).
 pub const TEMPLATE_R: usize = 10;
@@ -58,6 +58,8 @@ pub const REFRESH_SCORE: f32 = 0.6;
 pub struct Settings {
     pub adapt: f32,
     pub min_score: f32,
+    /// How alike a placement must be to count (`ncc::Tolerance`).
+    pub tolerance: Tolerance,
 }
 
 /// One frame's result, in view pixels.
@@ -82,15 +84,15 @@ pub struct LookTemplate {
 }
 
 impl LookTemplate {
-    /// Cut from `patch` centred at patch point `c`.
-    pub fn cut(patch: &Patch, c: [f64; 2], r: [usize; 2], mask: Option<Vec<u8>>) -> Option<Self> {
-        let template = Template::cut_rect(patch, c, r, mask.as_deref().map(|m| mask_of(m)))?;
+    /// Cut from `patch` centred at patch point `c`, matched with `tolerance`.
+    pub fn cut(patch: &Patch, c: [f64; 2], r: [usize; 2], mask: Option<Vec<u8>>, tolerance: Tolerance) -> Option<Self> {
+        let template = Template::cut_with(patch, c, r, mask.as_deref().map(|m| mask_of(m)), tolerance)?;
         Some(Self { template, r, mask, offset: [0.0, 0.0] })
     }
 
     /// The same look's appearance at patch point `c` of another frame.
     fn again(&self, patch: &Patch, c: [f64; 2]) -> Option<Template> {
-        Template::cut_rect(patch, c, self.r, self.mask.as_deref().map(|m| mask_of(m)))
+        Template::cut_with(patch, c, self.r, self.mask.as_deref().map(|m| mask_of(m)), self.template.tolerance)
     }
 }
 
@@ -116,7 +118,7 @@ impl TemplateTracker {
     /// An older tracker: one square look on the anchor frame's patch at view
     /// point `pos` (the guide's point there).
     pub fn seed(patch: &Patch, grid: Grid, pos: [f64; 2], settings: Settings) -> Option<Self> {
-        let look = LookTemplate::cut(patch, grid.from_view(pos), [TEMPLATE_R, TEMPLATE_R], None)?;
+        let look = LookTemplate::cut(patch, grid.from_view(pos), [TEMPLATE_R, TEMPLATE_R], None, settings.tolerance)?;
         Some(Self { looks: vec![look], last: None, offset: [0.0, 0.0], own: Some((pos, [0.0, 0.0])), settings })
     }
 

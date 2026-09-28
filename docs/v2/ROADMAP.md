@@ -404,12 +404,17 @@ Findings on the way:
 - `tests/real_footage.rs` prints "on the cursor" itself now (≥ 12 pixels of luma ≥ 220 within 14 px).
 - Tried and dropped: a matched blur before Lucas–Kanade (exact on an ideal square between pixels, worse on both encoded fixtures).
 
+**Matching options** (per tracker, in the inspector; DESIGN §6.3):
+- `contrast` and `brightness` slack (`ncc::photometric`'s constants, now settings), and `colour` (compare chroma too, from the NV12 frame).
+- The cursor fixture gained two stretches for them: a yellow twin of the cursor on bright scenery (colour: 99.3% → 100%) and a picture dimmed to 30% (contrast 3×: 62% → 100%). Neither option is worse anywhere; defaults unchanged.
+- Tried and not offered: an edges (gradient magnitude) channel; no gain, 2.5× slower.
+- Old saves load with the defaults (`Tracker` gains `fuse` and `matching`).
+
 **Next:**
 - run `tests/real_footage.rs` on the user's footage with the new tracker (baseline: 100.0% on the cursor, ~90 fps);
 - Tab into a tracker's view (stabilization);
 - unguided trackers (search around the last position and velocity);
 - tracker results feeding anticipatory speed's look-ahead;
-- colour (chroma) in the match;
 - learned trackers (CoTracker3 / TAPNext worker, SAM 2.1) behind the same operator and job protocol.
 
 ---
