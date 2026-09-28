@@ -168,6 +168,15 @@ impl Signal {
         }
     }
 
+    /// The first and last present frames (O(chunk size): chunks are ordered and never empty).
+    pub fn present_hull(&self) -> Option<(FrameIndex, FrameIndex)> {
+        let (first_c, first) = self.chunks.iter().next()?;
+        let (last_c, last) = self.chunks.iter().next_back()?;
+        let lo = first.state.iter().position(|s| *s != FrameState::Absent)?;
+        let hi = last.state.iter().rposition(|s| *s != FrameState::Absent)?;
+        Some((first_c * CHUNK as i64 + lo as i64, last_c * CHUNK as i64 + hi as i64))
+    }
+
     /// Present frames as maximal runs `(start..end, state)` within `range`.
     pub fn runs(&self, range: Range<FrameIndex>) -> Vec<(Range<FrameIndex>, FrameState)> {
         let mut out: Vec<(Range<FrameIndex>, FrameState)> = Vec::new();

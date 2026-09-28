@@ -177,6 +177,15 @@ pub enum Shown {
     Held { from: f64, to: f64 },
 }
 
+/// A capture drawn inside a view: that view's mapping ([`crate::view::SpaceMap`])
+/// for every frame the capture touched, as `[a, bx, by]` per frame. The hand
+/// pipeline runs in the view's pixels (where the hand moved); its results
+/// reach the source through these, so re-tuning the view later never moves
+/// the stroke.
+#[derive(Component, Reflect, Clone, Copy, Debug)]
+#[reflect(Component)]
+pub struct Through(pub crate::signal::SignalId);
+
 /// How a capture is laid over the sketch it belongs to (a *stroke*).
 #[derive(Component, Reflect, Clone, Debug, PartialEq)]
 #[reflect(Component)]
@@ -411,7 +420,7 @@ pub fn gauss(v: &[f64], sigma: f64) -> Vec<f64> {
 /// [`gauss`] for a signal with a trend (a moving point): the ends are padded
 /// with an odd reflection so a run's first and last values aren't pulled
 /// toward their only-one-sided neighbours.
-fn gauss_trend(v: &[f64], sigma: f64) -> Vec<f64> {
+pub(crate) fn gauss_trend(v: &[f64], sigma: f64) -> Vec<f64> {
     if sigma < 0.5 || v.len() < 2 {
         return v.to_vec();
     }
@@ -533,6 +542,53 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, f
         }
     }
     Some((first, out))
+}
+
+/// A `Through` value `[a, bx, by]` as a mapping.
+pub fn through_map(m: &[f32]) -> crate::view::SpaceMap {
+    crate::view::SpaceMap { a: m[0] as f64, b: [m[1] as f64, m[2] as f64], canvas: [0.0, 0.0] }
+}
+
+/// The home view's framing for frames `first..`, looked up once (the motion
+/// union reads each frame's framing many times). Empty for the source.
+pub struct HomeMaps {
+    first: FrameIndex,
+    maps: Vec<crate::view::SpaceMap>,
+}
+
+impl HomeMaps {
+    pub fn new(world: &World, home: Option<Entity>, frames: Range<FrameIndex>) -> Self {
+        let maps = match home {
+            Some(h) => frames.clone().map(|f| crate::view::map_at(world, Some(h), f)).collect(),
+            None => Vec::new(),
+        };
+        Self { first: frames.start, maps }
+    }
+
+    fn at(&self, f: FrameIndex) -> Option<crate::view::SpaceMap> {
+        self.maps.get(usize::try_from(f - self.first).ok()?).copied()
+    }
+
+    /// [`union_at`] with the motion measured as it looked in the sketch's home
+    /// view: each neighbouring frame's box goes through that view (as framed at
+    /// its own frame) and back out as framed at `f`. In a stabilized view the
+    /// subject barely moves, so a sketch drawn there stays tight. (For the
+    /// source, the plain union.)
+    pub fn union(&self, get: impl Fn(FrameIndex) -> Option<[f64; 6]>, f: FrameIndex, before: FrameIndex, after: FrameIndex) -> Option<[f64; 6]> {
+        let Some(at_f) = self.at(f) else { return union_at(get, f, before, after) };
+        union_at(
+            |g| {
+                let v = get(g)?;
+                Some(match self.at(g) {
+                    Some(at_g) if g != f => at_f.box_to_source(at_g.box_from_source(v)),
+                    _ => v,
+                })
+            },
+            f,
+            before,
+            after,
+        )
+    }
 }
 
 /// The motion union's reach in frames: `(before, after)`.
@@ -709,9 +765,12 @@ impl OperatorKind for SketchKind {
         out.clear(range.clone());
         let path = compose(ctx.world, ctx.entity, &params, fps);
         let (before, after) = union_reach(&params, fps);
+        let home = crate::view::home_of(ctx.world, ctx.entity);
+        let (Some(lo), Some(hi)) = (path.keys().next().copied(), path.keys().next_back().copied()) else { return Ok(()) };
+        let maps = HomeMaps::new(ctx.world, home, lo - before..hi + after + 1);
         let get = |f: FrameIndex| path.get(&f).copied();
         for f in path.range(range).map(|(f, _)| *f) {
-            if let Some(v) = union_at(get, f, before, after) {
+            if let Some(v) = maps.union(get, f, before, after) {
                 out.set(f, &v.map(|x| x as f32));
             }
         }
@@ -719,10 +778,13 @@ impl OperatorKind for SketchKind {
     }
 }
 
-/// A sketch's path before the motion union ([`union_at`]): its strokes'
-/// frames ([`stroke_frames`]) laid over each other in order.
+/// A sketch's path in source pixels before the motion union ([`union_at`]):
+/// its strokes' frames ([`stroke_frames`]) laid over each other in order.
 pub fn compose(world: &World, sketch: Entity, params: &SketchParams, fps: f64) -> BTreeMap<FrameIndex, [f64; 6]> {
-    let strokes: Vec<Entity> = world.get::<Inputs>(sketch).map(|i| i.0.iter().map(|(_, e)| *e).collect()).unwrap_or_default();
+    let strokes: Vec<Entity> = world
+        .get::<Inputs>(sketch)
+        .map(|i| i.0.iter().filter(|(slot, _)| slot == "stroke" || slot == "capture").map(|(_, e)| *e).collect())
+        .unwrap_or_default();
     let mut path = BTreeMap::new();
     for e in strokes {
         let Some(((first, boxes), stroke)) = stroke_boxes(world, e, params, fps) else { continue };
@@ -745,8 +807,14 @@ pub fn stroke_boxes(world: &World, e: Entity, params: &SketchParams, fps: f64) -
     }
     let (info, clock) = (entity.get::<Capture>()?, entity.get::<ClockMap>()?);
     let stream = world.resource::<SignalStore>().get(entity.get::<Output>()?.0)?;
-    let boxes = stroke_frames(&read_stream(stream, info.samples), clock, params, fps)?;
-    Some((boxes, entity.get::<Stroke>().cloned().unwrap_or_default()))
+    let (first, mut frames) = stroke_frames(&read_stream(stream, info.samples), clock, params, fps)?;
+    // Drawn inside a view: from the view's pixels to the source, frame by frame.
+    if let Some(through) = entity.get::<Through>().and_then(|t| world.resource::<SignalStore>().get(t.0)) {
+        for (i, v) in frames.iter_mut().enumerate() {
+            *v = v.zip(through.get(first + i as FrameIndex)).map(|(b, m)| through_map(m).box_to_source(b));
+        }
+    }
+    Some(((first, frames), entity.get::<Stroke>().cloned().unwrap_or_default()))
 }
 
 /// A stroke's layering changed: the sketches reading it recompute.
@@ -763,6 +831,7 @@ impl Module for SketchModule {
         app.component::<Capture>(Class::Document)
             .component::<ClockMap>(Class::Document)
             .component::<Stroke>(Class::Document)
+            .component::<Through>(Class::Document)
             .operator(SketchKind)
             .operator_params::<SketchParams>()
             .add_systems(stroke_changed.in_set(Set::Invalidate).before(crate::op::propagate));

@@ -1,118 +1,16 @@
 //! The Sketch tool driven through the world, as the app drives it: one
 //! PointerFrame per app frame at 175 Hz with 1 kHz samples.
 
-use bevy_ecs::entity::Entity;
 use tt_core::capture::LiveCapture;
 use tt_core::history::{self, History};
-use tt_core::input::{Action, KeysHeld, Mods, PendingActions};
-use tt_core::op::{Inputs, Operator, Output};
+use tt_core::input::Action;
 use tt_core::selection::Selection;
-use tt_core::signal::SignalStore;
 use tt_core::sketch::{Capture, falloff_weight};
-use tt_core::time::{Rational, WallClock};
 use tt_core::tool::{ActiveTool, PointerFrame, Tool};
 use tt_core::transport::Transport;
-use tt_core::{AppBuilder, Core, CoreModules};
 
-const UI_HZ: f64 = 175.0;
-
-struct Driver {
-    core: Core,
-    now: f64,
-}
-
-#[derive(Default, Clone, Copy)]
-struct Input {
-    press: bool,
-    down: bool,
-    shift: bool,
-    ctrl: bool,
-    wheel: f32,
-    action: Option<Action>,
-}
-
-const HOLD: Input = Input { press: false, down: true, shift: false, ctrl: false, wheel: 0.0, action: None };
-const PRESS: Input = Input { press: true, ..HOLD };
-const UP: Input = Input { down: false, ..HOLD };
-
-impl Driver {
-    fn new() -> Self {
-        let mut app = AppBuilder::new();
-        app.add_module(CoreModules);
-        let mut core = app.build();
-        *core.world.resource_mut::<Transport>() =
-            Transport { fps: Rational::new(60, 1), frame_count: 600, rate: 0.5, ..Transport::default() };
-        core.world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
-        Self { core, now: 1.0 }
-    }
-
-    /// One app frame: the pointer follows `path(t)` (1 kHz samples since the last frame).
-    fn frame(&mut self, path: impl Fn(f64) -> [f64; 2], input: Input) {
-        let prev = self.now;
-        self.now += 1.0 / UI_HZ;
-        let w = &mut self.core.world;
-        w.resource_mut::<WallClock>().tick(self.now);
-        let mut samples = Vec::new();
-        let mut t = (prev * 1000.0).floor() / 1000.0 + 0.001;
-        while t <= self.now {
-            let p = path(t);
-            samples.push([t, p[0], p[1]]);
-            t += 0.001;
-        }
-        *w.resource_mut::<PointerFrame>() = PointerFrame {
-            samples,
-            hover: Some(path(self.now)),
-            pressed: input.press.then_some(prev + 0.002),
-            down: input.down,
-            released: (!input.down).then_some(self.now - 0.001),
-            wheel: input.wheel,
-            scale: 1.0,
-            ..PointerFrame::default()
-        };
-        *w.resource_mut::<KeysHeld>() = KeysHeld { keys: Vec::new(), mods: Mods { shift: input.shift, ctrl: input.ctrl, ..Mods::NONE } };
-        if let Some(a) = input.action {
-            w.resource_mut::<PendingActions>().push(a);
-        }
-        self.core.run_pre_ui();
-        self.core.run_post_ui();
-    }
-
-    fn frames(&mut self, n: usize, path: impl Fn(f64) -> [f64; 2] + Copy, input: Input) {
-        for _ in 0..n {
-            self.frame(path, input);
-        }
-    }
-
-    fn sketches(&mut self) -> Vec<Entity> {
-        let w = &mut self.core.world;
-        let mut q = w.query::<(Entity, &Operator)>();
-        let mut v: Vec<Entity> = q.iter(w).filter(|(_, o)| o.kind == "sketch").map(|(e, _)| e).collect();
-        v.sort();
-        v
-    }
-
-    fn strokes(&self, sketch: Entity) -> usize {
-        self.core.world.get::<Inputs>(sketch).map_or(0, |i| i.0.len())
-    }
-
-    fn value(&self, sketch: Entity, f: i64) -> Option<[f32; 6]> {
-        let w = &self.core.world;
-        let out = w.get::<Output>(sketch)?.0;
-        w.resource::<SignalStore>().get(out)?.get_valid(f).map(|v| v.try_into().unwrap())
-    }
-
-    fn transport(&self) -> Transport {
-        self.core.world.resource::<Transport>().clone()
-    }
-}
-
-fn still(x: f64, y: f64) -> impl Fn(f64) -> [f64; 2] + Copy {
-    move |t| [x + 0.5 * (40.0 * t).sin(), y + 0.5 * (37.0 * t).cos()]
-}
-
-fn circle(t: f64) -> [f64; 2] {
-    [500.0 + 100.0 * t.cos(), 300.0 + 100.0 * t.sin()]
-}
+mod common;
+use common::*;
 
 #[test]
 fn pressing_records_without_touching_the_transport() {

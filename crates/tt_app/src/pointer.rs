@@ -9,7 +9,8 @@
 //!   this service owns it (winit's is superseded). egui still receives
 //!   ordinary cursor messages for the UI.
 //! - The sketch tool reads samples since a given time and converts screen
-//!   pixels → window points (DPI) → source pixels (viewport mapping).
+//!   pixels → window points (DPI) → canvas pixels (the shown space; the core
+//!   maps those to the source).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -110,12 +111,12 @@ pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now:
             for s in service.since(*read) {
                 *read = s.t;
                 // Screen pixels → window points (the client origin is `inner.min`) → source pixels.
-                samples.push(map.to_source_at(s.t, egui::pos2(s.x as f32 / ppp - inner.min.x, s.y as f32 / ppp - inner.min.y)));
+                samples.push(map.to_canvas_at(s.t, egui::pos2(s.x as f32 / ppp - inner.min.x, s.y as f32 / ppp - inner.min.y)));
             }
         }
         None => {
             if let Some(p) = latest {
-                samples.push(map.to_source_at(now, p));
+                samples.push(map.to_canvas_at(now, p));
             }
         }
     }
@@ -127,12 +128,12 @@ pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now:
     let over = hover.is_some_and(on_viewport);
     PointerFrame {
         samples,
-        hover: hover.filter(|_| over).map(|p| map.to_source(p)),
+        hover: hover.filter(|_| over).map(|p| map.to_canvas(p)),
         pressed: (pressed && origin.is_some_and(on_viewport)).then(|| when(LEFT_DOWN)),
         down,
         released: released.then(|| when(LEFT_UP)),
         wheel: if over { wheel } else { 0.0 },
-        scale: map.points_per_source(),
+        scale: map.points_per_canvas(),
         ..PointerFrame::default()
     }
 }

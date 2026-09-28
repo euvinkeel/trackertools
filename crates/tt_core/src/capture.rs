@@ -31,7 +31,8 @@ use crate::input::{Action, KeysHeld, PendingActions};
 use crate::meta::Class;
 use crate::op::{Inputs, Operator, Output};
 use crate::selection::Selection;
-use crate::sketch::{BOX_CHANNELS, Boxes, Capture, ClockMap, STREAM_CHANNELS, SketchParams, Stroke, compose, layer_over, sketch_of, stroke_frames, union_at, union_reach};
+use crate::sketch::{BOX_CHANNELS, Boxes, Capture, ClockMap, STREAM_CHANNELS, SketchParams, Stroke, Through, compose, layer_over, sketch_of, stroke_frames, union_at, union_reach};
+use crate::view::{ActiveView, SpaceMap, home_of, map_at};
 use crate::time::{FrameIndex, WallClock};
 use crate::tool::{ActiveTool, PointerFrame, Tool};
 use crate::transport::Transport;
@@ -52,6 +53,14 @@ pub struct Live {
     pub params: SketchParams,
     /// The target's path before the motion union, when the stroke began.
     base: std::collections::BTreeMap<FrameIndex, [f64; 6]>,
+    /// The view the stroke is drawn in (None = the source) and its mapping
+    /// for every frame shown during the stroke.
+    pub drawn_in: Option<Entity>,
+    pub through: std::collections::BTreeMap<FrameIndex, SpaceMap>,
+    /// The sketch's home view (for the motion union): the target's, or `drawn_in` for a new sketch.
+    home: Option<Entity>,
+    /// The home view's framing per frame, looked up once.
+    home_maps: std::collections::HashMap<FrameIndex, SpaceMap>,
     pub stroke: Stroke,
     /// The stroke's own frames (the frames it visited).
     pub boxes: Option<Boxes>,
@@ -110,6 +119,11 @@ pub fn sketch_tool(world: &mut World) {
         let stroke = Stroke { size: if mods.ctrl { 0.0 } else { 1.0 }, ..defaults.stroke };
         let fps = world.resource::<Transport>().fps.as_f64();
         let base = target.map(|t| compose(world, t, &params, fps)).unwrap_or_default();
+        let drawn_in = world.resource::<ActiveView>().0;
+        let home = match target {
+            Some(t) => home_of(world, t),
+            None => drawn_in,
+        };
         let live = Live {
             start,
             samples: Vec::new(),
@@ -118,6 +132,10 @@ pub fn sketch_tool(world: &mut World) {
             target,
             params,
             base,
+            drawn_in,
+            through: Default::default(),
+            home,
+            home_maps: Default::default(),
             stroke,
             boxes: None,
             preview: None,
@@ -135,6 +153,8 @@ pub fn sketch_tool(world: &mut World) {
         tracing::info!("the sketch {t} went away during the stroke; it will start a new sketch");
         live.target = None;
         live.base.clear();
+        live.home = live.drawn_in;
+        live.home_maps.clear();
     }
     if pointer.wheel != 0.0 {
         let f = (live.stroke.falloff.max(0.01) * WHEEL_STEP.powf(pointer.wheel)).min(FALLOFF_MAX);
@@ -161,20 +181,63 @@ pub fn sketch_tool(world: &mut World) {
         _ => {}
     }
 
-    // What was on screen (the transport is the user's; it is only recorded).
+    // What was on screen (the transport is the user's; it is only recorded),
+    // and, inside a view, how that view framed every frame shown since.
     let fps = {
-        let t = world.resource::<Transport>();
+        let t = world.resource::<Transport>().clone();
+        let prev = live.clock.frame.last().map_or(t.frame(), |f| f.floor() as FrameIndex);
+        let was_playing = live.clock.playing.last().copied().unwrap_or(false);
         live.clock.push(t_now, t.playhead, t.playing);
+        if live.drawn_in.is_some() {
+            // Playback shows every frame in between; a jump (seek, step, scrub) only its landing.
+            let continuous = was_playing && (0..=64).contains(&(t.frame() - prev));
+            let from = if continuous { prev } else { t.frame() };
+            for f in from..=t.frame() {
+                if !live.through.contains_key(&f) || f == t.frame() {
+                    let m = map_at(world, live.drawn_in, f);
+                    live.through.insert(f, m);
+                }
+            }
+        }
         t.fps.as_f64()
     };
-    live.boxes = stroke_frames(&live.samples, &live.clock, &live.params, fps);
+    live.boxes = stroke_frames(&live.samples, &live.clock, &live.params, fps).map(|(first, mut frames)| {
+        if live.drawn_in.is_some() {
+            for (i, v) in frames.iter_mut().enumerate() {
+                *v = v.zip(live.through.get(&(first + i as FrameIndex))).map(|(b, m)| m.box_to_source(b));
+            }
+        }
+        (first, frames)
+    });
     live.preview = live.boxes.as_ref().map(|(first, boxes)| {
         let (lo, layered) = layer_over(|f| live.base.get(&f).copied(), *first, boxes, live.stroke.falloff as f64 * fps, &live.stroke);
         // The motion union over the frames the change can reach.
         let get = |f: FrameIndex| layered.get(usize::try_from(f - lo).ok()?).copied().flatten().or_else(|| live.base.get(&f).copied());
         let (before, after) = union_reach(&live.params, fps);
-        let from = lo - after;
-        (from, (from..lo + layered.len() as FrameIndex + before).map(|f| union_at(get, f, before, after)).collect())
+        let (from, to) = (lo - after, lo + layered.len() as FrameIndex + before);
+        // The home view doesn't change during a stroke: its framing is looked up once per frame.
+        if live.home.is_some() {
+            for f in from - before..to + after {
+                live.home_maps.entry(f).or_insert_with(|| map_at(world, live.home, f));
+            }
+        }
+        let maps = |f: FrameIndex| live.home_maps.get(&f).copied();
+        let union = |f: FrameIndex| match maps(f) {
+            None => union_at(get, f, before, after),
+            Some(at_f) => union_at(
+                |g| {
+                    let v = get(g)?;
+                    Some(match maps(g) {
+                        Some(at_g) if g != f => at_f.box_to_source(at_g.box_from_source(v)),
+                        _ => v,
+                    })
+                },
+                f,
+                before,
+                after,
+            ),
+        };
+        (from, (from..to).map(union).collect())
     });
     if end.is_some() {
         if pointer.click.is_some() {
@@ -214,14 +277,24 @@ fn commit(world: &mut World, live: Live) {
             live.stroke.clone(),
             Output(stream),
         ));
+        if live.drawn_in.is_some() {
+            let through = tx.create_signal(3);
+            let sig = tx.signal(through);
+            for (f, m) in &live.through {
+                sig.set(*f, &m.channels());
+            }
+            tx.insert(capture, Through(through));
+        }
         match sketch {
             Some(s) => tx.modify::<Inputs>(s, |i| i.0.push(("stroke".into(), capture))),
             None => {
                 let out = tx.create_signal(BOX_CHANNELS);
+                let mut inputs = vec![("stroke".to_string(), capture)];
+                inputs.extend(live.drawn_in.map(|v| ("space".to_string(), v)));
                 sketch = Some(tx.spawn((
                     Name::new(format!("Sketch {}", sketches + 1)),
                     Operator { kind: "sketch".into() },
-                    Inputs(vec![("stroke".into(), capture)]),
+                    Inputs(inputs),
                     Output(out),
                     live.params.clone(),
                 )));

@@ -3844,6 +3844,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_tiles",
+ "png",
  "rfd",
  "serde",
  "serde_json",

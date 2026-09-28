@@ -31,7 +31,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         let selection = world.resource::<Selection>().clone();
         let mut clicked: Option<(Entity, bool)> = None;
         if entities.is_empty() {
-            ui.label(egui::RichText::new("No document objects yet — captures, views and trackers arrive in M3–M4.").weak());
+            ui.label(egui::RichText::new("Nothing yet · press D, then hold on the video to sketch.").weak());
         }
         for e in entities {
             let text = label(world, e);

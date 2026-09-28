@@ -270,7 +270,30 @@ The original plan follows.
 
 ---
 
-## M4 · Derived views (flagship, ≈1–2 weeks)
+## M4 · Derived views (flagship): core done 2026-09-27
+
+**Status (as built):**
+
+| Item | Status |
+|---|---|
+| `frame` operator | ✅ fit, hold (a decaying max, zero-phase), zoom and pan damping (zero-phase), dead zone, follow/zoom influence against the parent, zoom limits relative to the parent; the canvas is the widest crop. ⏳ causal mode, reference frame, a soft zone |
+| Views and nesting | ✅ every view maps straight to the source. A stroke drawn in a view records the view's mapping per frame and lives in source pixels, so re-tuning a parent never moves a child (a deliberate change from "children re-derive"). A nested sketch's motion union is measured in its home view |
+| Viewport | ✅ `Tab` / `Shift+Tab`, a clickable breadcrumb, rendering through the view (original when magnified, nearest framing outside the sketch), overlays and pointer in view pixels, the view's settings in the Inspector under the sketch. ⏳ an off-frame pattern (off-frame is the background colour) |
+| Side by side | ⏳ two viewports with a synced playhead |
+
+**Measured:**
+- `tests/view.rs`: a root view keeps the sprite in its central 30% on 100% of 172 frames. Three levels deep, the deepest view does too on 100% of 138 frames (the M4 acceptance, ≥ 99%). A sketch drawn inside view 1 has a median error of 0.68 px vs 1.99 px at level 1. Re-tuning view 1 leaves the child's points identical.
+- A review of M4 (4 reviewers + skeptics) confirmed 6 issues, all fixed with tests where testable:
+  - Tab-then-hold re-edited the parent instead of nesting (Tab now clears the selection);
+  - a tight parent's zoom limit could crop a child's region (fit now always wins);
+  - breadcrumb clicks reached the video (it is now on its own layer);
+  - a view snapped when its own sketch was edited (framing changes now ease in);
+  - scrubbing during a stroke in a view recorded every frame in between (only playback does now);
+  - the nearest-framing lookup rescanned the signal (it is now a clamp).
+  Per-view zoom/pan memory came from its unverified list.
+- In the running app (`TT_SKETCH_DEMO`, which now also Tabs into the view and records a nested sketch there, saving screenshots under `<TT_DATA_DIR>/screens/`): the view keeps the sprite central on 100% of 120 frames; the nested sketch's error is median 0.50 px, p95 1.34 px (level 1: 1.49 px).
+
+The original plan follows.
 
 **Goal:** see exactly what a sketch sees, sketch again inside it, and go as deep as you like.
 

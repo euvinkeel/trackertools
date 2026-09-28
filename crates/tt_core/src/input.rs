@@ -39,6 +39,10 @@ pub enum Action {
     Cancel,
     /// Clear the selection.
     DeselectAll,
+    /// Show the selected sketch's view in the viewport (creating it on first use).
+    EnterView,
+    /// Back out to the parent view (or the source).
+    ExitView,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -52,6 +56,7 @@ pub enum Key {
     Home,
     End,
     Escape,
+    Tab,
     Letter(char),
 }
 
@@ -106,6 +111,9 @@ impl Default for Keymap {
                 (b(Key::Letter('d'), Mods::NONE, false), Tool(crate::tool::Tool::Sketch)),
                 (b(Key::Escape, Mods::NONE, false), Cancel),
                 (b(Key::Letter('a'), Mods { ctrl: false, shift: false, alt: true }, false), DeselectAll),
+                // Like entering a group (Blender's Tab into edit mode, Figma's Enter).
+                (b(Key::Tab, Mods::NONE, false), EnterView),
+                (b(Key::Tab, Mods::SHIFT, false), ExitView),
             ],
         }
     }
@@ -142,6 +150,7 @@ impl Keymap {
             Key::Home => "Home".into(),
             Key::End => "End".into(),
             Key::Escape => "Esc".into(),
+            Key::Tab => "Tab".into(),
             Key::Letter(c) => c.to_ascii_uppercase().to_string(),
         });
         Some(s)

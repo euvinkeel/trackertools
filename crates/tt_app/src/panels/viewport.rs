@@ -2,10 +2,17 @@
 //! the world). The frame is drawn by the GPU through a paint callback
 //! (video.rs); while the exact frame is still decoding, the nearest cached
 //! frame is shown and labelled, so the picture never blanks.
+//!
+//! It shows the source or a derived view ([`ActiveView`]): the panel lays out
+//! the view's *canvas* (its pixel grid) and the shader samples the source
+//! through the view's per-frame mapping, from the original whenever the proxy
+//! would be magnified. A breadcrumb (`Source ▸ Sketch 1 ▸ …`) walks the chain.
 
+use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use tt_core::transport::Transport;
+use tt_core::view::{ActiveView, SpaceMap, chain, map_at, sketch_framed};
 use tt_core::{AppBuilder, Class, Module, Set};
 use tt_core::input::{Action, PendingActions};
 
@@ -16,59 +23,104 @@ use crate::video::{LAST_UPLOAD_US, VideoPaint};
 /// Zoom/pan of the viewport. Session state (not undoable).
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct ViewportView {
-    /// 1.0 = the whole frame fits the panel.
+    /// 1.0 = the whole canvas fits the panel.
     pub zoom: f32,
-    /// Video point (0..1 each axis) at the panel centre.
+    /// Canvas point (0..1 each axis) at the panel centre.
     pub center: [f32; 2],
+    /// The view this zoom/pan belongs to (a different view starts fitted).
+    pub for_view: Option<Entity>,
 }
 
 impl Default for ViewportView {
     fn default() -> Self {
-        Self { zoom: 1.0, center: [0.5, 0.5] }
+        Self { zoom: 1.0, center: [0.5, 0.5], for_view: None }
     }
 }
 
-/// Where the viewport and the video were drawn in the last UI pass (egui
-/// points), so the next frame's pointer samples map into source pixels.
+/// Where the viewport and the shown canvas (the source's pixels, or a view's)
+/// were drawn in the last UI pass (egui points), so the next frame's pointer
+/// samples map into canvas pixels. The core maps canvas pixels to the source.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct ViewportMapping {
     pub panel: Rect,
     pub video: Rect,
-    /// Source frame size (pixels).
-    pub source: Vec2,
+    /// Canvas size (pixels).
+    pub canvas: Vec2,
 }
 
 impl Default for ViewportMapping {
     fn default() -> Self {
-        Self { panel: Rect::NOTHING, video: Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), source: Vec2::splat(1.0) }
+        Self { panel: Rect::NOTHING, video: Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), canvas: Vec2::splat(1.0) }
     }
 }
 
 impl ViewportMapping {
     fn scale(self) -> f64 {
-        self.video.width() as f64 / self.source.x as f64
+        self.video.width() as f64 / self.canvas.x as f64
     }
 
-    /// Screen points per source pixel.
-    pub fn points_per_source(self) -> f64 {
+    /// Screen points per canvas pixel.
+    pub fn points_per_canvas(self) -> f64 {
         self.scale()
     }
 
-    pub fn to_source(self, p: Pos2) -> [f64; 2] {
+    pub fn to_canvas(self, p: Pos2) -> [f64; 2] {
         let s = self.scale();
         [(p.x - self.video.min.x) as f64 / s, (p.y - self.video.min.y) as f64 / s]
     }
 
     /// `[t, x, y]` for a timestamped sample.
-    pub fn to_source_at(self, t: f64, p: Pos2) -> [f64; 3] {
-        let [x, y] = self.to_source(p);
+    pub fn to_canvas_at(self, t: f64, p: Pos2) -> [f64; 3] {
+        let [x, y] = self.to_canvas(p);
         [t, x, y]
     }
 
-    pub fn to_screen(self, src: [f64; 2]) -> Pos2 {
+    pub fn to_screen(self, c: [f64; 2]) -> Pos2 {
         let s = self.scale();
-        Pos2::new(self.video.min.x + (src[0] * s) as f32, self.video.min.y + (src[1] * s) as f32)
+        Pos2::new(self.video.min.x + (c[0] * s) as f32, self.video.min.y + (c[1] * s) as f32)
     }
+}
+
+/// Zoom/pan per view (None = the source), restored when a view is shown again.
+#[derive(Resource, Debug, Default)]
+pub struct ViewMemory(pub std::collections::HashMap<Option<Entity>, (f32, [f32; 2])>);
+
+/// A change of framing at the frame being looked at (an edit to the view's
+/// own sketch, a re-tune) eases in instead of snapping.
+#[derive(Resource, Debug, Default)]
+pub struct FramingEase {
+    at: Option<(Option<Entity>, tt_core::time::FrameIndex)>,
+    target: Option<SpaceMap>,
+    shown: Option<SpaceMap>,
+    from: Option<(SpaceMap, f64)>,
+}
+
+const EASE_SECONDS: f64 = 0.25;
+
+fn ease_framing(world: &mut World, view: Option<Entity>, frame: tt_core::time::FrameIndex, target: SpaceMap) -> SpaceMap {
+    let now = world.resource::<tt_core::time::WallClock>().now;
+    let mut e = world.resource_mut::<FramingEase>();
+    if e.at != Some((view, frame)) {
+        // Another view or frame: show it as it is.
+        *e = FramingEase { at: Some((view, frame)), target: Some(target), shown: Some(target), from: None };
+        return target;
+    }
+    if e.target != Some(target) {
+        let from = e.shown.unwrap_or(target);
+        e.from = Some((from, now));
+        e.target = Some(target);
+    }
+    let shown = match e.from {
+        Some((from, t0)) if now - t0 < EASE_SECONDS => {
+            let u = ((now - t0) / EASE_SECONDS).clamp(0.0, 1.0);
+            let u = u * u * (3.0 - 2.0 * u);
+            let lerp = |a: f64, b: f64| a + (b - a) * u;
+            SpaceMap { a: (lerp(from.a.ln(), target.a.ln())).exp(), b: [lerp(from.b[0], target.b[0]), lerp(from.b[1], target.b[1])], canvas: target.canvas }
+        }
+        _ => target,
+    };
+    e.shown = Some(shown);
+    shown
 }
 
 /// Until when (wall seconds) the wheel is not the viewport's to zoom with.
@@ -109,6 +161,10 @@ impl Module for ViewportModule {
             .declare::<WaitingForFrame>(Class::Derived)
             .declare::<ViewportMapping>(Class::Derived)
             .declare::<WheelLock>(Class::Derived)
+            .declare::<ViewMemory>(Class::Session)
+            .declare::<FramingEase>(Class::Derived)
+            .init_resource::<ViewMemory>()
+            .init_resource::<FramingEase>()
             .init_resource::<WheelLock>()
             .init_resource::<ViewportMapping>()
             .init_resource::<ViewportView>()
@@ -129,16 +185,27 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
 
     let t = world.resource::<Transport>().clone();
+    let active_view = world.resource::<ActiveView>().0;
     let mut view = *world.resource::<ViewportView>();
+    if view.for_view != active_view {
+        // Each view keeps its own zoom/pan: stepping back restores it.
+        let mut memory = world.resource_mut::<ViewMemory>();
+        memory.0.insert(view.for_view, (view.zoom, view.center));
+        let (zoom, center) = memory.0.get(&active_view).copied().unwrap_or((1.0, [0.5, 0.5]));
+        view = ViewportView { zoom, center, for_view: active_view };
+    }
     let (vw, vh) = {
         let m = world.resource::<Media>();
         (m.index().width as f32, m.index().height as f32)
     };
+    // The canvas: the source's pixels, or the shown view's.
+    let space = map_at(world, active_view, t.frame());
+    let (cw, ch) = (space.canvas[0] as f32, space.canvas[1] as f32);
 
     // Zoom about the cursor, pan with the secondary/middle button.
-    let fit = (rect.width() / vw).min(rect.height() / vh);
+    let fit = (rect.width() / cw).min(rect.height() / ch);
     let video_rect = |view: &ViewportView| {
-        let size = Vec2::new(vw, vh) * fit * view.zoom;
+        let size = Vec2::new(cw, ch) * fit * view.zoom;
         let min = rect.center() - Vec2::new(view.center[0] * size.x, view.center[1] * size.y);
         Rect::from_min_size(min, size)
     };
@@ -155,7 +222,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             let before = video_rect(&view);
             let uv = (pos - before.min) / before.size();
             view.zoom = (view.zoom * (scroll * 0.0025).exp()).clamp(0.1, 64.0);
-            let size = Vec2::new(vw, vh) * fit * view.zoom;
+            let size = Vec2::new(cw, ch) * fit * view.zoom;
             let min = pos - Vec2::new(uv.x * size.x, uv.y * size.y);
             view.center = [(rect.center().x - min.x) / size.x, (rect.center().y - min.y) / size.y];
         }
@@ -168,15 +235,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     *world.resource_mut::<ViewportView>() = view;
 
     let vr = video_rect(&view);
-    let px_per_source = vr.width() / vw;
-    let mapping = ViewportMapping { panel: rect, video: vr, source: Vec2::new(vw, vh) };
+    let ppc = vr.width() / cw; // screen points per canvas pixel
+    let eased = ease_framing(world, active_view, t.frame(), space);
+    let screen_per_source = ppc as f64 / space.a;
+    let mapping = ViewportMapping { panel: rect, video: vr, canvas: Vec2::new(cw, ch) };
     *world.resource_mut::<ViewportMapping>() = mapping;
     let shown_grid = t.frame();
 
     // Show the proxy unless it would be magnified: past its resolution, the original.
     let media = world.resource::<Media>();
     let prefer = match media.proxy() {
-        Some(p) if vr.width() <= p.index.width as f32 => Which::Proxy,
+        Some(p) if vw as f64 * screen_per_source <= p.index.width as f64 => Which::Proxy,
         _ => Which::Original,
     };
     let other = if prefer == Which::Proxy { Which::Original } else { Which::Proxy };
@@ -194,15 +263,20 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     if let Some((which, p, data)) = shown.clone() {
         let src = media.source(which).expect("shown source exists");
         shown_source = Some(which);
+        // Panel → canvas → source → texture coordinates, through the view as it
+        // framed the frame actually shown (a stand-in keeps its own framing).
+        let g = media.index().grid_of[p] as tt_core::time::FrameIndex;
+        let m = if g == t.frame() { eased } else { map_at(world, active_view, g) };
+        let (a, b) = (m.a as f32, [m.b[0] as f32, m.b[1] as f32]);
         let callback = VideoPaint {
             key: (media.generation * 2 + u64::from(which == Which::Proxy), p),
             data,
             width: src.index.width,
             height: src.index.height,
-            scale: [rect.width() / vr.width(), rect.height() / vr.height()],
-            offset: [(rect.min.x - vr.min.x) / vr.width(), (rect.min.y - vr.min.y) / vr.height()],
+            scale: [a * rect.width() / (ppc * vw), a * rect.height() / (ppc * vh)],
+            offset: [(b[0] + a * (rect.min.x - vr.min.x) / ppc) / vw, (b[1] + a * (rect.min.y - vr.min.y) / ppc) / vh],
             background,
-            nearest: vr.width() / src.index.width as f32 >= 3.0,
+            nearest: (ppc / a) * (vw / src.index.width as f32) >= 3.0,
             color: media.color,
         };
         painter.add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
@@ -217,11 +291,12 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         None => format!("frame {shown_grid} · decoding…"),
     };
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
-    super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid);
+    super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid, active_view, eased);
+    breadcrumb(ui, world, rect.left_top() + Vec2::new(10.0, 34.0), active_view, shown_grid);
     let media = world.resource::<Media>();
     if let Some(pos) = response.hover_pos() {
-        let src = (pos - vr.min) / px_per_source;
-        hud(&painter, rect.right_top() + Vec2::new(-10.0, 8.0), Align2::RIGHT_TOP, &format!("{:.1}, {:.1} px · {:.0}%", src.x, src.y, px_per_source * 100.0), style::MUTED);
+        let src = space.to_source(mapping.to_canvas(pos));
+        hud(&painter, rect.right_top() + Vec2::new(-10.0, 8.0), Align2::RIGHT_TOP, &format!("{:.1}, {:.1} px · {:.0}%", src[0], src[1], screen_per_source * 100.0), style::MUTED);
     }
     let active = media.source(prefer).expect("preferred source exists");
     let stats = active.player.stats();
@@ -273,7 +348,59 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     if let Some(probe) = world.get_resource::<crate::input_probe::InputProbe>() {
         hud(&painter, rect.center_top() + Vec2::new(0.0, 34.0), Align2::CENTER_TOP, &format!("input probe · {}", probe.summary), style::ACCENT);
     }
-    world.resource_mut::<WaitingForFrame>().0 = !exact;
+    let easing = world.resource::<FramingEase>().from.is_some_and(|(_, t0)| now - t0 < EASE_SECONDS);
+    world.resource_mut::<WaitingForFrame>().0 = !exact || easing;
+}
+
+/// `Source ▸ Sketch 1 ▸ Sketch 3`: where the viewport is; click a level to go there.
+fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Entity>, frame: tt_core::time::FrameIndex) {
+    let chain = chain(world, active);
+    let selected = world.resource::<tt_core::selection::Selection>().primary().and_then(|e| tt_core::sketch::sketch_of(world, e));
+    let name = |w: &World, e: Entity| sketch_framed(w, e).and_then(|s| w.get::<Name>(s)).map_or("view".to_string(), |n| n.to_string());
+    let mut go: Option<Option<Entity>> = None;
+    // Its own foreground layer: a click here is the breadcrumb's, never a press on the video.
+    egui::Area::new(egui::Id::new("viewport-breadcrumb")).order(egui::Order::Foreground).fixed_pos(at).interactable(true).show(ui.ctx(), |ui| {
+        egui::Frame::new().fill(Color32::from_black_alpha(170)).corner_radius(3.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let crumb = |ui: &mut egui::Ui, text: String, current: bool| {
+                    let rich = egui::RichText::new(text).monospace().size(12.0);
+                    if current {
+                        ui.label(rich.color(style::TEXT).strong());
+                        false
+                    } else {
+                        ui.add(egui::Label::new(rich.color(style::ACCENT)).sense(Sense::click())).on_hover_text("Go to this level").clicked()
+                    }
+                };
+                if crumb(ui, "Source".into(), chain.is_empty()) {
+                    go = Some(None);
+                }
+                for (i, v) in chain.iter().enumerate() {
+                    ui.label(egui::RichText::new("▸").monospace().size(12.0).color(style::MUTED));
+                    if crumb(ui, name(world, *v), i + 1 == chain.len()) {
+                        go = Some(Some(*v));
+                    }
+                }
+                if let Some(v) = active
+                    && let Some(s) = sketch_framed(world, v)
+                    && world.get::<tt_core::op::Output>(s).and_then(|o| world.resource::<tt_core::signal::SignalStore>().get(o.0)).is_some_and(|sig| sig.get(frame).is_none())
+                {
+                    ui.label(egui::RichText::new("· outside this sketch: nearest framing").monospace().size(12.0).color(Color32::from_rgb(0xfb, 0xbf, 0x24)));
+                }
+                let hint = match (selected, active.and_then(|v| sketch_framed(world, v))) {
+                    (Some(s), current) if Some(s) != current => Some(format!("· Tab: view {}", world.get::<Name>(s).map_or("sketch".into(), |n| n.to_string()))),
+                    _ if active.is_some() => Some("· Shift+Tab: up".to_string()),
+                    _ => None,
+                };
+                if let Some(h) = hint {
+                    ui.label(egui::RichText::new(h).monospace().size(12.0).color(style::MUTED));
+                }
+            });
+        });
+    });
+    if let Some(v) = go {
+        world.resource_mut::<ActiveView>().0 = v;
+    }
 }
 
 fn hud(painter: &egui::Painter, pos: Pos2, align: Align2, text: &str, color: Color32) {

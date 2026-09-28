@@ -41,7 +41,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         open = ui.button("Open…").on_hover_text("Open a video (Ctrl+O), or drop a file on the window").clicked();
         let recent = world.resource::<Session>().recent();
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
-            ui.menu_button("Recent ▾", |ui| {
+            ui.menu_button("Recent ⏷", |ui| {
                 for path in recent {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
@@ -81,10 +81,10 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         ui.separator();
         let undo_tip = history.undo_label().map_or("Nothing to undo".to_string(), |l| format!("Undo {l} (Ctrl+Z)"));
         let redo_tip = history.redo_label().map_or("Nothing to redo".to_string(), |l| format!("Redo {l} (Ctrl+Shift+Z)"));
-        if ui.add_enabled(history.can_undo(), egui::Button::new("↶")).on_hover_text(undo_tip).on_disabled_hover_text("Nothing to undo").clicked() {
+        if ui.add_enabled(history.can_undo(), egui::Button::new("⟲")).on_hover_text(undo_tip).on_disabled_hover_text("Nothing to undo").clicked() {
             history_action = Some(Action::Undo);
         }
-        if ui.add_enabled(history.can_redo(), egui::Button::new("↷")).on_hover_text(redo_tip).on_disabled_hover_text("Nothing to redo").clicked() {
+        if ui.add_enabled(history.can_redo(), egui::Button::new("⟳")).on_hover_text(redo_tip).on_disabled_hover_text("Nothing to redo").clicked() {
             history_action = Some(Action::Redo);
         }
         ui.separator();
@@ -98,7 +98,8 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                  • Space while holding: play and record across frames\n\
                  • wheel while holding: falloff to neighbouring frames\n\
                  • Ctrl+hold: move only (keep the box size) · Shift+hold: new sketch\n\
-                 • click: select the sketch under the cursor · Alt+A: deselect · Esc: cancel"
+                 • click: select the sketch under the cursor · Alt+A: deselect · Esc: cancel
+                 • Tab: enter the selected sketch's view (sketch inside it for detail) · Shift+Tab: back up"
             ))
             .clicked()
         {
@@ -106,7 +107,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         }
         let sketch_selected = world.resource::<tt_core::selection::Selection>().primary().is_some_and(|e| tt_core::sketch::is_sketch(world, e));
         if ui
-            .add_enabled(sketch_selected || !sketching, egui::Button::new("＋ New sketch"))
+            .add_enabled(sketch_selected || !sketching, egui::Button::new("✚ New sketch"))
             .on_hover_text("The next stroke starts a new sketch instead of editing the selected one (deselects; Shift+hold does the same for one stroke)")
             .on_disabled_hover_text("Nothing is selected: the next stroke already starts a new sketch")
             .clicked()

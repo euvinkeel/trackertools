@@ -19,6 +19,7 @@ pub mod sketch;
 pub mod time;
 pub mod tool;
 pub mod transport;
+pub mod view;
 
 pub use app::{AppBuilder, Core, Module, PostSet, PostUi, PreUi, Set};
 pub use meta::{Class, ComponentMeta, ComponentMetas};
@@ -38,6 +39,7 @@ impl Module for CoreModules {
             .add_module(sketch::SketchModule)
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)
+            .add_module(view::ViewModule)
             .add_module(persist::PersistModule);
     }
 }

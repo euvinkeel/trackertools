@@ -295,14 +295,32 @@ Each modifier is an operator entity in an ordered chain, with an enable toggle a
 
 ## 10. Flagship: derived views
 
+*(As built in M4.)* A **view** is a `frame` operator on a sketch: per frame, a crop of the source `[cx, cy, crop_w, crop_h, canvas_w, canvas_h]` in source pixels. Its *canvas*, the view's own pixel grid, is as big as its widest crop ("display size = max size"): 1 view pixel = 1 source pixel at the widest framing, and the view magnifies as the crop shrinks. Views keep the video's aspect.
+
+- **Every view maps straight to the source** (`SpaceMap`: `source = a · p + b`), so nesting doesn't need a transform chain. The chain is provenance: the breadcrumb, the parent's influence and zoom limits.
+- **Strokes drawn in a view are stored through it.** The hand pipeline (lag, smoothing, jiggle) runs in the view's pixels, where the hand actually moved. Each stroke records the view's mapping for every frame it touched (`Through`), and its per-frame results reach the source through that record.
+  - Consequence: re-tuning a parent view never moves a child sketch that already tracks something. *(Changed from "children re-derive when parents are re-tuned": a face track must not drift because the body's camera damping changed.)*
+- **The motion union of a sketch drawn in a view is measured in that view** (its *home*, input `space`). In a stabilized view the subject barely moves, so nested sketches stay tight.
+- **Entering views:** `Tab` enters the selected sketch's view, creating it on first use as one undo step, and clears the selection. So a hold inside a view starts a new sketch nested there. To edit the sketch that defines the view from inside it, click its box first.
+  - `Shift+Tab` backs out to the parent and selects the sketch just left, so `Tab` goes straight back in.
+  - A breadcrumb (`Source ▸ Sketch 1 ▸ …`, on its own layer so its clicks never reach the video) jumps to any level.
+  - Each view keeps its own zoom and pan.
+  - Outside the frames a sketch covers, its view holds the nearest framing, labelled in the breadcrumb.
+  - A change of framing at the frame being looked at (an edit to the view's own sketch, a re-tune) eases in over 0.25 s instead of snapping.
+- **The region always fits:** `fit` wins over the parent's influence and the zoom limits.
+- **Measured** (tests/view.rs and the in-app demo):
+  - a root view keeps the sprite in its central 30% on 100% of frames;
+  - three levels deep, the deepest view does too;
+  - a sketch drawn inside a view is about 3× more accurate: 0.5–0.7 px vs 1.5–2 px median in source pixels.
+
 ### 10.1 Framing a view from a box
 
 The `Frame` operator (a virtual camera) turns a Box into a View transform. Its parameters are Cinemachine's framing controls:
 
 | Parameter | Meaning | Source |
 |---|---|---|
-| **Display size** | the view's fixed output size = the **max extent during the pass**, using a *slowly decaying* running max so one jiggle spike doesn't lock the zoom out for the whole pass | user spec + Cinemachine group framing |
-| **Fit** | how much of the display the box fills | Cinemachine framing size |
+| **Display size** | the view's fixed output size = the **max extent during the pass**, using a *slowly decaying* running max so one jiggle spike doesn't lock the zoom out for the whole pass. *(Built: the crop is a zero-phase decaying max of what the region needs, `hold` 1 s, smoothed in log space by `zoom_damping` 0.5 s and never smaller than the region needs; the canvas is the widest crop.)* | user spec + Cinemachine group framing |
+| **Fit** | how much of the display the box fills (default 0.6; the region always fits) | Cinemachine framing size |
 | **Dead zone / soft zone** | the box can move within the dead zone without the camera reacting; beyond it, the camera re-centres at the damping rate | Cinemachine position composer |
 | **Damping (pan, zoom)** | separate; *zero-phase* mode (lag-free, offline) or *causal* mode (camera-like) | Cinemachine, SciPy `filtfilt` |
 | **Zoom clamp** | minimum and maximum scale relative to the parent | Cinemachine min/max |

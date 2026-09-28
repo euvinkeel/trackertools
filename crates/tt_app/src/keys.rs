@@ -35,6 +35,7 @@ fn map_key(key: egui::Key) -> Option<Key> {
         E::Home => Key::Home,
         E::End => Key::End,
         E::Escape => Key::Escape,
+        E::Tab => Key::Tab,
         E::OpenBracket => Key::Letter('['),
         E::CloseBracket => Key::Letter(']'),
         other => {

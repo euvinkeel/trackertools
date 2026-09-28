@@ -4,9 +4,12 @@
 //! (tremor, 250 ms lag, 1 kHz):
 //! 1. records a new sketch: holds the button at frame 120, plays at ¼ speed
 //!    (Space taps), pauses for a second mid-way, plays on, pauses, releases;
-//! 2. edits it: at frame 180, holds 40 px to the right of the sprite.
+//! 2. edits it: at frame 180, holds 40 px to the right of the sprite;
+//! 3. enters its view (Tab) and records a nested sketch there, the hand
+//!    seeing the sprite as the view shows it.
 //!
-//! It logs the error against the truth and the edit's falloff, then quits.
+//! It logs the error against the truth, the edit's falloff, how central the
+//! sprite stays in the view and the nested sketch's error, then quits.
 
 use bevy_ecs::prelude::*;
 use tt_core::input::{Action, PendingActions};
@@ -16,6 +19,7 @@ use tt_core::signal::SignalStore;
 use tt_core::sketch::falloff_weight;
 use tt_core::tool::{ActiveTool, PointerFrame, Tool};
 use tt_core::transport::Transport;
+use tt_core::view::{ActiveView, map_at};
 
 const LAG: f64 = 0.25;
 const START_FRAME: i64 = 120;
@@ -25,6 +29,10 @@ const RELEASE: f64 = 9.4;
 const EDIT_FRAME: i64 = 180;
 const EDIT_DX: f64 = 40.0;
 const EDIT_HOLD: f64 = 0.6;
+const NEST_FRAME: i64 = 130;
+/// Wall seconds from the nested press: Space taps (play, pause), release.
+const NEST_TAPS: [f64; 2] = [0.05, 6.0];
+const NEST_RELEASE: f64 = 6.4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -35,6 +43,11 @@ enum Phase {
     Settle { t0: f64 },
     Edit { t0: f64 },
     Done { t0: f64 },
+    /// In the sketch's view; the hand settles on the sprite as shown there.
+    InView { since: f64 },
+    Nest { t0: f64, taps: usize },
+    NestSettle { t0: f64 },
+    Finish { at: f64 },
 }
 
 pub struct SketchDemo {
@@ -46,6 +59,13 @@ pub struct SketchDemo {
     last: f64,
     /// The path around the edit frame before the edit.
     before: Vec<Option<[f32; 6]>>,
+    /// Inside the view: the sprite as the view shows it, per frame (view pixels).
+    in_view: Vec<[f64; 2]>,
+    parent: Option<Entity>,
+    /// Screenshots to take (the shell asks the window for them): name, when.
+    shots: Vec<(&'static str, f64)>,
+    /// A screenshot due now.
+    pub shot: Option<&'static str>,
 }
 
 impl SketchDemo {
@@ -54,7 +74,7 @@ impl SketchDemo {
         let text = std::fs::read_to_string(&path).map_err(|e| tracing::error!("sketch demo: {e}")).ok()?;
         let json: serde_json::Value = serde_json::from_str(&text).ok()?;
         let truth = json["centers"].as_array()?.iter().filter_map(|c| Some([c[0].as_f64()?, c[1].as_f64()?])).collect();
-        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new() })
+        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None })
     }
 
     fn normal(&mut self) -> f64 {
@@ -78,6 +98,10 @@ impl SketchDemo {
         let p = if let Phase::Edit { .. } = self.phase {
             let t = self.truth_at(EDIT_FRAME);
             [t[0] + EDIT_DX, t[1]]
+        } else if !self.in_view.is_empty() {
+            let i = self.shown.partition_point(|(t, _)| *t <= w - LAG).saturating_sub(1);
+            let f = self.shown.get(i).map_or(NEST_FRAME, |s| s.1);
+            self.in_view[(f.max(0) as usize).min(self.in_view.len() - 1)]
         } else {
             let i = self.shown.partition_point(|(t, _)| *t <= w - LAG).saturating_sub(1);
             self.truth_at(self.shown.get(i).map_or(START_FRAME, |s| s.1))
@@ -88,6 +112,9 @@ impl SketchDemo {
 
     /// Replace this frame's pointer input. Returns true when finished.
     pub fn drive(&mut self, world: &mut World, now: f64, frame: &mut PointerFrame) -> bool {
+        if let Some(i) = self.shots.iter().position(|(_, at)| now >= *at) {
+            self.shot = Some(self.shots.remove(i).0);
+        }
         let t = world.resource::<Transport>().clone();
         self.shown.push((now, t.frame()));
         // The edit's hand is on its target from the press on.
@@ -143,6 +170,7 @@ impl SketchDemo {
                 world.resource_mut::<Selection>().clear();
                 *frame = hold(samples, Some(now - 0.002), None);
                 self.phase = Phase::Record { t0: now, taps: 0 };
+                self.shots.push(("1-recording", now + 2.5));
                 tracing::info!("sketch demo: recording from frame {START_FRAME} at 0.25× (Space taps at {TAPS:?} s)");
             }
             Phase::Record { t0, taps } => {
@@ -175,6 +203,51 @@ impl SketchDemo {
                 *frame = PointerFrame::default();
                 if now - t0 > 0.3 {
                     self.report_edit(world);
+                    self.parent = world.resource::<Selection>().primary();
+                    push(world, Action::EnterView);
+                    push(world, Action::Seek(NEST_FRAME));
+                    self.phase = Phase::InView { since: now };
+                }
+            }
+            Phase::InView { since } => {
+                *frame = PointerFrame::default();
+                let Some(view) = world.resource::<ActiveView>().0 else { return false };
+                if self.in_view.is_empty() && now - since > 0.2 {
+                    self.report_view(world, view);
+                    self.shots.push(("2-in-view", now));
+                    self.in_view = (0..self.truth.len() as i64).map(|f| map_at(world, Some(view), f).from_source(self.truth_at(f))).collect();
+                    world.resource_mut::<Selection>().clear(); // the next stroke starts a new sketch, in this view
+                }
+                if !self.in_view.is_empty() && now - since > 0.2 + LAG + 0.3 {
+                    *frame = hold(samples, Some(now - 0.002), None);
+                    self.phase = Phase::Nest { t0: now, taps: 0 };
+                    self.shots.push(("3-nested-live", now + 3.0));
+                    tracing::info!("sketch demo: recording a nested sketch inside the view from frame {NEST_FRAME}");
+                }
+            }
+            Phase::Nest { t0, taps } => {
+                let el = now - t0;
+                if taps < NEST_TAPS.len() && el >= NEST_TAPS[taps] {
+                    push(world, Action::TogglePlay);
+                    self.phase = Phase::Nest { t0, taps: taps + 1 };
+                }
+                let release = el >= NEST_RELEASE;
+                *frame = hold(samples, None, release.then_some(now - 0.001));
+                if release {
+                    self.phase = Phase::NestSettle { t0: now };
+                }
+            }
+            Phase::NestSettle { t0 } => {
+                *frame = PointerFrame::default();
+                if now - t0 > 0.3 {
+                    self.report_nested(world);
+                    self.shots.push(("4-nested-done", now));
+                    self.phase = Phase::Finish { at: now + 0.8 }; // let the last screenshot arrive
+                }
+            }
+            Phase::Finish { at } => {
+                *frame = PointerFrame::default();
+                if now >= at {
                     return true;
                 }
             }
@@ -215,6 +288,54 @@ impl SketchDemo {
         if !outside.is_empty() {
             tracing::info!("sketch demo: sprite outside the region on frames {outside:?}");
         }
+    }
+
+    fn report_view(&self, world: &World, view: Entity) {
+        let Some(sketch) = self.parent else { return };
+        let Some(sig) = world.get::<Output>(sketch).and_then(|o| world.resource::<SignalStore>().get(o.0)) else { return };
+        let (mut inside, mut n) = (0, 0);
+        for f in 0..self.truth.len() as i64 {
+            if sig.get(f).is_none() {
+                continue;
+            }
+            let m = map_at(world, Some(view), f);
+            let p = m.from_source(self.truth_at(f));
+            n += 1;
+            if (p[0] - m.canvas[0] / 2.0).abs() <= 0.15 * m.canvas[0] && (p[1] - m.canvas[1] / 2.0).abs() <= 0.15 * m.canvas[1] {
+                inside += 1;
+            }
+        }
+        let m = map_at(world, Some(view), NEST_FRAME);
+        tracing::info!(
+            "sketch demo: in the view (canvas {:.0}×{:.0}, {:.2} source px per view px at frame {NEST_FRAME}) the sprite stays in the central 30% on {:.1}% of {n} frames",
+            m.canvas[0],
+            m.canvas[1],
+            m.a,
+            inside as f64 * 100.0 / n.max(1) as f64
+        );
+    }
+
+    fn report_nested(&self, world: &World) {
+        let path = self.path(world, 0..self.truth.len() as i64);
+        let mut errors: Vec<f64> = path
+            .iter()
+            .enumerate()
+            .filter_map(|(f, v)| {
+                let v = (*v)?;
+                let t = self.truth[f];
+                Some((v[0] as f64 - t[0]).hypot(v[1] as f64 - t[1]))
+            })
+            .collect();
+        errors.sort_by(f64::total_cmp);
+        let n = errors.len();
+        let q = |f: f64| errors.get(((n.max(1) - 1) as f64 * f).round() as usize).copied().unwrap_or(f64::NAN);
+        let home = world.resource::<Selection>().primary().and_then(|s| tt_core::view::home_of(world, s));
+        tracing::info!(
+            "sketch demo: nested sketch drawn in the view ({}): {n} frames, point error in source pixels median {:.2} px, p95 {:.2} px",
+            if home.is_some() { "home = the view" } else { "home = source?!" },
+            q(0.5),
+            q(0.95)
+        );
     }
 
     fn report_edit(&self, world: &World) {

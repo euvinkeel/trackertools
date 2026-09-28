@@ -38,6 +38,16 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if world.get::<SketchParams>(e).is_some() {
         sketch_presets(ui, world, e);
     }
+    components(ui, world, e);
+    // A sketch's view (its framing) is edited right here too.
+    if let Some(view) = tt_core::view::view_of(world, e) {
+        ui.separator();
+        egui::CollapsingHeader::new("View (Tab to enter)").id_salt(("view", view)).default_open(true).show(ui, |ui| components(ui, world, view));
+    }
+}
+
+/// Every reflected document/session component of `e`, editable.
+fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     // Editable copies of each reflected document/session component on the entity.
     let mut components: Vec<(String, String, Box<dyn PartialReflect>, Class)> = {
         let registry = world.resource::<AppTypeRegistry>().read();
@@ -47,7 +57,8 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             .iter()
             .filter_map(|r| {
                 let class = metas.get(r.type_id())?.class;
-                if class == Class::Derived {
+                // Derived state isn't edited; the name is the heading.
+                if class == Class::Derived || r.type_id() == std::any::TypeId::of::<bevy_ecs::name::Name>() {
                     return None;
                 }
                 let rc = r.data::<ReflectComponent>()?;
@@ -61,7 +72,7 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
 
     let mut pending: Option<PendingEdit> = None;
     for (path, short, mut value, class) in components {
-        egui::CollapsingHeader::new(&short).id_salt(&path).default_open(true).show(ui, |ui| {
+        egui::CollapsingHeader::new(&short).id_salt((&path, e)).default_open(true).show(ui, |ui| {
             if class == Class::Session {
                 ui.label(egui::RichText::new("session (not undoable)").weak().small());
             }

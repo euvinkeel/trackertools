@@ -297,7 +297,7 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, top: Pos2, c
     }
     if let Some(l) = live.filter(|l| l.target.is_none()) {
         live_bars(y, l);
-        painter.text(Pos2::new(top.x + 6.0, y + 7.5), Align2::LEFT_CENTER, "● new sketch", FontId::proportional(11.0), style::TEXT);
+        painter.text(Pos2::new(top.x + 6.0, y + 7.5), Align2::LEFT_CENTER, "⏺ new sketch", FontId::proportional(11.0), style::TEXT);
     } else if rows.is_empty() {
         painter.text(Pos2::new(top.x + 8.0, y + 6.0), Align2::LEFT_TOP, "no sketches yet · D arms the Sketch tool, then press and hold on the video", FontId::proportional(11.0), style::MUTED);
     }

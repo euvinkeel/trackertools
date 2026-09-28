@@ -97,6 +97,8 @@ fn apply_tool_actions(mut actions: ResMut<PendingActions>, mut active: ResMut<Ac
 fn select_on_click(world: &mut World) {
     let Some(pos) = world.resource::<PointerFrame>().click else { return };
     let frame = world.resource::<crate::transport::Transport>().frame();
+    // The pointer is in the shown space's pixels; sketches live in source pixels.
+    let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);
     let picked = crate::sketch::pick_sketch(world, frame, pos);
     let mut sel = world.resource_mut::<crate::selection::Selection>();
     match picked {

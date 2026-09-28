@@ -193,7 +193,12 @@ impl eframe::App for Shell {
         let held = if typing { KeysHeld::default() } else { ctx.input(keys::held) };
         if let Some(demo) = &mut self.sketch_demo {
             ctx.request_repaint();
-            if demo.drive(&mut self.core.world, now, &mut frame) {
+            save_screenshots(ctx);
+            let done = demo.drive(&mut self.core.world, now, &mut frame);
+            if let Some(name) = demo.shot.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(name.to_string())));
+            }
+            if done {
                 self.sketch_demo = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -237,6 +242,42 @@ impl eframe::App for Shell {
         }
         if self.core.world.resource::<WaitingForFrame>().0 {
             ui.ctx().request_repaint_after(Duration::from_millis(8));
+        }
+    }
+}
+
+/// Screenshots the window delivered (the sketch demo asks for them), saved as
+/// PNGs under `<data dir>/screens/`.
+fn save_screenshots(ctx: &egui::Context) {
+    let shots: Vec<(String, std::sync::Arc<egui::ColorImage>)> = ctx.input(|i| {
+        i.raw
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Screenshot { image, user_data, .. } => {
+                    let name = user_data.data.as_ref().and_then(|d| d.downcast_ref::<String>()).cloned().unwrap_or_else(|| "shot".into());
+                    Some((name, image.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    });
+    for (name, image) in shots {
+        let dir = tt_media::proxy::data_dir().join("screens");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{name}.png"));
+        let result = (|| -> anyhow::Result<()> {
+            let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            let mut enc = png::Encoder::new(file, image.size[0] as u32, image.size[1] as u32);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+            enc.write_header()?.write_image_data(&bytes)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => tracing::info!("screenshot saved: {}", path.display()),
+            Err(e) => tracing::warn!("screenshot {}: {e:#}", path.display()),
         }
     }
 }

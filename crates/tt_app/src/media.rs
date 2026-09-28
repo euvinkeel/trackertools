@@ -150,6 +150,7 @@ fn open_requested(world: &mut World) {
         start_proxy(&index)
     };
     let original = Source { player: Player::new(index.clone(), DecodeOptions::default(), CACHE_BYTES), index };
+    world.insert_resource(tt_core::view::SourceSize { width: original.index.width as f64, height: original.index.height as f64 });
     world.insert_resource(Media { name, original, proxy, color, generation });
     world.insert_resource(ActiveSource(Which::Original));
     world.resource_mut::<StatusLine>().0 = None;
