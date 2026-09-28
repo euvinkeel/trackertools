@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod capture;
+pub mod commands;
 pub mod history;
 pub mod input;
 pub mod meta;
@@ -40,6 +41,7 @@ impl Module for CoreModules {
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)
             .add_module(view::ViewModule)
+            .add_module(commands::CommandsModule)
             .add_module(persist::PersistModule);
     }
 }

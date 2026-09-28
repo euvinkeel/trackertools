@@ -295,6 +295,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
     super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid, active_view, eased);
     breadcrumb(ui, world, rect.left_top() + Vec2::new(10.0, 34.0), active_view, shown_grid);
+    // Right-click: select the sketch under the pointer (if any), then the entity menu.
+    if response.secondary_clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let src = map_at(world, active_view, shown_grid).to_source(mapping.to_canvas(pos));
+        match tt_core::sketch::pick_sketch(world, shown_grid, src) {
+            Some(e) => super::menu::right_clicked(world, e),
+            None => world.resource_mut::<tt_core::selection::Selection>().clear(),
+        }
+    }
+    response.context_menu(|ui| super::menu::entity_menu(ui, world));
     speed(&painter, rect, t.rate, world);
     let media = world.resource::<Media>();
     if let Some(pos) = response.hover_pos() {

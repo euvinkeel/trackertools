@@ -185,9 +185,14 @@ pub fn load(world: &mut World, path: &Path) -> Result<()> {
         .prepare("SELECT entity, type, data FROM components ORDER BY entity, type")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    // Fresh entities in the saved ones' creation order (their index), so
+    // anything listed by creation (the outliner, the timeline) keeps its order.
+    let mut olds: Vec<u64> = rows.iter().map(|(old, _, _)| *old as u64).collect();
+    olds.sort_by_key(|o| Entity::try_from_bits(*o).map_or(u32::MAX, |e| e.index_u32()));
+    olds.dedup();
     let mut map: HashMap<u64, Entity> = HashMap::new();
-    for (old, _, _) in &rows {
-        map.entry(*old as u64).or_insert_with(|| world.spawn_empty().id());
+    for old in olds {
+        map.entry(old).or_insert_with(|| world.spawn_empty().id());
     }
     let registry = world.resource::<AppTypeRegistry>().clone();
     let registry = registry.read();

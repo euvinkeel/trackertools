@@ -2,6 +2,7 @@
 //! queue actions/intents; they never own state or mutate the document directly.
 
 mod inspector;
+mod menu;
 pub mod outliner;
 mod overlay;
 pub mod timeline;

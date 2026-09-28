@@ -28,7 +28,10 @@ const PATH_FRAMES: FrameIndex = 90;
 /// source): every frame's value goes through that view as it framed that frame.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: &mut World, map: &ViewportMapping, frame: FrameIndex, view: Option<Entity>, shown: SpaceMap) {
-    let selected = world.resource::<Selection>().primary().and_then(|e| sketch_of(world, e));
+    // Every selected sketch is lit (a selected stroke lights its sketch); the primary one is edited.
+    let picked: Vec<Entity> = world.resource::<Selection>().entities.clone();
+    let lit: Vec<Entity> = picked.iter().filter_map(|e| sketch_of(world, *e)).collect();
+    let selected = picked.last().and_then(|e| sketch_of(world, *e));
     let mut q = world.query::<(Entity, &Operator, &Output)>();
     let sketches: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "sketch").map(|(e, _, o)| (e, o.0)).collect();
     let world: &World = world;
@@ -48,12 +51,12 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let value = |f: FrameIndex| if editing == Some(*e) { live.and_then(|l| l.preview_at(f)).or_else(|| own(f)) } else { own(f) };
         let color = if editing == Some(*e) {
             LIVE
-        } else if selected == Some(*e) && live.is_none() {
+        } else if lit.contains(e) && live.is_none() {
             style::ACCENT
         } else {
             Color32::from_white_alpha(70)
         };
-        if editing == Some(*e) || (selected == Some(*e) && live.is_none()) {
+        if editing == Some(*e) || (lit.contains(e) && live.is_none()) {
             path(painter, map, frame, |f| value(f).map(|v| to_canvas(f, v)).map(|v| [v[0], v[1]]), color);
         }
         let Some(v) = value(frame) else { continue };

@@ -1,8 +1,13 @@
-//! Timeline: transport controls and a zoomable, scrubbable ruler. The visible
-//! range is session state in the world. A thin strip under the ruler shows
-//! which frames the decode service holds in its cache; below it, one lane per
-//! sketch shows the frames it covers and, for the selected sketch, its
-//! strokes (click a lane to select the sketch).
+//! Timeline: transport controls, a zoomable ruler you scrub on, a strip
+//! showing which frames the decode service holds in its cache, and below
+//! them one lane per sketch (the frames it covers; under a selected sketch, a
+//! tick per stroke). The visible range and lane scroll are session state.
+//!
+//! - Scrub by dragging on the ruler. On the lanes, a click selects (Ctrl
+//!   toggles, Shift adds), a drag draws a box that selects what it touches,
+//!   a double-click enters that sketch's view, a right-click opens the menu.
+//! - Wheel on the ruler or Ctrl+wheel zooms time; Shift+wheel pans time; the
+//!   wheel on the lanes scrolls them; a middle-drag pans both.
 
 use bevy_ecs::prelude::*;
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
@@ -13,12 +18,12 @@ use tt_core::{AppBuilder, Class, Module};
 
 use bevy_ecs::name::Name;
 use tt_core::capture::LiveCapture;
-use tt_core::op::{Inputs, Operator, Output};
+use tt_core::op::Output;
 use tt_core::selection::Selection;
-use tt_core::signal::{FrameState, SignalId, SignalStore};
+use tt_core::signal::{FrameState, SignalStore};
 use tt_core::sketch::{ClockMap, sketch_of};
 
-use super::overlay;
+use super::{menu, overlay};
 use crate::media::{ActiveSource, Media};
 use crate::style;
 
@@ -28,13 +33,18 @@ use crate::style;
 pub struct TimelineView {
     pub start: f64,
     pub span: Option<f64>,
+    /// How far the lanes are scrolled down (points).
+    pub lane_scroll: f32,
 }
 
 pub struct TimelineModule;
 
 impl Module for TimelineModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<TimelineView>(Class::Session).init_resource::<TimelineView>();
+        app.declare::<TimelineView>(Class::Session)
+            .declare::<TimelineUi>(Class::Derived)
+            .init_resource::<TimelineView>()
+            .init_resource::<TimelineUi>();
     }
 }
 
@@ -105,7 +115,11 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         ui.monospace(timecode(t.frame(), t.fps));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             fit = ui.button("Fit").on_hover_text("Show the whole clip").clicked();
-            ui.label(egui::RichText::new("wheel: zoom · shift+wheel / middle-drag: pan").weak().small());
+            ui.label(
+                egui::RichText::new("wheel on the ruler or Ctrl+wheel: zoom · Shift+wheel: pan · wheel on lanes: scroll · middle-drag: pan both · drag lanes: box select · right-click: menu")
+                    .weak()
+                    .small(),
+            );
         });
     });
 
@@ -117,29 +131,44 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         world.resource_mut::<PendingActions>().0.extend(actions);
         return;
     }
+    let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 22.0));
+    let strip = Rect::from_min_size(Pos2::new(rect.min.x, band.max.y + 1.0), Vec2::new(rect.width(), 3.0));
+    let lanes_area = Rect::from_min_max(Pos2::new(rect.min.x, strip.max.y + 4.0), rect.max);
 
-    // Visible range (session state), with zoom/pan/follow applied.
+    // Visible range and lane scroll (session state), with zoom/pan/follow applied:
+    // wheel over the ruler or Ctrl+wheel zooms time; Shift+wheel (or a
+    // trackpad's sideways scroll) pans time; the wheel over the lanes scrolls
+    // them; a middle-drag pans both.
     let count = t.frame_count as f64;
     let mut view = *world.resource::<TimelineView>();
     if fit {
-        view = TimelineView::default();
+        view = TimelineView { lane_scroll: view.lane_scroll, ..TimelineView::default() };
     }
     let min_span = (rect.width() as f64 / 40.0).max(4.0); // at most 40 px per frame
     let mut span = view.span.unwrap_or(count).clamp(min_span, count * 1.05);
     let mut start = if view.span.is_none() { 0.0 } else { view.start };
+    let mut lane_scroll = view.lane_scroll;
     if let Some(pos) = response.hover_pos() {
-        let (delta, shift) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
-        let pan_px = delta.x + if shift { delta.y } else { 0.0 };
-        if !shift && delta.y != 0.0 {
+        let (delta, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta() as f64));
+        let over_ruler = pos.y < lanes_area.min.y;
+        let mut factor = zoom;
+        if over_ruler {
+            factor *= (delta.y as f64 * 0.003).exp();
+        } else {
+            lane_scroll -= delta.y;
+        }
+        if (factor - 1.0).abs() > 1e-9 {
             let under = Scale { rect, start, span }.frame_at(pos.x);
-            let new_span = (span * (-delta.y as f64 * 0.003).exp()).clamp(min_span, count * 1.05);
+            let new_span = (span / factor).clamp(min_span, count * 1.05);
             start = under - (under - start) * new_span / span;
             span = new_span;
         }
-        start -= pan_px as f64 * span / rect.width() as f64;
+        start -= delta.x as f64 * span / rect.width() as f64;
     }
     if response.dragged_by(egui::PointerButton::Middle) {
-        start -= response.drag_delta().x as f64 * span / rect.width() as f64;
+        let d = response.drag_delta();
+        start -= d.x as f64 * span / rect.width() as f64;
+        lane_scroll -= d.y;
     }
     // Follow the playhead while playing: page forward when it leaves the view.
     let head = t.playhead;
@@ -147,12 +176,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         start = head - span * 0.05;
     }
     start = start.clamp(-span * 0.02, (count - span * 0.98).max(-span * 0.02));
-    let fitted = span >= count * 0.999 && start.abs() < 1.0;
-    *world.resource_mut::<TimelineView>() = if fitted { TimelineView::default() } else { TimelineView { start, span: Some(span) } };
     let scale = Scale { rect, start, span };
 
     // Ruler.
-    let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 22.0));
     painter.rect_filled(band, 0.0, style::RULER);
     let step = tick_step(scale.px_per_frame(), t.fps);
     let mut f = (start / step as f64).ceil() as FrameIndex * step;
@@ -169,7 +195,6 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
 
     // Decode cache coverage (active rendition).
-    let strip = Rect::from_min_size(Pos2::new(rect.min.x, band.max.y + 1.0), Vec2::new(rect.width(), 3.0));
     if let Some(media) = world.get_resource::<Media>() {
         let which = world.resource::<ActiveSource>().0;
         if let Some(src) = media.source(which) {
@@ -182,10 +207,69 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             }
         }
     }
-    let clicked_lane = lanes(&painter, world, &scale, Pos2::new(rect.min.x, strip.max.y + 4.0), response.clicked().then(|| response.interact_pointer_pos()).flatten());
-    if let Some(e) = clicked_lane {
-        world.resource_mut::<Selection>().select_only(e);
+
+    // Lanes, and what the pointer does on them.
+    let origin = ui.input(|i| i.pointer.press_origin());
+    let mods = ui.input(|i| i.modifiers);
+    let mut ui_state = std::mem::take(&mut *world.resource_mut::<TimelineUi>());
+    let marquee = ui_state.marquee.zip(ui.input(|i| i.pointer.interact_pos())).map(|(a, b)| Rect::from_two_pos(a, b));
+    let hits = lanes(&painter, world, &scale, lanes_area, &mut lane_scroll, marquee);
+    let fitted = span >= count * 0.999 && start.abs() < 1.0;
+    *world.resource_mut::<TimelineView>() =
+        if fitted { TimelineView { lane_scroll, ..TimelineView::default() } } else { TimelineView { start, span: Some(span), lane_scroll } };
+
+    ui_state.lanes_area = Some(lanes_area);
+    let in_lanes = origin.is_some_and(|o| lanes_area.contains(o));
+    if in_lanes && response.drag_started_by(egui::PointerButton::Primary) {
+        ui_state.marquee = origin;
     }
+    if let Some(m) = marquee {
+        painter.rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
+        if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+            let hit = hits.in_box(m);
+            let mut sel = world.resource_mut::<Selection>();
+            if !(mods.shift || mods.ctrl || mods.command) {
+                sel.clear();
+            }
+            for e in hit {
+                if !sel.is_selected(e) {
+                    sel.entities.push(e);
+                }
+            }
+            ui_state.marquee = None;
+        }
+    } else if in_lanes
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let under = hits.at(pos);
+        if response.double_clicked() {
+            // Double-click a lane: into that sketch's view.
+            if let Some(e) = under.and_then(|e| sketch_of(world, e)) {
+                world.resource_mut::<Selection>().select_only(e);
+                actions.push(Action::EnterView);
+            }
+        } else if response.clicked() {
+            let mut sel = world.resource_mut::<Selection>();
+            match under {
+                Some(e) if mods.ctrl || mods.command => sel.toggle(e),
+                Some(e) if mods.shift => {
+                    if !sel.is_selected(e) {
+                        sel.entities.push(e);
+                    }
+                }
+                Some(e) => sel.select_only(e),
+                None => sel.clear(),
+            }
+        }
+    }
+    *world.resource_mut::<TimelineUi>() = ui_state;
+    // Right-click: select what's under it, then the entity menu.
+    if response.secondary_clicked()
+        && let Some(e) = response.interact_pointer_pos().and_then(|p| hits.at(p))
+    {
+        menu::right_clicked(world, e);
+    }
+    response.context_menu(|ui| menu::entity_menu(ui, world));
 
     // Playhead: a frame-wide band when frames are wide enough to see, else a line.
     let shown = t.frame() as f64;
@@ -195,13 +279,15 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
     painter.line_segment([Pos2::new(x0, rect.min.y), Pos2::new(x0, rect.max.y)], Stroke::new(1.5, style::ACCENT));
 
-    // Scrub with the primary button.
+    // Scrub with the primary button, from the ruler.
     let to_frame = |x: f32| (scale.frame_at(x).floor() as FrameIndex).clamp(0, t.last_frame());
-    if let Some(pos) = response.hover_pos() {
+    if let Some(pos) = response.hover_pos().filter(|p| p.y < lanes_area.min.y) {
         let f = to_frame(pos.x);
         response.clone().on_hover_text_at_pointer(format!("{f}  ·  {}", timecode(f, t.fps)));
     }
-    if (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
+    let from_ruler = origin.is_some_and(|o| o.y < lanes_area.min.y);
+    if from_ruler
+        && (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
         && let Some(pos) = response.interact_pointer_pos()
     {
         let f = to_frame(pos.x);
@@ -215,32 +301,54 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
 const LANE_H: f32 = 18.0;
 
-/// One lane per sketch: its path's coverage (valid solid, stale dim) and, for
-/// the selected sketch, a tick row with each stroke's span. A stroke in
-/// progress shows on the lane of the sketch it edits (visited frames solid,
-/// frames its falloff moves dim), or on a lane of its own for a new sketch.
-/// Returns the sketch whose lane was clicked.
-fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, top: Pos2, click: Option<Pos2>) -> Option<Entity> {
-    let selected = world.resource::<Selection>().primary().and_then(|e| sketch_of(world, e));
-    let mut q = world.query::<(Entity, &Operator, &Output, Option<&Name>, Option<&Inputs>)>();
-    let mut rows: Vec<(Entity, String, SignalId, Vec<Entity>)> = q
-        .iter(world)
-        .filter(|(_, o, _, _, _)| o.kind == "sketch")
-        .map(|(e, _, out, n, i)| (e, n.map_or("sketch".into(), |n| n.to_string()), out.0, i.map(|i| i.0.iter().map(|x| x.1).collect()).unwrap_or_default()))
-        .collect();
-    rows.sort_by_key(|r| r.0);
-    let visible = (scale.start.floor() as FrameIndex).max(0)..(scale.start + scale.span).ceil() as FrameIndex;
+/// What the lanes put where (screen), for clicks and box selection.
+#[derive(Default)]
+struct Hits {
+    /// `(sketch, its lane's label area, its coverage bars)`.
+    lanes: Vec<(Entity, Rect, Rect, Vec<Rect>)>,
+    /// `(stroke, its tick)`, under selected sketches.
+    ticks: Vec<(Entity, Rect)>,
+}
+
+impl Hits {
+    /// The stroke tick or sketch lane at `p`.
+    fn at(&self, p: Pos2) -> Option<Entity> {
+        if let Some((e, _)) = self.ticks.iter().find(|(_, r)| r.expand(1.0).contains(p)) {
+            return Some(*e);
+        }
+        self.lanes.iter().find(|(_, lane, _, _)| lane.contains(p)).map(|(e, _, _, _)| *e)
+    }
+
+    /// Everything a box touches: sketches by their label or coverage, strokes by their ticks.
+    fn in_box(&self, m: Rect) -> Vec<Entity> {
+        let mut out: Vec<Entity> = self.lanes.iter().filter(|(_, _, label, bars)| label.intersects(m) || bars.iter().any(|b| b.intersects(m))).map(|(e, _, _, _)| *e).collect();
+        out.extend(self.ticks.iter().filter(|(_, r)| r.intersects(m)).map(|(e, _)| *e));
+        out
+    }
+}
+
+/// One lane per sketch, in the outliner's tree order (nested sketches
+/// indented): its path's coverage (valid solid, stale dim) and, under a
+/// selected sketch, a tick per stroke. A stroke in progress shows on the lane
+/// of the sketch it edits (visited frames solid, frames its falloff moves
+/// dim), or on a lane of its own for a new sketch. The lanes scroll
+/// vertically under the fixed ruler; `scroll` is clamped here.
+fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, scroll: &mut f32, marquee: Option<Rect>) -> Hits {
+    let tree = super::outliner::sketch_tree(world);
+    let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
     let live = world.resource::<LiveCapture>().0.as_ref();
-    let mut clicked = None;
-    let mut y = top.y;
-    let bar = |y0: f32, y1: f32, a: FrameIndex, b: FrameIndex, color: egui::Color32| {
+    let new_lane = live.is_some_and(|l| l.target.is_none());
+    let content_h = (tree.len() + usize::from(new_lane)) as f32 * LANE_H + 6.0;
+    *scroll = scroll.clamp(0.0, (content_h - area.height()).max(0.0));
+    let painter = painter.with_clip_rect(area);
+    let visible = (scale.start.floor() as FrameIndex).max(0)..(scale.start + scale.span).ceil() as FrameIndex;
+    let mut hits = Hits::default();
+    let bar = |y0: f32, y1: f32, a: FrameIndex, b: FrameIndex| -> Option<Rect> {
         let (x0, x1) = (scale.x(a as f64).max(scale.rect.min.x), scale.x(b as f64).min(scale.rect.max.x));
-        if x1 > x0 {
-            painter.rect_filled(Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), y0..=y1), 1.5, color);
-        }
+        (x1 > x0).then(|| Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), y0..=y1))
     };
-    // Runs of frames where `has(f)` holds, within the visible range.
+    // Runs of frames where `has(f)` holds.
     let runs = |first: FrameIndex, len: usize, has: &dyn Fn(usize) -> bool| -> Vec<(FrameIndex, FrameIndex)> {
         let mut out = Vec::new();
         let mut i = 0;
@@ -260,55 +368,89 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, top: Pos2, c
     let live_bars = |y: f32, live: &tt_core::capture::Live| {
         if let Some((first, values)) = &live.preview {
             for (a, b) in runs(*first, values.len(), &|i| values[i].is_some()) {
-                bar(y + 3.0, y + 12.0, a, b, overlay::LIVE.gamma_multiply(0.35));
+                if let Some(r) = bar(y + 2.0, y + 11.0, a, b) {
+                    painter.rect_filled(r, 1.5, overlay::LIVE.gamma_multiply(0.35));
+                }
             }
         }
         if let Some((first, values)) = &live.boxes {
             for (a, b) in runs(*first, values.len(), &|i| values[i].is_some()) {
-                bar(y + 3.0, y + 12.0, a, b, overlay::LIVE);
-            }
-        }
-    };
-    for (e, name, signal, strokes) in &rows {
-        let is_selected = selected == Some(*e);
-        let lane = Rect::from_min_size(Pos2::new(top.x, y), Vec2::new(scale.rect.width(), LANE_H));
-        if is_selected {
-            painter.rect_filled(lane, 0.0, style::ACCENT.gamma_multiply(0.08));
-        }
-        let color = if is_selected { style::ACCENT } else { style::MUTED };
-        if let Some(sig) = store.get(*signal) {
-            for (r, state) in sig.runs(visible.clone()) {
-                match state {
-                    FrameState::Valid => bar(y + 3.0, y + 12.0, r.start, r.end, color.gamma_multiply(0.7)),
-                    FrameState::Stale => bar(y + 3.0, y + 12.0, r.start, r.end, color.gamma_multiply(0.25)),
-                    FrameState::Absent => {}
+                if let Some(r) = bar(y + 2.0, y + 11.0, a, b) {
+                    painter.rect_filled(r, 1.5, overlay::LIVE);
                 }
             }
         }
-        if is_selected {
-            // Each stroke's span, as ticks under the path.
-            for s in strokes {
-                if let Some((a, b)) = world.get::<ClockMap>(*s).and_then(|c| c.frame_hull()) {
-                    bar(y + 13.5, y + 15.5, a, b + 1, style::TEXT.gamma_multiply(0.5));
+    };
+    for (i, (e, depth)) in tree.iter().enumerate() {
+        let y = area.min.y + i as f32 * LANE_H - *scroll;
+        let lane = Rect::from_min_size(Pos2::new(area.min.x, y), Vec2::new(area.width(), LANE_H));
+        if lane.max.y < area.min.y || lane.min.y > area.max.y {
+            continue;
+        }
+        let name = world.get::<Name>(*e).map_or("sketch".into(), |n| n.to_string());
+        let label_pos = Pos2::new(lane.min.x + 6.0 + *depth as f32 * 10.0, y + 7.0);
+        let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), style::TEXT);
+        let label = Rect::from_min_size(label_pos - Vec2::new(0.0, galley.size().y / 2.0), galley.size()).expand(2.0);
+        let mut bars = Vec::new();
+        if let Some(sig) = world.get::<Output>(*e).and_then(|o| store.get(o.0)) {
+            for (r, state) in sig.runs(visible.clone()) {
+                if state != FrameState::Absent
+                    && let Some(b) = bar(y + 2.0, y + 11.0, r.start, r.end)
+                {
+                    bars.push((b, state));
+                }
+            }
+        }
+        let strokes = tt_core::commands::strokes_of(world, *e);
+        let selected = selection.is_selected(*e);
+        let previewed = marquee.is_some_and(|m| label.intersects(m) || bars.iter().any(|(b, _)| b.intersects(m)));
+        if selected || previewed {
+            painter.rect_filled(lane, 0.0, style::ACCENT.gamma_multiply(if selected { 0.10 } else { 0.05 }));
+        }
+        let color = if selected || previewed { style::ACCENT } else { style::MUTED };
+        for (b, state) in &bars {
+            painter.rect_filled(*b, 1.5, color.gamma_multiply(if *state == FrameState::Valid { 0.7 } else { 0.25 }));
+        }
+        // A tick per stroke under a selected sketch (or one whose stroke is selected).
+        if selected || strokes.iter().any(|c| selection.is_selected(*c)) {
+            for c in &strokes {
+                if let Some((a, b)) = world.get::<ClockMap>(*c).and_then(|m| m.frame_hull())
+                    && let Some(r) = bar(y + 12.5, y + 16.5, a, b + 1)
+                {
+                    let lit = selection.is_selected(*c) || marquee.is_some_and(|m| r.intersects(m));
+                    painter.rect_filled(r, 1.0, if lit { style::TEXT } else { style::TEXT.gamma_multiply(0.4) });
+                    hits.ticks.push((*c, r));
                 }
             }
         }
         if let Some(l) = live.filter(|l| l.target == Some(*e)) {
             live_bars(y, l);
         }
-        painter.text(Pos2::new(lane.min.x + 6.0, y + 7.5), Align2::LEFT_CENTER, name, FontId::proportional(11.0), if is_selected { style::TEXT } else { style::MUTED });
-        if click.is_some_and(|p| lane.contains(p)) {
-            clicked = Some(*e);
-        }
-        y += LANE_H;
+        painter.galley(label.min + Vec2::splat(2.0), galley, if selected { style::TEXT } else { style::MUTED });
+        hits.lanes.push((*e, lane, label, bars.into_iter().map(|(b, _)| b).collect()));
     }
+    let y = area.min.y + tree.len() as f32 * LANE_H - *scroll;
     if let Some(l) = live.filter(|l| l.target.is_none()) {
         live_bars(y, l);
-        painter.text(Pos2::new(top.x + 6.0, y + 7.5), Align2::LEFT_CENTER, "⏺ new sketch", FontId::proportional(11.0), style::TEXT);
-    } else if rows.is_empty() {
-        painter.text(Pos2::new(top.x + 8.0, y + 6.0), Align2::LEFT_TOP, "no sketches yet · D arms the Sketch tool, then press and hold on the video", FontId::proportional(11.0), style::MUTED);
+        painter.text(Pos2::new(area.min.x + 6.0, y + 7.0), Align2::LEFT_CENTER, "⏺ new sketch", FontId::proportional(11.0), style::TEXT);
+    } else if tree.is_empty() {
+        painter.text(Pos2::new(area.min.x + 8.0, y + 4.0), Align2::LEFT_TOP, "no sketches yet · D arms the Sketch tool, then press and hold on the video", FontId::proportional(11.0), style::MUTED);
     }
-    clicked
+    // A scrollbar when the lanes don't fit.
+    if content_h > area.height() {
+        let h = area.height() * area.height() / content_h;
+        let top = area.min.y + (area.height() - h) * (*scroll / (content_h - area.height()));
+        painter.rect_filled(Rect::from_min_size(Pos2::new(area.max.x - 5.0, top), Vec2::new(4.0, h)), 2.0, style::TEXT.gamma_multiply(0.35));
+    }
+    hits
+}
+
+/// Timeline pointer state (a box being dragged over the lanes).
+#[derive(Resource, Debug, Default)]
+pub struct TimelineUi {
+    marquee: Option<Pos2>,
+    /// Where the lanes were drawn (the demo aims at it).
+    pub lanes_area: Option<Rect>,
 }
 
 pub(crate) fn rate_label(rate: f64) -> String {

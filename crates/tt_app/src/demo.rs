@@ -8,8 +8,14 @@
 //! 3. enters its view (Tab) and records a nested sketch there, the hand
 //!    seeing the sprite as the view shows it.
 //!
+//! 4. drives the UI through egui itself (injected pointer events): duplicates
+//!    the sketches until the timeline's lanes overflow, box-selects in the
+//!    timeline, middle-drags its lanes, right-clicks an outliner row, and
+//!    box-selects in the outliner.
+//!
 //! It logs the error against the truth, the edit's falloff, how central the
-//! sprite stays in the view and the nested sketch's error, then quits.
+//! sprite stays in the view, the nested sketch's error and what the UI steps
+//! selected, then quits. Screenshots go to `<data dir>/screens/`.
 
 use bevy_ecs::prelude::*;
 use tt_core::input::{Action, PendingActions};
@@ -22,6 +28,10 @@ use tt_core::transport::Transport;
 use tt_core::view::{ActiveView, map_at};
 
 const LAG: f64 = 0.25;
+
+fn push_action(world: &mut World, a: Action) {
+    world.resource_mut::<PendingActions>().push(a);
+}
 const START_FRAME: i64 = 120;
 /// Wall seconds from the press: Space taps (play, pause, play, pause), release.
 const TAPS: [f64; 4] = [0.05, 4.0, 5.0, 9.0];
@@ -47,6 +57,7 @@ enum Phase {
     InView { since: f64 },
     Nest { t0: f64, taps: usize },
     NestSettle { t0: f64 },
+    Ui { t0: f64, step: usize },
     Finish { at: f64 },
 }
 
@@ -66,6 +77,8 @@ pub struct SketchDemo {
     shots: Vec<(&'static str, f64)>,
     /// A screenshot due now.
     pub shot: Option<&'static str>,
+    /// Input events for egui's next frame (the UI script).
+    pub inject: Vec<egui::Event>,
 }
 
 impl SketchDemo {
@@ -74,7 +87,7 @@ impl SketchDemo {
         let text = std::fs::read_to_string(&path).map_err(|e| tracing::error!("sketch demo: {e}")).ok()?;
         let json: serde_json::Value = serde_json::from_str(&text).ok()?;
         let truth = json["centers"].as_array()?.iter().filter_map(|c| Some([c[0].as_f64()?, c[1].as_f64()?])).collect();
-        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None })
+        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None, inject: Vec::new() })
     }
 
     fn normal(&mut self) -> f64 {
@@ -243,7 +256,16 @@ impl SketchDemo {
                 if now - t0 > 0.3 {
                     self.report_nested(world);
                     self.shots.push(("4-nested-done", now));
-                    self.phase = Phase::Finish { at: now + 0.8 }; // let the last screenshot arrive
+                    self.phase = Phase::Ui { t0: now + 0.4, step: 0 };
+                }
+            }
+            Phase::Ui { t0, step } => {
+                *frame = PointerFrame::default();
+                if now >= t0 + 0.15 * step as f64 {
+                    match self.ui_step(world, step) {
+                        true => self.phase = Phase::Ui { t0, step: step + 1 },
+                        false => self.phase = Phase::Finish { at: now + 0.8 }, // let the last screenshot arrive
+                    }
                 }
             }
             Phase::Finish { at } => {
@@ -254,6 +276,73 @@ impl SketchDemo {
             }
         }
         false
+    }
+
+    /// One step of the scripted UI input. Returns false when the script is over.
+    fn ui_step(&mut self, world: &mut World, step: usize) -> bool {
+        use egui::{Event, Modifiers, PointerButton, Pos2, Vec2};
+        let Some(lanes) = world.resource::<crate::panels::timeline::TimelineUi>().lanes_area else { return true };
+        let (Some(list), row) = ({
+            let o = world.resource::<crate::panels::outliner::OutlinerState>();
+            (o.list_area, o.first_row)
+        }) else {
+            return true;
+        };
+        let moved = Event::PointerMoved;
+        let button = |pos: Pos2, button: PointerButton, pressed: bool| Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
+        let lerp = |a: Pos2, b: Pos2, u: f32| a + (b - a) * u;
+        // A box over the timeline's lanes, a middle-drag on them, a box over the outliner.
+        let (ta, tb) = (lanes.min + Vec2::new(200.0, 4.0), lanes.min + Vec2::new(1100.0, 64.0));
+        let (ma, mb) = (lanes.center(), lanes.center() - Vec2::new(0.0, 150.0));
+        let row_y = row.map_or(list.min.y + 10.0, |r| r.min.y);
+        let (oa, ob) = (Pos2::new(list.min.x + 40.0, row_y + 2.0), Pos2::new(list.min.x + 170.0, row_y + 90.0));
+        let selected = |world: &World| world.resource::<Selection>().entities.len();
+        match step {
+            0..=2 => {
+                push_action(world, Action::SelectAll);
+                push_action(world, Action::Duplicate);
+            }
+            3 => {
+                push_action(world, Action::ExitView);
+                push_action(world, Action::DeselectAll);
+            }
+            4 => {
+                let n = crate::panels::outliner::sketch_tree(world).len();
+                tracing::info!("sketch demo · UI: {n} sketches (duplicated), lanes area {:.0}×{:.0}", lanes.width(), lanes.height());
+                self.shot = Some("5-many-sketches");
+            }
+            5 => self.inject.extend([moved(ta), button(ta, PointerButton::Primary, true)]),
+            6..=9 => self.inject.push(moved(lerp(ta, tb, (step - 5) as f32 / 4.0))),
+            10 => self.shot = Some("6-timeline-box"),
+            11 => self.inject.push(button(tb, PointerButton::Primary, false)),
+            12 => tracing::info!("sketch demo · UI: a box over the timeline's lanes selected {}", selected(world)),
+            13 => self.inject.extend([moved(ma), button(ma, PointerButton::Middle, true)]),
+            14..=17 => self.inject.push(moved(lerp(ma, mb, (step - 13) as f32 / 4.0))),
+            18 => self.inject.push(button(mb, PointerButton::Middle, false)),
+            19 => {
+                let scroll = world.resource::<crate::panels::timeline::TimelineView>().lane_scroll;
+                tracing::info!("sketch demo · UI: a middle-drag up scrolled the lanes to {scroll:.0} pt");
+                self.shot = Some("7-timeline-scrolled");
+            }
+            20 => {
+                let p = row.map_or(list.center(), |r| r.min + Vec2::new(60.0, r.height() / 2.0));
+                self.inject.extend([moved(p), button(p, PointerButton::Secondary, true), button(p, PointerButton::Secondary, false)]);
+            }
+            21 => self.shot = Some("8-outliner-menu"),
+            22 => tracing::info!("sketch demo · UI: right-click on the first outliner row selected {} ({:?})", selected(world), world.resource::<Selection>().primary().map(|e| crate::panels::outliner::label(world, e))),
+            23 => {
+                // Close the menu with a click on an empty part of the outliner.
+                let p = Pos2::new(list.min.x + 100.0, list.max.y - 20.0);
+                self.inject.extend([moved(p), button(p, PointerButton::Primary, true), button(p, PointerButton::Primary, false)]);
+            }
+            24 => self.inject.extend([moved(oa), button(oa, PointerButton::Primary, true)]),
+            25..=28 => self.inject.push(moved(lerp(oa, ob, (step - 24) as f32 / 4.0))),
+            29 => self.shot = Some("9-outliner-box"),
+            30 => self.inject.push(button(ob, PointerButton::Primary, false)),
+            31 => tracing::info!("sketch demo · UI: a box over the outliner selected {}", selected(world)),
+            _ => return false,
+        }
+        true
     }
 
     fn path(&self, world: &World, frames: std::ops::Range<i64>) -> Vec<Option<[f32; 6]>> {

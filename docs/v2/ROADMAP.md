@@ -224,7 +224,8 @@ The original plan follows.
 | Hold-to-simulate | ✅ press and hold while paused. A held frame takes the hand at the end of the hold (no lag shift). Steps while holding sculpt frame by frame |
 | Live feedback | ✅ raw hand trail (0.5 s), the sketch with the stroke laid over it (path and region), other sketches faint, the selected one bright with its path ±90 frames, crosshair and key hints. In the Select tool, a click on a box selects its sketch |
 | Re-tuning | ✅ every parameter in the Inspector (drag = one undo step); presets Tight / Default / Loose; "use for new sketches". ⏳ raw vs smoothed trail toggle |
-| Timeline lanes | ✅ one lane per sketch (valid / stale coverage), with each stroke's span under the selected sketch. The live stroke shows its visited frames and the frames its falloff moves. Click to select. ⏳ summaries, uncertainty |
+| Timeline lanes | ✅ one lane per sketch in tree order (valid / stale coverage), with each stroke's span under selected sketches. The live stroke shows its visited frames and the frames its falloff moves. ⏳ summaries, uncertainty |
+| Selecting and commands | ✅ box selection in the Outliner and Timeline; click / Ctrl / Shift selection; a shared right-click menu (enter view, rename, duplicate, delete, select strokes / sketch, select all); keys `X`/`Delete`, `Shift+D`, `A`, `F2`. The Outliner is a tree with filtering. The Timeline scrolls its lanes (wheel, middle-drag, scrollbar) under a fixed ruler you scrub on. Each command is one undo step and tested (`tests/commands.rs`); the demo drives the UI with injected pointer events and checks each step |
 | Takes and levels, modifier stacks | ⏳ next |
 
 **Measured:**

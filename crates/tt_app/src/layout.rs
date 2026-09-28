@@ -57,6 +57,9 @@ pub struct LayoutModule;
 
 impl Module for LayoutModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<Layout>(Class::Session).init_resource::<Layout>();
+        app.declare::<Layout>(Class::Session)
+            .init_resource::<Layout>()
+            .declare::<crate::panels::outliner::OutlinerState>(Class::Session)
+            .init_resource::<crate::panels::outliner::OutlinerState>();
     }
 }

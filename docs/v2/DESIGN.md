@@ -424,10 +424,18 @@ Adopted from Rerun's proven design.
   - **Jobs/status.**
   - Later: **Curve editor**, **Operator graph** (egui-snarl).
 - **Tools** (Select, Sketch, Adjust, Pan/Zoom) are state machines in the `Tools` set, fed by a `PointerFrame` resource (every timestamped sample since the last frame, in source pixels) and `KeysHeld`, so they run headless in tests. An in-progress gesture is world state (the Sketch tool's `LiveCapture`), so overlays draw it; on commit it becomes document entities in one transaction.
+- **Selecting and commands** work the same in the Outliner, the Timeline and the Viewport.
+  - Click selects, Ctrl+click toggles, Shift+click adds (a range in the Outliner).
+  - Dragging a box over Outliner rows or Timeline lanes selects what it touches.
+  - Right-click opens one shared menu: enter view, rename, duplicate, delete, select its strokes or its sketch, select all.
+  - Each command is one undo step (`tt_core::commands`).
+  - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and scrolls to what is selected elsewhere.
+  - The Timeline scrubs from the ruler. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), and a double-click enters a sketch's view.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
   - `Space` play (also while holding the button: recording across frames);
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel sets a stroke's falloff while holding; `Esc` cancels the stroke or leaves the tool;
-  - `Alt+A` deselects;
+  - `Alt+A` deselects, `A` selects all sketches;
+  - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes, `F2` renames;
   - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when it changes;
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;

@@ -43,6 +43,14 @@ pub enum Action {
     EnterView,
     /// Back out to the parent view (or the source).
     ExitView,
+    /// Delete the selection (and what belongs to it).
+    Delete,
+    /// Duplicate the selected sketches.
+    Duplicate,
+    /// Select every sketch.
+    SelectAll,
+    /// Rename the selected entity (the outliner edits the name).
+    Rename,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -57,6 +65,8 @@ pub enum Key {
     End,
     Escape,
     Tab,
+    Delete,
+    F2,
     Letter(char),
 }
 
@@ -117,6 +127,11 @@ impl Default for Keymap {
                 // Like entering a group (Blender's Tab into edit mode, Figma's Enter).
                 (b(Key::Tab, Mods::NONE, false), EnterView),
                 (b(Key::Tab, Mods::SHIFT, false), ExitView),
+                (b(Key::Letter('x'), Mods::NONE, false), Delete),
+                (b(Key::Delete, Mods::NONE, false), Delete),
+                (b(Key::Letter('d'), Mods::SHIFT, false), Duplicate),
+                (b(Key::Letter('a'), Mods::NONE, false), SelectAll),
+                (b(Key::F2, Mods::NONE, false), Rename),
             ],
         }
     }
@@ -154,6 +169,8 @@ impl Keymap {
             Key::End => "End".into(),
             Key::Escape => "Esc".into(),
             Key::Tab => "Tab".into(),
+            Key::Delete => "Delete".into(),
+            Key::F2 => "F2".into(),
             Key::Letter(c) => c.to_ascii_uppercase().to_string(),
         });
         Some(s)

@@ -233,6 +233,10 @@ impl eframe::App for Shell {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         keys::take_tab(ctx, raw_input, &mut self.taken_keys);
+        // The sketch demo's scripted UI input.
+        if let Some(demo) = &mut self.sketch_demo {
+            raw_input.events.append(&mut demo.inject);
+        }
     }
 
     fn on_exit(&mut self) {
