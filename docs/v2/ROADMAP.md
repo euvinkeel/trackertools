@@ -425,6 +425,12 @@ Findings on the way:
 
 ---
 
+## macOS (Apple Silicon)
+
+Runs on a Mac as of 2026-09-28: the workspace compiles for `aarch64-apple-darwin`; data lives in `~/Library/Application Support/trackertools`; the scrub proxy uses VideoToolbox; CoTracker3 tries MPS. Not yet hands-on tested on a Mac. Sketching uses egui's pointer there (no high-rate input service yet). The plan for the M4 Pro's hardware (decode, a ProRes proxy, pointer input, the tracker on CPU/GPU, CoTracker on MPS/ANE): [APPLE_SILICON.md](APPLE_SILICON.md).
+
+---
+
 ## After the first target (to be re-planned)
 
 | Milestone | Scope |

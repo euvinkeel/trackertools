@@ -24,7 +24,9 @@ Protocol, little-endian, over stdin / stdout:
 
 Arguments: `--weights PATH` (CoTracker3 `scaled_online.pth`; default: the
 `TT_COTRACKER_WEIGHTS` environment variable, else torch hub's cache, where v1
-downloaded it) and `--device cpu|cuda` (default: cuda when available).
+downloaded it) and `--device cpu|cuda|mps` (default: CUDA when available,
+else Apple Silicon's GPU (MPS) if a trial window runs there, else the CPU;
+`TT_COTRACKER_DEVICE` sets it too).
 The weights are Meta's, CC-BY-NC 4.0: not part of this repository.
 """
 
@@ -33,6 +35,10 @@ import json
 import math
 import os
 import sys
+from typing import Optional
+
+# Ops MPS lacks run on the CPU instead of failing (must be set before torch loads).
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -75,6 +81,29 @@ class Engine(v1.TrackingEngine):
         self.iters = 6
         self.fp16_encoder = False
         self.graphed = v1.GraphedWindow(self) if device == "cuda" else None
+
+
+def pick_engine(weights: str, asked: Optional[str]) -> "Engine":
+    """The engine on the asked device, else the best one that works: CUDA,
+    then MPS (after a trial window: not every op of the model is proven
+    there), then the CPU."""
+    if asked:
+        return Engine(weights, asked)
+    if torch.cuda.is_available():
+        return Engine(weights, "cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        try:
+            eng = Engine(weights, "mps")
+            with torch.inference_mode():
+                frames = [np.zeros((v1.MODEL_H, v1.MODEL_W, 3), np.uint8)] * eng.S
+                pyramid = eng.encode(frames)
+                probe = [v1.Track(key="probe", q=0, x=100.0, y=100.0, end=1)]
+                eng.sample_feats(pyramid, probe, 0)
+                eng.run_window(pyramid, probe, 0)
+            return eng
+        except Exception as exc:  # fall back, and say why on stderr
+            print(f"MPS failed ({type(exc).__name__}: {exc}); using the CPU", file=sys.stderr)
+    return Engine(weights, "cpu")
 
 
 def send(msg: dict):
@@ -189,10 +218,9 @@ def main():
         weights = args.weights or default_weights()
         if not os.path.exists(weights):
             raise FileNotFoundError(f"CoTracker3 weights not found at {weights} (set TT_COTRACKER_WEIGHTS)")
-        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
         torch.set_grad_enabled(False)
-        eng = Engine(weights, device)
-        send({"ready": {"device": device, "window": eng.S}})
+        eng = pick_engine(weights, args.device or os.environ.get("TT_COTRACKER_DEVICE"))
+        send({"ready": {"device": eng.device, "window": eng.S}})
         stdin = sys.stdin.buffer
         header = json.loads(stdin.readline())
         with torch.inference_mode():

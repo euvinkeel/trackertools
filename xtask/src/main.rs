@@ -243,11 +243,23 @@ fn counter_graph(frames: u32) -> String {
     format!(
         "testsrc2=s={W}x{H}:r={FPS}:d={d},format=yuv420p[bg];{code}[code];\
          [bg][code]overlay=x={bx}:y={by}:shortest=1,\
-         drawtext=fontfile='C\\:/Windows/Fonts/consola.ttf':text='%{{frame_num}}':start_number=0:x=40:y=40:fontsize=96:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
+         drawtext={font}:text='%{{frame_num}}':start_number=0:x=40:y=40:fontsize=96:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12",
         code = barcode_source(frames),
         bx = BARCODE.x,
         by = BARCODE.y,
+        font = counter_font(),
     )
+}
+
+/// The burned-in counter's font (only for looking at the clips: tests read the barcode).
+fn counter_font() -> &'static str {
+    if cfg!(windows) {
+        "fontfile='C\\:/Windows/Fonts/consola.ttf'"
+    } else if cfg!(target_os = "macos") {
+        "fontfile='/System/Library/Fonts/Menlo.ttc'"
+    } else {
+        "font=monospace"
+    }
 }
 
 fn encode(graph: &str, codec_args: &[String], extra: &[String], path: &Path) -> Result<()> {
