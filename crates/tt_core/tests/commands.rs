@@ -7,7 +7,9 @@ use bevy_ecs::name::Name;
 use tt_core::commands::{delete, duplicate, rename, strokes_of};
 use tt_core::history::{self, History};
 use tt_core::input::Action;
+use tt_core::persist;
 use tt_core::selection::Selection;
+use tt_core::signal::{SignalId, SignalStore};
 use tt_core::sketch::SketchParams;
 use tt_core::transport::Transport;
 use tt_core::view::{ActiveView, view_of};
@@ -175,6 +177,41 @@ fn a_nested_sketch_survives_its_parent_being_deleted() {
         }
     }
     assert_eq!(before.iter().flatten().count(), after.iter().flatten().count());
+}
+
+#[test]
+fn a_save_after_a_delete_leaves_the_deleted_signals_out() {
+    let mut d = Driver::new();
+    let parent = record(&mut d, false);
+    edit_at_130(&mut d, parent);
+    d.core.world.resource_mut::<Selection>().select_only(parent);
+    d.frame(still(0.0, 0.0), Input { action: Some(Action::EnterView), ..UP });
+    d.frames(2, still(0.0, 0.0), UP);
+    let nested = record(&mut d, true);
+    // The parent: its output, 2 strokes, its view. The nested sketch: its output, a stroke and its Through.
+    assert_eq!(d.core.world.resource::<SignalStore>().ids().count(), 7);
+    delete(&mut d.core.world, &[parent]);
+    d.frames(3, still(0.0, 0.0), UP);
+    let kept = values(&d, nested);
+    assert!(kept.iter().flatten().count() > 40);
+
+    let path = std::env::temp_dir().join(format!("tt_commands_{}.ttproj", std::process::id()));
+    let stats = persist::save(&mut d.core.world, &path).unwrap();
+    assert_eq!((stats.entities, stats.signals), (2, 3), "only the nested sketch, its stroke and their signals");
+    // An older save could hold signals nothing refers to: they are dropped on load.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("INSERT INTO signals (id, channels) VALUES (9999, 3)", []).unwrap();
+    drop(conn);
+
+    let mut e = Driver::new();
+    persist::load(&mut e.core.world, &path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(e.core.world.resource::<SignalStore>().ids().count(), 3);
+    assert!(e.core.world.resource::<SignalStore>().get(SignalId(9999)).is_none());
+    // Its deleted home view is a dangling edge now; it evaluates as before.
+    e.frames(3, still(0.0, 0.0), UP);
+    let s = e.sketches()[0];
+    assert_eq!(values(&e, s), kept);
 }
 
 #[test]

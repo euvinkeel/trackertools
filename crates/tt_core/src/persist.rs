@@ -6,14 +6,15 @@
 //!   operator inputs) are remapped on load by walking the reflected value.
 //! - **Signals**: chunks are content-addressed (BLAKE3) and LZ4-compressed,
 //!   so a save after a small edit writes only the chunks that changed.
-//! - **Deleted entities** (disabled, kept only for undo) are not saved; undo
-//!   history does not outlive the session.
+//! - **Deleted entities** (disabled, kept only for undo) are not saved, nor
+//!   are signals no saved component refers to; undo history does not outlive
+//!   the session.
 //! - **Meta**: format and version for migrations, plus app-level entries
 //!   (the media path, …) through [`ProjectMeta`].
 //!
 //! Saving runs in one SQLite transaction: a crash never leaves half a project.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +23,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::resource::IsResource;
 use bevy_reflect::serde::{TypedReflectDeserializer, TypedReflectSerializer};
-use bevy_reflect::{PartialReflect, ReflectMut, TypeRegistry};
+use bevy_reflect::{FromReflect, PartialReflect, ReflectMut, ReflectRef, TypeRegistry};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::DeserializeSeed;
 
@@ -78,6 +79,9 @@ pub fn save(world: &mut World, path: &Path) -> Result<SaveStats> {
 
     // Serialize components first (no DB borrow while holding world references).
     let mut rows: Vec<(u64, String, String)> = Vec::new();
+    // The signals those components refer to: the only ones saved (a deleted
+    // entity's signals stay in the store for undo, but not in the file).
+    let mut used: HashSet<SignalId> = HashSet::new();
     {
         let registry = world.resource::<AppTypeRegistry>().clone();
         let registry = registry.read();
@@ -89,6 +93,7 @@ pub fn save(world: &mut World, path: &Path) -> Result<SaveStats> {
                 let ser = TypedReflectSerializer::new(value.as_partial_reflect(), &registry);
                 let text = ron::to_string(&ser).with_context(|| format!("serializing {type_path}"))?;
                 rows.push((entity.id().to_bits(), type_path.clone(), text));
+                collect_signals(value.as_partial_reflect(), &mut used);
                 any = true;
             }
             stats.entities += usize::from(any);
@@ -116,7 +121,7 @@ pub fn save(world: &mut World, path: &Path) -> Result<SaveStats> {
     tx.execute("DELETE FROM signal_chunks", [])?;
     {
         let store = world.resource::<SignalStore>();
-        let mut ids: Vec<SignalId> = store.ids().collect();
+        let mut ids: Vec<SignalId> = store.ids().filter(|id| used.contains(id)).collect();
         ids.sort();
         let mut ins_sig = tx.prepare("INSERT INTO signals (id, channels) VALUES (?1, ?2)")?;
         let mut ins_chunk = tx.prepare("INSERT INTO signal_chunks (signal, idx, hash) VALUES (?1, ?2, ?3)")?;
@@ -170,6 +175,7 @@ pub fn load(world: &mut World, path: &Path) -> Result<()> {
         "SELECT signal_chunks.idx, blobs.data FROM signal_chunks JOIN blobs ON blobs.hash = signal_chunks.hash
          WHERE signal_chunks.signal = ?1",
     )?;
+    let loaded: Vec<SignalId> = channels.iter().map(|(id, _)| SignalId(*id as u64)).collect();
     for (id, ch) in channels {
         let packed: Vec<(i64, Vec<u8>)> = chunk_q.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         let raw: Vec<(i64, Vec<u8>)> = packed
@@ -210,6 +216,26 @@ pub fn load(world: &mut World, path: &Path) -> Result<()> {
         rc.insert(&mut world.entity_mut(target), value.as_ref(), &registry);
     }
     drop(registry);
+
+    // Signals nothing loaded refers to (older saves kept deleted entities' signals) are dropped.
+    let types = document_types(world);
+    let mut used: HashSet<SignalId> = HashSet::new();
+    for e in map.values() {
+        let entity = world.entity(*e);
+        for (_, rc) in &types {
+            if let Some(value) = rc.reflect(entity) {
+                collect_signals(value.as_partial_reflect(), &mut used);
+            }
+        }
+    }
+    let unused: Vec<SignalId> = loaded.into_iter().filter(|id| !used.contains(id)).collect();
+    if !unused.is_empty() {
+        tracing::info!("{}: dropped {} signals nothing refers to", path.display(), unused.len());
+        let mut store = world.resource_mut::<SignalStore>();
+        for id in unused {
+            store.remove(id);
+        }
+    }
 
     let app_meta = meta.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("app.")?.to_string(), v))).collect();
     world.insert_resource(ProjectMeta(app_meta));
@@ -287,6 +313,29 @@ fn map_entities(value: &mut dyn PartialReflect, map: &HashMap<u64, Entity>) {
             }
         }
         // Maps/sets of entities aren't used by any component yet.
+        _ => {}
+    }
+}
+
+/// Every `SignalId` inside a reflected value (`Output`, `Through`, …), found
+/// the way [`map_entities`] finds entities, so new components are covered.
+fn collect_signals(value: &dyn PartialReflect, out: &mut HashSet<SignalId>) {
+    if value.represents::<SignalId>() {
+        out.extend(SignalId::from_reflect(value));
+        return;
+    }
+    match value.reflect_ref() {
+        ReflectRef::Struct(s) => (0..s.field_len()).filter_map(|i| s.field_at(i)).for_each(|f| collect_signals(f, out)),
+        ReflectRef::TupleStruct(s) => (0..s.field_len()).filter_map(|i| s.field(i)).for_each(|f| collect_signals(f, out)),
+        ReflectRef::Tuple(t) => (0..t.field_len()).filter_map(|i| t.field(i)).for_each(|f| collect_signals(f, out)),
+        ReflectRef::List(l) => l.iter().for_each(|f| collect_signals(f, out)),
+        ReflectRef::Array(a) => a.iter().for_each(|f| collect_signals(f, out)),
+        ReflectRef::Map(m) => m.iter().for_each(|(k, v)| {
+            collect_signals(k, out);
+            collect_signals(v, out);
+        }),
+        ReflectRef::Set(s) => s.iter().for_each(|f| collect_signals(f, out)),
+        ReflectRef::Enum(e) => (0..e.field_len()).filter_map(|i| e.field_at(i)).for_each(|f| collect_signals(f, out)),
         _ => {}
     }
 }
