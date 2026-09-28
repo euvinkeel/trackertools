@@ -290,14 +290,11 @@ pub fn sketch_tool(world: &mut World) {
         }
         t.fps.as_f64()
     };
-    live.boxes = stroke_frames(&live.samples, &live.clock, &live.params, fps).map(|(first, mut frames)| {
+    live.boxes = stroke_frames(&live.samples, &live.clock, &live.stroke.sized(&live.params), fps).map(|(first, mut frames)| {
         if live.drawn_in.is_some() {
             for (i, v) in frames.iter_mut().enumerate() {
                 *v = v.zip(live.through.get(&(first + i as FrameIndex))).map(|(b, m)| m.box_to_source(b));
             }
-        }
-        for v in frames.iter_mut().flatten() {
-            *v = live.stroke.scaled(*v);
         }
         (first, frames)
     });

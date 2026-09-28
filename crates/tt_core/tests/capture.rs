@@ -173,6 +173,19 @@ fn a_bigger_size_makes_a_bigger_region_and_carries_to_the_next_stroke() {
 }
 
 #[test]
+fn a_smaller_size_never_goes_under_the_smallest_half_size() {
+    use tt_core::capture::SketchDefaults;
+    use tt_core::sketch::SketchParams;
+    let mut d = Driver::new();
+    d.core.world.resource_mut::<SketchDefaults>().stroke.scale = 0.25;
+    hold_at(&mut d, 50, 300.0, 300.0, 60, HOLD);
+    let s = d.core.world.resource::<Selection>().primary().unwrap();
+    let v = d.value(s, 50).unwrap();
+    let min_half = SketchParams::default().min_half;
+    assert!(v[4] - v[2] >= 2.0 * min_half - 0.01 && v[5] - v[3] >= 2.0 * min_half - 0.01, "a still hand at ×0.25 still gets {min_half} px: {v:?}");
+}
+
+#[test]
 fn the_wheel_sets_the_falloff_and_esc_cancels() {
     let mut d = Driver::new();
     d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().wheel = tt_core::capture::WheelMode::Falloff;
