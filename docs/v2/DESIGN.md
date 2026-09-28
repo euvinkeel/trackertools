@@ -179,6 +179,33 @@ Operator inputs and outputs are **typed ports**. This is the whole "node system"
 - **Coarse-to-fine is plain composition.** Tracker A runs on the ¼ proxy. Its Track feeds tracker B's *guide* input, and B refines at full resolution in a small window. That's classic pyramid tracking, built from two ordinary operators and needing no special feature.
 - **A graph view** (egui-snarl) can visualize and edit these connections later. Day-to-day, connections are made by tools and commands ("add tracker to this view", "track at ½"), not by wiring nodes.
 
+### 6.2 Job operators: trackers (as built, M6)
+
+Some operators are too slow to evaluate inline because they read pixels. Their kind says `job()`. Evaluation then leaves their dirty frames alone, and their dependents run on whatever results exist so far (stale-while-revalidate).
+
+A runner system in `Set::Jobs` owns them. It does four things:
+- waits until the operator's inputs are evaluated;
+- snapshots those inputs into jobs (plain data sent to threads);
+- writes the results as they arrive;
+- reports each changed range as an `output_changed`, so dependents update chunk by chunk.
+
+New dirt on a job's frames cancels the job and restarts it.
+
+**The tracker** (`tt_track`) is the first such operator. Inputs:
+- `guide`: a box producer, normally a sketch;
+- `space`: a view.
+
+Output: `[x, y, left, top, right, bottom, score]`.
+
+The rough pass is what makes it robust:
+- the tracker only searches the guide's box;
+- it predicts from the guide's motion;
+- where it can't see the subject, it follows the guide.
+
+It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)`. A saved hash of its inputs lets a reopened project keep results instead of re-tracking.
+
+Strategies (template now; learned models later) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. A Python worker for CoTracker3, TAPNext or SAM 2.1 slots in as another job backend.
+
 **Result caching** (planned for after M4): results keyed by `(kind, params hash, input chunk versions)` in a content-addressed store. Undo and redo then re-link earlier results instead of recomputing, and A/B-ing parameters becomes free.
 
 ---
@@ -400,10 +427,11 @@ app.component::<SketchParams>(Meta::document())   // persisted + undoable + insp
   - spawned and despawned entities (with full reflected bundles);
   - SignalStore chunk references (copy-on-write, so snapshots are cheap).
 - **Gestures** (drags, captures) hold one open transaction for their lifetime, so a whole gesture is one undo step. In debug builds, an audit compares change detection against recorded transactions and flags untracked document mutations.
+- **Creation order:** every document entity carries `Created(u64)`, stamped when it gets its first document component and saved. Lists that show things in the order they were made (the outliner, the timeline's lanes, Select All) sort by it, never by entity id: bevy reuses freed ids.
 - **Project file:** a single SQLite database (`*.ttproj`).
   - Entities carry `StableId(Uuid)`; entity references are mapped through it.
   - Components are stored as versioned RON via reflection.
-  - Signals and streams are stored as content-hashed, zstd-compressed chunk blobs.
+  - Signals and streams are stored as content-hashed, zstd-compressed chunk blobs; only those a saved component refers to (a deleted entity's signals stay in memory for undo, not in the file).
   - Saves are incremental (only dirty chunks), transactional and crash-safe.
   - Schema migrations are versioned from day one.
 - **Media paths** are stored both absolute and relative to the project, fixing v1's orphaned-project problem.
@@ -449,9 +477,10 @@ Adopted from Rerun's proven design.
   - Dragging a box over Outliner rows or Timeline lanes selects what it touches.
   - Right-click opens one shared menu: enter view, rename, duplicate, delete, select its strokes or its sketch, select all.
   - Each command is one undo step (`tt_core::commands`).
-  - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and scrolls to what is selected elsewhere.
-  - The Timeline scrubs from the ruler. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), and a double-click enters a sketch's view.
-- **Settings tab** (beside the Inspector), remembered in the session file:
+  - A box keeps its start on the content: dragged past the edge it scrolls the list, and what it swept stays in it. Esc drops it.
+  - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and unfolds and scrolls to what is selected elsewhere (only when it is out of view).
+  - The Timeline scrubs from the ruler (a click seeks). Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
+- **Settings tab** (beside the Inspector), remembered in the session file (scripted runs, the demo and benchmarks, neither use nor save it):
   - what the wheel does while sketching;
   - the size and falloff the next stroke starts with;
   - the preset new sketches use;
@@ -462,9 +491,9 @@ Adopted from Rerun's proven design.
   - where the data folder is.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
   - `Space` play (also while holding the button: recording across frames);
-  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel sets a stroke's falloff while holding; `Esc` cancels the stroke or leaves the tool;
+  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel while holding sets the stroke's size, falloff or both (a setting; a move-only stroke's falloff); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
-  - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes, `F2` renames;
+  - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
   - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when you change it (fully for 0.25 s, then a 0.3 s fade; auto speed's changes don't flash, §8.4);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;

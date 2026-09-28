@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tt_core::autospeed::AutoSpeed;
 use tt_core::capture::{SketchDefaults, WheelMode};
 use tt_core::input::{Action, PendingActions};
+use tt_core::sketch::SketchParams;
 use tt_core::time::{FrameIndex, WallClock};
 use tt_core::transport::Transport;
 use tt_core::view::ViewDefaults;
@@ -24,8 +25,18 @@ struct SessionFile {
     recent: Vec<PathBuf>,
     /// Frame of the most recent file when last seen.
     frame: FrameIndex,
-    #[serde(default)]
+    /// Read leniently: a bad value (another build's, a hand edit) resets the
+    /// settings, not the recent files with them.
+    #[serde(default, deserialize_with = "lenient")]
     settings: SettingsFile,
+}
+
+fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SettingsFile, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|e| {
+        tracing::warn!("session settings unreadable ({e}); using the defaults");
+        SettingsFile::default()
+    }))
 }
 
 /// The user's settings (the Settings tab), remembered between launches.
@@ -35,6 +46,8 @@ struct SettingsFile {
     wheel: WheelMode,
     stroke_scale: f32,
     stroke_falloff: f32,
+    /// What new sketches start with (a preset, or a sketch's "Use for new sketches").
+    new_sketches: SketchParams,
     /// New views keep a steady zoom (`FrameParams::lock_zoom`).
     view_lock_zoom: bool,
     /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
@@ -52,6 +65,7 @@ impl Default for SettingsFile {
             wheel: WheelMode::default(),
             stroke_scale: s.scale,
             stroke_falloff: s.falloff,
+            new_sketches: SketchParams::default(),
             view_lock_zoom: v.params.lock_zoom,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
@@ -66,6 +80,7 @@ impl SettingsFile {
             wheel: d.wheel,
             stroke_scale: d.stroke.scale,
             stroke_falloff: d.stroke.falloff,
+            new_sketches: d.params.clone(),
             view_lock_zoom: v.params.lock_zoom,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
@@ -78,10 +93,17 @@ impl SettingsFile {
         d.wheel = self.wheel;
         d.stroke.scale = self.stroke_scale.clamp(tt_core::capture::SCALE_RANGE.0, tt_core::capture::SCALE_RANGE.1);
         d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
+        d.params = self.new_sketches.clone();
         world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
         *world.resource_mut::<AutoSpeed>() = self.auto_speed.clone();
     }
+}
+
+/// Scripted runs (the sketch demo, the step benchmark) start from the
+/// built-in settings and leave the user's alone.
+fn scripted() -> bool {
+    ["TT_SKETCH_DEMO", "TT_BENCH_STEPS"].iter().any(|v| std::env::var_os(v).is_some())
 }
 
 #[derive(Resource)]
@@ -92,6 +114,8 @@ pub struct Session {
     pending_seek: Option<FrameIndex>,
     seen_generation: u64,
     last_save: f64,
+    /// Settings are neither applied nor saved ([`scripted`]).
+    scripted: bool,
 }
 
 impl Session {
@@ -104,9 +128,11 @@ impl Session {
     }
 
     fn load() -> Self {
-        let file: SessionFile =
-            std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { saved: file.clone(), file, pending_seek: None, seen_generation: 0, last_save: 0.0 }
+        let file: SessionFile = std::fs::read(Self::path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| tracing::warn!("session file unreadable ({e}); starting afresh")).ok())
+            .unwrap_or_default();
+        Self { saved: file.clone(), file, pending_seek: None, seen_generation: 0, last_save: 0.0, scripted: scripted() }
     }
 
     pub fn save(&mut self) {
@@ -139,7 +165,7 @@ impl Session {
 /// The Settings tab's values, kept in the session file.
 fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, auto: Res<AutoSpeed>, mut session: ResMut<Session>) {
     let settings = SettingsFile::of(&defaults, &views, &pointer, &auto);
-    if session.file.settings != settings {
+    if session.file.settings != settings && !session.scripted {
         session.file.settings = settings;
     }
 }
@@ -187,7 +213,52 @@ impl Module for SessionModule {
     fn build(&self, app: &mut AppBuilder) {
         let session = Session::load();
         // The remembered settings replace the built-in defaults.
-        session.file.settings.apply(app.world_mut());
+        if !session.scripted {
+            session.file.settings.apply(app.world_mut());
+        }
         app.declare::<Session>(Class::Session).insert_resource(session).add_systems((track_settings, track_session).chain().in_set(Set::Prepare));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_setting_resets_the_settings_but_keeps_the_recent_files() {
+        let text = r#"{"recent": ["C:/clips/a.mp4"], "frame": 12, "settings": {"wheel": "Sideways", "stroke_scale": 2.0}}"#;
+        let file: SessionFile = serde_json::from_str(text).expect("the file still reads");
+        assert_eq!(file.recent, vec![PathBuf::from("C:/clips/a.mp4")]);
+        assert_eq!(file.frame, 12);
+        assert_eq!(file.settings, SettingsFile::default());
+    }
+
+    #[test]
+    fn the_preset_new_sketches_use_is_remembered() {
+        let chosen = SketchDefaults { params: SketchParams::preset("Loose").unwrap(), ..SketchDefaults::default() };
+        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default())).unwrap();
+        let mut world = World::new();
+        world.init_resource::<SketchDefaults>();
+        world.init_resource::<ViewDefaults>();
+        world.init_resource::<PointerView>();
+        world.init_resource::<AutoSpeed>();
+        serde_json::from_str::<SettingsFile>(&text).unwrap().apply(&mut world);
+        assert_eq!(world.resource::<SketchDefaults>().params, chosen.params);
+    }
+
+    #[test]
+    fn auto_speed_and_its_knobs_are_remembered() {
+        let knobs = AutoSpeed { enabled: true, comfort: 450.0, look_ahead: 0.0, ..AutoSpeed::default() };
+        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs)).unwrap();
+        let mut world = World::new();
+        world.init_resource::<SketchDefaults>();
+        world.init_resource::<ViewDefaults>();
+        world.init_resource::<PointerView>();
+        world.init_resource::<AutoSpeed>();
+        serde_json::from_str::<SettingsFile>(&text).unwrap().apply(&mut world);
+        assert_eq!(*world.resource::<AutoSpeed>(), knobs);
+        // A session file from before auto speed reads with it off.
+        let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
+        assert_eq!(old.auto_speed, AutoSpeed::default());
     }
 }

@@ -34,6 +34,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     let selected = picked.last().and_then(|e| sketch_of(world, *e));
     let mut q = world.query::<(Entity, &Operator, &Output)>();
     let sketches: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "sketch").map(|(e, _, o)| (e, o.0)).collect();
+    let trackers = super::tracks::list(world);
     let world: &World = world;
     // The shown space's framing around the playhead, looked up once per frame drawn.
     // (The playhead's frame uses the framing as shown, which may be easing in.)
@@ -63,6 +64,8 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let stale = editing != Some(*e) && sig.state(frame) == FrameState::Stale;
         region(painter, map, to_canvas(frame, v), color, stale);
     }
+
+    super::tracks::draw(painter, map, world, &trackers, frame, &space);
 
     if let Some(live) = live {
         if live.target.is_none() {
@@ -98,15 +101,15 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let name = |e: Option<Entity>| e.and_then(|e| world.get::<Name>(e)).map(|n| n.to_string());
         let text = match live {
             Some(l) => format!(
-                "⏺ recording into {}{} · frame {} · {} · size ×{:.2} · falloff {:.2} s ({:.0} frames) · wheel: {} · Esc cancels",
+                "⏺ recording into {}{} · frame {} · {} · {}falloff {:.2} s ({:.0} frames) · wheel: {} · Esc cancels",
                 name(l.target).unwrap_or_else(|| "a new sketch".into()),
                 if l.stroke.size == 0.0 { " (move only)" } else { "" },
                 t.frame(),
                 if t.playing { "playing: recording across frames" } else { "paused: editing this instant" },
-                l.stroke.scale,
+                if l.stroke.size == 0.0 { String::new() } else { format!("size ×{:.2} · ", l.stroke.scale) },
                 l.stroke.falloff,
                 l.stroke.falloff as f64 * fps,
-                match world.resource::<tt_core::capture::SketchDefaults>().wheel {
+                match tt_core::capture::wheel_target(world.resource::<tt_core::capture::SketchDefaults>().wheel, &l.stroke) {
                     tt_core::capture::WheelMode::Size => "size",
                     tt_core::capture::WheelMode::Falloff => "falloff",
                     tt_core::capture::WheelMode::Both => "size + falloff",

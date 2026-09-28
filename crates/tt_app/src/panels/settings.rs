@@ -165,5 +165,6 @@ fn describe(action: Action) -> &'static str {
         Duplicate => "Duplicate the selected sketches",
         SelectAll => "Select all sketches",
         Rename => "Rename the selection",
+        Track => "Track the selected sketch from here (on a tracker: re-seed it here)",
     }
 }

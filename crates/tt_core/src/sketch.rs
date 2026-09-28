@@ -224,16 +224,19 @@ impl Default for Stroke {
 }
 
 impl Stroke {
-    /// A box with its extents around the point multiplied by `scale`.
-    pub fn scaled(&self, b: [f64; 6]) -> [f64; 6] {
-        let k = self.scale.max(0.01) as f64;
-        [b[0], b[1], b[0] - (b[0] - b[2]) * k, b[1] - (b[1] - b[3]) * k, b[0] + (b[4] - b[0]) * k, b[1] + (b[5] - b[1]) * k]
+    /// `p` with the stroke's region size multiplied by `scale` (the jiggle
+    /// size's gain and pad; the floor only when growing), so a smaller size
+    /// never goes under `min_half`.
+    pub fn sized(&self, p: &SketchParams) -> SketchParams {
+        let k = self.scale.max(0.01);
+        SketchParams { gain: p.gain * k, pad: p.pad * k, min_half: p.min_half * k.max(1.0), ..p.clone() }
     }
 }
 
 /// Tuning of the sketch pipeline (all re-tunable after capture).
-#[derive(Component, Reflect, Clone, Debug, PartialEq)]
+#[derive(Component, Reflect, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[reflect(Component)]
+#[serde(default)]
 pub struct SketchParams {
     /// Lag given to new strokes on this sketch: seconds (real time) the hand
     /// trails the subject. Each stroke keeps its own (`Stroke::lag`).
@@ -835,15 +838,12 @@ pub fn stroke_boxes(world: &World, e: Entity, params: &SketchParams, fps: f64) -
     let (info, clock) = (entity.get::<Capture>()?, entity.get::<ClockMap>()?);
     let stream = world.resource::<SignalStore>().get(entity.get::<Output>()?.0)?;
     let stroke = entity.get::<Stroke>().cloned().unwrap_or_default();
-    let (first, mut frames) = stroke_frames(&read_stream(stream, info.samples), clock, params, stroke.lag as f64, fps)?;
+    let (first, mut frames) = stroke_frames(&read_stream(stream, info.samples), clock, &stroke.sized(params), stroke.lag as f64, fps)?;
     // Drawn inside a view: from the view's pixels to the source, frame by frame.
     if let Some(through) = entity.get::<Through>().and_then(|t| world.resource::<SignalStore>().get(t.0)) {
         for (i, v) in frames.iter_mut().enumerate() {
             *v = v.zip(through.get(first + i as FrameIndex)).map(|(b, m)| through_map(m).box_to_source(b));
         }
-    }
-    for v in frames.iter_mut().flatten() {
-        *v = stroke.scaled(*v);
     }
     Some(((first, frames), stroke))
 }

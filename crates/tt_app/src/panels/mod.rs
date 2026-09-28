@@ -6,6 +6,7 @@ mod menu;
 pub mod outliner;
 mod settings;
 mod overlay;
+mod tracks;
 pub mod timeline;
 pub mod viewport;
 
@@ -28,6 +29,8 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
             layout.tree.ui(&mut behavior, ui);
         });
     });
+    // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
+    world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
 }
 
 fn top_bar(ui: &mut egui::Ui, world: &mut World) {
@@ -35,6 +38,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut reopen = None;
     let mut history_action = None;
     let mut new_sketch = false;
+    let tracking = tracks::summary(world);
     let t = world.resource::<Transport>();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
@@ -70,6 +74,10 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 if let Some(status) = proxy_status(m) {
                     ui.separator();
                     ui.label(egui::RichText::new(status).color(style::MUTED));
+                }
+                if let Some((text, tip)) = &tracking {
+                    ui.separator();
+                    ui.label(egui::RichText::new(text).color(tracks::TRACK)).on_hover_text(tip);
                 }
             }
             None => {

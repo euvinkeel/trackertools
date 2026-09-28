@@ -173,6 +173,19 @@ fn a_bigger_size_makes_a_bigger_region_and_carries_to_the_next_stroke() {
 }
 
 #[test]
+fn a_smaller_size_never_goes_under_the_smallest_half_size() {
+    use tt_core::capture::SketchDefaults;
+    use tt_core::sketch::SketchParams;
+    let mut d = Driver::new();
+    d.core.world.resource_mut::<SketchDefaults>().stroke.scale = 0.25;
+    hold_at(&mut d, 50, 300.0, 300.0, 60, HOLD);
+    let s = d.core.world.resource::<Selection>().primary().unwrap();
+    let v = d.value(s, 50).unwrap();
+    let min_half = SketchParams::default().min_half;
+    assert!(v[4] - v[2] >= 2.0 * min_half - 0.01 && v[5] - v[3] >= 2.0 * min_half - 0.01, "a still hand at ×0.25 still gets {min_half} px: {v:?}");
+}
+
+#[test]
 fn the_wheel_sets_the_falloff_and_esc_cancels() {
     let mut d = Driver::new();
     d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().wheel = tt_core::capture::WheelMode::Falloff;
@@ -189,6 +202,67 @@ fn the_wheel_sets_the_falloff_and_esc_cancels() {
     assert_eq!(d.core.world.resource::<ActiveTool>().0, Tool::Sketch, "Esc cancelled the stroke, not the tool");
     d.frame(circle, Input { action: Some(Action::Cancel), ..UP });
     assert_eq!(d.core.world.resource::<ActiveTool>().0, Tool::Select, "a second Esc leaves the tool");
+}
+
+#[test]
+fn the_wheel_on_a_move_only_stroke_sets_its_falloff_and_not_the_next_size() {
+    use tt_core::capture::{SketchDefaults, WheelMode, wheel_target};
+    let mut d = Driver::new();
+    assert_eq!(d.core.world.resource::<SketchDefaults>().wheel, WheelMode::Size);
+    d.frame(circle, Input { ctrl: true, ..PRESS });
+    d.frame(circle, Input { wheel: 2.0, ..HOLD });
+    let live = d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.clone();
+    assert_eq!(wheel_target(WheelMode::Size, &live), WheelMode::Falloff);
+    assert!(live.size == 0.0 && live.scale == 1.0 && (live.falloff - 0.2 * 1.25 * 1.25).abs() < 1e-6, "{live:?}");
+    d.frames(30, circle, HOLD);
+    d.frame(circle, UP);
+    let next = d.core.world.resource::<SketchDefaults>().stroke.clone();
+    assert!(next.scale == 1.0 && (next.falloff - live.falloff).abs() < 1e-6, "the next stroke keeps its size, takes the falloff: {next:?}");
+}
+
+#[test]
+fn the_wheel_brings_falloff_back_from_zero_and_both_turns_back_exactly() {
+    use tt_core::capture::{SketchDefaults, WheelMode};
+    let mut d = Driver::new();
+    let stroke = |d: &Driver| d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.clone();
+    // Falloff 0: one notch up leaves 0, one down goes back.
+    {
+        let mut defaults = d.core.world.resource_mut::<SketchDefaults>();
+        defaults.wheel = WheelMode::Falloff;
+        defaults.stroke.falloff = 0.0;
+    }
+    d.frame(circle, PRESS);
+    d.frame(circle, Input { wheel: 1.0, ..HOLD });
+    assert!(stroke(&d).falloff > 0.0, "one notch up from 0");
+    d.frame(circle, Input { wheel: -1.0, ..HOLD });
+    assert_eq!(stroke(&d).falloff, 0.0);
+    // A touchpad's small steps add up.
+    d.frames(4, circle, Input { wheel: 0.25, ..HOLD });
+    assert!(stroke(&d).falloff > 0.0, "four quarter notches make one");
+    d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
+    d.frame(circle, UP);
+
+    // Both: 12 notches down (size stops at its limit, falloff reaches 0), 12 back up.
+    {
+        let mut defaults = d.core.world.resource_mut::<SketchDefaults>();
+        defaults.wheel = WheelMode::Both;
+        defaults.stroke.falloff = 0.2;
+    }
+    d.frame(circle, PRESS);
+    d.frames(12, circle, Input { wheel: -1.0, ..HOLD });
+    let low = stroke(&d);
+    assert!((low.scale - 0.25).abs() < 1e-6 && low.falloff == 0.0, "{low:?}");
+    d.frames(12, circle, Input { wheel: 1.0, ..HOLD });
+    let back = stroke(&d);
+    assert!((back.scale - 1.0).abs() < 1e-4 && (back.falloff - 0.2).abs() < 1e-4, "back where it started: {back:?}");
+    // Past every limit the knob stops, so the first notch back acts at once.
+    d.frames(40, circle, Input { wheel: 1.0, ..HOLD });
+    let top = stroke(&d);
+    d.frame(circle, Input { wheel: -1.0, ..HOLD });
+    let s = stroke(&d);
+    assert!(s.scale < top.scale || s.falloff < top.falloff, "{top:?} → {s:?}");
+    d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
+    d.frame(circle, UP);
 }
 
 /// A hold of `n` app frames at `(x, y)` on frame `f`.

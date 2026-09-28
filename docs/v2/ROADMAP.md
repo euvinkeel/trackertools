@@ -158,7 +158,8 @@ The proxy (item 6) exists for the step-back tail and for seeks.
   - generic reflection (RON) for every document component;
   - entity references remapped on load by a reflection walk;
   - content-addressed LZ4 signal chunks (a one-frame edit writes 1 chunk; identical chunks dedupe);
-  - deleted entities skipped;
+  - deleted entities skipped, and so are signals no saved component refers to (found by a reflection walk; older files drop them on load);
+  - a saved creation order (`Created`), so lists keep their order although bevy reuses freed entity ids;
   - format version guard.
 
   Tested in `tests/persist.rs`.
@@ -218,15 +219,15 @@ The original plan follows.
 | Item | Status |
 |---|---|
 | Sketch tool | ✅ `D` arms it. **Auto-key model** (reworked after hands-on use): holding the button records against whatever frame is shown and never touches the transport. Paused, it edits that instant; tap Space while holding to record across frames. Each press → release is a *stroke* on the selected sketch, or a new sketch with nothing selected or with Shift. Each stroke is **one undo step**. `＋ New sketch` (or Shift+hold, or clicking empty video) starts a new sketch. A quick click selects the sketch under it and never records. Ctrl+hold moves only (keeps the box size). Esc cancels, Alt+A deselects. If the edited sketch is undone mid-stroke, the stroke starts a new sketch instead of writing into the deleted one |
-| Wheel and settings | ✅ the wheel while holding changes the stroke's size by default (`Stroke::scale`), or its falloff, or both ("roughness"), chosen in a new Settings tab that also lists every key; remembered between launches |
+| Wheel and settings | ✅ the wheel while holding changes the stroke's size by default (`Stroke::scale`), or its falloff, or both ("roughness"), chosen in a new Settings tab that also lists every key. The wheel is one knob position, so turning back returns both values exactly; one notch up from a falloff of 0 moves it off 0 (it used to snap back). On a move-only (Ctrl) stroke it sets the falloff, and such a stroke never changes the next stroke's size. A size below 1 keeps `min_half` as the floor. Remembered between launches, the preset new sketches use included; a bad value resets the settings, not the recent files. The demo and the step benchmark neither use nor save them |
 | Strokes and falloff | ✅ `layer_over`: a stroke replaces the frames it visited (× influence), and frames within its falloff move with its edge offset (Blender's smooth falloff, normalised where edits overlap). Short gaps in new territory are bridged (blocking with holds). The wheel sets the falloff while holding. Stroke falloff, influence and lag are editable afterwards (the lag is per stroke, in real seconds, taken from the sketch's `lag` when drawn) |
 | Pointer input | ✅ a raw-input service thread (1 kHz, QPC timestamps mapped exactly onto the app clock); button transitions timed from the raw reports; screen px → window points → source px through the viewport as last drawn. The input probe (`TT_INPUT_PROBE=1`) shows the mapping offset against egui's pointer |
 | Pipeline | ✅ one `sketch` operator (Global footprint, evaluated in one call): 240 Hz grid → dead zone → zero-phase One Euro (odd-reflection padded ends) → jiggle → size → lag-compensated resampling through the ClockMap → union window → smoothing of the point (trend-preserving ends) and of the region *as extents around the point*. Frames shown in the last `lag` before the release get no result: the hand never reached them (replaces the planned catch-up, which would invent positions) |
 | Hold-to-simulate | ✅ press and hold while paused. A held frame takes the hand at the end of the hold (no lag shift). Steps while holding sculpt frame by frame |
 | Live feedback | ✅ raw hand trail (0.5 s), the sketch with the stroke laid over it (path and region), other sketches faint, the selected one bright with its path ±90 frames, crosshair and key hints. In the Select tool, a click on a box selects its sketch. While holding: the pointer hidden, and a 24 pt clear window of raw video at the pointer (a masked second draw of the frame over the overlays; both in Settings; seen in the demo's `1-recording` and `3-nested-live` screenshots) |
 | Re-tuning | ✅ every parameter in the Inspector (drag = one undo step); presets Tight / Default / Loose; "use for new sketches". ⏳ raw vs smoothed trail toggle |
-| Timeline lanes | ✅ one lane per sketch in tree order (valid / stale coverage), with each stroke's span under selected sketches. The live stroke shows its visited frames and the frames its falloff moves. ⏳ summaries, uncertainty |
-| Selecting and commands | ✅ box selection in the Outliner and Timeline; click / Ctrl / Shift selection; a shared right-click menu (enter view, rename, duplicate, delete, select strokes / sketch, select all); keys `X`/`Delete`, `Shift+D`, `A`, `F2`. The Outliner is a tree with filtering. The Timeline scrolls its lanes (wheel, middle-drag, scrollbar) under a fixed ruler you scrub on. Each command is one undo step and tested (`tests/commands.rs`); the demo drives the UI with injected pointer events and checks each step |
+| Timeline lanes | ✅ one lane per sketch in tree order (valid / stale coverage), with each stroke's span under selected sketches. The live stroke shows its visited frames and the frames its falloff moves, and its lane scrolls into view when it starts. ⏳ summaries, uncertainty |
+| Selecting and commands | ✅ box selection in the Outliner and Timeline; click / Ctrl / Shift selection; a shared right-click menu (enter view, rename, duplicate, delete, select strokes / sketch, select all); keys `X`/`Delete`, `Shift+D`, `A`, `F2` (Delete and Duplicate wait for a stroke to end). The Outliner is a tree with filtering. The Timeline scrolls its lanes (wheel, middle-drag, scrollbar) under a fixed ruler you scrub or click on. Boxes are anchored to the content and scroll the list past its edges; Esc drops them. Lists (and Select All) follow creation order. New names never repeat a live one. Each command is one undo step and tested (`tests/commands.rs`); the demo drives the UI with injected pointer events and checks each step |
 | Anticipatory speed | ✅ (the user's idea) a Settings switch, off by default, with knobs (`tt_core::autospeed::AutoSpeed`, remembered): while a stroke records and the video plays, the rate follows the hand's speed on screen, its jiggle against a calm baseline, and, over an existing sketch, the stretch ahead (a braking ramp); quickly down, slowly up. The release restores your rate; Q/E hands it back to you for the stroke. The badge shows `auto ×… · <what limits it>`; no flash. DESIGN §8.4 |
 | Takes and levels, modifier stacks | ⏳ next |
 
@@ -235,15 +236,16 @@ The original plan follows.
 - The same through the running app (`TT_SKETCH_DEMO=fixtures/sprite_truth.json`: hold, Space taps to play at ¼×, a 1 s pause mid-way, pause and release): median ≈ 1.5 px, p95 ≈ 2.5 px, max < 3 px, 100% containment over 120 frames (three runs). Then an edit (a 0.6 s hold 40 px off the path at frame 180) moves that frame by ≈ 37 px (the hand's tremor and the dead zone take the rest), its neighbours exactly by the falloff curve, and nothing beyond ±12 frames.
 - Paused vs playing (`tests/capture.rs`): the same ±20 px jiggle gave a 108 × 74 box while playing but 43 × 36 as a paused edit. Two causes: the jiggle was measured against the responsive point path, which follows part of a jiggle; and the motion union was per stroke, so a one-frame edit had no neighbours to union with. Now the jiggle is measured against a slow reference and the union runs after layering: 132 × 94 while playing, 130 × 102 as a paused edit (88 × 74 for the jiggle alone, without the path's motion). Accuracy unchanged (median 1.10 px, 100% containment); re-tuning a 60 s capture 3.1 ms.
 - An adversarial review of the stroke model (4 reviewers + skeptics) confirmed 7 issues, all fixed with tests: writes into a sketch undone mid-stroke, clicks committing edits, quiet holds shrinking the box (now Ctrl = move only), text focus swallowing Space/Shift/Esc during a stroke, one wheel notch both setting falloff and zooming, Alt+A applied after the tool read the selection, and bridging reach rounded up for sub-frame falloffs.
+- A review of the selection, commands and settings work confirmed 2 high and 6 medium issues (plus low ones), all fixed, most with tests: timeline clicks were dead (egui clears `press_origin` on the release frame; the demo now clicks the ruler and a lane and double-clicks it), a panic on clips shorter than about width/42 frames, Duplicate copying a sketch twice when one of its strokes was selected too, Delete/Duplicate during a stroke, deleted entities' signals kept in the project file forever, list order scrambled after a video switch (bevy reuses freed entity ids last-freed-first), outliner boxes picking rows out of sight and auto-scroll fighting the user, and the wheel's size/falloff traps.
 - Dev runs use `TT_DATA_DIR=<scratch>` and `--target-dir target/bench`, so they never touch the user's projects or the release build they are running.
 - Hold-to-simulate: holding still settles to the minimum box (32 × 32); jiggling grows it 3.5×.
 - Anticipatory speed (`tests/autospeed.rs`, 1 canvas px = 1 pt, default knobs):
-  - a still hand, then racing at 1500 pt/s with a ±30 pt jiggle: ×1.68 while calm, below ×0.5 in 0.074 s, down to ×0.10;
-  - a still hand from ×0.25: ×0.55 after 0.5 s, ×1.83 after 4 s;
-  - editing a sketch with a 20 px/frame dash at frames 300–330: ×1.26 while it is beyond the look-ahead, ×0.27 five frames before it, ×0.21 on arrival; frames 250–300 took 1.39 s;
+  - a still hand, then racing at 1500 pt/s with a ±30 pt jiggle: ×1.82 while calm, below ×0.5 in 0.086 s, down to ×0.10;
+  - a still hand from ×0.25: ×0.57 after 0.5 s, ×1.93 after 4 s;
+  - editing a sketch with a 20 px/frame dash at frames 300–330: ×1.41 while it is beyond the look-ahead, ×0.33 five frames before it, ×0.26 on arrival; frames 250–300 took 1.23 s;
   - the release (commit or Esc) restores the manual rate exactly; Q mid-stroke steps down from the auto rate and holds it for the stroke;
-  - the sprite recorded under auto speed (×0.27–×0.77): median 1.55 px, p95 2.28 px (1.51 px median at a fixed ½×).
-  - In the app (demo phase 5, from ¼×, the viewport at 0.54 pt per source px; two runs): ×0.25–×1.30 (limited by the hand's speed 62% of the time, calm 34%, jiggle 4–5%), back to ×0.25 after the release, no flash; ~325 frames, median 2.8 px, p95 5.8 px, max 12–15 px at a sharp turn passed at ~1.3× (the ¼× recording: 1.16 px). `comfort` sets that trade. Screenshot `11-auto-speed`.
+  - the sprite recorded under auto speed (×0.39–×1.01, 279 frames): median 1.63 px, p95 2.70 px (1.51 px median at a fixed ½×).
+  - In the app (demo phase 5, from ¼×, the viewport at 0.54 pt per source px; two runs): ×0.25–×1.30 (limited by the hand's speed 58–61% of the time, calm 35–37%, jiggle 4–5%), back to ×0.25 after the release, no flash; ~325 frames, median 2.5–2.6 px, p95 4.8–5.0 px, max 13–17 px at a sharp turn passed at ~1.3× (the ¼× recording: 1.16 px). `comfort` sets that trade. Screenshot `11-auto-speed`.
 - The demo's scripted hand saw each frame one app frame late (it logged the frame shown before that frame's advance). Harmless at ¼×, it cost several pixels at 1×; fixed. The ¼× recording went from ≈ 1.5 px to 1.16 px median (p95 2.0 px, max 2.2 px), the nested sketch 0.47–0.50 px.
 - Per-stroke lag in real time (`tests/capture.rs`, the hand 0.25 s late at the playback rate, through the tool): median point error 2.33 px at 2× (481 frames) and 1.51 px at ½× (121 frames). Counted as 0.25 s of *video* instead, the same strokes would be off by 109 px and 57 px. Changing one stroke's lag leaves the other stroke's frames bit-identical.
 - Re-tuning a 60 s capture: 2.1 ms at 1× (3,600 frames), 1.7 ms at ¼× (release build).
@@ -329,6 +331,54 @@ The original plan follows.
 - Re-tuning a level-1 sketch updates levels 2–3 live, marking stale ranges until re-derived.
 - A position picked inside a level-3 view lifts to source space within 0.1 px of the analytic transform.
 
+## M6 · Trackers: started 2026-09-27
+
+The first automatic tracker, built the way the whole design intends: an operator entity whose inputs are a rough pass and a view, run by background jobs (DESIGN §6.2).
+
+**Built (`tt_track`):**
+- **The `track` operator.** Inputs `guide` (a sketch, or any box producer) and `space` (the view it tracks in; none = the source). Its output `[x, y, left, top, right, bottom, score]` in source px is a box, so views, overlays and the like take a tracker wherever they take a sketch. `T` tracks the selected sketches from the playhead in the view being looked at. On a selected tracker, `T` re-seeds it at the playhead. One undo step.
+- **Template strategy.**
+  - At the anchor, a template is cut around the guide's point.
+  - On every other frame:
+    - the prediction is the guide's point plus the last offset;
+    - a centre-weighted NCC search runs within the guide's box, with a gentle preference for the prediction;
+    - the appearance blends the anchor's look with the last frame's (`adapt`).
+  - Below `min_score`, a frame is *lost*: it follows the guide and is drawn red. The tracker re-locks when the look returns.
+  - The patch scale comes from the guide's box: `feature` = the fraction of the box that is the subject.
+- **Jobs.**
+  - Each side of the anchor is a thread with its own ffmpeg.
+  - Backward jobs decode keyframe-aligned segments (≥ 64 frames), keep only the guide's region, and track the segment in reverse, so any source GOP works backward.
+  - Rendition Auto reads the proxy only where it has a pixel per patch pixel on every frame.
+  - At most 4 jobs run at once.
+- **Invalidation (the operator machinery, unchanged):**
+  - `Footprint::Radiating(anchor)`: an edit after the anchor re-tracks from the edit onward, an edit before it from the edit backward, and nothing else.
+  - A restart resumes from the valid result just before the dirty frames.
+  - Results stay on screen as stale until replaced.
+  - A saved input stamp keeps results when a reopened project's inputs come out the same.
+- **Catch-up mode** (`follow_playhead`): jobs stop at the playhead and continue as it moves, forward and backward.
+- **Re-centring on the guide** (`center_on_guide`, on by default): a finished path is shifted by the median offset between it and the guide over the frames where the tracker saw the subject. The tracker gives the motion; the rough pass, averaged, gives where the subject is. Without it, every frame would inherit the guide's error at the anchor.
+- **UI:**
+  - the viewport draws each tracker's box and path (cyan; lost frames red; stale dim);
+  - the top bar shows running trackers and their fps;
+  - the inspector shows progress per side, lost frames, the rendition read and errors, plus a Track button on sketches.
+
+**Measured** (`crates/tt_track/tests/sprite.rs`: the sprite fixture, 1200 frames of 1080p60 H.264 with GOP 250 and B-frames; the guide wanders ~6 px off the truth in a 56 px box; anchor mid-clip, tracked both ways):
+- absolute error, re-centred on the guide: **median 0.25 px, max 0.65**, with no lost frames, at ~500 fps (both sides together);
+- the motion alone (the anchor's offset removed): median 0.31 px, p95 0.80, max 0.87;
+- the rough pass alone is ~1.5 px median;
+- synthetic subpixel motion (`tests/template.rs`): median 0.02–0.06 px.
+
+Findings on the way:
+- **The sprite fixture's truth was off by up to 1 px:** ffmpeg's overlay on yuv420 puts the sprite on even pixels. `sprite_truth.json` (the in-app demo's truth) needs the same rounding; see the xtask.
+- **A plain NCC template lost the sprite whenever it crossed from dark background to bright** (the box always holds background). Centre-weighting the correlation fixed it.
+
+**Next:**
+- trackers in the outliner and timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);
+- a Lucas–Kanade refinement for hard-edged features (NCC peaks lean toward whole pixels);
+- colour (chroma) in the match;
+- the forward/backward fuse;
+- learned trackers (CoTracker3 / TAPNext worker, SAM 2.1) behind the same operator and job protocol.
+
 ---
 
 ## After the first target (to be re-planned)
@@ -336,7 +386,7 @@ The original plan follows.
 | Milestone | Scope |
 |---|---|
 | **M5 · Keys & curves** | Keys operator as a Track ("human animation is a tracker"), curve editor, dope-sheet editing, finetune-style offset layers |
-| **M6 · Trackers** | **FrameSource** entities with Auto rendition selection (a mip level per view and model input) and on-demand ½ / ¼ tracking renditions; coarse-to-fine via guide inputs; template matcher (Rust / GPU); learned trackers via a Python worker (v1's CoTracker3 engine; TAPNext as the permissive option) over a narrow job protocol (seeds + view transform in, result chunks out); trackers attach to any view; **reverse** jobs (backward decode by keyframe interval) with a forward/backward fuse; **catch-up-to-playhead** mode; stale-while-revalidate |
+| **M6 · Trackers** *(started: see above)* | **FrameSource** entities with Auto rendition selection (a mip level per view and model input) and on-demand ½ / ¼ tracking renditions; coarse-to-fine via guide inputs; template matcher (Rust / GPU); learned trackers via a Python worker (v1's CoTracker3 engine; TAPNext as the permissive option) over a narrow job protocol (seeds + view transform in, result chunks out); trackers attach to any view; **reverse** jobs (backward decode by keyframe interval) with a forward/backward fuse; **catch-up-to-playhead** mode; stale-while-revalidate |
 | **M7 · Targets & quality** | Combine / Contribution (pushed position, from v1), drift and motion-consistency checks, automatic ends |
 | **M8 · Export** | JSON / CSV, AE keyframe clipboard text, Fusion `.setting` (validated in Resolve this time), Nuke `.chan` |
 | **Later** | Result caching (content-addressed), audio, zero-copy hardware decode, operator graph view |

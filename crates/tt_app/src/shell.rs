@@ -28,6 +28,8 @@ pub struct Shell {
     pointer_read: f64,
     /// Key events kept from egui (Tab: see keys::take_tab), for the keymap.
     taken_keys: Vec<egui::Event>,
+    /// A text field had the keyboard at the end of the last UI pass.
+    was_typing: bool,
     /// Dev/benchmark: `TT_AUTOPLAY_SECS=N` plays N seconds once the video is
     /// open, logs the playback probe, and quits (spike S2 measurements).
     autoplay: Option<(f64, Option<f64>)>,
@@ -92,7 +94,8 @@ impl Shell {
             .add_module(ViewportModule)
             .add_module(TimelineModule)
             .add_module(SessionModule)
-            .add_module(crate::project::ProjectModule);
+            .add_module(crate::project::ProjectModule)
+            .add_module(tt_track::TrackModule);
         let mut core = app.build();
 
         // Until a video is open, a one-minute demo clock keeps the transport live.
@@ -114,7 +117,7 @@ impl Shell {
         let epoch = Instant::now();
         let pointer = PointerService::start(epoch);
         let sketch_demo = crate::demo::SketchDemo::start();
-        Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), autoplay, bench, sketch_demo }
+        Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), was_typing: false, autoplay, bench, sketch_demo }
     }
 
     fn drive_bench(&mut self, ctx: &egui::Context, now: f64) {
@@ -186,8 +189,12 @@ impl eframe::App for Shell {
                     m.surrender_focus(id);
                 }
             });
+            self.was_typing = false;
         }
-        let typing = ctx.egui_wants_keyboard_input();
+        // A text field focused at the end of the last pass counts too: egui has
+        // already let go of it here when Esc (or Enter) ended the edit, and that
+        // key belongs to the field, not the keymap.
+        let typing = ctx.egui_wants_keyboard_input() || self.was_typing;
         let taken = std::mem::take(&mut self.taken_keys);
         if !typing {
             let keymap = self.core.world.resource::<Keymap>();
@@ -246,6 +253,7 @@ impl eframe::App for Shell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         panels::draw(ui, &mut self.core.world);
+        self.was_typing = ui.ctx().egui_wants_keyboard_input();
 
         let had_actions = !self.core.world.resource::<PendingActions>().0.is_empty();
         self.core.run_post_ui();

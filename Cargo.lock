@@ -3852,6 +3852,7 @@ dependencies = [
  "tracing-subscriber",
  "tt_core",
  "tt_media",
+ "tt_track",
  "windows-sys 0.61.2",
 ]
 
@@ -3880,6 +3881,20 @@ dependencies = [
  "serde_json",
  "tracing",
  "tt_core",
+]
+
+[[package]]
+name = "tt_track"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bevy_ecs",
+ "bevy_reflect",
+ "blake3",
+ "serde_json",
+ "tracing",
+ "tt_core",
+ "tt_media",
 ]
 
 [[package]]
