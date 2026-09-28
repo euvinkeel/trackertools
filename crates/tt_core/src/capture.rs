@@ -12,7 +12,8 @@
 //!   falloff (`sketch::layer_over`). The mouse wheel while holding sets the
 //!   stroke's region size, its falloff, or both ([`WheelMode`], a setting). With no sketch selected, or with Shift held at the press, the
 //!   stroke starts a new sketch.
-//! - `Ctrl` at the press: move only (the stroke keeps the region's size).
+//! - `Ctrl` at the press: move only (the stroke keeps the region's size; the
+//!   wheel sets its falloff).
 //! - A quick click doesn't record: it selects the sketch under it (tool.rs).
 //! - Esc abandons the stroke.
 //!
@@ -62,6 +63,8 @@ pub struct Live {
     /// The home view's framing per frame, looked up once.
     home_maps: std::collections::HashMap<FrameIndex, SpaceMap>,
     pub stroke: Stroke,
+    /// The wheel while holding: sets `stroke`'s size and falloff.
+    knob: Knob,
     /// The stroke's own frames (the frames it visited).
     pub boxes: Option<Boxes>,
     /// The sketch with the stroke laid over it (motion union included), on the frames that change.
@@ -109,14 +112,83 @@ pub enum WheelMode {
     Both,
 }
 
+/// What the wheel changes on `stroke`: a move-only stroke keeps the region's
+/// size, so there it always sets the falloff.
+pub fn wheel_target(mode: WheelMode, stroke: &Stroke) -> WheelMode {
+    if stroke.size == 0.0 { WheelMode::Falloff } else { mode }
+}
+
 /// Raw input only reports motion: a still pointer is extended to "now" once
 /// it has been still this long.
 const STILL: f64 = 0.02;
-/// Falloff change per wheel notch, and its limits (seconds of video).
+/// Size and falloff change per wheel notch (×), and the falloff's limits
+/// (seconds of video; below `FALLOFF_SNAP` it is 0).
 const WHEEL_STEP: f32 = 1.25;
 const FALLOFF_MAX: f32 = 5.0;
+const FALLOFF_SNAP: f32 = 0.015;
 /// Limits of a stroke's size multiplier.
 pub const SCALE_RANGE: (f32, f32) = (0.25, 8.0);
+
+/// The wheel while holding a stroke: one knob position (notches turned since
+/// the press), from which the size and falloff follow, each clamped only on
+/// the way out. Turning back returns both exactly, also in Both mode where
+/// they hit their limits at different notches, and a falloff of 0 is one
+/// notch below the smallest non-zero one, so it never gets stuck there.
+#[derive(Debug, Clone, Copy)]
+struct Knob {
+    turned: f32,
+    /// Where the size and falloff started, in notches ([`Knob::size_at`], [`Knob::falloff_at`]).
+    size: f32,
+    falloff: f32,
+}
+
+impl Knob {
+    fn new(s: &Stroke) -> Self {
+        let falloff = if s.falloff < FALLOFF_SNAP { -1.0 } else { Self::notches(s.falloff / FALLOFF_SNAP) };
+        Self { turned: 0.0, size: Self::notches(s.scale.max(1e-3)), falloff }
+    }
+
+    fn notches(ratio: f32) -> f32 {
+        ratio.ln() / WHEEL_STEP.ln()
+    }
+
+    fn size_range() -> (f32, f32) {
+        (Self::notches(SCALE_RANGE.0), Self::notches(SCALE_RANGE.1))
+    }
+
+    fn falloff_range() -> (f32, f32) {
+        (-1.0, Self::notches(FALLOFF_MAX / FALLOFF_SNAP))
+    }
+
+    fn size_at(n: f32) -> f32 {
+        let (lo, hi) = Self::size_range();
+        WHEEL_STEP.powf(n.clamp(lo, hi))
+    }
+
+    fn falloff_at(n: f32) -> f32 {
+        let (lo, hi) = Self::falloff_range();
+        if n < 0.0 { 0.0 } else { FALLOFF_SNAP * WHEEL_STEP.powf(n.clamp(lo, hi)) }
+    }
+
+    /// Turn by `notches`, changing what `mode` says.
+    fn turn(&mut self, notches: f32, mode: WheelMode, stroke: &mut Stroke) {
+        let (size, falloff) = (mode != WheelMode::Falloff, mode != WheelMode::Size);
+        // Once everything it changes is at a limit the knob stops, so turning back acts at once.
+        let (mut lo, mut hi) = (0.0f32, 0.0f32);
+        for (on, start, (a, b)) in [(size, self.size, Self::size_range()), (falloff, self.falloff, Self::falloff_range())] {
+            if on {
+                (lo, hi) = (lo.min(a - start), hi.max(b - start));
+            }
+        }
+        self.turned = (self.turned + notches).max(lo).min(hi);
+        if size {
+            stroke.scale = Self::size_at(self.size + self.turned);
+        }
+        if falloff {
+            stroke.falloff = Self::falloff_at(self.falloff + self.turned);
+        }
+    }
+}
 
 /// Start, extend and commit strokes (`Set::Tools`, after the transport moved).
 pub fn sketch_tool(world: &mut World) {
@@ -152,6 +224,7 @@ pub fn sketch_tool(world: &mut World) {
             through: Default::default(),
             home,
             home_maps: Default::default(),
+            knob: Knob::new(&stroke),
             stroke,
             boxes: None,
             preview: None,
@@ -173,15 +246,8 @@ pub fn sketch_tool(world: &mut World) {
         live.home_maps.clear();
     }
     if pointer.wheel != 0.0 {
-        let k = WHEEL_STEP.powf(pointer.wheel);
-        let mode = world.resource::<SketchDefaults>().wheel;
-        if matches!(mode, WheelMode::Size | WheelMode::Both) {
-            live.stroke.scale = (live.stroke.scale * k).clamp(SCALE_RANGE.0, SCALE_RANGE.1);
-        }
-        if matches!(mode, WheelMode::Falloff | WheelMode::Both) {
-            let f = (live.stroke.falloff.max(0.01) * k).min(FALLOFF_MAX);
-            live.stroke.falloff = if f < 0.015 { 0.0 } else { f };
-        }
+        let mode = wheel_target(world.resource::<SketchDefaults>().wheel, &live.stroke);
+        live.knob.turn(pointer.wheel, mode, &mut live.stroke);
     }
     let end = pointer.released.or((!pointer.down).then_some(now));
 
@@ -329,10 +395,13 @@ fn commit(world: &mut World, live: Live) {
     });
     let sketch = sketch.expect("a sketch");
     world.resource_mut::<Selection>().select_only(sketch);
-    // The next stroke starts with the size and falloff this one ended with.
+    // The next stroke starts with the size and falloff this one ended with
+    // (a move-only stroke has no size of its own).
     let mut defaults = world.resource_mut::<SketchDefaults>();
     defaults.stroke.falloff = live.stroke.falloff;
-    defaults.stroke.scale = live.stroke.scale;
+    if live.stroke.size > 0.0 {
+        defaults.stroke.scale = live.stroke.scale;
+    }
     let visited = live.boxes.as_ref().map_or(0, |(_, b)| b.iter().flatten().count());
     tracing::info!("{label}: {} samples over {:.2} s, {visited} frames visited", live.samples.len(), live.samples.last().map_or(0.0, |s| s[0]));
 }
