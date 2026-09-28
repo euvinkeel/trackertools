@@ -22,9 +22,18 @@ use tt_core::time::FrameIndex;
 use tt_core::view::SpaceMap;
 use tt_media::{DecodeOptions, FrameStream, VideoIndex};
 
-use crate::TRACK_CHANNELS;
 use crate::image::{Grid, Luma, Patch, resample_xy};
-use crate::template::{Settings, TEMPLATE_R, TemplateTracker};
+use crate::template::{LookTemplate, Settings, TEMPLATE_R, TemplateTracker};
+use crate::{LOST, OUTSIDE, TRACK_CHANNELS};
+
+/// A look, as a job reads it: a frame, a rectangle there (source px), a mask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LookSpec {
+    pub frame: FrameIndex,
+    pub center: [f64; 2],
+    pub half: [f64; 2],
+    pub mask: Option<Vec<u8>>,
+}
 
 /// Which way a job runs from the anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -75,6 +84,10 @@ pub struct JobSpec {
     /// The source's index (the frame grid).
     pub grid: Arc<VideoIndex>,
     pub decode: DecodeOptions,
+    /// What the subject looks like; none: a square around the guide's point.
+    pub looks: Arc<Vec<LookSpec>>,
+    /// Where the tracker starts on the anchor frame (source px); none: the guide's point.
+    pub seed: Option<[f64; 2]>,
 }
 
 /// State shared between a job and the runner.
@@ -127,7 +140,7 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
         .name(format!("tracker {:?}", spec.side))
         .spawn(move || {
             let _alive = alive;
-            let mut worker = Worker { spec, shared, tx: tx.clone(), out: Vec::new(), flushed: Instant::now() };
+            let mut worker = Worker { spec, shared, tx: tx.clone(), out: Vec::new(), flushed: Instant::now(), half: [TEMPLATE_R as f64; 2], margin: TEMPLATE_R as f64 + 2.0 };
             let result = worker.run();
             worker.flush();
             let _ = tx.send(match result {
@@ -144,6 +157,9 @@ struct Worker {
     tx: Sender<Msg>,
     out: Vec<(FrameIndex, [f32; TRACK_CHANNELS])>,
     flushed: Instant,
+    /// The output box's half-size, and the patch margin the templates need (patch px).
+    half: [f64; 2],
+    margin: f64,
 }
 
 impl Worker {
@@ -173,14 +189,50 @@ impl Worker {
     fn patch(&self, frame: &[u8], f: FrameIndex) -> (Grid, Patch) {
         let (map, s) = (self.map(f), &self.spec);
         let b = map.box_from_source(self.guide(f));
-        let margin = TEMPLATE_R as f64 + 2.0;
-        let half = |h: f64| (h * s.search * s.scale + margin).clamp(margin + 16.0, MAX_HALF);
+        let margin = self.margin;
+        let half = |h: f64| (h * s.search * s.scale + margin).clamp(margin + 16.0, MAX_HALF + margin);
         let (hw, hh) = (half((b[0] - b[2]).max(b[4] - b[0])), half((b[1] - b[3]).max(b[5] - b[1])));
         let (w, h) = ((2.0 * hw).ceil() as usize, (2.0 * hh).ceil() as usize);
         let grid = Grid { origin: [b[0] - w as f64 / 2.0 / s.scale, b[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
         let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
         (grid, resample_xy(&luma, s.k, map, grid, w, h))
+    }
+
+    /// A patch just big enough for a look's template, around view point `c` on frame `f`.
+    fn patch_around(&self, frame: &[u8], f: FrameIndex, c: [f64; 2], r: [usize; 2]) -> (Grid, Patch) {
+        let (map, s) = (self.map(f), &self.spec);
+        let (w, h) = (2 * (r[0] + 4) + 1, 2 * (r[1] + 4) + 1);
+        let grid = Grid { origin: [c[0] - w as f64 / 2.0 / s.scale, c[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
+        let (vw, vh) = (s.video.width as usize, s.video.height as usize);
+        let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
+        (grid, resample_xy(&luma, s.k, map, grid, w, h))
+    }
+
+    /// The looks' templates, each cut from its own frame through the view.
+    fn look_templates(&mut self) -> Result<Vec<LookTemplate>> {
+        let looks = self.spec.looks.clone();
+        let mut frames: Vec<(FrameIndex, Vec<u8>)> = Vec::new();
+        let mut out = Vec::new();
+        for look in looks.iter() {
+            if !frames.iter().any(|(f, _)| *f == look.frame) {
+                let frame = self.decode_one(look.frame)?;
+                frames.push((look.frame, frame));
+            }
+            if self.cancelled() {
+                return Ok(out);
+            }
+            let frame = &frames.iter().find(|(f, _)| *f == look.frame).expect("decoded").1;
+            let map = self.map(look.frame);
+            let c = map.from_source(look.center);
+            let r = [look.half[0], look.half[1]].map(|h| ((h / map.a * self.spec.scale).round() as usize).max(2));
+            let (grid, patch) = self.patch_around(frame, look.frame, c, r);
+            match LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone()) {
+                Some(t) => out.push(t),
+                None => tracing::warn!("a look on frame {} has no detail to follow (flat or an empty mask); skipped", look.frame),
+            }
+        }
+        Ok(out)
     }
 
     fn decode_one(&self, f: FrameIndex) -> Result<Vec<u8>> {
@@ -202,11 +254,14 @@ impl Worker {
         Ok(())
     }
 
-    fn emit(&mut self, f: FrameIndex, pos: [f64; 2], score: f32) {
+    fn emit(&mut self, f: FrameIndex, pos: [f64; 2], score: f32, lost: bool) {
         let map = self.map(f);
         let [x, y] = map.to_source(pos);
-        let half = (TEMPLATE_R as f64 + 0.5) / self.spec.scale * map.a;
-        self.out.push((f, [x, y, x - half, y - half, x + half, y + half, score as f64].map(|v| v as f32)));
+        let [hx, hy] = self.half.map(|h| (h + 0.5) / self.spec.scale * map.a);
+        let g = self.guide(f);
+        let outside = !(g[2]..=g[4]).contains(&x) || !(g[3]..=g[5]).contains(&y);
+        let flags = if lost { LOST } else { 0 } | if outside { OUTSIDE } else { 0 };
+        self.out.push((f, [x, y, x - hx, y - hy, x + hx, y + hy, score as f64, flags as f64].map(|v| v as f32)));
         self.shared.at.store(f, Ordering::Relaxed);
         if self.out.len() >= FLUSH_FRAMES || self.flushed.elapsed() >= FLUSH_EVERY {
             self.flush();
@@ -255,16 +310,26 @@ impl Worker {
         let (anchor, settings) = (s.anchor, s.settings);
         let dir: FrameIndex = if s.side == Side::Forward { 1 } else { -1 };
 
-        // Seed on the anchor frame: its appearance defines the tracked point.
-        let seed = self.guide_point(anchor);
-        let frame = self.decode_one(anchor)?;
-        if self.cancelled() {
-            return Ok(());
-        }
-        let mut tracker = {
+        // Seed on the anchor frame: the user's look there, or the guide's point.
+        let guide_at = self.guide_point(anchor);
+        let seed = self.spec.seed.map_or(guide_at, |s| self.map(anchor).from_source(s));
+        let mut tracker = if self.spec.looks.is_empty() {
+            let frame = self.decode_one(anchor)?;
+            if self.cancelled() {
+                return Ok(());
+            }
             let (grid, patch) = self.patch(&frame, anchor);
-            TemplateTracker::seed(&patch, grid, seed, settings)
-                .context("the guide's point at the anchor frame has no detail to follow (flat)")?
+            TemplateTracker::seed(&patch, grid, seed, settings).context("the guide's point at the anchor frame has no detail to follow (flat)")?
+        } else {
+            let looks = self.look_templates()?;
+            if self.cancelled() {
+                return Ok(());
+            }
+            let r = looks.first().map_or([TEMPLATE_R; 2], |l| l.r);
+            self.half = r.map(|v| v as f64);
+            self.margin = looks.iter().map(|l| l.r[0].max(l.r[1])).max().unwrap_or(TEMPLATE_R) as f64 + 2.0;
+            TemplateTracker::with_looks(looks, [seed[0] - guide_at[0], seed[1] - guide_at[1]], settings)
+                .context("no look has detail to follow (flat, or an empty mask)")?
         };
         let start = match self.spec.resume {
             Some((src, score)) => {
@@ -280,7 +345,7 @@ impl Worker {
             }
             None if self.spec.side == Side::Forward => {
                 if self.wait_for(anchor, || {}) {
-                    self.emit(anchor, seed, 1.0);
+                    self.emit(anchor, seed, 1.0, false);
                 }
                 anchor + 1
             }
@@ -311,7 +376,7 @@ impl Worker {
             self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
             let (grid, patch) = self.patch(&buf, f);
             let step = tracker.step(&patch, grid, self.guide_point(f));
-            self.emit(f, step.pos, step.score);
+            self.emit(f, step.pos, step.score, step.lost);
         }
         Ok(())
     }
@@ -342,7 +407,7 @@ impl Worker {
                 }
                 let (grid, patch) = &patches[(f - lo) as usize];
                 let step = tracker.step(patch, *grid, self.guide_point(f));
-                self.emit(f, step.pos, step.score);
+                self.emit(f, step.pos, step.score, step.lost);
             }
             hi = lo - 1;
         }

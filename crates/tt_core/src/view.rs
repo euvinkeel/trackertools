@@ -304,7 +304,8 @@ pub fn frame_views(sketch: &Signal, parent: Option<&Signal>, p: &FrameParams, fp
     // Point and half extents per frame; gaps interpolated linearly.
     let mut known: Vec<Option<[f64; 4]>> = (first..=last)
         .map(|f| {
-            sketch.get(f).map(|v| {
+            // A box producer may flag frames not to trust (a tracker's channel 7): gaps here.
+            sketch.get(f).filter(|v| v.get(7).is_none_or(|flags| *flags == 0.0)).map(|v| {
                 let [x, y, l, t, r, b] = [v[0], v[1], v[2], v[3], v[4], v[5]].map(|c| c as f64);
                 [x, y, (x - l).max(r - x), (y - t).max(b - y)]
             })

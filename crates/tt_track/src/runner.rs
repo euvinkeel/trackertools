@@ -44,9 +44,10 @@ use tt_core::transport::Transport;
 use tt_core::view::{SpaceMap, home_of, map_at};
 use tt_media::{DecodeOptions, VideoIndex};
 
-use crate::job::{JobSpec, Msg, Shared, Side, spawn};
-use crate::template::{Settings, TEMPLATE_R};
-use crate::{Direction, Rendition, Tracker, guide_of};
+use crate::job::{JobSpec, LookSpec, Msg, Shared, Side, spawn};
+use crate::look::Look;
+use crate::template::{LOOK_PX, Settings, TEMPLATE_R};
+use crate::{Direction, Rendition, TRACK_CHANNELS, Tracker, guide_of};
 
 /// Part of every stamp: bump it when a change to the tracking makes saved
 /// results out of date (they re-track when their project is opened).
@@ -185,6 +186,9 @@ struct Plan {
     video: Arc<VideoIndex>,
     k: [f64; 2],
     stamp: u64,
+    /// The looks (in the tracked range), and the seed: the look on the anchor frame's centre, source px.
+    looks: Arc<Vec<LookSpec>>,
+    seed: Option<[f64; 2]>,
 }
 
 impl Plan {
@@ -219,7 +223,9 @@ impl Plan {
         let same_seed = self.anchor == old.anchor
             && close(self.scale, old.scale)
             && Arc::ptr_eq(&self.video, &old.video)
-            && (p.feature, p.search, p.adapt, p.min_score) == (q.feature, q.search, q.adapt, q.min_score);
+            && (p.feature, p.search, p.adapt, p.min_score) == (q.feature, q.search, q.adapt, q.min_score)
+            && self.looks == old.looks
+            && self.seed == old.seed;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
             (Some((g, m)), Some((h, n))) => g.iter().zip(h).all(|(a, b)| close(*a, *b)) && close(m.a, n.a) && close(m.b[0], n.b[0]) && close(m.b[1], n.b[1]),
             _ => false,
@@ -329,8 +335,8 @@ fn drain(world: &mut World, op: Entity) {
             Msg::Frames(frames) => {
                 if let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out) {
                     for (f, v) in &frames {
-                        let [x, y, l, t, r, b, s] = *v;
-                        sig.set(*f, &[x + ox, y + oy, l + ox, t + oy, r + ox, b + oy, s]);
+                        let [x, y, l, t, r, b, s, flags] = *v;
+                        sig.set(*f, &[x + ox, y + oy, l + ox, t + oy, r + ox, b + oy, s, flags]);
                         if outdated.contains(*f) {
                             sig.mark_stale(*f..*f + 1);
                         }
@@ -390,6 +396,15 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
         return;
     }
     world.get_mut::<Dirty>(op).expect("checked").0 = RangeSet::new();
+    // An output from before the flags channel: start it afresh.
+    if let Some(out) = world.get::<Output>(op).map(|o| o.0)
+        && world.resource::<SignalStore>().get(out).is_some_and(|s| s.channels() != TRACK_CHANNELS)
+    {
+        world.resource_mut::<SignalStore>().insert(out, tt_core::signal::Signal::new(TRACK_CHANNELS));
+        world.resource_mut::<TrackJobs>().basis.remove(&op);
+        let book = world.get::<TrackBook>(op).copied().unwrap_or_default();
+        set_book(world, op, TrackBook { stamp: 0, ..book });
+    }
     let Some(out) = world.get::<Output>(op).map(|o| o.0) else { return };
     let extent = extent(world);
     let old = world.resource_mut::<TrackJobs>().basis.remove(&op);
@@ -526,6 +541,8 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         k: plan.k,
         grid: footage.original.clone(),
         decode: footage.decode.clone(),
+        looks: plan.looks.clone(),
+        seed: plan.seed,
     };
     let shared = Arc::new(Shared::new(catch_up_limit(world, op, side), from));
     let (tx, rx) = channel();
@@ -598,7 +615,7 @@ fn recenter(world: &mut World, op: Entity) {
         let (mut dx, mut dy) = (Vec::new(), Vec::new());
         for f in lo..=hi {
             if let (Some(v), Some(gv)) = (sig.get_valid(f), g.get(f))
-                && v[6] >= params.min_score
+                && crate::flags(v) == 0
             {
                 dx.push(gv[0] - (v[0] - book.offset[0]));
                 dy.push(gv[1] - (v[1] - book.offset[1]));
@@ -621,7 +638,7 @@ fn recenter(world: &mut World, op: Entity) {
     let Some((lo, hi)) = sig.present_hull() else { return };
     for f in lo..=hi {
         let state = sig.state(f);
-        let Some(v) = sig.get(f).map(|v| [v[0] + dx, v[1] + dy, v[2] + dx, v[3] + dy, v[4] + dx, v[5] + dy, v[6]]) else { continue };
+        let Some(v) = sig.get(f).filter(|v| v.len() == TRACK_CHANNELS).map(|v| [v[0] + dx, v[1] + dy, v[2] + dx, v[3] + dy, v[4] + dx, v[5] + dy, v[6], v[7]]) else { continue };
         sig.set(f, &v);
         if state == FrameState::Stale {
             sig.mark_stale(f..f + 1);
@@ -681,11 +698,30 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     let space = home_of(world, op);
     let maps: Vec<SpaceMap> = (lo..=hi).map(|f| map_at(world, space, f)).collect();
 
-    // Patch scale: the feature (a fraction of the guide's box at the anchor) spans the template.
-    let at = (anchor - lo) as usize;
-    let b = maps[at].box_from_source(guide_boxes[at]);
-    let half = ((b[0] - b[2]).max(b[4] - b[0])).min((b[1] - b[3]).max(b[5] - b[1])).max(1.0);
-    let scale = (TEMPLATE_R as f64 / (params.feature.max(0.01) as f64 * half)).clamp(1.0 / 32.0, 8.0);
+    // The looks the user showed it (those on frames the guide covers), and the seed.
+    let looks: Vec<LookSpec> = crate::look::looks_of(world, op)
+        .iter()
+        .filter_map(|e| world.get::<Look>(*e))
+        .filter(|l| (lo..=hi).contains(&l.frame))
+        .map(|l| LookSpec { frame: l.frame, center: l.center(), half: l.half(), mask: l.painted().map(<[u8]>::to_vec) })
+        .collect();
+    let seed = looks.iter().find(|l| l.frame == anchor).map(|l| l.center);
+
+    // Patch scale: the first look's larger half-size spans `LOOK_PX` patch
+    // pixels; with no looks (an older tracker), the feature (a fraction of
+    // the guide's box at the anchor) spans the template.
+    let scale = match looks.first() {
+        Some(l) => {
+            let a = maps[(l.frame - lo) as usize].a;
+            (LOOK_PX / (l.half[0].max(l.half[1]) / a).max(0.5)).clamp(1.0 / 32.0, 2.0)
+        }
+        None => {
+            let at = (anchor - lo) as usize;
+            let b = maps[at].box_from_source(guide_boxes[at]);
+            let half = ((b[0] - b[2]).max(b[4] - b[0])).min((b[1] - b[3]).max(b[5] - b[1])).max(1.0);
+            (TEMPLATE_R as f64 / (params.feature.max(0.01) as f64 * half)).clamp(1.0 / 32.0, 8.0)
+        }
+    };
 
     // Rendition: the proxy only where it has a pixel per patch pixel on every
     // frame (on both axes: a proxy's width is rounded to even).
@@ -729,10 +765,14 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     for m in &maps {
         [m.a, m.b[0], m.b[1]].iter().for_each(|x| put(*x));
     }
+    for l in &looks {
+        [l.frame as f64, l.center[0], l.center[1], l.half[0], l.half[1]].iter().for_each(|x| put(*x));
+        l.mask.iter().flatten().for_each(|c| put(*c as f64));
+    }
     h.update(original.path.to_string_lossy().as_bytes());
     let stamp = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"));
 
-    Ok(Plan { lo, hi, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp })
+    Ok(Plan { lo, hi, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed })
 }
 
 /// Fill gaps by linear interpolation; ends hold the nearest value.
