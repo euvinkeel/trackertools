@@ -175,21 +175,30 @@ impl eframe::App for Shell {
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.core.world.resource_mut::<OpenRequest>().0 = Some(path);
         }
+        let mut frame = crate::pointer::frame(ctx, &self.pointer, &mut self.pointer_read, now, self.core.world.resource::<ViewportMapping>());
+        if frame.pressed.is_some() {
+            // A press on the video ends any text editing (an Inspector field keeping
+            // focus would otherwise swallow Space, Shift and Esc for the whole stroke).
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
         let typing = ctx.egui_wants_keyboard_input();
         if !typing {
             let actions = ctx.input(|i| keys::actions(i, self.core.world.resource::<Keymap>()));
             self.core.world.resource_mut::<PendingActions>().0.extend(actions);
         }
-        let mut held = if typing { Vec::new() } else { ctx.input(keys::held) };
-        let mut frame = crate::pointer::frame(ctx, &self.pointer, &mut self.pointer_read, now, self.core.world.resource::<ViewportMapping>());
+        let held = if typing { KeysHeld::default() } else { ctx.input(keys::held) };
         if let Some(demo) = &mut self.sketch_demo {
             ctx.request_repaint();
-            if demo.drive(&mut self.core.world, now, &mut frame, &mut held) {
+            if demo.drive(&mut self.core.world, now, &mut frame) {
                 self.sketch_demo = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        self.core.world.resource_mut::<KeysHeld>().0 = held;
+        *self.core.world.resource_mut::<KeysHeld>() = held;
         *self.core.world.resource_mut::<PointerFrame>() = frame;
         self.drive_autoplay(ctx, now);
         self.drive_bench(ctx, now);

@@ -1,6 +1,6 @@
 //! egui key events → toolkit-independent keys → actions via the world's Keymap.
 
-use tt_core::input::{Action, Key, Keymap, Mods};
+use tt_core::input::{Action, Key, Keymap, KeysHeld, Mods};
 
 pub fn actions(input: &egui::InputState, keymap: &Keymap) -> Vec<Action> {
     let mut out = Vec::new();
@@ -15,9 +15,13 @@ pub fn actions(input: &egui::InputState, keymap: &Keymap) -> Vec<Action> {
     out
 }
 
-/// Keys held right now (hold bindings such as the simulate key).
-pub fn held(input: &egui::InputState) -> Vec<Key> {
-    input.keys_down.iter().filter_map(|k| map_key(*k)).collect()
+/// Keys and modifiers held right now.
+pub fn held(input: &egui::InputState) -> KeysHeld {
+    let m = input.modifiers;
+    KeysHeld {
+        keys: input.keys_down.iter().filter_map(|k| map_key(*k)).collect(),
+        mods: Mods { ctrl: m.ctrl || m.command, shift: m.shift, alt: m.alt },
+    }
 }
 
 fn map_key(key: egui::Key) -> Option<Key> {

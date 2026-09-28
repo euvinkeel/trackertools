@@ -1,35 +1,43 @@
-//! The Sketch tool (DESIGN §8.1, §8.3): press and hold on the viewport and
-//! follow something with the pointer.
+//! The Sketch tool (DESIGN §8.1, §8.3): record the pointer into a path, like
+//! auto-keying while the video plays.
 //!
-//! - The video plays at the transport rate, which is the capture speed, set
-//!   with `[` / `]` beforehand. It pauses at the last frame instead of looping.
-//! - Hold the simulate key (Space) to freeze on the current frame: samples keep
-//!   streaming and the box sizes to the jiggle (hold-to-simulate). Steps and
-//!   scrubs while holding are recorded too, so a hard passage can be sculpted
-//!   frame by frame. With the Sketch tool active, a *tap* of the key still
-//!   plays/pauses, decided when the key comes up.
-//! - Esc abandons the capture.
+//! - Press and hold on the viewport: the pointer is recorded against whatever
+//!   frame is on screen. The transport stays independent (Space plays and
+//!   pauses as usual, even while holding):
+//!   - paused, the hold edits that instant (hold-to-simulate: the point is
+//!     where the hand settles, the box is sized by its jiggle);
+//!   - playing (or stepping, scrubbing), it records across frames.
+//! - Each press → release is a *stroke* laid over the selected sketch: it
+//!   replaces the frames it visited and pulls neighbouring frames along with a
+//!   falloff (`sketch::layer_over`); the mouse wheel sets the falloff while
+//!   holding. With no sketch selected, or with Shift held at the press, the
+//!   stroke starts a new sketch.
+//! - `Ctrl` at the press: move only (the stroke keeps the region's size).
+//! - A quick click doesn't record: it selects the sketch under it (tool.rs).
+//! - Esc abandons the stroke.
 //!
-//! While the button is held, the capture lives in [`LiveCapture`] and its
-//! preview is the same pipeline over the samples so far. Release commits it
-//! as one transaction (one undo step): a [`Capture`] entity (raw stream + clock
-//! map) and a `sketch` operator reading it, which becomes the selection.
+//! While the button is held, the stroke lives in [`LiveCapture`]; its preview
+//! is the same pipeline and layering over the sketch as it stands. Release
+//! commits it as one transaction (one undo step): a [`Capture`] entity (raw
+//! stream + clock map + [`Stroke`]) appended to the sketch's inputs, or a new
+//! `sketch` operator reading it. The sketch becomes the selection.
 
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 
-use crate::app::{AppBuilder, Module, Set};
+use crate::app::{AppBuilder, Module};
 use crate::history::edit;
-use crate::input::{Action, Keymap, KeysHeld, PendingActions};
+use crate::input::{Action, KeysHeld, PendingActions};
 use crate::meta::Class;
 use crate::op::{Inputs, Operator, Output};
 use crate::selection::Selection;
-use crate::sketch::{BOX_CHANNELS, Capture, ClockMap, STREAM_CHANNELS, SketchParams, sketch_boxes};
+use crate::signal::SignalStore;
+use crate::sketch::{BOX_CHANNELS, Boxes, Capture, ClockMap, STREAM_CHANNELS, SketchParams, Stroke, layer_over, sketch_boxes, sketch_of};
 use crate::time::{FrameIndex, WallClock};
 use crate::tool::{ActiveTool, PointerFrame, Tool};
 use crate::transport::Transport;
 
-/// A capture in progress.
+/// A stroke in progress.
 #[derive(Debug, Clone)]
 pub struct Live {
     /// Wall time of the press; sample and clock times are relative to it.
@@ -37,92 +45,96 @@ pub struct Live {
     /// `[t, x, y]`, t ascending.
     pub samples: Vec<[f64; 3]>,
     pub clock: ClockMap,
-    /// Capture speed: the transport rate at the press.
+    /// The transport rate at the press.
     pub rate: f64,
+    /// The sketch this stroke edits; `None` = a new sketch on release.
+    pub target: Option<Entity>,
+    /// The target's parameters (or the defaults for a new sketch).
     pub params: SketchParams,
-    /// The pipeline over the samples so far: `(first frame, boxes)`.
-    pub preview: Option<(FrameIndex, Vec<Option<[f64; 6]>>)>,
-    looping: bool,
+    pub stroke: Stroke,
+    /// The stroke's own boxes (frames it visited).
+    pub boxes: Option<Boxes>,
+    /// The sketch with the stroke laid over it, on the frames that change.
+    pub preview: Option<Boxes>,
 }
 
 impl Live {
-    /// The preview's `[x, y, left, top, right, bottom]` at frame `f`.
+    /// The previewed `[x, y, left, top, right, bottom]` at `f`, if the stroke changes `f`.
     pub fn preview_at(&self, f: FrameIndex) -> Option<[f64; 6]> {
-        let (first, boxes) = self.preview.as_ref()?;
-        let i = usize::try_from(f - first).ok()?;
-        boxes.get(i).copied().flatten()
+        at(self.preview.as_ref()?, f)
     }
+
+    /// Whether the stroke itself visited `f`.
+    pub fn visits(&self, f: FrameIndex) -> bool {
+        self.boxes.as_ref().is_some_and(|b| at(b, f).is_some())
+    }
+}
+
+fn at((first, values): &Boxes, f: FrameIndex) -> Option<[f64; 6]> {
+    values.get(usize::try_from(f - first).ok()?).copied().flatten()
 }
 
 #[derive(Resource, Debug, Default)]
 pub struct LiveCapture(pub Option<Live>);
 
-/// Parameters new sketches start with.
+/// What new sketches and strokes start with.
 #[derive(Resource, Debug, Default, Clone)]
-pub struct SketchDefaults(pub SketchParams);
-
-/// With the Sketch tool active the simulate key is a hold during captures
-/// and a tap-to-play otherwise; which one is known when the key comes up.
-#[derive(Resource, Debug, Default)]
-struct SimulateKey {
-    held: bool,
-    toggle_on_release: bool,
+pub struct SketchDefaults {
+    pub params: SketchParams,
+    /// The falloff last chosen with the wheel.
+    pub stroke: Stroke,
 }
 
-/// Raw input only reports motion: a still pointer is extended to "now"
-/// once it has been still this long.
+/// Raw input only reports motion: a still pointer is extended to "now" once
+/// it has been still this long.
 const STILL: f64 = 0.02;
+/// Falloff change per wheel notch, and its limits (seconds of video).
+const WHEEL_STEP: f32 = 1.25;
+const FALLOFF_MAX: f32 = 5.0;
 
-fn simulate_key(
-    tool: Res<ActiveTool>,
-    keys: Res<KeysHeld>,
-    keymap: Res<Keymap>,
-    live: Res<LiveCapture>,
-    mut actions: ResMut<PendingActions>,
-    mut sim: ResMut<SimulateKey>,
-) {
-    let held = keys.contains(keymap.simulate);
-    let capturing = live.0.is_some();
-    if (tool.0 == Tool::Sketch && held) || capturing {
-        // The key's own press queued TogglePlay: hold it until the key comes up.
-        if !actions.take(|a| a == Action::TogglePlay).is_empty() && !capturing {
-            sim.toggle_on_release = true;
-        }
-    }
-    if capturing {
-        sim.toggle_on_release = false; // it was a hold after all
-    }
-    if sim.held && !held && std::mem::take(&mut sim.toggle_on_release) {
-        actions.push(Action::TogglePlay);
-    }
-    sim.held = held;
-}
-
-/// Start, extend and commit captures (`Set::Tools`, after the transport moved).
+/// Start, extend and commit strokes (`Set::Tools`, after the transport moved).
 pub fn sketch_tool(world: &mut World) {
     let pointer = world.resource::<PointerFrame>().clone();
     let now = world.resource::<WallClock>().now;
-    let frozen = world.resource::<KeysHeld>().contains(world.resource::<Keymap>().simulate);
 
     if world.resource::<LiveCapture>().0.is_none() {
         let armed = world.resource::<ActiveTool>().0 == Tool::Sketch && world.resource::<Transport>().has_media();
         let Some(start) = pointer.pressed.filter(|_| armed) else { return };
-        let params = world.resource::<SketchDefaults>().0.clone();
-        let mut t = world.resource_mut::<Transport>();
+        let mods = world.resource::<KeysHeld>().mods;
+        let selected = world.resource::<Selection>().primary();
+        let target = selected.filter(|_| !mods.shift).and_then(|e| sketch_of(world, e));
+        let defaults = world.resource::<SketchDefaults>().clone();
+        let params = target.and_then(|t| world.get::<SketchParams>(t).cloned()).unwrap_or(defaults.params);
+        // Ctrl: move only, keeping the region's size.
+        let stroke = Stroke { size: if mods.ctrl { 0.0 } else { 1.0 }, ..defaults.stroke };
         let live = Live {
             start,
             samples: Vec::new(),
             clock: ClockMap::default(),
-            rate: t.rate,
+            rate: world.resource::<Transport>().rate,
+            target,
             params,
+            stroke,
+            boxes: None,
             preview: None,
-            looping: t.looping,
         };
-        t.looping = false;
         world.resource_mut::<LiveCapture>().0 = Some(live);
     }
     let mut live = world.resource_mut::<LiveCapture>().0.take().expect("live capture");
-    let cancelled = !world.resource_mut::<PendingActions>().take(|a| a == Action::Cancel).is_empty();
+    world.resource_mut::<PointerFrame>().wheel_taken = true;
+    if !world.resource_mut::<PendingActions>().take(|a| a == Action::Cancel).is_empty() {
+        tracing::info!("stroke cancelled");
+        return;
+    }
+    // The sketch being edited was deleted meanwhile (e.g. undone): the stroke starts a new one.
+    if let Some(t) = live.target.filter(|t| !is_live_sketch(world, *t)) {
+        tracing::info!("the sketch {t} went away during the stroke; it will start a new sketch");
+        live.target = None;
+    }
+    if pointer.wheel != 0.0 {
+        let f = (live.stroke.falloff.max(0.01) * WHEEL_STEP.powf(pointer.wheel)).min(FALLOFF_MAX);
+        live.stroke.falloff = if f < 0.015 { 0.0 } else { f };
+    }
     let end = pointer.released.or((!pointer.down).then_some(now));
 
     // Samples up to the release, kept in time order.
@@ -133,79 +145,91 @@ pub fn sketch_tool(world: &mut World) {
             live.samples.push([t, s[1], s[2]]);
         }
     }
-    let t_now = end.unwrap_or(now) - live.start;
+    let t_now = (end.unwrap_or(now) - live.start).max(0.0);
     match live.samples.last().copied() {
         Some(l) if t_now - l[0] > STILL => live.samples.push([t_now, l[1], l[2]]),
         None => {
             if let Some(h) = pointer.hover {
-                live.samples.push([t_now.max(0.0), h[0], h[1]]);
+                live.samples.push([t_now, h[0], h[1]]);
             }
         }
         _ => {}
     }
 
-    // The transport: playing unless frozen; the clock map records what was shown.
+    // What was on screen (the transport is the user's; it is only recorded).
     let fps = {
-        let mut t = world.resource_mut::<Transport>();
-        if end.is_none() && !cancelled {
-            t.playing = !frozen && t.frame() < t.last_frame();
-        } else {
-            t.playing = false;
-            t.looping = live.looping;
-        }
+        let t = world.resource::<Transport>();
         live.clock.push(t_now, t.playhead, t.playing);
         t.fps.as_f64()
     };
-    if cancelled {
-        tracing::info!("sketch cancelled");
-        return;
-    }
-    live.preview = sketch_boxes(&live.samples, &live.clock, &live.params, fps);
+    live.boxes = sketch_boxes(&live.samples, &live.clock, &live.params, fps);
+    live.preview = live.boxes.as_ref().map(|(first, boxes)| {
+        let base = live.target.and_then(|t| world.get::<Output>(t)).and_then(|o| world.resource::<SignalStore>().get(o.0));
+        let base = |f: FrameIndex| base.and_then(|s| s.get(f)).map(|v| std::array::from_fn(|c| v[c] as f64));
+        layer_over(base, *first, boxes, live.stroke.falloff as f64 * fps, &live.stroke)
+    });
     if end.is_some() {
+        if pointer.click.is_some() {
+            return; // a click selects (tool.rs); it doesn't record
+        }
         commit(world, live);
     } else {
         world.resource_mut::<LiveCapture>().0 = Some(live);
     }
 }
 
-/// One undo step: the capture entity (stream + clock map) and a sketch operator on it.
+/// One undo step: the stroke's capture entity, laid over its sketch (or a new sketch).
 fn commit(world: &mut World, live: Live) {
-    if live.preview.as_ref().is_none_or(|(_, b)| b.iter().all(Option::is_none)) {
-        return; // a click, not a gesture
+    if live.boxes.as_ref().is_none_or(|(_, b)| b.iter().all(Option::is_none)) {
+        return; // nothing visited
     }
-    let n = {
-        let mut q = world.query::<&Operator>();
-        q.iter(world).filter(|o| o.kind == "sketch").count() + 1
+    let (sketches, strokes) = {
+        let mut ops = world.query::<&Operator>();
+        let sketches = ops.iter(world).filter(|o| o.kind == "sketch").count();
+        let mut captures = world.query::<&Capture>();
+        (sketches, captures.iter(world).count())
     };
-    let mut made = None;
-    edit(world, "Sketch", |tx| {
+    let target = live.target.filter(|t| is_live_sketch(world, *t));
+    let label = match target.and_then(|t| world.get::<Name>(t)) {
+        Some(name) => format!("Stroke on {name}"),
+        None => "New sketch".to_string(),
+    };
+    let mut sketch = target;
+    edit(world, &label, |tx| {
         let stream = tx.create_signal(STREAM_CHANNELS);
         let flat: Vec<f32> = live.samples.iter().flat_map(|s| s.map(|v| v as f32)).collect();
         tx.signal(stream).write(0, &flat);
         let capture = tx.spawn((
-            Name::new(format!("Capture {n}")),
+            Name::new(format!("Stroke {}", strokes + 1)),
             Capture { rate: live.rate, samples: live.samples.len() as u32 },
             live.clock.clone(),
+            live.stroke.clone(),
             Output(stream),
         ));
-        let out = tx.create_signal(BOX_CHANNELS);
-        made = Some(tx.spawn((
-            Name::new(format!("Sketch {n}")),
-            Operator { kind: "sketch".into() },
-            Inputs(vec![("capture".into(), capture)]),
-            Output(out),
-            live.params.clone(),
-        )));
+        match sketch {
+            Some(s) => tx.modify::<Inputs>(s, |i| i.0.push(("stroke".into(), capture))),
+            None => {
+                let out = tx.create_signal(BOX_CHANNELS);
+                sketch = Some(tx.spawn((
+                    Name::new(format!("Sketch {}", sketches + 1)),
+                    Operator { kind: "sketch".into() },
+                    Inputs(vec![("stroke".into(), capture)]),
+                    Output(out),
+                    live.params.clone(),
+                )));
+            }
+        }
     });
-    if let Some(op) = made {
-        world.resource_mut::<Selection>().select_only(op);
-        tracing::info!(
-            "sketch {n}: {} samples over {:.2} s, {} frames",
-            live.samples.len(),
-            live.samples.last().map_or(0.0, |s| s[0]),
-            live.preview.as_ref().map_or(0, |(_, b)| b.iter().flatten().count())
-        );
-    }
+    let sketch = sketch.expect("a sketch");
+    world.resource_mut::<Selection>().select_only(sketch);
+    world.resource_mut::<SketchDefaults>().stroke.falloff = live.stroke.falloff;
+    let visited = live.boxes.as_ref().map_or(0, |(_, b)| b.iter().flatten().count());
+    tracing::info!("{label}: {} samples over {:.2} s, {visited} frames visited", live.samples.len(), live.samples.last().map_or(0.0, |s| s[0]));
+}
+
+/// An enabled sketch (not deleted, not undone).
+fn is_live_sketch(world: &World, e: Entity) -> bool {
+    world.get_entity(e).is_ok_and(|r| !r.contains::<bevy_ecs::entity_disabling::Disabled>()) && crate::sketch::is_sketch(world, e)
 }
 
 pub struct CaptureModule;
@@ -214,11 +238,7 @@ impl Module for CaptureModule {
     fn build(&self, app: &mut AppBuilder) {
         app.declare::<LiveCapture>(Class::Session)
             .declare::<SketchDefaults>(Class::Session)
-            .declare::<SimulateKey>(Class::Derived)
             .init_resource::<LiveCapture>()
-            .init_resource::<SketchDefaults>()
-            .init_resource::<SimulateKey>()
-            .add_systems(simulate_key.in_set(Set::Input))
-            .add_systems(sketch_tool.in_set(Set::Tools));
+            .init_resource::<SketchDefaults>();
     }
 }

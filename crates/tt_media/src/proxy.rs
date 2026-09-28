@@ -32,8 +32,13 @@ pub fn source_key(source: &Path) -> Result<String> {
     Ok(format!("{hash:016x}"))
 }
 
-/// The per-user data directory (`%LOCALAPPDATA%\trackertools`).
+/// The per-user data directory (`%LOCALAPPDATA%\trackertools`): session,
+/// projects, proxies. `TT_DATA_DIR` overrides it, so dev and benchmark runs
+/// never read or write the user's own data.
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("TT_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("trackertools")
 }
 

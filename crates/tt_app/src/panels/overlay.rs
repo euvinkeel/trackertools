@@ -1,14 +1,17 @@
 //! Viewport overlays (DESIGN §8.1 live feedback): every sketch's region and
 //! point at the playhead (the selected one bright, with its path; the rest
-//! faint), the capture in progress, and the Sketch tool's cursor and hints.
+//! faint), the stroke in progress laid over the sketch it edits, and the
+//! Sketch tool's cursor and hints. (A click on a region selects its sketch:
+//! tt_core's tool.rs.)
 
+use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use egui::{Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
 use tt_core::capture::LiveCapture;
-use tt_core::input::Keymap;
-use tt_core::op::{Inputs, Operator, Output};
+use tt_core::op::{Operator, Output};
 use tt_core::selection::Selection;
 use tt_core::signal::{FrameState, SignalStore};
+use tt_core::sketch::sketch_of;
 use tt_core::time::FrameIndex;
 use tt_core::tool::{ActiveTool, Tool};
 use tt_core::transport::Transport;
@@ -16,71 +19,75 @@ use tt_core::transport::Transport;
 use super::viewport::ViewportMapping;
 use crate::style;
 
-const LIVE: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+pub const LIVE: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
 /// Frames of path drawn either side of the playhead for the selected sketch.
 const PATH_FRAMES: FrameIndex = 90;
 
 pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: &mut World, map: &ViewportMapping, frame: FrameIndex) {
-    let selection = world.resource::<Selection>().clone();
-    let mut q = world.query::<(Entity, &Operator, &Output, Option<&Inputs>)>();
-    let sketches: Vec<(Entity, tt_core::signal::SignalId, bool)> = q
-        .iter(world)
-        .filter(|(_, o, _, _)| o.kind == "sketch")
-        .map(|(e, _, out, inputs)| {
-            let selected = selection.is_selected(e) || inputs.is_some_and(|i| i.0.iter().any(|(_, p)| selection.is_selected(*p)));
-            (e, out.0, selected)
-        })
-        .collect();
+    let selected = world.resource::<Selection>().primary().and_then(|e| sketch_of(world, e));
+    let mut q = world.query::<(Entity, &Operator, &Output)>();
+    let sketches: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "sketch").map(|(e, _, o)| (e, o.0)).collect();
     let store = world.resource::<SignalStore>();
     let live = world.resource::<LiveCapture>().0.as_ref();
+    let editing = live.and_then(|l| l.target);
+    let tool = world.resource::<ActiveTool>().0;
 
-    for (_, signal, selected) in &sketches {
+    for (e, signal) in &sketches {
         let Some(sig) = store.get(*signal) else { continue };
-        if *selected && live.is_none() {
-            path(painter, map, frame, |f| sig.get(f).map(|v| [v[0] as f64, v[1] as f64]), style::ACCENT);
-        }
-        let Some(v) = sig.get(frame) else { continue };
-        let stale = sig.state(frame) == FrameState::Stale;
-        let color = match (selected, live.is_some()) {
-            (true, false) => style::ACCENT,
-            _ => Color32::from_white_alpha(70),
+        let own = |f: FrameIndex| sig.get(f).map(|v| std::array::from_fn::<f64, 6, _>(|c| v[c] as f64));
+        let value = |f: FrameIndex| if editing == Some(*e) { live.and_then(|l| l.preview_at(f)).or_else(|| own(f)) } else { own(f) };
+        let color = if editing == Some(*e) {
+            LIVE
+        } else if selected == Some(*e) && live.is_none() {
+            style::ACCENT
+        } else {
+            Color32::from_white_alpha(70)
         };
-        region(painter, map, [v[0], v[1], v[2], v[3], v[4], v[5]].map(|x| x as f64), color, stale);
+        if editing == Some(*e) || (selected == Some(*e) && live.is_none()) {
+            path(painter, map, frame, |f| value(f).map(|v| [v[0], v[1]]), color);
+        }
+        let Some(v) = value(frame) else { continue };
+        let stale = editing != Some(*e) && sig.state(frame) == FrameState::Stale;
+        region(painter, map, v, color, stale);
     }
 
     if let Some(live) = live {
-        // The raw hand over the last half second, the smoothed path so far, and the live region.
-        let recent: Vec<Pos2> = {
-            let end = live.samples.last().map_or(0.0, |s| s[0]);
-            let from = live.samples.partition_point(|s| s[0] < end - 0.5);
-            live.samples[from..].iter().map(|s| map.to_screen([s[1], s[2]])).collect()
-        };
-        painter.add(Shape::line(recent, Stroke::new(1.0, Color32::from_white_alpha(110))));
-        path(painter, map, frame, |f| live.preview_at(f).map(|b| [b[0], b[1]]), LIVE);
-        if let Some(b) = live.preview_at(frame) {
-            region(painter, map, b, LIVE, false);
+        if live.target.is_none() {
+            path(painter, map, frame, |f| live.preview_at(f).map(|b| [b[0], b[1]]), LIVE);
+            if let Some(b) = live.preview_at(frame) {
+                region(painter, map, b, LIVE, false);
+            }
         }
+        // The raw hand over the last half second.
+        let end = live.samples.last().map_or(0.0, |s| s[0]);
+        let from = live.samples.partition_point(|s| s[0] < end - 0.5);
+        let trail: Vec<Pos2> = live.samples[from..].iter().map(|s| map.to_screen([s[1], s[2]])).collect();
+        painter.add(Shape::line(trail, Stroke::new(1.0, Color32::from_white_alpha(110))));
     }
 
     // The Sketch tool: a crosshair and what the keys do.
-    let tool = world.resource::<ActiveTool>().0;
     if tool == Tool::Sketch || live.is_some() {
         if let Some(pos) = response.hover_pos() {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-            let c = if live.is_some() { LIVE } else { style::TEXT };
-            painter.circle_stroke(pos, 7.0, Stroke::new(1.0, c));
+            painter.circle_stroke(pos, 7.0, Stroke::new(1.0, if live.is_some() { LIVE } else { style::TEXT }));
         }
         let t = world.resource::<Transport>();
-        let key = world.resource::<Keymap>().simulate;
-        let key = format!("{key:?}");
+        let fps = t.fps.as_f64();
+        let name = |e: Option<Entity>| e.and_then(|e| world.get::<Name>(e)).map(|n| n.to_string());
         let text = match live {
             Some(l) => format!(
-                "● sketching at {:.0}% · {:.1} s · {} — hold {key} to freeze · Esc cancels",
-                l.rate * 100.0,
-                l.samples.last().map_or(0.0, |s| s[0]),
-                if t.playing { "playing" } else { "frozen" }
+                "● recording into {}{} · frame {} · {} · falloff {:.2} s = {:.0} frames (wheel) · Esc cancels",
+                name(l.target).unwrap_or_else(|| "a new sketch".into()),
+                if l.stroke.size == 0.0 { " (move only)" } else { "" },
+                t.frame(),
+                if t.playing { "playing: recording across frames" } else { "paused: editing this instant" },
+                l.stroke.falloff,
+                l.stroke.falloff as f64 * fps,
             ),
-            None => format!("SKETCH · press and hold to follow at {:.0}% speed ([ / ] change it) · hold {key} to freeze · D or Esc exits", t.rate * 100.0),
+            None => match name(selected) {
+                Some(n) => format!("SKETCH · hold to record into {n} at the shown frame · Space plays while you hold · Ctrl+hold: move only · Shift+hold: new sketch · click: select · D/Esc exits"),
+                None => "SKETCH · hold to start a sketch at the shown frame · Space plays while you hold · click a box to select its sketch · D/Esc exits".to_string(),
+            },
         };
         let color = if live.is_some() { LIVE } else { style::TEXT };
         let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), color);

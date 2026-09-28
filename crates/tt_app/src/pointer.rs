@@ -92,7 +92,7 @@ impl PointerService {
 /// raw reports. Without the service, egui's one position per frame stands in.
 pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now: f64, map: &ViewportMapping) -> PointerFrame {
     let ppp = ctx.pixels_per_point();
-    let (inner, pressed, down, released, origin, latest, hover) = ctx.input(|i| {
+    let (inner, pressed, down, released, origin, latest, hover, wheel) = ctx.input(|i| {
         (
             i.viewport().inner_rect,
             i.pointer.primary_pressed(),
@@ -101,6 +101,7 @@ pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now:
             i.pointer.press_origin(),
             i.pointer.latest_pos(),
             i.pointer.hover_pos(),
+            wheel_notches(i),
         )
     });
     let mut samples = Vec::new();
@@ -123,13 +124,30 @@ pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now:
     };
     // The report that carried the transition, if the service saw it (egui events carry no time).
     let when = |flags: u16| service.last_button(flags, now - 0.25, now + 0.02).map_or(now, |t| t.min(now));
+    let over = hover.is_some_and(on_viewport);
     PointerFrame {
         samples,
-        hover: hover.filter(|p| map.panel.contains(*p)).map(|p| map.to_source(p)),
+        hover: hover.filter(|_| over).map(|p| map.to_source(p)),
         pressed: (pressed && origin.is_some_and(on_viewport)).then(|| when(LEFT_DOWN)),
         down,
         released: released.then(|| when(LEFT_UP)),
+        wheel: if over { wheel } else { 0.0 },
+        scale: map.points_per_source(),
+        ..PointerFrame::default()
     }
+}
+
+/// Mouse-wheel notches this frame (+ = away from you), whatever unit the OS reported.
+fn wheel_notches(i: &egui::InputState) -> f32 {
+    i.events
+        .iter()
+        .map(|e| match e {
+            egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta, .. } => delta.y,
+            egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, .. } => delta.y / 50.0,
+            egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Page, delta, .. } => delta.y * 10.0,
+            _ => 0.0,
+        })
+        .sum()
 }
 
 #[cfg(windows)]

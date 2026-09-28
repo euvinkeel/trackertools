@@ -218,29 +218,36 @@ Consequences:
 
 ## 8. Flagship: motion sketch
 
-### 8.1 Capture
+### 8.1 Capture: recording like auto-key
 
-- **Tool:** *Sketch*, default key `D` (Blender's draw/annotate key; `S` belongs to Blender's scale, see §18). Press and hold on a viewport to begin. The capture records every pointer event, not one per UI frame:
-  - egui's input abstraction yields one pointer sample per frame, built from OS cursor events;
-  - we tap winit below eframe for all `CursorMoved` events with timestamps, and optionally `DeviceEvent::MouseMotion` for raw deltas;
-  - this is milestone spike M1-S3.
-- **Capture speed:** the playback rate during a capture (100% / 50% / 25% / 10%). The ClockMap records it; slow motion is just a rate. Unlike After Effects' inverted "capture speed" wording, ours says what it does.
-- **Start modes:**
-  - start at the playhead and play;
-  - or start paused and use hold-to-simulate (§8.3).
+*(Reworked in M3 after hands-on use: a press no longer starts anything. The transport stays the user's, and the tool records against whatever is on screen, like auto-keying in an animation package.)*
 
-  Any transport action during a capture (pause, step, scrub) is recorded in the ClockMap and is valid.
+- **Tool:** *Sketch*, default key `D` (Blender's draw/annotate key; `S` belongs to Blender's scale, see §18).
+- **Recording:** press and hold on a viewport. Every pointer report is recorded (1 kHz raw input, timestamped; not one sample per UI frame), against whatever frame is on screen:
+  - **paused:** the hold edits that instant (hold-to-simulate, §8.3);
+  - **playing:** tap `Space` while holding and it records across frames, at the playback rate (the capture speed, set with `[` / `]`; slow motion is just a rate). Tap again to pause and keep shaping that frame;
+  - steps, jumps and scrubs while holding are recorded too.
+
+  The ClockMap records every transport change, so all of it maps back to video frames.
+- **Strokes and sketches:** each press → release is a *stroke* (a Capture entity plus a `Stroke { falloff, influence, size }` component). It goes onto the **selected sketch**, so editing a rough path means: select it (a click on its box, its timeline lane, or the outliner), go to a frame, press and hold or drag. With nothing selected, or with `Shift` held at the press, the stroke starts a new sketch. `Alt+A` deselects.
+- **Clicks select, holds record:** a press shorter than 0.18 s that moves less than 4 screen points is a click, in any tool. It selects the sketch whose box is under it (the smallest where boxes overlap), or clears the selection on empty video, and never records. Only a hold or a drag edits, so a stray click can't change a path.
+- **Move only:** `Ctrl` at the press makes the stroke keep the box size that was there (`size = 0`). Without it, a hold also sets the size from its jiggle (§8.3), so a quiet hold makes the box tight. Both stay editable per stroke.
+- **Layering (proportional editing in time):** a sketch's strokes are laid over each other in order:
+  - frames a stroke visited take its value (blended by `influence`, like an NLA strip);
+  - frames within `falloff` of a visited run keep their own motion but move by the run's edge offset, with Blender's smooth falloff curve. Where several edits reach one frame, the weights are normalised, so the frames between two edits with the same offset move by exactly that offset (no overshoot);
+  - where there is no path yet, a gap of at most twice the falloff between the stroke and another value is bridged linearly, so a path can be blocked out with holds on key frames;
+  - the mouse wheel sets the falloff while holding (shown in the HUD and on the timeline). Every stroke stays re-tunable, and removing one restores what was under it.
 - **Live feedback:**
-  - the raw cursor, and a One Euro-filtered cursor;
-  - the live box, computed by the same pipeline over the samples so far (v1's bounded-window re-synthesis);
-  - a faint preview of existing sketches at this level.
+  - the raw hand trail;
+  - the sketch with the stroke laid over it (path and region), computed by the same pipeline over the samples so far;
+  - the other sketches, faint;
+  - on the timeline, the frames the stroke visits and the frames its falloff moves.
 
   The box outline follows After Effects' "Show Wireframe".
-- **Takes and levels** carry over from v1:
-  - a new capture over an existing one becomes a refinement *level*;
+- **Takes and levels** carry over from v1 (to do):
   - "take again" at the same level averages robustly (weighted median centres, log-space sizes);
   - disagreement widens the box a little and marks those frames *uncertain*.
-- **Release:** the capture ends. Frames shown in the last `lag` before the release get no result: the hand never reached them, and a catch-up (Krita's "finish line") would invent positions for them. Because the smoothing is zero-phase with padded ends, no lag offset remains to catch up elsewhere. *(Changed from a planned catch-up after the first measurements, M3.)*
+- **Release:** the stroke is committed as one undo step. Frames *played* in the last `lag` before the release get no result: the hand never reached them, and a catch-up (Krita's "finish line") would invent positions for them. Because the smoothing is zero-phase with padded ends, no lag offset remains to catch up elsewhere. *(Changed from a planned catch-up after the first measurements, M3.)*
 
 ### 8.2 The sketch pipeline (all operators, all re-tunable)
 
@@ -263,11 +270,11 @@ Every stage's output signal is inspectable: raw, lag-shifted, smoothed, extent. 
 
 ### 8.3 Hold-to-simulate while paused
 
-1. With the video paused and the Sketch tool active, **hold the simulate key** (default `Space` while the pointer is down; rebindable).
-2. The ClockMap gets a `rate = 0` segment at the current frame.
-3. Samples keep streaming in wall time. Jiggle measures spread over its wall-time window, so the box at this frame grows while you jiggle and settles tight when you hold still, animated live by the spring: a "simulation step" in the Houdini live-tick sense.
-4. The same operators run whether playing or paused; *paused* is simply a rate-0 segment.
-5. Combining with stepping works too: hold simulate, press `→` to step a frame, and keep shaping. You can sculpt a box frame by frame through a difficult passage.
+1. With the video paused and the Sketch tool active, **press and hold** on the subject.
+2. The ClockMap records a held segment on the current frame.
+3. Samples keep streaming in wall time. Jiggle measures spread over its wall-time window, so the box at this frame grows while you jiggle and settles tight when you hold still: a "simulation step" in the Houdini live-tick sense.
+4. The frame takes the hand's state at the end of the hold, with no lag shift, since the hand has settled on what is shown. Before `lag` has passed, it uses the time the hand needed to get there, `start + lag`.
+5. It combines with stepping: keep holding, press `→` to step a frame, and keep shaping, sculpting a box frame by frame through a difficult passage. On an existing sketch, each held frame's change spreads to its neighbours through the falloff (§8.1).
 
 ---
 
@@ -399,14 +406,15 @@ Adopted from Rerun's proven design.
   - Later: **Curve editor**, **Operator graph** (egui-snarl).
 - **Tools** (Select, Sketch, Adjust, Pan/Zoom) are state machines in the `Tools` set, fed by a `PointerFrame` resource (every timestamped sample since the last frame, in source pixels) and `KeysHeld`, so they run headless in tests. An in-progress gesture is world state (the Sketch tool's `LiveCapture`), so overlays draw it; on commit it becomes document entities in one transaction.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
-  - `Space` play; while sketching, hold `Space` to freeze (hold-to-simulate);
-  - `D` Sketch tool, `Esc` cancels the gesture or leaves the tool;
+  - `Space` play (also while holding the button: recording across frames);
+  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel sets a stroke's falloff while holding; `Esc` cancels the stroke or leaves the tool;
+  - `Alt+A` deselects;
   - `[` / `]` playback rate (= capture speed);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;
   - `X` delete;
   - `Ctrl+Z` / `Ctrl+Shift+Z` undo / redo;
-  - `A` select all, `Alt+A` deselect;
+  - `A` select all;
   - `N` toggles the sidebar;
   - `Home` frames all.
 

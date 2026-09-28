@@ -49,6 +49,11 @@ impl ViewportMapping {
         self.video.width() as f64 / self.source.x as f64
     }
 
+    /// Screen points per source pixel.
+    pub fn points_per_source(self) -> f64 {
+        self.scale()
+    }
+
     pub fn to_source(self, p: Pos2) -> [f64; 2] {
         let s = self.scale();
         [(p.x - self.video.min.x) as f64 / s, (p.y - self.video.min.y) as f64 / s]
@@ -65,6 +70,10 @@ impl ViewportMapping {
         Pos2::new(self.video.min.x + (src[0] * s) as f32, self.video.min.y + (src[1] * s) as f32)
     }
 }
+
+/// Until when (wall seconds) the wheel is not the viewport's to zoom with.
+#[derive(Resource, Debug, Default)]
+pub struct WheelLock(pub f64);
 
 /// Set while the viewport shows a stand-in for a frame still decoding, so the
 /// shell keeps repainting until the exact frame arrives.
@@ -99,6 +108,8 @@ impl Module for ViewportModule {
             .declare::<PlaybackProbe>(Class::Derived)
             .declare::<WaitingForFrame>(Class::Derived)
             .declare::<ViewportMapping>(Class::Derived)
+            .declare::<WheelLock>(Class::Derived)
+            .init_resource::<WheelLock>()
             .init_resource::<ViewportMapping>()
             .init_resource::<ViewportView>()
             .init_resource::<PlaybackProbe>()
@@ -131,7 +142,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         let min = rect.center() - Vec2::new(view.center[0] * size.x, view.center[1] * size.y);
         Rect::from_min_size(min, size)
     };
-    if let Some(pos) = response.hover_pos() {
+    // While a stroke uses the wheel (falloff), and briefly after, the wheel doesn't
+    // zoom: egui spreads one notch over several frames of smoothed scrolling.
+    let now = world.resource::<tt_core::time::WallClock>().now;
+    if world.resource::<tt_core::tool::PointerFrame>().wheel_taken {
+        world.resource_mut::<WheelLock>().0 = now + 0.4;
+    }
+    let wheel_free = now >= world.resource::<WheelLock>().0;
+    if let Some(pos) = response.hover_pos().filter(|_| wheel_free) {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
             let before = video_rect(&view);

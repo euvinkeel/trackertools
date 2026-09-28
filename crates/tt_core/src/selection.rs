@@ -6,6 +6,7 @@ use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::prelude::*;
 
 use crate::app::{AppBuilder, Module, Set};
+use crate::input::{Action, PendingActions};
 use crate::meta::Class;
 
 #[derive(Resource, Debug, Default, Clone, PartialEq)]
@@ -47,10 +48,19 @@ fn prune(mut sel: ResMut<Selection>, alive: Query<(), Without<Disabled>>) {
     }
 }
 
+fn apply_selection_actions(mut actions: ResMut<PendingActions>, mut sel: ResMut<Selection>) {
+    if !actions.take(|a| a == Action::DeselectAll).is_empty() {
+        sel.clear();
+    }
+}
+
 pub struct SelectionModule;
 
 impl Module for SelectionModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<Selection>(Class::Session).init_resource::<Selection>().add_systems(prune.in_set(Set::Prepare));
+        app.declare::<Selection>(Class::Session).init_resource::<Selection>()
+            // Before the tools, which read the selection when a stroke starts.
+            .add_systems(apply_selection_actions.in_set(Set::Input))
+            .add_systems(prune.in_set(Set::Prepare));
     }
 }

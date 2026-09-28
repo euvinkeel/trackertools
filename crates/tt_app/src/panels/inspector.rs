@@ -108,7 +108,7 @@ fn sketch_presets(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                 chosen = Some((name, preset));
             }
         }
-        let is_default = world.resource::<SketchDefaults>().0 == current;
+        let is_default = world.resource::<SketchDefaults>().params == current;
         make_default = ui
             .add_enabled(!is_default, egui::Button::new("Use for new sketches").small())
             .on_hover_text("New captures start with these numbers")
@@ -119,7 +119,7 @@ fn sketch_presets(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         edit(world, &format!("Preset {name}"), |tx| tx.insert(e, preset));
     }
     if make_default {
-        world.resource_mut::<SketchDefaults>().0 = current;
+        world.resource_mut::<SketchDefaults>().params = current;
     }
 }
 

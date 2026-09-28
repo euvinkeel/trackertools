@@ -287,7 +287,7 @@ fn rebuild_graph(world: &mut World) {
 
 /// Propagate queued changes through the graph (topological order), marking
 /// affected output frames stale and dirty.
-fn propagate(world: &mut World) {
+pub(crate) fn propagate(world: &mut World) {
     let queued = std::mem::take(&mut world.resource_mut::<Invalidations>().0);
     if queued.is_empty() {
         return;

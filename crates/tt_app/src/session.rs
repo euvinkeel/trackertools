@@ -38,8 +38,7 @@ impl Session {
     }
 
     fn path() -> PathBuf {
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        base.join("trackertools").join("session.json")
+        tt_media::proxy::data_dir().join("session.json")
     }
 
     fn load() -> Self {

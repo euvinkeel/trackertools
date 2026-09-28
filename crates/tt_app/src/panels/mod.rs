@@ -91,7 +91,14 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Sketch)).unwrap_or_default();
         if ui
             .selectable_label(sketching, "✏ Sketch")
-            .on_hover_text(format!("Sketch tool ({chord}): press and hold on the video to follow something"))
+            .on_hover_text(format!(
+                "Sketch tool ({chord})\n\
+                 • hold on the video: record into the selected sketch at the shown frame (paused: edit that instant)\n\
+                 • Space while holding: play and record across frames\n\
+                 • wheel while holding: falloff to neighbouring frames\n\
+                 • Ctrl+hold: move only (keep the box size) · Shift+hold: new sketch\n\
+                 • click: select the sketch under the cursor · Alt+A: deselect · Esc: cancel"
+            ))
             .clicked()
         {
             history_action = Some(Action::Tool(Tool::Sketch));

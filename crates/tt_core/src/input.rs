@@ -37,6 +37,8 @@ pub enum Action {
     Tool(Tool),
     /// Abandon the gesture in progress (Esc); with none, return to Select.
     Cancel,
+    /// Clear the selection.
+    DeselectAll,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -78,9 +80,6 @@ pub struct Binding {
 #[derive(Resource, Debug, Clone)]
 pub struct Keymap {
     pub bindings: Vec<(Binding, Action)>,
-    /// Held during a sketch: freeze on the current frame (hold-to-simulate).
-    /// With the Sketch tool active, a tap still plays/pauses.
-    pub simulate: Key,
 }
 
 impl Default for Keymap {
@@ -106,8 +105,8 @@ impl Default for Keymap {
                 // Blender: D + drag draws (annotate); here it arms the Sketch tool.
                 (b(Key::Letter('d'), Mods::NONE, false), Tool(crate::tool::Tool::Sketch)),
                 (b(Key::Escape, Mods::NONE, false), Cancel),
+                (b(Key::Letter('a'), Mods { ctrl: false, shift: false, alt: true }, false), DeselectAll),
             ],
-            simulate: Key::Space,
         }
     }
 }
@@ -149,13 +148,16 @@ impl Keymap {
     }
 }
 
-/// Keys held down right now (the host refreshes it every app frame).
+/// Keys and modifiers held down right now (the host refreshes it every app frame).
 #[derive(Resource, Debug, Default, Clone)]
-pub struct KeysHeld(pub Vec<Key>);
+pub struct KeysHeld {
+    pub keys: Vec<Key>,
+    pub mods: Mods,
+}
 
 impl KeysHeld {
     pub fn contains(&self, key: Key) -> bool {
-        self.0.contains(&key)
+        self.keys.contains(&key)
     }
 }
 

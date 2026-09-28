@@ -1,6 +1,7 @@
 //! Spike S3 diagnostics (`TT_INPUT_PROBE=1`): pointer rate and timing from
 //! the [`PointerService`] vs egui's per-frame events, shown live in the
-//! viewport and appended every 5 s to `%LOCALAPPDATA%\trackertools\input_probe.log`.
+//! viewport and appended every 5 s to `input_probe.log` in the data dir
+//! (`%LOCALAPPDATA%\trackertools`, or `TT_DATA_DIR`).
 
 use std::collections::VecDeque;
 use std::io::Write;

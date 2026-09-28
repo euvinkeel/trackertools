@@ -217,18 +217,21 @@ The original plan follows.
 
 | Item | Status |
 |---|---|
-| Sketch tool | ✅ `D` arms it; press and hold on the video to follow at the transport rate (the capture speed, `[` / `]`); the video pauses at the last frame instead of looping; Esc cancels; release commits a Capture + `sketch` operator as **one undo step** and selects it |
+| Sketch tool | ✅ `D` arms it. **Auto-key model** (reworked after hands-on use): holding the button records against whatever frame is shown and never touches the transport. Paused, it edits that instant; tap Space while holding to record across frames. Each press → release is a *stroke* on the selected sketch, or a new sketch with nothing selected or with Shift. Each stroke is **one undo step**. A quick click selects the sketch under it and never records. Ctrl+hold moves only (keeps the box size). Esc cancels, Alt+A deselects. If the edited sketch is undone mid-stroke, the stroke starts a new sketch instead of writing into the deleted one |
+| Strokes and falloff | ✅ `layer_over`: a stroke replaces the frames it visited (× influence), and frames within its falloff move with its edge offset (Blender's smooth falloff, normalised where edits overlap). Short gaps in new territory are bridged (blocking with holds). The wheel sets the falloff while holding. Stroke falloff and influence are editable afterwards |
 | Pointer input | ✅ a raw-input service thread (1 kHz, QPC timestamps mapped exactly onto the app clock); button transitions timed from the raw reports; screen px → window points → source px through the viewport as last drawn. The input probe (`TT_INPUT_PROBE=1`) shows the mapping offset against egui's pointer |
 | Pipeline | ✅ one `sketch` operator (Global footprint, evaluated in one call): 240 Hz grid → dead zone → zero-phase One Euro (odd-reflection padded ends) → jiggle → size → lag-compensated resampling through the ClockMap → union window → smoothing of the point (trend-preserving ends) and of the region *as extents around the point*. Frames shown in the last `lag` before the release get no result: the hand never reached them (replaces the planned catch-up, which would invent positions) |
-| Hold-to-simulate | ✅ hold Space during a capture to freeze on the frame (steps and scrubs while frozen are recorded); hold Space *then* press to start frozen. With the Sketch tool active a tap of Space still plays/pauses, decided when the key comes up |
-| Live feedback | ✅ raw hand trail (0.5 s), the live path and region from the same pipeline over the samples so far, existing sketches faint, the selected one bright with its path ±90 frames, crosshair and key hints |
+| Hold-to-simulate | ✅ press and hold while paused. A held frame takes the hand at the end of the hold (no lag shift). Steps while holding sculpt frame by frame |
+| Live feedback | ✅ raw hand trail (0.5 s), the sketch with the stroke laid over it (path and region), other sketches faint, the selected one bright with its path ±90 frames, crosshair and key hints. In the Select tool, a click on a box selects its sketch |
 | Re-tuning | ✅ every parameter in the Inspector (drag = one undo step); presets Tight / Default / Loose; "use for new sketches". ⏳ raw vs smoothed trail toggle |
-| Timeline lanes | ✅ one lane per sketch (valid / stale coverage), the live capture's lane, click to select. ⏳ summaries, uncertainty |
+| Timeline lanes | ✅ one lane per sketch (valid / stale coverage), with each stroke's span under the selected sketch. The live stroke shows its visited frames and the frames its falloff moves. Click to select. ⏳ summaries, uncertainty |
 | Takes and levels, modifier stacks | ⏳ next |
 
 **Measured:**
 - Scripted noisy hand at ¼× (tremor, 250 ms lag) over the sprite path, every frame counted including the first and last: point error median 1.10 px, p95 1.95 px, the sprite inside the region on 100% of frames (`tests/sketch.rs`, held as the regression bar: median < 1.5, p95 < 3.0, ≥ 99.5%).
-- The same through the running app (`TT_SKETCH_DEMO=fixtures/sprite_truth.json`, with a 1 s freeze mid-capture): median 1.46 px, p95 2.25 px, 100% containment over 116 frames.
+- The same through the running app (`TT_SKETCH_DEMO=fixtures/sprite_truth.json`: hold, Space taps to play at ¼×, a 1 s pause mid-way, pause and release): median ≈ 1.5 px, p95 ≈ 2.5 px, max < 3 px, 100% containment over 120 frames (three runs). Then an edit (a 0.6 s hold 40 px off the path at frame 180) moves that frame by ≈ 37 px (the hand's tremor and the dead zone take the rest), its neighbours exactly by the falloff curve, and nothing beyond ±12 frames.
+- An adversarial review of the stroke model (4 reviewers + skeptics) confirmed 7 issues, all fixed with tests: writes into a sketch undone mid-stroke, clicks committing edits, quiet holds shrinking the box (now Ctrl = move only), text focus swallowing Space/Shift/Esc during a stroke, one wheel notch both setting falloff and zooming, Alt+A applied after the tool read the selection, and bridging reach rounded up for sub-frame falloffs.
+- Dev runs use `TT_DATA_DIR=<scratch>` and `--target-dir target/bench`, so they never touch the user's projects or the release build they are running.
 - Hold-to-simulate: holding still settles to the minimum box (32 × 32); jiggling grows it 3.5×.
 - Re-tuning a 60 s capture: 2.1 ms at 1× (3,600 frames), 1.7 ms at ¼× (release build).
 

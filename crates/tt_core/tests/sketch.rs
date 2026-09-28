@@ -225,3 +225,113 @@ fn retune_speed() {
         println!("60 s capture at {rate}× ({} samples, {frames} frames): {:.2} ms per re-derive", samples.len(), t.elapsed().as_secs_f64() * 1e3 / runs as f64);
     }
 }
+
+// ---- layering strokes --------------------------------------------------------------------
+
+mod layering {
+    use tt_core::sketch::{Stroke, falloff_weight, layer_over};
+
+    fn stroke(influence: f32, size: f32) -> Stroke {
+        Stroke { influence, size, ..Stroke::default() }
+    }
+
+    /// A path moving right one pixel per frame, frames 0..300.
+    fn line(f: i64) -> Option<[f64; 6]> {
+        (0..300).contains(&f).then(|| {
+            let x = f as f64;
+            [x, 50.0, x - 10.0, 40.0, x + 10.0, 60.0]
+        })
+    }
+
+    fn shifted(f: i64, dx: f64) -> Option<[f64; 6]> {
+        line(f).map(|v| [v[0] + dx, v[1], v[2] + dx, v[3], v[4] + dx, v[5]])
+    }
+
+    fn get(result: &(i64, Vec<Option<[f64; 6]>>), f: i64) -> Option<[f64; 6]> {
+        result.1.get(usize::try_from(f - result.0).ok()?).copied().flatten()
+    }
+
+    #[test]
+    fn a_one_frame_edit_pulls_its_neighbours_with_falloff() {
+        let r = layer_over(line, 100, &[shifted(100, 40.0)], 10.0, &stroke(1.0, 1.0));
+        assert_eq!(get(&r, 100).unwrap()[0], 140.0, "the edited frame takes the stroke");
+        let mut last = 40.0;
+        for k in 1..=10 {
+            for f in [100 - k, 100 + k] {
+                let moved = get(&r, f).unwrap()[0] - f as f64;
+                assert!((moved - 40.0 * falloff_weight(k as f64, 10.0)).abs() < 1e-9, "frame {f} moved {moved}");
+                assert!(moved < last + 1e-9 && moved > 0.0, "falloff decreases with distance");
+            }
+            last = get(&r, 100 + k).unwrap()[0] - (100 + k) as f64;
+            // The neighbours keep their own motion: box edges move with the point.
+            let v = get(&r, 100 + k).unwrap();
+            assert!((v[4] - v[0] - 10.0).abs() < 1e-9);
+        }
+        assert!(get(&r, 89).is_none() && get(&r, 111).is_none(), "beyond the radius nothing changes");
+    }
+
+    #[test]
+    fn frames_between_two_edits_with_the_same_offset_move_by_exactly_that_offset() {
+        let stroke: Vec<_> = (100..=106).map(|f| if f == 100 || f == 106 { shifted(f, 40.0) } else { None }).collect();
+        let r = layer_over(line, 100, &stroke, 10.0, &super::layering::stroke(1.0, 1.0));
+        for f in 100..=106 {
+            let moved = get(&r, f).unwrap()[0] - f as f64;
+            assert!((moved - 40.0).abs() < 1e-9, "frame {f} moved {moved}: normalised, no overshoot");
+        }
+    }
+
+    #[test]
+    fn influence_blends_and_zero_radius_touches_only_the_visited_frames() {
+        let r = layer_over(line, 100, &[shifted(100, 40.0)], 0.0, &stroke(0.5, 1.0));
+        assert_eq!(get(&r, 100).unwrap()[0], 120.0);
+        assert!(get(&r, 99).is_none() && get(&r, 101).is_none());
+    }
+
+    #[test]
+    fn a_move_only_stroke_keeps_the_regions_size() {
+        // The stroke's region is tiny (a quiet hold), 40 px to the right.
+        let tiny = [140.0, 50.0, 138.0, 48.0, 142.0, 52.0];
+        let moved = layer_over(line, 100, &[Some(tiny)], 10.0, &stroke(1.0, 0.0));
+        let v = get(&moved, 100).unwrap();
+        assert_eq!(v, [140.0, 50.0, 130.0, 40.0, 150.0, 60.0], "the point moves, the extents stay 10 px");
+        let resized = layer_over(line, 100, &[Some(tiny)], 10.0, &stroke(1.0, 1.0));
+        assert_eq!(get(&resized, 100).unwrap(), tiny, "size 1 takes the stroke's region");
+    }
+
+    #[test]
+    fn bridging_follows_the_real_radius() {
+        let none = |_| None;
+        let key = |x: f64| Some([x, 0.0, x - 5.0, -5.0, x + 5.0, 5.0]);
+        let gap = |n: usize| {
+            let mut s = vec![None; n + 2];
+            s[0] = key(0.0);
+            s[n + 1] = key(10.0);
+            s
+        };
+        // radius 0.5 frames: a one-frame gap (≤ 2·0.5) is bridged, a two-frame gap is not.
+        assert!(get(&layer_over(none, 100, &gap(1), 0.5, &stroke(1.0, 1.0)), 101).is_some());
+        let two = layer_over(none, 100, &gap(2), 0.5, &stroke(1.0, 1.0));
+        assert!(get(&two, 101).is_none() && get(&two, 102).is_none());
+    }
+
+    #[test]
+    fn new_territory_is_bridged_between_nearby_edits_only() {
+        let none = |_| None;
+        let key = |x: f64| Some([x, 0.0, x - 5.0, -5.0, x + 5.0, 5.0]);
+        // Two holds 8 frames apart, radius 10: the frames between are interpolated.
+        let mut stroke = vec![None; 9];
+        stroke[0] = key(0.0);
+        stroke[8] = key(80.0);
+        let r = layer_over(none, 100, &stroke, 10.0, &super::layering::stroke(1.0, 1.0));
+        for k in 0..=8 {
+            assert!((get(&r, 100 + k).unwrap()[0] - 10.0 * k as f64).abs() < 1e-9, "frame {}", 100 + k);
+        }
+        assert!(get(&r, 99).is_none() && get(&r, 109).is_none(), "no extrapolation past the ends");
+        // 30 frames apart (more than twice the radius): left alone.
+        let mut far = vec![None; 31];
+        far[0] = key(0.0);
+        far[30] = key(300.0);
+        let r = layer_over(none, 100, &far, 10.0, &super::layering::stroke(1.0, 1.0));
+        assert!((101..130).all(|f| get(&r, f).is_none()));
+    }
+}
