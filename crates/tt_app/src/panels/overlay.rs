@@ -103,8 +103,8 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
                 l.stroke.falloff as f64 * fps,
             ),
             None => match name(selected) {
-                Some(n) => format!("SKETCH · hold to record into {n} at the shown frame · Space plays while you hold · Ctrl+hold: move only · Shift+hold: new sketch · click: select · D/Esc exits"),
-                None => "SKETCH · hold to start a sketch at the shown frame · Space plays while you hold · click a box to select its sketch · D/Esc exits".to_string(),
+                Some(n) => format!("SKETCH · hold to record into {n} at the shown frame · Space plays at {} (Q/E) · Ctrl+hold: move only · Shift+hold: new sketch · click: select · D/Esc exits", super::timeline::rate_label(t.rate)),
+                None => format!("SKETCH · hold to start a sketch at the shown frame · Space plays at {} (Q/E) · click a box to select its sketch · D/Esc exits", super::timeline::rate_label(t.rate)),
             },
         };
         let color = if live.is_some() { LIVE } else { style::TEXT };

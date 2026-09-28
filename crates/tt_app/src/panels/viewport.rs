@@ -162,6 +162,8 @@ impl Module for ViewportModule {
             .declare::<ViewportMapping>(Class::Derived)
             .declare::<WheelLock>(Class::Derived)
             .declare::<ViewMemory>(Class::Session)
+            .declare::<SpeedFlash>(Class::Derived)
+            .init_resource::<SpeedFlash>()
             .declare::<FramingEase>(Class::Derived)
             .init_resource::<ViewMemory>()
             .init_resource::<FramingEase>()
@@ -293,10 +295,11 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
     super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid, active_view, eased);
     breadcrumb(ui, world, rect.left_top() + Vec2::new(10.0, 34.0), active_view, shown_grid);
+    speed(&painter, rect, t.rate, world);
     let media = world.resource::<Media>();
     if let Some(pos) = response.hover_pos() {
         let src = space.to_source(mapping.to_canvas(pos));
-        hud(&painter, rect.right_top() + Vec2::new(-10.0, 8.0), Align2::RIGHT_TOP, &format!("{:.1}, {:.1} px · {:.0}%", src[0], src[1], screen_per_source * 100.0), style::MUTED);
+        hud(&painter, rect.right_top() + Vec2::new(-10.0, 44.0), Align2::RIGHT_TOP, &format!("{:.1}, {:.1} px · {:.0}%", src[0], src[1], screen_per_source * 100.0), style::MUTED);
     }
     let active = media.source(prefer).expect("preferred source exists");
     let stats = active.player.stats();
@@ -400,6 +403,50 @@ fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Ent
     });
     if let Some(v) = go {
         world.resource_mut::<ActiveView>().0 = v;
+    }
+}
+
+/// The playback speed, always in view (it is the capture speed of the next
+/// stroke): a badge top-right, and a big flash in the middle when it changes.
+fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
+    const FLASH: f64 = 1.2;
+    let now = world.resource::<tt_core::time::WallClock>().now;
+    let mut flash = world.resource_mut::<SpeedFlash>();
+    if flash.rate != Some(rate) {
+        // Not on the first frame (opening a video isn't a change).
+        flash.changed_at = if flash.rate.is_some() { now } else { f64::NEG_INFINITY };
+        flash.rate = Some(rate);
+    }
+    let age = now - flash.changed_at;
+    let label = super::timeline::rate_label(rate);
+    let color = if (rate - 1.0).abs() < 1e-9 { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) };
+
+    let galley = painter.layout_no_wrap(format!("{label} speed"), FontId::proportional(20.0), color);
+    let r = Align2::RIGHT_TOP.anchor_size(rect.right_top() + Vec2::new(-10.0, 8.0), galley.size()).expand(5.0);
+    painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
+    painter.galley(r.min + Vec2::splat(5.0), galley, color);
+
+    if age < FLASH {
+        // Full for 0.6 s, then fading out.
+        let alpha = (1.0 - ((age - 0.6) / (FLASH - 0.6)).clamp(0.0, 1.0)) as f32;
+        let galley = painter.layout_no_wrap(label, FontId::proportional(96.0), color.gamma_multiply(alpha));
+        let r = Align2::CENTER_CENTER.anchor_size(rect.center(), galley.size()).expand(18.0);
+        painter.rect_filled(r, 12.0, Color32::from_black_alpha((170.0 * alpha) as u8));
+        painter.galley(r.min + Vec2::splat(18.0), galley, color.gamma_multiply(alpha));
+        painter.ctx().request_repaint();
+    }
+}
+
+/// When the playback speed last changed (for the flash).
+#[derive(Resource, Debug)]
+pub struct SpeedFlash {
+    rate: Option<f64>,
+    changed_at: f64,
+}
+
+impl Default for SpeedFlash {
+    fn default() -> Self {
+        Self { rate: None, changed_at: f64::NEG_INFINITY }
     }
 }
 

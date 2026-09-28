@@ -101,6 +101,9 @@ impl Default for Keymap {
                 (b(Key::ArrowLeft, Mods::SHIFT, false), GoToStart),
                 (b(Key::ArrowRight, Mods::SHIFT, false), GoToEnd),
                 (b(Key::Home, Mods::NONE, false), FrameAll),
+                // Playback speed (= capture speed): Q slower, E faster; [ / ] too.
+                (b(Key::Letter('e'), Mods::NONE, false), FasterPlayback),
+                (b(Key::Letter('q'), Mods::NONE, false), SlowerPlayback),
                 (b(Key::Letter(']'), Mods::NONE, false), FasterPlayback),
                 (b(Key::Letter('['), Mods::NONE, false), SlowerPlayback),
                 (b(Key::Letter('o'), Mods::CTRL, false), OpenFile),
@@ -211,6 +214,9 @@ mod tests {
         assert_eq!(k.lookup(Key::Space, Mods::NONE, false), Some(Action::TogglePlay));
         assert_eq!(k.lookup(Key::Space, Mods::NONE, true), None);
         assert_eq!(k.lookup(Key::ArrowRight, Mods::SHIFT, false), Some(Action::GoToEnd));
+        assert_eq!(k.lookup(Key::Letter('q'), Mods::NONE, false), Some(Action::SlowerPlayback));
+        assert_eq!(k.lookup(Key::Letter('e'), Mods::NONE, false), Some(Action::FasterPlayback));
+        assert_eq!(k.chord_for(Action::FasterPlayback).as_deref(), Some("E"), "E is the one shown");
     }
 
     #[test]

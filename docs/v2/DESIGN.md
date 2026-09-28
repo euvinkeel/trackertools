@@ -428,7 +428,7 @@ Adopted from Rerun's proven design.
   - `Space` play (also while holding the button: recording across frames);
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel sets a stroke's falloff while holding; `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects;
-  - `[` / `]` playback rate (= capture speed);
+  - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when it changes;
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;
   - `X` delete;

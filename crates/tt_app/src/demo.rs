@@ -160,6 +160,7 @@ impl SketchDemo {
                     return false;
                 }
                 self.phase = Phase::Ready { since: now };
+                self.shots.push(("0-speed-flash", now + 0.15));
             }
             Phase::Ready { since } => {
                 *frame = PointerFrame::default();

@@ -83,13 +83,20 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         button(ui, "⏭", Action::GoToEnd, "Go to end");
         ui.separator();
 
+        let speed_tip = format!(
+            "Playback speed, which is also the capture speed while sketching ({} slower, {} faster)",
+            keymap.chord_for(Action::SlowerPlayback).unwrap_or_default(),
+            keymap.chord_for(Action::FasterPlayback).unwrap_or_default()
+        );
         egui::ComboBox::from_id_salt("rate").width(64.0).selected_text(rate_label(t.rate)).show_ui(ui, |ui| {
             for (i, r) in RATES.iter().enumerate() {
                 if ui.selectable_label((r - t.rate).abs() < 1e-9, rate_label(*r)).clicked() {
                     actions.push(Action::SetRate(i as u8));
                 }
             }
-        });
+        })
+        .response
+        .on_hover_text(speed_tip);
         if ui.selectable_label(t.looping, "⟲ loop").clicked() {
             actions.push(Action::ToggleLoop);
         }
@@ -304,7 +311,7 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, top: Pos2, c
     clicked
 }
 
-fn rate_label(rate: f64) -> String {
+pub(crate) fn rate_label(rate: f64) -> String {
     if rate >= 1.0 { format!("{rate:.0}×") } else { format!("{rate}×") }
 }
 
