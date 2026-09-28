@@ -60,6 +60,8 @@ pub const STREAM_CHANNELS: usize = 3;
 /// Channels of a sketch result: `[x, y, left, top, right, bottom]`.
 pub const BOX_CHANNELS: usize = 6;
 const GRID_HZ: f64 = 240.0;
+/// A held frame takes the median of the hand's last this-many seconds on it.
+const SETTLE: f64 = 0.15;
 /// Dead-zone variant (see `dead_zone_symmetric`); chosen by the sweep in tests/sketch.rs.
 const SYMMETRIC_DEAD_ZONE: bool = false;
 
@@ -192,7 +194,9 @@ pub struct Through(pub crate::signal::SignalId);
 #[reflect(Component)]
 pub struct Stroke {
     /// Seconds (video time) over which frames beside the stroke are pulled
-    /// along with it, fading out (proportional editing in time).
+    /// along with it, fading out (proportional editing in time). 0 (the
+    /// default) = a retake: only the frames the stroke visited change, and
+    /// the region around them re-derives from the new data.
     pub falloff: f32,
     /// How much the stroke moves the point: 0 = no effect, 1 = it replaces what was there.
     pub influence: f32,
@@ -219,7 +223,7 @@ fn default_lag() -> f32 {
 
 impl Default for Stroke {
     fn default() -> Self {
-        Self { falloff: 0.2, influence: 1.0, size: 1.0, scale: 1.0, lag: default_lag() }
+        Self { falloff: 0.0, influence: 1.0, size: 1.0, scale: 1.0, lag: default_lag() }
     }
 }
 
@@ -527,13 +531,34 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, l
         [c[0], c[1], c[0] - h[0], c[1] - h[1], c[0] + h[0], c[1] + h[1]]
     };
 
+    // A held frame is a retake of where the hand should have been: where it
+    // sat on that frame (the median of its last `SETTLE` s there, so neither
+    // the move that brought it nor the one after leaving pulls it, and tremor
+    // doesn't need the dead zone), sized by the jiggle while it was there.
+    let settled = |from: f64, to: f64| -> [f64; 6] {
+        let idx = |t: f64| (((t - t0) * hz).round().max(0.0) as usize).min(raw.len() - 1);
+        let e = idx(to);
+        let median = |b: usize, k: usize| {
+            let mut v: Vec<f64> = raw[b..=e].iter().map(|p| p[k]).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let b = idx(from.max(to - SETTLE)).min(e);
+        let c = [median(b, 0), median(b, 1)];
+        let j = idx(from.max(to - p.jiggle_window as f64)).min(e);
+        let spread = |k: usize| (raw[j..=e].iter().map(|r| (r[k] - c[k]).powi(2)).sum::<f64>() / (e - j + 1) as f64).sqrt();
+        let h = |s: f64| (p.gain as f64 * 2.2 * s + p.pad as f64).max(p.min_half as f64);
+        let (hx, hy) = (h(spread(0)), h(spread(1)));
+        [c[0], c[1], c[0] - hx, c[1] - hy, c[0] + hx, c[1] + hy]
+    };
+
     // To video frames: the path at the moment each frame was shown, plus the lag.
     // - A played frame shown in the last `lag` before the release was never
     //   reached by the hand: no result.
-    // - A held frame takes the end of the hold (the hand has settled on it),
-    //   but at least `lag` after the hold began (it had to get there first).
+    // - A held frame (paused, stepped onto) takes where the hand settled on it.
     let (first, shown) = clock.frame_times()?;
     let (start, end) = (samples[0][0], samples[samples.len() - 1][0]);
+    let held: Vec<bool> = shown.iter().map(|s| matches!(s, Some(Shown::Held { .. }))).collect();
     let frames: Vec<Option<[f64; 6]>> = shown
         .iter()
         .map(|s| match (*s)? {
@@ -541,23 +566,24 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, l
                 let t = t + lag;
                 (start..=end).contains(&t).then(|| jiggle_box(t))
             }
-            Shown::Held { from, to } => Some(jiggle_box(to.max(from + lag).min(end))),
+            Shown::Held { from, to } => Some(settled(from, to.min(end))),
         })
         .collect();
 
-    // Light smoothing within each visited run (no bleeding across gaps). The
-    // box is smoothed as extents around the point, so smoothing its size never
-    // drags it behind a moving subject.
+    // Light smoothing within each played run (no bleeding across gaps, and
+    // none into held frames: each was placed by hand). The box is smoothed
+    // as extents around the point, so smoothing its size never drags it
+    // behind a moving subject.
     let n = frames.len();
     let mut out = frames.clone();
     let mut i = 0;
     while i < n {
-        if frames[i].is_none() {
+        if frames[i].is_none() || held[i] {
             i += 1;
             continue;
         }
         let start = i;
-        while i < n && frames[i].is_some() {
+        while i < n && frames[i].is_some() && !held[i] {
             i += 1;
         }
         let run: Vec<[f64; 6]> = frames[start..i].iter().map(|b| b.unwrap()).collect();

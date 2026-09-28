@@ -66,6 +66,7 @@ fn holding_while_the_video_plays_records_across_frames() {
 #[test]
 fn a_stroke_edits_the_selected_sketch_with_falloff_and_undoes_alone() {
     let mut d = Driver::new();
+    d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().stroke.falloff = 0.2;
     // A first stroke along a line, followed while playing.
     let line = |t: f64| [200.0 + 60.0 * t, 300.0];
     d.core.world.resource_mut::<Transport>().seek(100);
@@ -133,14 +134,16 @@ fn the_wheel_sets_size_falloff_or_both_as_chosen() {
     use tt_core::capture::{SketchDefaults, WheelMode};
     let mut d = Driver::new();
     let stroke = |d: &Driver| d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.clone();
-    // Default: the wheel sizes the region.
+    // Default: the wheel leaves the stroke alone (it zooms the view).
     d.frame(circle, PRESS);
     d.frame(circle, Input { wheel: 2.0, ..HOLD });
     let s = stroke(&d);
-    assert!((s.scale - 1.25 * 1.25).abs() < 1e-6 && s.falloff == 0.2, "size ×{}, falloff {}", s.scale, s.falloff);
+    assert!(s.scale == 1.0 && s.falloff == 0.0, "size ×{}, falloff {}", s.scale, s.falloff);
+    assert!(!d.core.world.resource::<tt_core::tool::PointerFrame>().wheel_taken, "the view gets the wheel");
     d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
     d.frame(circle, UP);
-    for (mode, scale, falloff) in [(WheelMode::Falloff, 1.0, 0.2 * 1.25), (WheelMode::Both, 1.25, 0.2 * 1.25)] {
+    d.core.world.resource_mut::<SketchDefaults>().stroke.falloff = 0.2;
+    for (mode, scale, falloff) in [(WheelMode::Size, 1.25, 0.2), (WheelMode::Falloff, 1.0, 0.2 * 1.25), (WheelMode::Both, 1.25, 0.2 * 1.25)] {
         d.core.world.resource_mut::<SketchDefaults>().wheel = mode;
         d.frame(circle, PRESS);
         d.frame(circle, Input { wheel: 1.0, ..HOLD });
@@ -155,6 +158,7 @@ fn the_wheel_sets_size_falloff_or_both_as_chosen() {
 fn a_bigger_size_makes_a_bigger_region_and_carries_to_the_next_stroke() {
     use tt_core::capture::SketchDefaults;
     let mut d = Driver::new();
+    d.core.world.resource_mut::<SketchDefaults>().wheel = tt_core::capture::WheelMode::Size;
     let hold = |d: &mut Driver, f: i64, wheel: f32, new: bool| {
         d.core.world.resource_mut::<Transport>().seek(f);
         d.frame(still(300.0, 300.0), Input { shift: new, ..PRESS });
@@ -189,6 +193,7 @@ fn a_smaller_size_never_goes_under_the_smallest_half_size() {
 fn the_wheel_sets_the_falloff_and_esc_cancels() {
     let mut d = Driver::new();
     d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().wheel = tt_core::capture::WheelMode::Falloff;
+    d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().stroke.falloff = 0.2;
     d.frame(circle, PRESS);
     d.frame(circle, Input { wheel: 2.0, ..HOLD });
     let falloff = d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.falloff;
@@ -208,7 +213,13 @@ fn the_wheel_sets_the_falloff_and_esc_cancels() {
 fn the_wheel_on_a_move_only_stroke_sets_its_falloff_and_not_the_next_size() {
     use tt_core::capture::{SketchDefaults, WheelMode, wheel_target};
     let mut d = Driver::new();
-    assert_eq!(d.core.world.resource::<SketchDefaults>().wheel, WheelMode::Size);
+    assert_eq!(d.core.world.resource::<SketchDefaults>().wheel, WheelMode::Zoom, "by default the wheel zooms");
+    assert_eq!(wheel_target(WheelMode::Zoom, &tt_core::sketch::Stroke { size: 0.0, ..Default::default() }), WheelMode::Zoom);
+    {
+        let mut defaults = d.core.world.resource_mut::<SketchDefaults>();
+        defaults.wheel = WheelMode::Size;
+        defaults.stroke.falloff = 0.2;
+    }
     d.frame(circle, Input { ctrl: true, ..PRESS });
     d.frame(circle, Input { wheel: 2.0, ..HOLD });
     let live = d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.clone();
@@ -343,8 +354,9 @@ fn deselecting_in_the_same_frame_as_the_press_starts_a_new_sketch() {
 }
 
 #[test]
-fn a_live_stroke_takes_the_wheel() {
+fn a_live_stroke_takes_the_wheel_when_it_sets_the_stroke() {
     let mut d = Driver::new();
+    d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().wheel = tt_core::capture::WheelMode::Size;
     d.frame(circle, PRESS);
     assert!(d.core.world.resource::<PointerFrame>().wheel_taken);
     d.frames(40, circle, HOLD);

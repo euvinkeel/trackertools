@@ -101,15 +101,15 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let name = |e: Option<Entity>| e.and_then(|e| world.get::<Name>(e)).map(|n| n.to_string());
         let text = match live {
             Some(l) => format!(
-                "⏺ recording into {}{} · frame {} · {} · {}falloff {:.2} s ({:.0} frames) · wheel: {} · Esc cancels",
+                "⏺ recording into {}{} · frame {} · {} · {}{}wheel: {} · Esc cancels",
                 name(l.target).unwrap_or_else(|| "a new sketch".into()),
                 if l.stroke.size == 0.0 { " (move only)" } else { "" },
                 t.frame(),
-                if t.playing { "playing: recording across frames" } else { "paused: editing this instant" },
+                if t.playing { "playing: recording across frames" } else { "paused: retaking this frame (← → retake the next)" },
                 if l.stroke.size == 0.0 { String::new() } else { format!("size ×{:.2} · ", l.stroke.scale) },
-                l.stroke.falloff,
-                l.stroke.falloff as f64 * fps,
+                if l.stroke.falloff > 0.0 { format!("falloff {:.2} s ({:.0} frames) · ", l.stroke.falloff, l.stroke.falloff as f64 * fps) } else { String::new() },
                 match tt_core::capture::wheel_target(world.resource::<tt_core::capture::SketchDefaults>().wheel, &l.stroke) {
+                    tt_core::capture::WheelMode::Zoom => "zoom",
                     tt_core::capture::WheelMode::Size => "size",
                     tt_core::capture::WheelMode::Falloff => "falloff",
                     tt_core::capture::WheelMode::Both => "size + falloff",

@@ -4,16 +4,19 @@
 //! - Press and hold on the viewport: the pointer is recorded against whatever
 //!   frame is on screen. The transport stays independent (Space plays and
 //!   pauses as usual, even while holding):
-//!   - paused, the hold edits that instant (hold-to-simulate: the point is
-//!     where the hand settles, the box is sized by its jiggle);
-//!   - playing (or stepping, scrubbing), it records across frames.
+//!   - paused, the hold is a *retake* of that frame: where the mouse should
+//!     have been there (the point is where the hand sits, the box is sized
+//!     by its jiggle); stepping while holding retakes each frame shown;
+//!   - playing (or scrubbing), it records across frames.
 //! - Each press → release is a *stroke* laid over the selected sketch: it
-//!   replaces the frames it visited and pulls neighbouring frames along with a
-//!   falloff (`sketch::layer_over`). The mouse wheel while holding sets the
-//!   stroke's region size, its falloff, or both ([`WheelMode`], a setting). With no sketch selected, or with Shift held at the press, the
-//!   stroke starts a new sketch.
-//! - `Ctrl` at the press: move only (the stroke keeps the region's size; the
-//!   wheel sets its falloff).
+//!   replaces the frames it visited, and the region around them re-derives
+//!   from the new data (`sketch::layer_over`; an optional falloff pulls
+//!   neighbouring frames along too). The stroke's size, falloff and lag are
+//!   set beforehand (the Brush panel); the wheel zooms the view, or, as a
+//!   setting, sets the size, the falloff or both ([`WheelMode`]). With no
+//!   sketch selected, or with Shift held at the press, the stroke starts a
+//!   new sketch.
+//! - `Ctrl` at the press: move only (the stroke keeps the region's size).
 //! - A quick click doesn't record: it selects the sketch under it (tool.rs).
 //! - Esc abandons the stroke.
 //!
@@ -104,8 +107,11 @@ pub struct SketchDefaults {
 /// What the mouse wheel changes while holding a stroke.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WheelMode {
-    /// The region's size around the point (`Stroke::scale`).
+    /// Nothing on the stroke: the wheel zooms the view as always (the
+    /// stroke's size and falloff are set beforehand, in the Brush panel).
     #[default]
+    Zoom,
+    /// The region's size around the point (`Stroke::scale`).
     Size,
     /// How far the stroke pulls neighbouring frames along.
     Falloff,
@@ -116,7 +122,7 @@ pub enum WheelMode {
 /// What the wheel changes on `stroke`: a move-only stroke keeps the region's
 /// size, so there it always sets the falloff.
 pub fn wheel_target(mode: WheelMode, stroke: &Stroke) -> WheelMode {
-    if stroke.size == 0.0 { WheelMode::Falloff } else { mode }
+    if stroke.size == 0.0 && mode != WheelMode::Zoom { WheelMode::Falloff } else { mode }
 }
 
 /// Raw input only reports motion: a still pointer is extended to "now" once
@@ -233,7 +239,8 @@ pub fn sketch_tool(world: &mut World) {
         world.resource_mut::<LiveCapture>().0 = Some(live);
     }
     let mut live = world.resource_mut::<LiveCapture>().0.take().expect("live capture");
-    world.resource_mut::<PointerFrame>().wheel_taken = true;
+    let wheel = wheel_target(world.resource::<SketchDefaults>().wheel, &live.stroke);
+    world.resource_mut::<PointerFrame>().wheel_taken = wheel != WheelMode::Zoom;
     if !world.resource_mut::<PendingActions>().take(|a| a == Action::Cancel).is_empty() {
         tracing::info!("stroke cancelled");
         return;
@@ -246,9 +253,8 @@ pub fn sketch_tool(world: &mut World) {
         live.home = live.drawn_in;
         live.home_maps.clear();
     }
-    if pointer.wheel != 0.0 {
-        let mode = wheel_target(world.resource::<SketchDefaults>().wheel, &live.stroke);
-        live.knob.turn(pointer.wheel, mode, &mut live.stroke);
+    if pointer.wheel != 0.0 && wheel != WheelMode::Zoom {
+        live.knob.turn(pointer.wheel, wheel, &mut live.stroke);
     }
     let end = pointer.released.or((!pointer.down).then_some(now));
 
