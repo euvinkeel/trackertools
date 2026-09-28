@@ -313,6 +313,21 @@ impl SketchDemo {
             m.a,
             inside as f64 * 100.0 / n.max(1) as f64
         );
+        // Size jitter: the region's height from frame to frame vs the view's zoom.
+        let frames: Vec<i64> = (0..self.truth.len() as i64).filter(|f| sig.get(*f).is_some()).collect();
+        let change = |a: f64, b: f64| (b / a).ln().abs() * 100.0;
+        let (mut region, mut zoom) = (Vec::new(), Vec::new());
+        for w in frames.windows(2).filter(|w| w[1] == w[0] + 1) {
+            let (r0, r1) = (sig.get(w[0]).unwrap(), sig.get(w[1]).unwrap());
+            region.push(change((r0[5] - r0[3]) as f64, (r1[5] - r1[3]) as f64));
+            zoom.push(change(map_at(world, Some(view), w[0]).a, map_at(world, Some(view), w[1]).a));
+        }
+        let stats = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            (v.get(v.len() / 2).copied().unwrap_or(0.0), v.last().copied().unwrap_or(0.0))
+        };
+        let ((rm, rx), (zm, zx)) = (stats(region), stats(zoom));
+        tracing::info!("sketch demo: size change per frame — region height median {rm:.2}%, max {rx:.2}%; view zoom median {zm:.3}%, max {zx:.3}%");
     }
 
     fn report_nested(&self, world: &World) {

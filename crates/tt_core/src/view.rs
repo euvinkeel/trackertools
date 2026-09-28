@@ -199,11 +199,17 @@ pub fn ensure_view(world: &mut World, sketch: Entity) -> Entity {
 pub struct FrameParams {
     /// How much of the view the region fills (0–1).
     pub fit: f32,
-    /// Seconds (video) the view stays zoomed out after the region shrinks.
+    /// After the region shrinks, the view zooms back in slowly: by half per
+    /// this many seconds (video).
     pub hold: f32,
+    /// Before the region grows, the view zooms out ahead of it: by double per
+    /// this many seconds (video).
+    #[reflect(default = "default_lead")]
+    pub lead: f32,
     /// Pan smoothing, seconds (video), zero-phase.
     pub pan_damping: f32,
-    /// Zoom smoothing, seconds (video), zero-phase.
+    /// Zoom smoothing, seconds (video), zero-phase; it never lets the region
+    /// out of the view.
     pub zoom_damping: f32,
     /// The point may wander this fraction of the view from its centre before the view follows.
     pub dead_zone: f32,
@@ -219,8 +225,12 @@ pub struct FrameParams {
 
 impl Default for FrameParams {
     fn default() -> Self {
-        Self { fit: 0.6, hold: 1.0, pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0 }
+        Self { fit: 0.6, hold: 1.0, lead: default_lead(), pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0 }
     }
+}
+
+fn default_lead() -> f32 {
+    0.25
 }
 
 /// `frame`: a sketch (input "box") and optionally its parent view (input
@@ -279,18 +289,9 @@ pub fn frame_views(sketch: &Signal, parent: Option<&Signal>, p: &FrameParams, fp
     fill_gaps(&mut known);
     let pts: Vec<[f64; 4]> = known.into_iter().map(|v| v.expect("filled")).collect();
 
-    // Crop height the region needs, held (a zero-phase decaying max) and smoothed in log space.
+    // Zoom: the crop height the region needs, as an envelope that never dips below it.
     let need: Vec<f64> = pts.iter().map(|v| (2.0 * v[3]).max(2.0 * v[2] / aspect).max(1.0) / p.fit.clamp(0.05, 1.0) as f64).collect();
-    let k = if p.hold > 0.0 { (-1.0 / (p.hold as f64 * fps)).exp() } else { 0.0 };
-    let mut held = need.clone();
-    for i in 1..n {
-        held[i] = held[i].max(held[i - 1] * k);
-    }
-    for i in (0..n - 1).rev() {
-        held[i] = held[i].max(held[i + 1] * k);
-    }
-    let logs = gauss(&held.iter().map(|h| h.ln()).collect::<Vec<_>>(), p.zoom_damping as f64 * fps);
-    let mut crop_h: Vec<f64> = logs.iter().zip(&need).map(|(l, n)| l.exp().max(*n)).collect();
+    let mut crop_h: Vec<f64> = zoom_envelope(&need, p, fps);
 
     // Centre: the point, through a dead zone (both ways, so no lag) and zero-phase damping.
     let radius: Vec<f64> = crop_h.iter().map(|h| p.dead_zone.max(0.0) as f64 * h / 2.0).collect();
@@ -337,6 +338,41 @@ pub fn frame_views(sketch: &Signal, parent: Option<&Signal>, p: &FrameParams, fp
     let canvas_h = crop_h.iter().copied().fold(1.0, f64::max);
     let out = (0..n).map(|i| [centre[i][0], centre[i][1], crop_h[i] * aspect, crop_h[i], canvas_h * aspect, canvas_h]).collect();
     Some((first, out))
+}
+
+/// The crop height over time, in log space (zoom is perceived as ratios):
+/// 1. zoom out ahead of the region growing: rising at most ×2 per `lead`
+///    seconds before a larger need (a backward decaying max);
+/// 2. zoom back in slowly after it shrinks: falling at most ×½ per `hold`
+///    seconds (a forward decaying max);
+/// 3. smooth without ever dipping below the need: a max filter over
+///    ±`zoom_damping`, then a Gaussian (σ = a third of that) whose reach stays
+///    inside the filter's window, so every value it averages covers the need.
+///
+/// The region always fits, and a jittery region size makes no zoom jitter.
+pub fn zoom_envelope(need: &[f64], p: &FrameParams, fps: f64) -> Vec<f64> {
+    let n = need.len();
+    let rate = |secs: f32| if secs > 0.0 { std::f64::consts::LN_2 / (secs as f64 * fps) } else { f64::INFINITY };
+    let (up, down) = (rate(p.lead), rate(p.hold));
+    let log: Vec<f64> = need.iter().map(|v| v.max(1e-6).ln()).collect();
+    let mut fwd = log.clone();
+    for i in 1..n {
+        fwd[i] = fwd[i].max(fwd[i - 1] - down);
+    }
+    let mut env = log.clone();
+    for i in (0..n.saturating_sub(1)).rev() {
+        env[i] = env[i].max(env[i + 1] - up);
+    }
+    for (e, f) in env.iter_mut().zip(&fwd) {
+        *e = e.max(*f);
+    }
+    let w = (p.zoom_damping.max(0.0) as f64 * fps).round() as usize;
+    if w > 0 {
+        let dilated: Vec<f64> = (0..n).map(|i| env[i.saturating_sub(w)..(i + w + 1).min(n)].iter().copied().fold(f64::NEG_INFINITY, f64::max)).collect();
+        env = gauss(&dilated, w as f64 / 3.0);
+    }
+    // (Numerically the envelope already covers the need; the max only guards rounding.)
+    env.iter().zip(need).map(|(e, v)| e.exp().max(*v)).collect()
 }
 
 /// Linear interpolation across `None` runs between known values (ends held).
@@ -435,6 +471,41 @@ mod tests {
             let (crop_w, crop_h) = (v[2], v[3]);
             assert!(crop_h >= 240.0 && crop_w >= 200.0, "the 200×240 region fits: crop {crop_w:.0}×{crop_h:.0}");
         }
+    }
+
+    /// A pseudo-random walk in [0, 1).
+    fn noise(i: usize) -> f64 {
+        let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2545_f491_4f6c_dd1d;
+        ((x >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    #[test]
+    fn a_jittery_region_size_makes_a_smooth_zoom_that_always_fits() {
+        // A region whose needed crop jitters ±25% from frame to frame, around 400 px.
+        let need: Vec<f64> = (0..600).map(|i| 400.0 * (1.0 + 0.5 * (noise(i) - 0.5))).collect();
+        let crop = zoom_envelope(&need, &FrameParams::default(), 60.0);
+        let worst_need = need.windows(2).map(|w| (w[1] / w[0]).ln().abs()).fold(0.0, f64::max);
+        let worst_crop = crop.windows(2).map(|w| (w[1] / w[0]).ln().abs()).fold(0.0, f64::max);
+        println!("largest frame-to-frame zoom change: region {:.1}%, view {:.2}%", worst_need * 100.0, worst_crop * 100.0);
+        assert!(crop.iter().zip(&need).all(|(c, n)| c >= n), "the region always fits");
+        assert!(worst_crop < 0.01, "the zoom barely moves between frames: {:.2}%", worst_crop * 100.0);
+    }
+
+    #[test]
+    fn the_view_zooms_out_ahead_and_back_in_slowly() {
+        // The region doubles for one second (frames 300-360), then shrinks back.
+        let need: Vec<f64> = (0..900).map(|i| if (300..360).contains(&i) { 800.0 } else { 400.0 }).collect();
+        let p = FrameParams::default();
+        let crop = zoom_envelope(&need, &p, 60.0);
+        assert!(crop[295] > 600.0, "already zooming out before the growth: {:.0}", crop[295]);
+        assert!((300..360).all(|i| crop[i] >= 800.0), "the region fits throughout");
+        let jump = crop[250..420].windows(2).map(|w| (w[1] / w[0]).ln().abs()).fold(0.0, f64::max);
+        assert!(jump < 0.03, "no snap at the edges of the growth: {:.2}% per frame", jump * 100.0);
+        // Back in slowly: still well zoomed out half a second after, settled after ~3 hold times.
+        assert!(crop[390] > 650.0, "half a second later: {:.0}", crop[390]);
+        assert!(crop[600] < 450.0, "settled back: {:.0}", crop[600]);
+        let steps: Vec<f64> = crop[360..600].windows(2).map(|w| w[0] / w[1]).collect();
+        assert!(steps.iter().all(|s| *s >= 0.999), "zooming back in never overshoots");
     }
 
     #[test]

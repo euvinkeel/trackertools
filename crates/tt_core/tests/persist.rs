@@ -161,3 +161,25 @@ fn newer_format_is_refused() {
     assert!(err.contains("newer version"), "{err}");
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn a_view_saved_before_a_setting_existed_still_loads() {
+    use bevy_ecs::reflect::AppTypeRegistry;
+    use bevy_reflect::FromReflect;
+    use bevy_reflect::serde::TypedReflectDeserializer;
+    use serde::de::DeserializeSeed;
+    use tt_core::view::FrameParams;
+
+    let mut app = AppBuilder::new();
+    app.add_module(CoreModules);
+    let core = app.build();
+    let registry = core.world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    let registration = registry.get_with_type_path(std::any::type_name::<FrameParams>()).expect("registered");
+    // FrameParams as saved before `lead` existed.
+    let old = "(fit: 0.5, hold: 2.0, pan_damping: 0.1, zoom_damping: 0.5, dead_zone: 0.0, follow: 1.0, zoom: 1.0, min_zoom: 1.0, max_zoom: 32.0)";
+    let mut de = ron::Deserializer::from_str(old).unwrap();
+    let value = TypedReflectDeserializer::new(registration, &registry).deserialize(&mut de).expect("an old save deserializes");
+    let p = FrameParams::from_reflect(value.as_ref()).expect("and converts");
+    assert_eq!((p.fit, p.hold, p.lead), (0.5, 2.0, FrameParams::default().lead), "saved values kept, the new one defaulted");
+}

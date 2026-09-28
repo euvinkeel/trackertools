@@ -283,6 +283,9 @@ The original plan follows.
 
 **Measured:**
 - `tests/view.rs`: a root view keeps the sprite in its central 30% on 100% of 172 frames. Three levels deep, the deepest view does too on 100% of 138 frames (the M4 acceptance, ≥ 99%). A sketch drawn inside view 1 has a median error of 0.68 px vs 1.99 px at level 1. Re-tuning view 1 leaves the child's points identical.
+- Zoom from a jittery region (after hands-on use): the crop had been clamped to the raw need after smoothing, so the zoom snapped wherever the region poked out. Now it zooms out ahead (`lead`), back in slowly (`hold`, halving time), and is smoothed by a max filter plus an inner Gaussian that provably covers the need.
+  - On the demo's sketch the region's height changes by a median 1.69% (max 7.27%) per frame; the view's zoom by 0.22% (max 0.79%).
+  - Synthetic ±25% jitter: 0.03% per frame, the region inside on every frame.
 - A review of M4 (4 reviewers + skeptics) confirmed 6 issues, all fixed with tests where testable:
   - Tab-then-hold re-edited the parent instead of nesting (Tab now clears the selection);
   - a tight parent's zoom limit could crop a child's region (fit now always wins);

@@ -319,7 +319,7 @@ The `Frame` operator (a virtual camera) turns a Box into a View transform. Its p
 
 | Parameter | Meaning | Source |
 |---|---|---|
-| **Display size** | the view's fixed output size = the **max extent during the pass**, using a *slowly decaying* running max so one jiggle spike doesn't lock the zoom out for the whole pass. *(Built: the crop is a zero-phase decaying max of what the region needs, `hold` 1 s, smoothed in log space by `zoom_damping` 0.5 s and never smaller than the region needs; the canvas is the widest crop.)* | user spec + Cinemachine group framing |
+| **Display size** | the view's fixed output size = the **max extent during the pass**, using a *slowly decaying* running max so one jiggle spike doesn't lock the zoom out for the whole pass. *(Built, in log space: the view zooms out ahead of the region growing, up to ×2 per `lead` 0.25 s, and back in slowly after it shrinks, ×½ per `hold` 1 s. Then a max filter over ±`zoom_damping` 0.5 s and a Gaussian that stays inside that window, so the crop is smooth and never smaller than the region needs; a jittery region size makes no zoom jitter. The canvas is the widest crop.)* | user spec + Cinemachine group framing |
 | **Fit** | how much of the display the box fills (default 0.6; the region always fits) | Cinemachine framing size |
 | **Dead zone / soft zone** | the box can move within the dead zone without the camera reacting; beyond it, the camera re-centres at the damping rate | Cinemachine position composer |
 | **Damping (pan, zoom)** | separate; *zero-phase* mode (lag-free, offline) or *causal* mode (camera-like) | Cinemachine, SciPy `filtfilt` |

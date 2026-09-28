@@ -74,7 +74,15 @@ fn track_project(world: &mut World) {
         if let Some(p) = path.as_ref().filter(|p| p.exists()) {
             match persist::load(world, p) {
                 Ok(()) => tracing::info!("loaded project {}", p.display()),
-                Err(e) => tracing::warn!("could not load project {}: {e:#}", p.display()),
+                Err(e) => {
+                    // Keep the file: the next autosave would otherwise overwrite it.
+                    persist::clear_document(world);
+                    let aside = p.with_extension("unreadable.ttproj");
+                    let kept = std::fs::copy(p, &aside).is_ok();
+                    tracing::warn!("could not load project {}: {e:#}; {}", p.display(), if kept { format!("kept as {}", aside.display()) } else { "could not copy it aside".into() });
+                    world.resource_mut::<crate::media::StatusLine>().0 =
+                        Some((format!("Couldn't read this video's project (kept as {}); starting fresh", aside.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())), true));
+                }
             }
         }
         let meta = &mut world.resource_mut::<ProjectMeta>().0;
