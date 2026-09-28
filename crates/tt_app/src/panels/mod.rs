@@ -32,6 +32,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut open = false;
     let mut reopen = None;
     let mut history_action = None;
+    let mut new_sketch = false;
     let t = world.resource::<Transport>();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
@@ -103,6 +104,15 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         {
             history_action = Some(Action::Tool(Tool::Sketch));
         }
+        let sketch_selected = world.resource::<tt_core::selection::Selection>().primary().is_some_and(|e| tt_core::sketch::is_sketch(world, e));
+        if ui
+            .add_enabled(sketch_selected || !sketching, egui::Button::new("＋ New sketch"))
+            .on_hover_text("The next stroke starts a new sketch instead of editing the selected one (deselects; Shift+hold does the same for one stroke)")
+            .on_disabled_hover_text("Nothing is selected: the next stroke already starts a new sketch")
+            .clicked()
+        {
+            new_sketch = true;
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // egui repaints on demand, so frame time only means something while playing.
             if t.playing {
@@ -120,6 +130,10 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     }
     if let Some(a) = history_action {
         world.resource_mut::<PendingActions>().push(a);
+    }
+    if new_sketch {
+        world.resource_mut::<tt_core::selection::Selection>().clear();
+        world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
     }
     if let Some(path) = reopen {
         world.resource_mut::<OpenRequest>().0 = Some(path);

@@ -26,16 +26,19 @@
 //! 3. One Euro smoothing run forward then backward (zero-phase: no lag, so no
 //!    end-of-stroke catch-up is needed) — `steadiness` = min cutoff,
 //!    `responsiveness` = beta, tuned in that order;
-//! 4. jiggle → size: RMS spread of the raw hand around the smoothed path over
+//! 4. jiggle → size: RMS spread of the raw hand around a slow reference (the
+//!    steadiness cutoff alone, so it doesn't chase the jiggle) over
 //!    `jiggle_window`, × 2.2 × `gain` + `pad`, at least `min_half`;
 //! 5. to video frames: each frame takes the path at the wall time it was
 //!    shown, shifted by `lag` (the hand trails what it follows); a paused
 //!    stretch maps to one frame and keeps the state at the end of the hold
 //!    (no lag shift: the hand has settled);
-//! 6. union of the boxes over [f − before, f + after] (motion blur of the
-//!    hand), then light smoothing of the point and of the region's extents
-//!    around it. Frames shown in the last `lag` before the release get no
-//!    result: the hand never reached them.
+//!    Light smoothing of the point and of the jiggle box's extents around
+//!    it. Frames played in the last `lag` before the release get no result:
+//!    the hand never reached them;
+//! 6. after the sketch's strokes are layered: each frame's box grows to
+//!    cover the boxes over [f − before, f + after] (the motion blur of the
+//!    region), so an edit made while paused reads like a recorded frame.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -433,10 +436,28 @@ fn at(series: &[[f64; 2]], t0: f64, hz: f64, t: f64) -> [f64; 2] {
     [series[i][0] + (series[j][0] - series[i][0]) * u, series[i][1] + (series[j][1] - series[i][1]) * u]
 }
 
-/// The whole pipeline. `samples` are `(t, x, y)` sorted by t. Returns
-/// `(first_frame, frames)` with `[x, y, left, top, right, bottom]` per frame;
-/// `None` entries are frames the capture didn't visit.
+/// The whole pipeline for one stroke on its own: [`stroke_frames`], then
+/// the region's motion union ([`union_at`]). `samples` are `(t, x, y)` sorted
+/// by t. Returns `(first_frame, frames)` with `[x, y, left, top, right,
+/// bottom]` per frame; `None` entries are frames the capture didn't visit.
 pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fps: f64) -> Option<Boxes> {
+    let (first, frames) = stroke_frames(samples, clock, p, fps)?;
+    let (before, after) = union_reach(p, fps);
+    let get = |f: FrameIndex| frames.get(usize::try_from(f - first).ok()?).copied().flatten();
+    let out = (0..frames.len()).map(|i| union_at(get, first + i as FrameIndex, before, after)).collect();
+    Some((first, out))
+}
+
+/// One stroke, steps 1–5 of the pipeline plus light smoothing: per visited
+/// frame the point and its *jiggle box* (the region before the motion
+/// union, which is applied to the whole sketch after its strokes are
+/// layered, [`union_at`]).
+///
+/// A played frame takes the hand at the moment it was shown plus `lag`, a
+/// held (paused) frame the hand at the end of the hold; either way its box is
+/// the smoothed point ± the jiggle size then, so the same jiggle reads as the
+/// same size whether the video was playing or paused.
+pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fps: f64) -> Option<Boxes> {
     if samples.len() < 2 {
         return None;
     }
@@ -444,9 +465,15 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
     let (t0, raw) = to_grid(samples, hz);
     let steady = if SYMMETRIC_DEAD_ZONE { dead_zone_symmetric(&raw, p.dead_zone as f64) } else { dead_zone(&raw, p.dead_zone as f64) };
     let center = one_euro_zero_phase(&steady, hz, p.steadiness.max(0.01) as f64, p.responsiveness.max(0.0) as f64);
+    // Jiggle is measured against a slow, non-adaptive reference (the
+    // steadiness cutoff alone): the point's path speeds up with the hand and
+    // would follow part of a jiggle, by an amount that differs between
+    // playing and paused. Against this reference the same jiggle reads as the
+    // same size in both.
+    let reference = one_euro_zero_phase(&raw, hz, p.steadiness.max(0.01) as f64, 0.0);
     let sigma = p.jiggle_window as f64 * hz;
-    let var_x = gauss(&raw.iter().zip(&center).map(|(r, c)| (r[0] - c[0]).powi(2)).collect::<Vec<_>>(), sigma);
-    let var_y = gauss(&raw.iter().zip(&center).map(|(r, c)| (r[1] - c[1]).powi(2)).collect::<Vec<_>>(), sigma);
+    let var_x = gauss(&raw.iter().zip(&reference).map(|(r, c)| (r[0] - c[0]).powi(2)).collect::<Vec<_>>(), sigma);
+    let var_y = gauss(&raw.iter().zip(&reference).map(|(r, c)| (r[1] - c[1]).powi(2)).collect::<Vec<_>>(), sigma);
     let half: Vec<[f64; 2]> = var_x
         .iter()
         .zip(&var_y)
@@ -455,6 +482,10 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
             [h(*vx), h(*vy)]
         })
         .collect();
+    let jiggle_box = |t: f64| -> [f64; 6] {
+        let (c, h) = (at(&center, t0, hz, t), at(&half, t0, hz, t));
+        [c[0], c[1], c[0] - h[0], c[1] - h[1], c[0] + h[0], c[1] + h[1]]
+    };
 
     // To video frames: the path at the moment each frame was shown, plus the lag.
     // - A played frame shown in the last `lag` before the release was never
@@ -464,33 +495,21 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
     let (first, shown) = clock.frame_times()?;
     let lag = p.lag as f64;
     let (start, end) = (samples[0][0], samples[samples.len() - 1][0]);
-    let raw_frames: Vec<Option<([f64; 2], [f64; 2])>> = shown
+    let frames: Vec<Option<[f64; 6]>> = shown
         .iter()
-        .map(|s| {
-            let t = match (*s)? {
-                Shown::At(t) => t + lag,
-                Shown::Held { from, to } => to.max(from + lag).min(end),
-            };
-            (start..=end).contains(&t).then(|| (at(&center, t0, hz, t), at(&half, t0, hz, t)))
+        .map(|s| match (*s)? {
+            Shown::At(t) => {
+                let t = t + lag;
+                (start..=end).contains(&t).then(|| jiggle_box(t))
+            }
+            Shown::Held { from, to } => Some(jiggle_box(to.max(from + lag).min(end))),
         })
         .collect();
 
-    // Region: union of the jiggle boxes over [f − before, f + after] (video time).
-    let (before, after) = ((p.before as f64 * fps).round() as usize, (p.after as f64 * fps).round() as usize);
-    let n = raw_frames.len();
-    let mut frames: Vec<Option<[f64; 6]>> = vec![None; n];
-    for (i, slot) in frames.iter_mut().enumerate() {
-        let Some((point, _)) = raw_frames[i] else { continue };
-        let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for (c, h) in raw_frames[i.saturating_sub(before)..(i + after + 1).min(n)].iter().flatten() {
-            x0 = x0.min(c[0] - h[0]);
-            x1 = x1.max(c[0] + h[0]);
-            y0 = y0.min(c[1] - h[1]);
-            y1 = y1.max(c[1] + h[1]);
-        }
-        *slot = Some([point[0], point[1], x0, y0, x1, y1]);
-    }
-    // Light smoothing within each visited run (no bleeding across gaps).
+    // Light smoothing within each visited run (no bleeding across gaps). The
+    // box is smoothed as extents around the point, so smoothing its size never
+    // drags it behind a moving subject.
+    let n = frames.len();
     let mut out = frames.clone();
     let mut i = 0;
     while i < n {
@@ -502,13 +521,11 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
         while i < n && frames[i].is_some() {
             i += 1;
         }
-        // The region is smoothed as extents around the point, so smoothing its
-        // size never drags it behind a moving subject.
         let run: Vec<[f64; 6]> = frames[start..i].iter().map(|b| b.unwrap()).collect();
-        let extents: Vec<[f64; 4]> = run.iter().map(|b| [b[0] - b[2], b[1] - b[3], b[4] - b[0], b[5] - b[1]]).collect();
+        let ext: Vec<[f64; 4]> = run.iter().map(extents).collect();
         let (sp, ss) = (p.smooth_position as f64 * fps, p.smooth_size as f64 * fps);
         let point = |k: usize| gauss_trend(&run.iter().map(|b| b[k]).collect::<Vec<_>>(), sp);
-        let extent = |k: usize| gauss(&extents.iter().map(|e| e[k]).collect::<Vec<_>>(), ss);
+        let extent = |k: usize| gauss(&ext.iter().map(|e| e[k]).collect::<Vec<_>>(), ss);
         let (x, y) = (point(0), point(1));
         let e = [extent(0), extent(1), extent(2), extent(3)];
         for k in 0..run.len() {
@@ -516,6 +533,24 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
         }
     }
     Some((first, out))
+}
+
+/// The motion union's reach in frames: `(before, after)`.
+pub fn union_reach(p: &SketchParams, fps: f64) -> (FrameIndex, FrameIndex) {
+    ((p.before as f64 * fps).round() as FrameIndex, (p.after as f64 * fps).round() as FrameIndex)
+}
+
+/// The region at `f`: its box grown to cover the boxes of every frame in
+/// `[f − before, f + after]` (the motion blur of the region; step 6). The
+/// point stays. `None` where `f` has no value.
+pub fn union_at(get: impl Fn(FrameIndex) -> Option<[f64; 6]>, f: FrameIndex, before: FrameIndex, after: FrameIndex) -> Option<[f64; 6]> {
+    let mut b = get(f)?;
+    for g in (f - before)..=(f + after) {
+        if let Some(v) = get(g).filter(|_| g != f) {
+            b = [b[0], b[1], b[2].min(v[2]), b[3].min(v[3]), b[4].max(v[4]), b[5].max(v[5])];
+        }
+    }
+    Some(b)
 }
 
 /// Read a capture's raw stream (`[t, x, y]` per sample index) into a Vec.
@@ -673,14 +708,19 @@ impl OperatorKind for SketchKind {
         let fps = ctx.world.get_resource::<crate::transport::Transport>().map_or(60.0, |t| t.fps.as_f64());
         out.clear(range.clone());
         let path = compose(ctx.world, ctx.entity, &params, fps);
-        for (f, v) in path.range(range) {
-            out.set(*f, &v.map(|x| x as f32));
+        let (before, after) = union_reach(&params, fps);
+        let get = |f: FrameIndex| path.get(&f).copied();
+        for f in path.range(range).map(|(f, _)| *f) {
+            if let Some(v) = union_at(get, f, before, after) {
+                out.set(f, &v.map(|x| x as f32));
+            }
         }
         Ok(())
     }
 }
 
-/// A sketch's path: its strokes laid over each other in order.
+/// A sketch's path before the motion union ([`union_at`]): its strokes'
+/// frames ([`stroke_frames`]) laid over each other in order.
 pub fn compose(world: &World, sketch: Entity, params: &SketchParams, fps: f64) -> BTreeMap<FrameIndex, [f64; 6]> {
     let strokes: Vec<Entity> = world.get::<Inputs>(sketch).map(|i| i.0.iter().map(|(_, e)| *e).collect()).unwrap_or_default();
     let mut path = BTreeMap::new();
@@ -696,7 +736,7 @@ pub fn compose(world: &World, sketch: Entity, params: &SketchParams, fps: f64) -
     path
 }
 
-/// One stroke's boxes and layering, read from the world (`None` unless `e`
+/// One stroke's frames and layering, read from the world (`None` unless `e`
 /// is an enabled capture with a stream and a result).
 pub fn stroke_boxes(world: &World, e: Entity, params: &SketchParams, fps: f64) -> Option<(Boxes, Stroke)> {
     let entity = world.get_entity(e).ok()?;
@@ -705,7 +745,7 @@ pub fn stroke_boxes(world: &World, e: Entity, params: &SketchParams, fps: f64) -
     }
     let (info, clock) = (entity.get::<Capture>()?, entity.get::<ClockMap>()?);
     let stream = world.resource::<SignalStore>().get(entity.get::<Output>()?.0)?;
-    let boxes = sketch_boxes(&read_stream(stream, info.samples), clock, params, fps)?;
+    let boxes = stroke_frames(&read_stream(stream, info.samples), clock, params, fps)?;
     Some((boxes, entity.get::<Stroke>().cloned().unwrap_or_default()))
 }
 

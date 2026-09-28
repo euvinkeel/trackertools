@@ -336,3 +336,73 @@ fn a_live_stroke_takes_the_wheel() {
     d.frame(circle, UP);
     assert!(!d.core.world.resource::<PointerFrame>().wheel_taken);
 }
+
+/// A subject moving right at 240 px per second of video.
+fn subject_x(video_t: f64) -> f64 {
+    300.0 + 240.0 * video_t
+}
+
+/// The same deliberate jiggle in both modes: ±20 px, a few hertz.
+fn jiggle(t: f64) -> [f64; 2] {
+    [20.0 * (std::f64::consts::TAU * 3.0 * t).sin(), 20.0 * (std::f64::consts::TAU * 2.3 * t).cos()]
+}
+
+#[test]
+fn a_paused_jiggle_sizes_the_box_like_the_same_jiggle_during_playback() {
+    // Recording while playing at ½ speed: the hand follows the subject 250 ms
+    // late (what it saw), jiggling.
+    let mut d = Driver::new();
+    d.core.world.resource_mut::<Transport>().seek(100);
+    let shown = std::rc::Rc::new(std::cell::RefCell::new(vec![(d.now, 100.0f64)]));
+    let hand = |shown: &std::rc::Rc<std::cell::RefCell<Vec<(f64, f64)>>>| {
+        let shown = shown.clone();
+        move |t: f64| {
+            let s = shown.borrow();
+            let i = s.partition_point(|(w, _)| *w <= t - 0.25).saturating_sub(1);
+            let f = s[i].1;
+            let j = jiggle(t);
+            [subject_x(f / 60.0) + j[0], 300.0 + j[1]]
+        }
+    };
+    let follow = hand(&shown);
+    d.frame(&follow, PRESS);
+    d.frame(&follow, Input { action: Some(Action::TogglePlay), ..HOLD });
+    for _ in 0..700 {
+        let f = d.transport().playhead;
+        shown.borrow_mut().push((d.now, f.floor()));
+        d.frame(&follow, HOLD);
+    }
+    d.frame(&follow, Input { action: Some(Action::TogglePlay), ..UP });
+    let s = d.sketches()[0];
+    let f = 150;
+    let played = d.value(s, f).expect("frame 150 recorded");
+    let (w_play, h_play) = (played[4] - played[2], played[5] - played[3]);
+
+    // The same jiggle, paused on frame 150, as an edit of that sketch.
+    d.core.world.resource_mut::<Transport>().seek(f);
+    let x = subject_x(f as f64 / 60.0);
+    let paused = move |t: f64| {
+        let j = jiggle(t);
+        [x + j[0], 300.0 + j[1]]
+    };
+    d.frame(paused, PRESS);
+    d.frames(175, paused, HOLD);
+    d.frame(paused, UP);
+    let held = d.value(s, f).unwrap();
+    let (w_hold, h_hold) = (held[4] - held[2], held[5] - held[3]);
+
+    // And on its own (a new sketch: jiggle only, no neighbouring motion).
+    d.frame(paused, Input { action: Some(Action::DeselectAll), ..UP });
+    d.frame(paused, PRESS);
+    d.frames(175, paused, HOLD);
+    d.frame(paused, UP);
+    let second = d.sketches().into_iter().find(|e| *e != s).expect("a second sketch");
+    let alone = d.value(second, f).unwrap();
+    println!(
+        "box at frame {f}: recorded while playing {w_play:.0}×{h_play:.0}; paused jiggle edit {w_hold:.0}×{h_hold:.0}; paused jiggle alone {:.0}×{:.0}",
+        alone[4] - alone[2],
+        alone[5] - alone[3]
+    );
+    assert!((0.75..=1.33).contains(&(w_hold / w_play)), "width: paused {w_hold:.0} vs playing {w_play:.0}");
+    assert!((0.75..=1.33).contains(&(h_hold / h_play)), "height: paused {h_hold:.0} vs playing {h_play:.0}");
+}

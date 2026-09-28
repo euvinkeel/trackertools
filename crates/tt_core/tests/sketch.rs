@@ -335,3 +335,26 @@ mod layering {
         assert!((101..130).all(|f| get(&r, f).is_none()));
     }
 }
+
+/// Diagnostic: a pure hold with a ±20 px, 3 Hz jiggle in x, by hold length.
+#[test]
+#[ignore]
+fn hold_jiggle_size() {
+    for secs in [0.5, 1.0, 2.0] {
+        let mut samples = Vec::new();
+        let mut w = 0.0;
+        while w <= secs {
+            samples.push([w, 500.0 + 20.0 * (std::f64::consts::TAU * 3.0 * (w + 7.3)).sin(), 300.0]);
+            w += 0.001;
+        }
+        let mut clock = ClockMap::default();
+        let mut w = 0.0;
+        while w <= secs {
+            clock.push(w, 150.0, false);
+            w += 1.0 / 175.0;
+        }
+        let (_, frames) = tt_core::sketch::stroke_frames(&samples, &clock, &SketchParams::default(), FPS).unwrap();
+        let b = frames[0].unwrap();
+        println!("hold {secs} s: box {:.0}×{:.0}, point x {:.1}", b[4] - b[2], b[5] - b[3], b[0]);
+    }
+}

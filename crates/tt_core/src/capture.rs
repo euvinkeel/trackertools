@@ -31,8 +31,7 @@ use crate::input::{Action, KeysHeld, PendingActions};
 use crate::meta::Class;
 use crate::op::{Inputs, Operator, Output};
 use crate::selection::Selection;
-use crate::signal::SignalStore;
-use crate::sketch::{BOX_CHANNELS, Boxes, Capture, ClockMap, STREAM_CHANNELS, SketchParams, Stroke, layer_over, sketch_boxes, sketch_of};
+use crate::sketch::{BOX_CHANNELS, Boxes, Capture, ClockMap, STREAM_CHANNELS, SketchParams, Stroke, compose, layer_over, sketch_of, stroke_frames, union_at, union_reach};
 use crate::time::{FrameIndex, WallClock};
 use crate::tool::{ActiveTool, PointerFrame, Tool};
 use crate::transport::Transport;
@@ -51,10 +50,12 @@ pub struct Live {
     pub target: Option<Entity>,
     /// The target's parameters (or the defaults for a new sketch).
     pub params: SketchParams,
+    /// The target's path before the motion union, when the stroke began.
+    base: std::collections::BTreeMap<FrameIndex, [f64; 6]>,
     pub stroke: Stroke,
-    /// The stroke's own boxes (frames it visited).
+    /// The stroke's own frames (the frames it visited).
     pub boxes: Option<Boxes>,
-    /// The sketch with the stroke laid over it, on the frames that change.
+    /// The sketch with the stroke laid over it (motion union included), on the frames that change.
     pub preview: Option<Boxes>,
 }
 
@@ -107,6 +108,8 @@ pub fn sketch_tool(world: &mut World) {
         let params = target.and_then(|t| world.get::<SketchParams>(t).cloned()).unwrap_or(defaults.params);
         // Ctrl: move only, keeping the region's size.
         let stroke = Stroke { size: if mods.ctrl { 0.0 } else { 1.0 }, ..defaults.stroke };
+        let fps = world.resource::<Transport>().fps.as_f64();
+        let base = target.map(|t| compose(world, t, &params, fps)).unwrap_or_default();
         let live = Live {
             start,
             samples: Vec::new(),
@@ -114,6 +117,7 @@ pub fn sketch_tool(world: &mut World) {
             rate: world.resource::<Transport>().rate,
             target,
             params,
+            base,
             stroke,
             boxes: None,
             preview: None,
@@ -130,6 +134,7 @@ pub fn sketch_tool(world: &mut World) {
     if let Some(t) = live.target.filter(|t| !is_live_sketch(world, *t)) {
         tracing::info!("the sketch {t} went away during the stroke; it will start a new sketch");
         live.target = None;
+        live.base.clear();
     }
     if pointer.wheel != 0.0 {
         let f = (live.stroke.falloff.max(0.01) * WHEEL_STEP.powf(pointer.wheel)).min(FALLOFF_MAX);
@@ -162,11 +167,14 @@ pub fn sketch_tool(world: &mut World) {
         live.clock.push(t_now, t.playhead, t.playing);
         t.fps.as_f64()
     };
-    live.boxes = sketch_boxes(&live.samples, &live.clock, &live.params, fps);
+    live.boxes = stroke_frames(&live.samples, &live.clock, &live.params, fps);
     live.preview = live.boxes.as_ref().map(|(first, boxes)| {
-        let base = live.target.and_then(|t| world.get::<Output>(t)).and_then(|o| world.resource::<SignalStore>().get(o.0));
-        let base = |f: FrameIndex| base.and_then(|s| s.get(f)).map(|v| std::array::from_fn(|c| v[c] as f64));
-        layer_over(base, *first, boxes, live.stroke.falloff as f64 * fps, &live.stroke)
+        let (lo, layered) = layer_over(|f| live.base.get(&f).copied(), *first, boxes, live.stroke.falloff as f64 * fps, &live.stroke);
+        // The motion union over the frames the change can reach.
+        let get = |f: FrameIndex| layered.get(usize::try_from(f - lo).ok()?).copied().flatten().or_else(|| live.base.get(&f).copied());
+        let (before, after) = union_reach(&live.params, fps);
+        let from = lo - after;
+        (from, (from..lo + layered.len() as FrameIndex + before).map(|f| union_at(get, f, before, after)).collect())
     });
     if end.is_some() {
         if pointer.click.is_some() {
