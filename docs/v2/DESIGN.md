@@ -244,7 +244,7 @@ Consequences:
   - the other sketches, faint;
   - on the timeline, the frames the stroke visits and the frames its falloff moves.
 
-  The box outline follows After Effects' "Show Wireframe".
+  The box outline follows After Effects' "Show Wireframe". So that nothing hides a small target at the pointer while holding, the OS pointer is hidden over the viewport, and a **clear window** (radius 24 pt) around the stroke's latest sample shows the raw video: the frame is painted a second time after the overlays and HUD, with the same view transform, through a circular mask (soft 1.5 px edge, the rest discarded), with a thin ring at its edge. Both are settings (0 pt turns the window off).
 - **Takes and levels** carry over from v1 (to do):
   - "take again" at the same level averages robustly (weighted median centres, log-space sizes);
   - disagreement widens the box a little and marks those frames *uncertain*.
@@ -436,6 +436,7 @@ Adopted from Rerun's proven design.
   - what the wheel does while sketching;
   - the size and falloff the next stroke starts with;
   - the preset new sketches use;
+  - while holding a stroke: hide the pointer, and the clear window's radius (§8.1);
   - whether new views keep a steady zoom (§10);
   - every key, generated from the keymap;
   - where the data folder is.

@@ -7,6 +7,7 @@ use tt_core::input::{Action, Keymap};
 use tt_core::sketch::SketchParams;
 use tt_core::view::ViewDefaults;
 
+use super::viewport::PointerView;
 use crate::style;
 
 pub fn ui(ui: &mut egui::Ui, world: &mut World) {
@@ -44,6 +45,18 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
         if d.wheel != before.wheel || d.stroke != before.stroke || d.params != before.params {
             *world.resource_mut::<SketchDefaults>() = d;
+        }
+        ui.add_space(6.0);
+        ui.label("While holding a stroke");
+        let mut pv = world.resource::<PointerView>().clone();
+        ui.checkbox(&mut pv.hide_pointer, "Hide the pointer while holding a stroke");
+        ui.horizontal(|ui| {
+            ui.label("Clear window around the pointer");
+            ui.add(egui::DragValue::new(&mut pv.clear_radius).range(0.0..=200.0).speed(0.5).suffix(" pt"))
+                .on_hover_text("The video inside this radius is shown raw: no boxes, trails or text over it. 0 = off.");
+        });
+        if pv != *world.resource::<PointerView>() {
+            *world.resource_mut::<PointerView>() = pv;
         }
 
         ui.separator();

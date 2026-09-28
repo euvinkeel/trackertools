@@ -14,6 +14,7 @@ use tt_core::view::ViewDefaults;
 use tt_core::{AppBuilder, Class, Module, Set};
 
 use crate::media::{Media, OpenRequest};
+use crate::panels::viewport::PointerView;
 
 const MAX_RECENT: usize = 10;
 
@@ -35,19 +36,36 @@ struct SettingsFile {
     stroke_falloff: f32,
     /// New views keep a steady zoom (`FrameParams::lock_zoom`).
     view_lock_zoom: bool,
+    /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
+    hide_pointer: bool,
+    clear_radius: f32,
 }
 
 impl Default for SettingsFile {
     fn default() -> Self {
         let s = tt_core::sketch::Stroke::default();
-        let v = ViewDefaults::default();
-        Self { wheel: WheelMode::default(), stroke_scale: s.scale, stroke_falloff: s.falloff, view_lock_zoom: v.params.lock_zoom }
+        let (v, p) = (ViewDefaults::default(), PointerView::default());
+        Self {
+            wheel: WheelMode::default(),
+            stroke_scale: s.scale,
+            stroke_falloff: s.falloff,
+            view_lock_zoom: v.params.lock_zoom,
+            hide_pointer: p.hide_pointer,
+            clear_radius: p.clear_radius,
+        }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults, v: &ViewDefaults) -> Self {
-        Self { wheel: d.wheel, stroke_scale: d.stroke.scale, stroke_falloff: d.stroke.falloff, view_lock_zoom: v.params.lock_zoom }
+    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView) -> Self {
+        Self {
+            wheel: d.wheel,
+            stroke_scale: d.stroke.scale,
+            stroke_falloff: d.stroke.falloff,
+            view_lock_zoom: v.params.lock_zoom,
+            hide_pointer: p.hide_pointer,
+            clear_radius: p.clear_radius,
+        }
     }
 
     fn apply(&self, world: &mut World) {
@@ -56,6 +74,7 @@ impl SettingsFile {
         d.stroke.scale = self.stroke_scale.clamp(tt_core::capture::SCALE_RANGE.0, tt_core::capture::SCALE_RANGE.1);
         d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
         world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
+        *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
     }
 }
 
@@ -111,19 +130,21 @@ impl Session {
     }
 }
 
+/// The Settings tab's values, kept in the session file.
+fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, mut session: ResMut<Session>) {
+    let settings = SettingsFile::of(&defaults, &views, &pointer);
+    if session.file.settings != settings {
+        session.file.settings = settings;
+    }
+}
+
 fn track_session(
     media: Option<Res<Media>>,
     transport: Res<Transport>,
     clock: Res<WallClock>,
-    defaults: Res<SketchDefaults>,
-    views: Res<ViewDefaults>,
     mut session: ResMut<Session>,
     mut actions: ResMut<PendingActions>,
 ) {
-    let settings = SettingsFile::of(&defaults, &views);
-    if session.file.settings != settings {
-        session.file.settings = settings;
-    }
     let Some(media) = media else {
         if clock.now - session.last_save > 2.0 {
             session.last_save = clock.now;
@@ -161,6 +182,6 @@ impl Module for SessionModule {
         let session = Session::load();
         // The remembered settings replace the built-in defaults.
         session.file.settings.apply(app.world_mut());
-        app.declare::<Session>(Class::Session).insert_resource(session).add_systems(track_session.in_set(Set::Prepare));
+        app.declare::<Session>(Class::Session).insert_resource(session).add_systems((track_settings, track_session).chain().in_set(Set::Prepare));
     }
 }
