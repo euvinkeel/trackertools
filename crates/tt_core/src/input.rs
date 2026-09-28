@@ -149,6 +149,14 @@ impl Keymap {
     /// Human-readable chord for an action (help overlay, tooltips).
     pub fn chord_for(&self, action: Action) -> Option<String> {
         let (b, _) = self.bindings.iter().find(|(_, a)| *a == action)?;
+        Some(b.chord())
+    }
+}
+
+impl Binding {
+    /// Human-readable chord, e.g. `Shift+D`.
+    pub fn chord(&self) -> String {
+        let b = self;
         let mut s = String::new();
         if b.mods.ctrl {
             s.push_str("Ctrl+");
@@ -173,7 +181,7 @@ impl Keymap {
             Key::F2 => "F2".into(),
             Key::Letter(c) => c.to_ascii_uppercase().to_string(),
         });
-        Some(s)
+        s
     }
 }
 

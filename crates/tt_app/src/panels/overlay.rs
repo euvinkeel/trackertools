@@ -97,13 +97,19 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let name = |e: Option<Entity>| e.and_then(|e| world.get::<Name>(e)).map(|n| n.to_string());
         let text = match live {
             Some(l) => format!(
-                "⏺ recording into {}{} · frame {} · {} · falloff {:.2} s = {:.0} frames (wheel) · Esc cancels",
+                "⏺ recording into {}{} · frame {} · {} · size ×{:.2} · falloff {:.2} s ({:.0} frames) · wheel: {} · Esc cancels",
                 name(l.target).unwrap_or_else(|| "a new sketch".into()),
                 if l.stroke.size == 0.0 { " (move only)" } else { "" },
                 t.frame(),
                 if t.playing { "playing: recording across frames" } else { "paused: editing this instant" },
+                l.stroke.scale,
                 l.stroke.falloff,
                 l.stroke.falloff as f64 * fps,
+                match world.resource::<tt_core::capture::SketchDefaults>().wheel {
+                    tt_core::capture::WheelMode::Size => "size",
+                    tt_core::capture::WheelMode::Falloff => "falloff",
+                    tt_core::capture::WheelMode::Both => "size + falloff",
+                },
             ),
             None => match name(selected) {
                 Some(n) => format!("SKETCH · hold to record into {n} at the shown frame · Space plays at {} (Q/E) · Ctrl+hold: move only · Shift+hold: new sketch · click: select · D/Esc exits", super::timeline::rate_label(t.rate)),

@@ -12,6 +12,7 @@ pub enum Pane {
     Timeline,
     Inspector,
     Outliner,
+    Settings,
 }
 
 impl Pane {
@@ -21,6 +22,7 @@ impl Pane {
             Pane::Timeline => "Timeline",
             Pane::Inspector => "Inspector",
             Pane::Outliner => "Outliner",
+            Pane::Settings => "Settings",
         }
     }
 }
@@ -36,10 +38,12 @@ impl Default for Layout {
         let outliner = tiles.insert_pane(Pane::Outliner);
         let viewport = tiles.insert_pane(Pane::Viewport);
         let inspector = tiles.insert_pane(Pane::Inspector);
+        let settings = tiles.insert_pane(Pane::Settings);
+        let right = tiles.insert_tab_tile(vec![inspector, settings]);
         let timeline = tiles.insert_pane(Pane::Timeline);
-        let top = tiles.insert_horizontal_tile(vec![outliner, viewport, inspector]);
+        let top = tiles.insert_horizontal_tile(vec![outliner, viewport, right]);
         let root = tiles.insert_vertical_tile(vec![top, timeline]);
-        set_shares(&mut tiles, top, &[(outliner, 1.0), (viewport, 4.5), (inspector, 1.4)]);
+        set_shares(&mut tiles, top, &[(outliner, 1.0), (viewport, 4.5), (right, 1.4)]);
         set_shares(&mut tiles, root, &[(top, 3.4), (timeline, 1.0)]);
         Self { tree: Tree::new("main_layout", root, tiles) }
     }

@@ -237,7 +237,7 @@ Consequences:
   - frames a stroke visited take its value (blended by `influence`, like an NLA strip);
   - frames within `falloff` of a visited run keep their own motion but move by the run's edge offset, with Blender's smooth falloff curve. Where several edits reach one frame, the weights are normalised, so the frames between two edits with the same offset move by exactly that offset (no overshoot);
   - where there is no path yet, a gap of at most twice the falloff between the stroke and another value is bridged linearly, so a path can be blocked out with holds on key frames;
-  - the mouse wheel sets the falloff while holding (shown in the HUD and on the timeline). Every stroke stays re-tunable, and removing one restores what was under it.
+  - the mouse wheel while holding changes the stroke's **size** (a multiplier on its region around the point) by default. A setting makes it change the falloff instead, or both as one "roughness" knob. The next stroke starts with what the last one ended with. Every stroke stays re-tunable, and removing one restores what was under it.
 - **Live feedback:**
   - the raw hand trail;
   - the sketch with the stroke laid over it (path and region), computed by the same pipeline over the samples so far;
@@ -431,6 +431,12 @@ Adopted from Rerun's proven design.
   - Each command is one undo step (`tt_core::commands`).
   - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and scrolls to what is selected elsewhere.
   - The Timeline scrubs from the ruler. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), and a double-click enters a sketch's view.
+- **Settings tab** (beside the Inspector), remembered in the session file:
+  - what the wheel does while sketching;
+  - the size and falloff the next stroke starts with;
+  - the preset new sketches use;
+  - every key, generated from the keymap;
+  - where the data folder is.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
   - `Space` play (also while holding the button: recording across frames);
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel sets a stroke's falloff while holding; `Esc` cancels the stroke or leaves the tool;

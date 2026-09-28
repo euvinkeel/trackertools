@@ -198,11 +198,27 @@ pub struct Stroke {
     /// How much the stroke's jiggle sets the region's size: 0 keeps the size
     /// that was there (a "move only" stroke, Ctrl at the press), 1 replaces it.
     pub size: f32,
+    /// Makes the stroke's region bigger (> 1) or smaller around its point (the
+    /// wheel while holding, by default).
+    #[reflect(default = "one")]
+    pub scale: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl Default for Stroke {
     fn default() -> Self {
-        Self { falloff: 0.2, influence: 1.0, size: 1.0 }
+        Self { falloff: 0.2, influence: 1.0, size: 1.0, scale: 1.0 }
+    }
+}
+
+impl Stroke {
+    /// A box with its extents around the point multiplied by `scale`.
+    pub fn scaled(&self, b: [f64; 6]) -> [f64; 6] {
+        let k = self.scale.max(0.01) as f64;
+        [b[0], b[1], b[0] - (b[0] - b[2]) * k, b[1] - (b[1] - b[3]) * k, b[0] + (b[4] - b[0]) * k, b[1] + (b[5] - b[1]) * k]
     }
 }
 
@@ -814,7 +830,11 @@ pub fn stroke_boxes(world: &World, e: Entity, params: &SketchParams, fps: f64) -
             *v = v.zip(through.get(first + i as FrameIndex)).map(|(b, m)| through_map(m).box_to_source(b));
         }
     }
-    Some(((first, frames), entity.get::<Stroke>().cloned().unwrap_or_default()))
+    let stroke = entity.get::<Stroke>().cloned().unwrap_or_default();
+    for v in frames.iter_mut().flatten() {
+        *v = stroke.scaled(*v);
+    }
+    Some(((first, frames), stroke))
 }
 
 /// A stroke's layering changed: the sketches reading it recompute.

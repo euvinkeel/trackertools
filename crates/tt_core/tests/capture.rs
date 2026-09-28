@@ -129,8 +129,53 @@ fn shift_starts_a_new_sketch_and_alt_a_deselects() {
 }
 
 #[test]
+fn the_wheel_sets_size_falloff_or_both_as_chosen() {
+    use tt_core::capture::{SketchDefaults, WheelMode};
+    let mut d = Driver::new();
+    let stroke = |d: &Driver| d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.clone();
+    // Default: the wheel sizes the region.
+    d.frame(circle, PRESS);
+    d.frame(circle, Input { wheel: 2.0, ..HOLD });
+    let s = stroke(&d);
+    assert!((s.scale - 1.25 * 1.25).abs() < 1e-6 && s.falloff == 0.2, "size ×{}, falloff {}", s.scale, s.falloff);
+    d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
+    d.frame(circle, UP);
+    for (mode, scale, falloff) in [(WheelMode::Falloff, 1.0, 0.2 * 1.25), (WheelMode::Both, 1.25, 0.2 * 1.25)] {
+        d.core.world.resource_mut::<SketchDefaults>().wheel = mode;
+        d.frame(circle, PRESS);
+        d.frame(circle, Input { wheel: 1.0, ..HOLD });
+        let s = stroke(&d);
+        assert!((s.scale - scale).abs() < 1e-6 && (s.falloff - falloff).abs() < 1e-6, "{mode:?}: size ×{}, falloff {}", s.scale, s.falloff);
+        d.frame(circle, Input { action: Some(Action::Cancel), ..HOLD });
+        d.frame(circle, UP);
+    }
+}
+
+#[test]
+fn a_bigger_size_makes_a_bigger_region_and_carries_to_the_next_stroke() {
+    use tt_core::capture::SketchDefaults;
+    let mut d = Driver::new();
+    let hold = |d: &mut Driver, f: i64, wheel: f32, new: bool| {
+        d.core.world.resource_mut::<Transport>().seek(f);
+        d.frame(still(300.0, 300.0), Input { shift: new, ..PRESS });
+        d.frame(still(300.0, 300.0), Input { wheel, ..HOLD });
+        d.frames(60, still(300.0, 300.0), HOLD);
+        d.frame(still(300.0, 300.0), UP);
+        d.core.world.resource::<tt_core::selection::Selection>().primary().unwrap()
+    };
+    let a = hold(&mut d, 50, 0.0, true);
+    let small = d.value(a, 50).unwrap();
+    let b = hold(&mut d, 50, 3.0, true); // ×1.25³ ≈ 1.95
+    let big = d.value(b, 50).unwrap();
+    let ratio = (big[4] - big[2]) / (small[4] - small[2]);
+    assert!((ratio - 1.953).abs() < 0.02, "the region grew ×{ratio:.3}");
+    assert!((d.core.world.resource::<SketchDefaults>().stroke.scale - 1.953).abs() < 0.01, "the next stroke starts at that size");
+}
+
+#[test]
 fn the_wheel_sets_the_falloff_and_esc_cancels() {
     let mut d = Driver::new();
+    d.core.world.resource_mut::<tt_core::capture::SketchDefaults>().wheel = tt_core::capture::WheelMode::Falloff;
     d.frame(circle, PRESS);
     d.frame(circle, Input { wheel: 2.0, ..HOLD });
     let falloff = d.core.world.resource::<LiveCapture>().0.as_ref().unwrap().stroke.falloff;

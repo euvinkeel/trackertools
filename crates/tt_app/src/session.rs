@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
+use tt_core::capture::{SketchDefaults, WheelMode};
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::{FrameIndex, WallClock};
 use tt_core::transport::Transport;
@@ -20,6 +21,36 @@ struct SessionFile {
     recent: Vec<PathBuf>,
     /// Frame of the most recent file when last seen.
     frame: FrameIndex,
+    #[serde(default)]
+    settings: SettingsFile,
+}
+
+/// The user's settings (the Settings tab), remembered between launches.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+struct SettingsFile {
+    wheel: WheelMode,
+    stroke_scale: f32,
+    stroke_falloff: f32,
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        let s = tt_core::sketch::Stroke::default();
+        Self { wheel: WheelMode::default(), stroke_scale: s.scale, stroke_falloff: s.falloff }
+    }
+}
+
+impl SettingsFile {
+    fn of(d: &SketchDefaults) -> Self {
+        Self { wheel: d.wheel, stroke_scale: d.stroke.scale, stroke_falloff: d.stroke.falloff }
+    }
+
+    fn apply(&self, d: &mut SketchDefaults) {
+        d.wheel = self.wheel;
+        d.stroke.scale = self.stroke_scale.clamp(tt_core::capture::SCALE_RANGE.0, tt_core::capture::SCALE_RANGE.1);
+        d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
+    }
 }
 
 #[derive(Resource)]
@@ -78,10 +109,21 @@ fn track_session(
     media: Option<Res<Media>>,
     transport: Res<Transport>,
     clock: Res<WallClock>,
+    defaults: Res<SketchDefaults>,
     mut session: ResMut<Session>,
     mut actions: ResMut<PendingActions>,
 ) {
-    let Some(media) = media else { return };
+    let settings = SettingsFile::of(&defaults);
+    if session.file.settings != settings {
+        session.file.settings = settings;
+    }
+    let Some(media) = media else {
+        if clock.now - session.last_save > 2.0 {
+            session.last_save = clock.now;
+            session.save();
+        }
+        return;
+    };
     if media.generation != session.seen_generation {
         // A file was just opened: it becomes the most recent one.
         session.seen_generation = media.generation;
@@ -109,8 +151,9 @@ pub struct SessionModule;
 
 impl Module for SessionModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<Session>(Class::Session)
-            .insert_resource(Session::load())
-            .add_systems(track_session.in_set(Set::Prepare));
+        let session = Session::load();
+        // The remembered settings replace the built-in defaults.
+        session.file.settings.apply(&mut app.world_mut().resource_mut::<SketchDefaults>());
+        app.declare::<Session>(Class::Session).insert_resource(session).add_systems(track_session.in_set(Set::Prepare));
     }
 }

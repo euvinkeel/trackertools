@@ -9,8 +9,8 @@
 //!   - playing (or stepping, scrubbing), it records across frames.
 //! - Each press → release is a *stroke* laid over the selected sketch: it
 //!   replaces the frames it visited and pulls neighbouring frames along with a
-//!   falloff (`sketch::layer_over`); the mouse wheel sets the falloff while
-//!   holding. With no sketch selected, or with Shift held at the press, the
+//!   falloff (`sketch::layer_over`). The mouse wheel while holding sets the
+//!   stroke's region size, its falloff, or both ([`WheelMode`], a setting). With no sketch selected, or with Shift held at the press, the
 //!   stroke starts a new sketch.
 //! - `Ctrl` at the press: move only (the stroke keeps the region's size).
 //! - A quick click doesn't record: it selects the sketch under it (tool.rs).
@@ -87,12 +87,26 @@ fn at((first, values): &Boxes, f: FrameIndex) -> Option<[f64; 6]> {
 #[derive(Resource, Debug, Default)]
 pub struct LiveCapture(pub Option<Live>);
 
-/// What new sketches and strokes start with.
+/// What new sketches and strokes start with, and what the wheel does while
+/// holding (user settings; the app remembers them between launches).
 #[derive(Resource, Debug, Default, Clone)]
 pub struct SketchDefaults {
     pub params: SketchParams,
-    /// The falloff last chosen with the wheel.
+    /// The size and falloff last chosen with the wheel.
     pub stroke: Stroke,
+    pub wheel: WheelMode,
+}
+
+/// What the mouse wheel changes while holding a stroke.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WheelMode {
+    /// The region's size around the point (`Stroke::scale`).
+    #[default]
+    Size,
+    /// How far the stroke pulls neighbouring frames along.
+    Falloff,
+    /// Both together: one "roughness" knob.
+    Both,
 }
 
 /// Raw input only reports motion: a still pointer is extended to "now" once
@@ -101,6 +115,8 @@ const STILL: f64 = 0.02;
 /// Falloff change per wheel notch, and its limits (seconds of video).
 const WHEEL_STEP: f32 = 1.25;
 const FALLOFF_MAX: f32 = 5.0;
+/// Limits of a stroke's size multiplier.
+pub const SCALE_RANGE: (f32, f32) = (0.25, 8.0);
 
 /// Start, extend and commit strokes (`Set::Tools`, after the transport moved).
 pub fn sketch_tool(world: &mut World) {
@@ -157,8 +173,15 @@ pub fn sketch_tool(world: &mut World) {
         live.home_maps.clear();
     }
     if pointer.wheel != 0.0 {
-        let f = (live.stroke.falloff.max(0.01) * WHEEL_STEP.powf(pointer.wheel)).min(FALLOFF_MAX);
-        live.stroke.falloff = if f < 0.015 { 0.0 } else { f };
+        let k = WHEEL_STEP.powf(pointer.wheel);
+        let mode = world.resource::<SketchDefaults>().wheel;
+        if matches!(mode, WheelMode::Size | WheelMode::Both) {
+            live.stroke.scale = (live.stroke.scale * k).clamp(SCALE_RANGE.0, SCALE_RANGE.1);
+        }
+        if matches!(mode, WheelMode::Falloff | WheelMode::Both) {
+            let f = (live.stroke.falloff.max(0.01) * k).min(FALLOFF_MAX);
+            live.stroke.falloff = if f < 0.015 { 0.0 } else { f };
+        }
     }
     let end = pointer.released.or((!pointer.down).then_some(now));
 
@@ -206,6 +229,9 @@ pub fn sketch_tool(world: &mut World) {
             for (i, v) in frames.iter_mut().enumerate() {
                 *v = v.zip(live.through.get(&(first + i as FrameIndex))).map(|(b, m)| m.box_to_source(b));
             }
+        }
+        for v in frames.iter_mut().flatten() {
+            *v = live.stroke.scaled(*v);
         }
         (first, frames)
     });
@@ -303,7 +329,10 @@ fn commit(world: &mut World, live: Live) {
     });
     let sketch = sketch.expect("a sketch");
     world.resource_mut::<Selection>().select_only(sketch);
-    world.resource_mut::<SketchDefaults>().stroke.falloff = live.stroke.falloff;
+    // The next stroke starts with the size and falloff this one ended with.
+    let mut defaults = world.resource_mut::<SketchDefaults>();
+    defaults.stroke.falloff = live.stroke.falloff;
+    defaults.stroke.scale = live.stroke.scale;
     let visited = live.boxes.as_ref().map_or(0, |(_, b)| b.iter().flatten().count());
     tracing::info!("{label}: {} samples over {:.2} s, {visited} frames visited", live.samples.len(), live.samples.last().map_or(0.0, |s| s[0]));
 }

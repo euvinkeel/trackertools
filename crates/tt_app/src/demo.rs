@@ -340,6 +340,13 @@ impl SketchDemo {
             29 => self.shot = Some("9-outliner-box"),
             30 => self.inject.push(button(ob, PointerButton::Primary, false)),
             31 => tracing::info!("sketch demo · UI: a box over the outliner selected {}", selected(world)),
+            32 => {
+                // The Settings tab, next to the Inspector's above the right column.
+                let panel = world.resource::<crate::panels::viewport::ViewportMapping>().panel;
+                let p = Pos2::new(panel.max.x + 100.0, panel.min.y - 12.0);
+                self.inject.extend([moved(p), button(p, PointerButton::Primary, true), button(p, PointerButton::Primary, false)]);
+            }
+            33 => self.shot = Some("10-settings"),
             _ => return false,
         }
         true

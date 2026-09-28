@@ -4,6 +4,7 @@
 mod inspector;
 mod menu;
 pub mod outliner;
+mod settings;
 mod overlay;
 pub mod timeline;
 pub mod viewport;
@@ -153,6 +154,7 @@ impl egui_tiles::Behavior<Pane> for Behavior<'_> {
             Pane::Timeline => timeline::ui(ui, self.world),
             Pane::Inspector => inspector::ui(ui, self.world),
             Pane::Outliner => outliner::ui(ui, self.world),
+            Pane::Settings => settings::ui(ui, self.world),
         }
         egui_tiles::UiResponse::None
     }
