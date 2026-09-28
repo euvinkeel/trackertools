@@ -120,6 +120,11 @@ fn tracks_the_sprite_both_ways_from_the_anchor() {
     let lost = out.iter().flatten().filter(|(_, s, _)| *s < 0.5).count();
     let e = errors(&out, 600);
     let (median, p95, max) = (e[e.len() / 2], e[e.len() * 95 / 100], e[e.len() - 1]);
+    // Re-centred on the guide: the absolute error too (the guide's wander averages out).
+    let mut abs: Vec<f64> = (0..FRAMES).filter_map(|f| out[f as usize].map(|(p, _, _)| (p[0] - truth(f)[0]).hypot(p[1] - truth(f)[1]))).collect();
+    abs.sort_by(f64::total_cmp);
+    eprintln!("absolute error (re-centred on the guide): median {:.3} px, max {:.3}", abs[abs.len() / 2], abs[abs.len() - 1]);
+    assert!(abs[abs.len() / 2] < 0.6, "absolute median {:.3}", abs[abs.len() / 2]);
     eprintln!("{FRAMES} frames in {secs:.1} s ({:.0} fps): error median {median:.3} px, p95 {p95:.3}, max {max:.3}; {lost} low-score frames", FRAMES as f64 / secs);
     assert!(out.iter().flatten().all(|(_, _, s)| *s == FrameState::Valid));
     assert_eq!(lost, 0);

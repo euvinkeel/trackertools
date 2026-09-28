@@ -8,8 +8,12 @@
 //!   frame, resuming from the result just before it when that is still valid.
 //! - Results land as they arrive; old ones stay on screen as stale until
 //!   replaced (stale-while-revalidate), and dependents update chunk by chunk.
-//! - A [`TrackStamp`] (saved) hashes the inputs the results came from, so a
+//! - A [`TrackBook`] (saved) hashes the inputs the results came from, so a
 //!   reopened project keeps its results instead of tracking again.
+//! - When a tracker finishes, its path is shifted onto the guide's: by the
+//!   median offset between the two over the frames it saw the subject. The
+//!   tracker gives the motion's shape; the rough pass, on average, where the
+//!   subject is (instead of wherever the guide happened to be at the anchor).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -41,10 +45,14 @@ pub struct Footage {
     pub decode: DecodeOptions,
 }
 
-/// Hash of the inputs a tracker's results came from (saved with the project).
+/// A tracker's bookkeeping, saved with its results: the hash of the inputs
+/// they came from, and the shift applied to them (re-centring on the guide).
 #[derive(Component, Reflect, Clone, Copy, Debug, Default, PartialEq)]
 #[reflect(Component)]
-pub struct TrackStamp(pub u64);
+pub struct TrackBook {
+    pub stamp: u64,
+    pub offset: [f32; 2],
+}
 
 /// What a tracker is doing, for panels.
 #[derive(Component, Clone, Debug, Default)]
@@ -150,6 +158,7 @@ fn drain(world: &mut World, op: Entity) {
         return;
     }
     let Some(out) = world.get::<Output>(op).map(|o| o.0) else { return };
+    let [ox, oy] = world.get::<TrackBook>(op).map_or([0.0; 2], |b| b.offset);
     let mut changed = RangeSet::default();
     let mut finished_stamp = None;
     for (side, msg) in msgs {
@@ -157,7 +166,8 @@ fn drain(world: &mut World, op: Entity) {
             Msg::Frames(frames) => {
                 if let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out) {
                     for (f, v) in &frames {
-                        sig.set(*f, v);
+                        let [x, y, l, t, r, b, s] = *v;
+                        sig.set(*f, &[x + ox, y + oy, l + ox, t + oy, r + ox, b + oy, s]);
                     }
                 }
                 let mut jobs = world.resource_mut::<TrackJobs>();
@@ -192,8 +202,58 @@ fn drain(world: &mut World, op: Entity) {
         && world.get::<Dirty>(op).is_none_or(|d| d.0.is_empty())
         && world.get::<OpError>(op).is_none()
     {
-        world.entity_mut(op).insert(TrackStamp(stamp));
+        let book = world.get::<TrackBook>(op).copied().unwrap_or_default();
+        world.entity_mut(op).insert(TrackBook { stamp, ..book });
+        recenter(world, op);
     }
+}
+
+/// Shift the tracker's path onto its guide's (or back, with re-centring off).
+fn recenter(world: &mut World, op: Entity) {
+    let Some(params) = world.get::<Tracker>(op).cloned() else { return };
+    let book = world.get::<TrackBook>(op).copied().unwrap_or_default();
+    let (Some(out), Some(guide)) = (world.get::<Output>(op).map(|o| o.0), guide_of(world, op).and_then(|g| world.get::<Output>(g)).map(|o| o.0)) else { return };
+    let new = if params.center_on_guide {
+        let store = world.resource::<SignalStore>();
+        let (Some(sig), Some(g)) = (store.get(out), store.get(guide)) else { return };
+        let Some((lo, hi)) = sig.present_hull() else { return };
+        let (mut dx, mut dy) = (Vec::new(), Vec::new());
+        for f in lo..=hi {
+            if let (Some(v), Some(gv)) = (sig.get_valid(f), g.get(f))
+                && v[6] >= params.min_score
+            {
+                dx.push(gv[0] - (v[0] - book.offset[0]));
+                dy.push(gv[1] - (v[1] - book.offset[1]));
+            }
+        }
+        if dx.len() < 3 {
+            return;
+        }
+        let median = |v: &mut Vec<f32>| {
+            v.sort_by(f32::total_cmp);
+            v[v.len() / 2]
+        };
+        [median(&mut dx), median(&mut dy)]
+    } else {
+        [0.0, 0.0]
+    };
+    let [dx, dy] = [new[0] - book.offset[0], new[1] - book.offset[1]];
+    if dx.abs() < 1e-3 && dy.abs() < 1e-3 {
+        return;
+    }
+    let mut store = world.resource_mut::<SignalStore>();
+    let Some(sig) = store.get_mut(out) else { return };
+    let Some((lo, hi)) = sig.present_hull() else { return };
+    for f in lo..=hi {
+        let state = sig.state(f);
+        let Some(v) = sig.get(f).map(|v| [v[0] + dx, v[1] + dy, v[2] + dx, v[3] + dy, v[4] + dx, v[5] + dy, v[6]]) else { continue };
+        sig.set(f, &v);
+        if state == FrameState::Stale {
+            sig.mark_stale(f..f + 1);
+        }
+    }
+    world.resource_mut::<Invalidations>().output_changed(op, lo..hi + 1);
+    world.entity_mut(op).insert(TrackBook { offset: new, ..book });
 }
 
 fn start_dirty(world: &mut World, op: Entity, footage: &Footage) {
@@ -233,10 +293,11 @@ fn start_dirty(world: &mut World, op: Entity, footage: &Footage) {
     let complete = world.resource::<SignalStore>().get(out).is_some_and(|s| {
         s.runs(lo..hi + 1).iter().filter(|(_, st)| *st != FrameState::Absent).map(|(r, _)| r.end - r.start).sum::<FrameIndex>() == hi - lo + 1
     });
-    if !running && complete && world.get::<TrackStamp>(op).is_some_and(|s| s.0 == plan.stamp) {
+    if !running && complete && world.get::<TrackBook>(op).is_some_and(|b| b.stamp == plan.stamp) {
         if let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out) {
             sig.mark_valid(lo..hi + 1);
         }
+        recenter(world, op);
         return;
     }
 
@@ -267,9 +328,11 @@ fn start_dirty(world: &mut World, op: Entity, footage: &Footage) {
             todo.union(&old.owned.intersect(&range));
         }
         let hull = todo.hull().expect("not empty");
+        // Where the tracker itself was (the output minus the re-centring shift).
+        let offset = world.get::<TrackBook>(op).map_or([0.0; 2], |b| b.offset);
         let valid = |world: &World, f: FrameIndex| -> Option<[f64; 2]> {
             let v = world.resource::<SignalStore>().get(out)?.get_valid(f)?;
-            Some([v[0] as f64, v[1] as f64])
+            Some([(v[0] - offset[0]) as f64, (v[1] - offset[1]) as f64])
         };
         let (from, resume) = match side {
             Side::Forward => match valid(world, hull.start - 1).filter(|_| hull.start > anchor) {

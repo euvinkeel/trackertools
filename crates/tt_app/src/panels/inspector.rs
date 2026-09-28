@@ -59,7 +59,7 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             .filter_map(|r| {
                 let class = metas.get(r.type_id())?.class;
                 // Derived state isn't edited; the name is the heading; a tracker's stamp is bookkeeping.
-                let hidden = [std::any::TypeId::of::<bevy_ecs::name::Name>(), std::any::TypeId::of::<tt_track::runner::TrackStamp>()];
+                let hidden = [std::any::TypeId::of::<bevy_ecs::name::Name>(), std::any::TypeId::of::<tt_track::runner::TrackBook>()];
                 if class == Class::Derived || hidden.contains(&r.type_id()) {
                     return None;
                 }

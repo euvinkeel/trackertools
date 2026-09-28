@@ -343,13 +343,15 @@ The first automatic tracker, built the way the whole design intends: an operator
   - Results stay on screen as stale until replaced.
   - A saved input stamp keeps results when a reopened project's inputs come out the same.
 - **Catch-up mode** (`follow_playhead`): jobs stop at the playhead and continue as it moves, forward and backward.
+- **Re-centring on the guide** (`center_on_guide`, on by default): a finished path is shifted by the median offset between it and the guide over the frames where the tracker saw the subject. The tracker gives the motion; the rough pass, averaged, gives where the subject is. Without it, every frame would inherit the guide's error at the anchor.
 - **UI:**
   - the viewport draws each tracker's box and path (cyan; lost frames red; stale dim);
   - the top bar shows running trackers and their fps;
   - the inspector shows progress per side, lost frames, the rendition read and errors, plus a Track button on sketches.
 
 **Measured** (`crates/tt_track/tests/sprite.rs`: the sprite fixture, 1200 frames of 1080p60 H.264 with GOP 250 and B-frames; the guide wanders ~6 px off the truth in a 56 px box; anchor mid-clip, tracked both ways):
-- error after removing the anchor's offset: **median 0.31 px, p95 0.80, max 0.87**, with no lost frames, at ~500 fps (both sides together);
+- absolute error, re-centred on the guide: **median 0.25 px, max 0.65**, with no lost frames, at ~500 fps (both sides together);
+- the motion alone (the anchor's offset removed): median 0.31 px, p95 0.80, max 0.87;
 - the rough pass alone is ~1.5 px median;
 - synthetic subpixel motion (`tests/template.rs`): median 0.02–0.06 px.
 
@@ -359,7 +361,6 @@ Findings on the way:
 
 **Next:**
 - trackers in the outliner and timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);
-- re-centring the result on the guide (the track's shape, the rough pass's average position);
 - a Lucas–Kanade refinement for hard-edged features (NCC peaks lean toward whole pixels);
 - colour (chroma) in the match;
 - the forward/backward fuse;

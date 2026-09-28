@@ -79,11 +79,14 @@ pub struct Tracker {
     /// Match score (0–1) below which a frame counts as lost; lost frames follow the guide.
     pub min_score: f32,
     pub rendition: Rendition,
+    /// Shift the finished path onto the guide's average position (the median
+    /// offset), instead of wherever the guide was at the anchor.
+    pub center_on_guide: bool,
 }
 
 impl Tracker {
     pub fn at(anchor: FrameIndex) -> Self {
-        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.5, rendition: Rendition::Auto }
+        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.5, rendition: Rendition::Auto, center_on_guide: true }
     }
 }
 
@@ -150,7 +153,7 @@ pub fn add_tracker(world: &mut World, guide: Entity, frame: FrameIndex, space: O
         let out = tx.create_signal(TRACK_CHANNELS);
         let mut inputs = vec![("guide".to_string(), guide)];
         inputs.extend(space.map(|v| ("space".to_string(), v)));
-        made = Some(tx.spawn((Name::new(format!("Tracker {n}")), Operator { kind: "track".into() }, Inputs(inputs), Output(out), Tracker::at(anchor), runner::TrackStamp::default())));
+        made = Some(tx.spawn((Name::new(format!("Tracker {n}")), Operator { kind: "track".into() }, Inputs(inputs), Output(out), Tracker::at(anchor), runner::TrackBook::default())));
     });
     let tracker = made?;
     world.resource_mut::<Selection>().select_only(tracker);
@@ -194,7 +197,7 @@ impl Module for TrackModule {
     fn build(&self, app: &mut AppBuilder) {
         app.operator(TrackKind)
             .operator_params::<Tracker>()
-            .component::<runner::TrackStamp>(Class::Document)
+            .component::<runner::TrackBook>(Class::Document)
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .declare::<TrackStatus>(Class::Derived)
