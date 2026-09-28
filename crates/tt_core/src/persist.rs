@@ -23,11 +23,11 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::resource::IsResource;
 use bevy_reflect::serde::{TypedReflectDeserializer, TypedReflectSerializer};
-use bevy_reflect::{FromReflect, PartialReflect, ReflectMut, ReflectRef, TypeRegistry};
+use bevy_reflect::{FromReflect, PartialReflect, ReflectMut, ReflectRef, TypePath, TypeRegistry};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::DeserializeSeed;
 
-use crate::meta::{Class, ComponentMetas};
+use crate::meta::{Class, ComponentMetas, Created, CreationCounter};
 use crate::signal::{Signal, SignalId, SignalStore};
 
 pub const FORMAT: &str = "trackertools.project";
@@ -191,18 +191,30 @@ pub fn load(world: &mut World, path: &Path) -> Result<()> {
         .prepare("SELECT entity, type, data FROM components ORDER BY entity, type")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    // Fresh entities in the saved ones' creation order (their index), so
-    // anything listed by creation (the outliner, the timeline) keeps its order.
+    let registry = world.resource::<AppTypeRegistry>().clone();
+    let registry = registry.read();
+    // Fresh entities in the saved creation order ([`Created`]; files from before
+    // it: the saved ids' index), stamped anew so the order carries on from here.
+    let created_path = <Created as TypePath>::type_path();
+    let mut created: HashMap<u64, u64> = HashMap::new();
+    for (old, _, data) in rows.iter().filter(|(_, t, _)| t == created_path) {
+        let registration = registry.get_with_type_path(created_path).context("Created is registered")?;
+        let mut de = ron::Deserializer::from_str(data).context("parsing Created")?;
+        let value = TypedReflectDeserializer::new(registration, &registry).deserialize(&mut de).context("reading Created")?;
+        created.extend(Created::from_reflect(value.as_ref()).map(|c| (*old as u64, c.0)));
+    }
     let mut olds: Vec<u64> = rows.iter().map(|(old, _, _)| *old as u64).collect();
-    olds.sort_by_key(|o| Entity::try_from_bits(*o).map_or(u32::MAX, |e| e.index_u32()));
+    olds.sort_by_key(|o| (created.get(o).copied().unwrap_or(u64::MAX), Entity::try_from_bits(*o).map_or(u32::MAX, |e| e.index_u32())));
     olds.dedup();
     let mut map: HashMap<u64, Entity> = HashMap::new();
     for old in olds {
-        map.entry(old).or_insert_with(|| world.spawn_empty().id());
+        let stamp = world.resource_mut::<CreationCounter>().stamp();
+        map.insert(old, world.spawn(stamp).id());
     }
-    let registry = world.resource::<AppTypeRegistry>().clone();
-    let registry = registry.read();
     for (old, type_path, data) in rows {
+        if type_path == created_path {
+            continue; // stamped above
+        }
         let Some(registration) = registry.get_with_type_path(&type_path) else {
             tracing::warn!("project has component {type_path}, unknown to this build; skipped");
             continue;
@@ -253,6 +265,7 @@ pub fn clear_document(world: &mut World) {
         world.despawn(e);
     }
     *world.resource_mut::<SignalStore>() = SignalStore::default();
+    world.resource_mut::<CreationCounter>().reset();
     world.resource_mut::<crate::history::History>().clear();
     world.resource_mut::<crate::selection::Selection>().clear();
     world.resource_mut::<ProjectMeta>().0.clear();

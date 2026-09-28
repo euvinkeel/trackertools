@@ -57,8 +57,8 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             .iter()
             .filter_map(|r| {
                 let class = metas.get(r.type_id())?.class;
-                // Derived state isn't edited; the name is the heading.
-                if class == Class::Derived || r.type_id() == std::any::TypeId::of::<bevy_ecs::name::Name>() {
+                // Derived state isn't edited; the name is the heading; the creation order is bookkeeping.
+                if class == Class::Derived || [std::any::TypeId::of::<bevy_ecs::name::Name>(), std::any::TypeId::of::<tt_core::meta::Created>()].contains(&r.type_id()) {
                     return None;
                 }
                 let rc = r.data::<ReflectComponent>()?;

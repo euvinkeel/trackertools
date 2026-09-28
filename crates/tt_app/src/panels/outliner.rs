@@ -21,7 +21,7 @@ use egui::{Pos2, Rect, Sense};
 use tt_core::ComponentMetas;
 use tt_core::app::ModuleList;
 use tt_core::commands::{RenameRequest, rename, strokes_of};
-use tt_core::meta::Class;
+use tt_core::meta::{Class, creation_order};
 use tt_core::op::{OpError, Operator};
 use tt_core::selection::Selection;
 use tt_core::sketch::{Capture, sketch_of};
@@ -67,7 +67,7 @@ pub struct OutlinerState {
 pub fn sketch_tree(world: &mut World) -> Vec<(Entity, usize)> {
     let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
     let mut sketches: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "sketch").map(|(e, _)| e).collect();
-    sketches.sort_by_key(|e| e.index_u32()); // creation order (ids are never reused within a document)
+    creation_order(world, &mut sketches);
     let parent = |w: &World, s: Entity| home_of(w, s).and_then(|v| sketch_framed(w, v)).filter(|p| sketches.contains(p));
     let parents: Vec<Option<Entity>> = sketches.iter().map(|s| parent(world, *s)).collect();
     let mut out = Vec::new();
@@ -404,7 +404,7 @@ fn other_entities(world: &mut World) -> Vec<Entity> {
         .filter(|e| !e.contains::<Capture>() && !e.get::<Operator>().is_some_and(|o| o.kind == "sketch" || o.kind == "frame"))
         .map(|e| e.id())
         .collect();
-    out.sort_by_key(|e| e.index_u32());
+    creation_order(world, &mut out);
     out
 }
 

@@ -16,7 +16,7 @@ use crate::app::{AppBuilder, Module, Set};
 use crate::capture::LiveCapture;
 use crate::history::edit;
 use crate::input::{Action, PendingActions};
-use crate::meta::Class;
+use crate::meta::{Class, creation_order};
 use crate::op::{Inputs, Operator, Output};
 use crate::selection::Selection;
 use crate::signal::{Signal, SignalStore};
@@ -177,11 +177,11 @@ pub fn rename(world: &mut World, e: Entity, name: &str) -> bool {
     edit(world, &format!("Rename to {name}"), |tx| tx.insert(e, Name::new(name.to_string())))
 }
 
-/// Select every sketch.
+/// Select every sketch, in creation order (the newest is the primary).
 pub fn select_all(world: &mut World) {
     let mut q = world.query::<(Entity, &Operator)>();
     let mut all: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "sketch").map(|(e, _)| e).collect();
-    all.sort();
+    creation_order(world, &mut all);
     world.resource_mut::<Selection>().entities = all;
 }
 
