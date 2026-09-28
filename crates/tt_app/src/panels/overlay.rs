@@ -95,6 +95,9 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
             let hide = live.is_some() && world.resource::<super::viewport::PointerView>().hide_pointer;
             ui.ctx().set_cursor_icon(if hide { CursorIcon::None } else { CursorIcon::Crosshair });
             painter.circle_stroke(pos, 7.0, Stroke::new(1.0, if live.is_some() { LIVE } else { style::TEXT }));
+            if live.is_none() {
+                brush_outline(painter, map, world, selected, pos);
+            }
         }
         let t = world.resource::<Transport>();
         let fps = t.fps.as_f64();
@@ -105,7 +108,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
                 name(l.target).unwrap_or_else(|| "a new sketch".into()),
                 if l.stroke.size == 0.0 { " (move only)" } else { "" },
                 t.frame(),
-                if t.playing { "playing: recording across frames" } else { "paused: retaking this frame (← → retake the next)" },
+                if t.playing { "playing: recording across frames" } else { "paused: retaking this frame (arrow keys: the next)" },
                 if l.stroke.size == 0.0 { String::new() } else { format!("size ×{:.2} · ", l.stroke.scale) },
                 if l.stroke.falloff > 0.0 { format!("falloff {:.2} s ({:.0} frames) · ", l.stroke.falloff, l.stroke.falloff as f64 * fps) } else { String::new() },
                 match tt_core::capture::wheel_target(world.resource::<tt_core::capture::SketchDefaults>().wheel, &l.stroke) {
@@ -126,6 +129,21 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let r = Align2::LEFT_TOP.anchor_size(map.panel.left_top() + Vec2::new(15.0, 65.0), galley.size()).expand(5.0);
         painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
         painter.galley(r.min + Vec2::splat(5.0), galley, color);
+    }
+}
+
+/// Before a stroke: the box a still hand would get here (padding and the
+/// smallest box, times the stroke's size), dashed, so the brush's size is
+/// something you see.
+fn brush_outline(painter: &Painter, map: &ViewportMapping, world: &World, target: Option<Entity>, pos: Pos2) {
+    let defaults = world.resource::<tt_core::capture::SketchDefaults>();
+    let params = target.and_then(|e| world.get::<tt_core::sketch::SketchParams>(e)).unwrap_or(&defaults.params);
+    let sized = defaults.stroke.sized(params);
+    let half = (sized.pad.max(sized.min_half) as f64 * map.points_per_canvas()) as f32;
+    let r = Rect::from_center_size(pos, Vec2::splat(2.0 * half));
+    let stroke = Stroke::new(1.0, Color32::from_white_alpha(90));
+    for (a, b) in [(r.left_top(), r.right_top()), (r.right_top(), r.right_bottom()), (r.right_bottom(), r.left_bottom()), (r.left_bottom(), r.left_top())] {
+        painter.add(Shape::dashed_line(&[a, b], stroke, 4.0, 4.0));
     }
 }
 

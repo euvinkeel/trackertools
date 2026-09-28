@@ -251,7 +251,7 @@ Consequences:
 
 - **Tool:** *Sketch*, default key `D` (Blender's draw/annotate key; `S` belongs to Blender's scale, see §18).
 - **Recording:** press and hold on a viewport. Every pointer report is recorded (1 kHz raw input, timestamped; not one sample per UI frame), against whatever frame is on screen:
-  - **paused:** the hold edits that instant (hold-to-simulate, §8.3);
+  - **paused:** the hold is a **retake** of that frame: where the mouse *should* have been there (§8.3);
   - **playing:** tap `Space` while holding and it records across frames, at the playback rate (the capture speed, set with `[` / `]`; slow motion is just a rate). Tap again to pause and keep shaping that frame;
   - steps, jumps and scrubs while holding are recorded too.
 
@@ -260,11 +260,11 @@ Consequences:
 - **Strokes and sketches:** each press → release is a *stroke* (a Capture entity plus a `Stroke { falloff, influence, size, scale, lag }` component). It goes onto the **selected sketch**, so editing a rough path means: select it (a click on its box, its timeline lane, or the outliner), go to a frame, press and hold or drag. With nothing selected, or with `Shift` held at the press, the stroke starts a new sketch. `Alt+A` deselects.
 - **Clicks select, holds record:** a press shorter than 0.18 s that moves less than 4 screen points is a click, in any tool. It selects the sketch whose box is under it (the smallest where boxes overlap), or clears the selection on empty video, and never records. Only a hold or a drag edits, so a stray click can't change a path.
 - **Move only:** `Ctrl` at the press makes the stroke keep the box size that was there (`size = 0`). Without it, a hold also sets the size from its jiggle (§8.3), so a quiet hold makes the box tight. Both stay editable per stroke.
-- **Layering (proportional editing in time):** a sketch's strokes are laid over each other in order:
-  - frames a stroke visited take its value (blended by `influence`, like an NLA strip);
-  - frames within `falloff` of a visited run keep their own motion but move by the run's edge offset, with Blender's smooth falloff curve. Where several edits reach one frame, the weights are normalised, so the frames between two edits with the same offset move by exactly that offset (no overshoot);
+- **Layering (retakes by default):** a sketch's strokes are laid over each other in order:
+  - frames a stroke visited take its value (blended by `influence`, like an NLA strip). Nothing else moves. The region around them re-derives from the new data (the motion union takes the retake in), so the box jumps and grows to include it, as if the recording had been that way. *(Changed after hands-on use: the falloff used to default to 0.2 s and dragged neighbouring frames' positions, which read as "ruining" them.)*
+  - with a `falloff` (optional, 0 by default), frames within it of a visited run keep their own motion but move by the run's edge offset, with Blender's smooth falloff curve. Where several edits reach one frame, the weights are normalised, so the frames between two edits with the same offset move by exactly that offset (no overshoot);
   - where there is no path yet, a gap of at most twice the falloff between the stroke and another value is bridged linearly, so a path can be blocked out with holds on key frames;
-  - the mouse wheel while holding changes the stroke's **size** (a multiplier on its region around the point) by default. A setting makes it change the falloff instead, or both as one "roughness" knob. The next stroke starts with what the last one ended with. Every stroke stays re-tunable, and removing one restores what was under it.
+  - a stroke's **size** (a multiplier on its region), falloff and lag are set before drawing, in the **Brush** tab (§14). The mouse wheel zooms the view as always. As a setting, the wheel while holding can set the size, the falloff or both instead. Every stroke stays re-tunable, and removing one restores what was under it.
 - **Live feedback:**
   - the raw hand trail;
   - the sketch with the stroke laid over it (path and region), computed by the same pipeline over the samples so far;
@@ -300,9 +300,11 @@ Every stage's output signal is inspectable: raw, lag-shifted, smoothed, extent. 
 
 1. With the video paused and the Sketch tool active, **press and hold** on the subject.
 2. The ClockMap records a held segment on the current frame.
-3. Samples keep streaming in wall time. Jiggle measures spread over its wall-time window, so the box at this frame grows while you jiggle and settles tight when you hold still: a "simulation step" in the Houdini live-tick sense. The same jiggle gives the same size as it would while playing, and on an existing sketch the frame also takes the motion union from its neighbours, so a paused edit reads like a recorded frame.
-4. The frame takes the hand's state at the end of the hold, with no lag shift, since the hand has settled on what is shown. Before `lag` has passed, it uses the time the hand needed to get there, `start + lag`.
-5. It combines with stepping: keep holding, press `→` to step a frame, and keep shaping, sculpting a box frame by frame through a difficult passage. On an existing sketch, each held frame's change spreads to its neighbours through the falloff (§8.1).
+3. Samples keep streaming in wall time. The box at this frame is sized by the jiggle *during the hold* (the raw hand's spread around where it sits, over its last `jiggle_window`), so it grows while you jiggle and settles tight when you hold still. The same jiggle gives the same size as it would while playing. On an existing sketch the frame also takes the motion union from its neighbours, and theirs take it in, so a retake reads like a recorded frame.
+4. The frame is a **retake**: it takes where the hand *sat* on it, the median of the raw hand over its last 0.15 s there (no lag shift, no dead zone). Neither the move that brought the hand there nor the move after leaving pulls it. *(Fixed after hands-on use: it took the zero-phase smoothed hand at the moment the frame was left, half blended with the move to the next frame, so stepping while holding wrote only about half of each position.)* Held frames are not smoothed with their neighbours: each was placed by hand.
+5. It combines with stepping and playing: keep holding, press an arrow key to step a frame (or Space to play), and keep going. Each frame shown while you hold is retaken when you leave it or let go, whether frame by frame or in straight playback.
+
+Measured (tests/retake.rs, and the in-app demo): a paused hold 60 px off lands within 1.5 px of the mouse; stepping while holding with +60 / +30 / −20 px lands each frame on its own spot (the demo's three frames 30 px right of the sprite: +30.2, +30.2, +29.9), and the neighbouring frames keep their points exactly.
 
 ### 8.4 Anticipatory speed
 
@@ -481,7 +483,7 @@ Adopted from Rerun's proven design.
   - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and unfolds and scrolls to what is selected elsewhere (only when it is out of view).
   - The Timeline scrubs from the ruler (a click seeks). Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
 - **Settings tab** (beside the Inspector), remembered in the session file (scripted runs, the demo and benchmarks, neither use nor save it):
-  - what the wheel does while sketching;
+  - the **Brush** tab: the next stroke's size and falloff, what the wheel does, anticipatory speed on/off, and the box of the selected sketch (or of new sketches): padding and smallest box in px of the space drawn on (video pixels on the source, view pixels inside a view, with the conversion shown), jiggle gain, hand lag, presets. Before a stroke, a dashed outline at the cursor shows the box a still hand would get;
   - the size and falloff the next stroke starts with;
   - the preset new sketches use;
   - while holding a stroke: hide the pointer, and the clear window's radius (§8.1);
@@ -491,7 +493,7 @@ Adopted from Rerun's proven design.
   - where the data folder is.
 - **Keymap** is data (a resource), rebindable, with a help overlay generated from it. Defaults are **Blender-like**:
   - `Space` play (also while holding the button: recording across frames);
-  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel while holding sets the stroke's size, falloff or both (a setting; a move-only stroke's falloff); `Esc` cancels the stroke or leaves the tool;
+  - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; arrow keys while holding retake frame by frame; the wheel zooms (or, as a setting, sets the stroke's size, falloff or both); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
   - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
   - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when you change it (fully for 0.25 s, then a 0.3 s fade; auto speed's changes don't flash, §8.4);

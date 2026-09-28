@@ -3,9 +3,7 @@
 
 use bevy_ecs::prelude::*;
 use tt_core::autospeed::AutoSpeed;
-use tt_core::capture::{SCALE_RANGE, SketchDefaults, WheelMode};
 use tt_core::input::{Action, Keymap};
-use tt_core::sketch::SketchParams;
 use tt_core::view::ViewDefaults;
 
 use super::viewport::PointerView;
@@ -13,40 +11,8 @@ use crate::style;
 
 pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        let mut d = world.resource::<SketchDefaults>().clone();
-        let before = d.clone();
-
         ui.heading("Sketching");
-        ui.label("The mouse wheel while holding a stroke changes");
-        ui.radio_value(&mut d.wheel, WheelMode::Size, "the box's size");
-        ui.radio_value(&mut d.wheel, WheelMode::Falloff, "the falloff: how far neighbouring frames follow the stroke");
-        ui.radio_value(&mut d.wheel, WheelMode::Both, "both together, as one \"roughness\" knob");
-        ui.add_space(6.0);
-        ui.label("The next stroke starts with (each stroke keeps what it ended with)");
-        egui::Grid::new("stroke-defaults").num_columns(2).show(ui, |ui| {
-            ui.label("size");
-            ui.add(egui::DragValue::new(&mut d.stroke.scale).range(SCALE_RANGE.0..=SCALE_RANGE.1).speed(0.01).prefix("×"));
-            ui.end_row();
-            ui.label("falloff");
-            ui.add(egui::DragValue::new(&mut d.stroke.falloff).range(0.0..=5.0).speed(0.01).suffix(" s"));
-            ui.end_row();
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("New sketches use");
-            for name in SketchParams::PRESETS {
-                let preset = SketchParams::preset(name).expect("listed preset");
-                if ui.selectable_label(d.params == preset, name).clicked() {
-                    d.params = preset;
-                }
-            }
-        });
-        if d.params != SketchParams::default() && SketchParams::PRESETS.iter().all(|n| SketchParams::preset(n).as_ref() != Some(&d.params)) {
-            ui.label(egui::RichText::new("(custom, from a sketch's \"Use for new sketches\")").weak().small());
-        }
-        if d.wheel != before.wheel || d.stroke != before.stroke || d.params != before.params {
-            *world.resource_mut::<SketchDefaults>() = d;
-        }
+        ui.label(egui::RichText::new("The next stroke's size, falloff, the wheel and the box are in the Brush tab.").color(style::MUTED).small());
         ui.add_space(6.0);
         ui.label("While holding a stroke");
         let mut pv = world.resource::<PointerView>().clone();

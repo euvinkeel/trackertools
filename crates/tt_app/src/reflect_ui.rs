@@ -149,7 +149,7 @@ fn edit_leaf(ui: &mut egui::Ui, value: &mut dyn PartialReflect, out: &mut Edited
         return true;
     }
     if let Some(e) = value.try_downcast_ref::<Entity>() {
-        ui.monospace(format!("→ {e}"));
+        ui.monospace(format!("▸ {e}"));
         return true;
     }
     if let Some(r) = value.try_downcast_ref::<tt_core::time::Rational>() {

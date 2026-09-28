@@ -105,7 +105,7 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
 fn side_line(s: &SideStatus, forward: bool) -> String {
     let arrow = if forward { "▸" } else { "◂" };
     let state = if s.waiting { " · waiting for the playhead".to_string() } else if s.fps > 0.0 { format!(" · {:.0} fps", s.fps) } else { String::new() };
-    format!("{arrow} frame {} → {}{state}", s.at, s.to)
+    format!("{arrow} at frame {}, to {}{state}", s.at, s.to)
 }
 
 /// The top bar's summary while trackers run: (label, details).

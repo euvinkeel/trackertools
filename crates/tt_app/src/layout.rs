@@ -12,6 +12,7 @@ pub enum Pane {
     Timeline,
     Inspector,
     Outliner,
+    Brush,
     Settings,
 }
 
@@ -22,6 +23,7 @@ impl Pane {
             Pane::Timeline => "Timeline",
             Pane::Inspector => "Inspector",
             Pane::Outliner => "Outliner",
+            Pane::Brush => "Brush",
             Pane::Settings => "Settings",
         }
     }
@@ -38,8 +40,9 @@ impl Default for Layout {
         let outliner = tiles.insert_pane(Pane::Outliner);
         let viewport = tiles.insert_pane(Pane::Viewport);
         let inspector = tiles.insert_pane(Pane::Inspector);
+        let brush = tiles.insert_pane(Pane::Brush);
         let settings = tiles.insert_pane(Pane::Settings);
-        let right = tiles.insert_tab_tile(vec![inspector, settings]);
+        let right = tiles.insert_tab_tile(vec![inspector, brush, settings]);
         let timeline = tiles.insert_pane(Pane::Timeline);
         let top = tiles.insert_horizontal_tile(vec![outliner, viewport, right]);
         let root = tiles.insert_vertical_tile(vec![top, timeline]);

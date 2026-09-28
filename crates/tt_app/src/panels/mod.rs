@@ -1,6 +1,7 @@
 //! Panels are functions of the world (DESIGN §1, §14): they read state and
 //! queue actions/intents; they never own state or mutate the document directly.
 
+mod brush;
 mod inspector;
 mod menu;
 pub mod outliner;
@@ -162,6 +163,7 @@ impl egui_tiles::Behavior<Pane> for Behavior<'_> {
             Pane::Timeline => timeline::ui(ui, self.world),
             Pane::Inspector => inspector::ui(ui, self.world),
             Pane::Outliner => outliner::ui(ui, self.world),
+            Pane::Brush => brush::ui(ui, self.world),
             Pane::Settings => settings::ui(ui, self.world),
         }
         egui_tiles::UiResponse::None

@@ -14,7 +14,10 @@
 //!    box-selects in the outliner, then clicks the ruler, clicks a lane and
 //!    double-clicks it;
 //! 5. records one more sketch (from frame 300, from ¼×) with anticipatory
-//!    speed on, pointer distances in real screen points.
+//!    speed on, pointer distances in real screen points;
+//! 6. tracks that sketch (T) from its middle and waits for the tracker;
+//! 7. retakes three of its frames one by one: holds 30 px right of the
+//!    sprite, steps forward while holding, releases.
 //!
 //! It logs the error against the truth, the edit's falloff, how central the
 //! sprite stays in the view, the nested sketch's error, what the UI steps
@@ -53,6 +56,11 @@ const NEST_RELEASE: f64 = 6.4;
 const AUTO_FRAME: i64 = 300;
 const AUTO_TAPS: [f64; 2] = [0.05, 6.0];
 const AUTO_RELEASE: f64 = 6.4;
+/// The tracker's anchor, and the frames retaken one by one (from here, 3 frames, `RETAKE_DX` right).
+const TRACK_FRAME: i64 = 340;
+const RETAKE_FRAME: i64 = 360;
+const RETAKE_DX: f64 = 30.0;
+const RETAKE_HOLD: f64 = 0.35;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -72,6 +80,10 @@ enum Phase {
     AutoReady { since: f64, set: bool },
     Auto { t0: f64, taps: usize },
     AutoSettle { t0: f64 },
+    /// T on the sketch just drawn; waiting for its tracker.
+    Track { since: f64, started: bool },
+    /// Holding on `RETAKE_FRAME + step`, stepping forward while holding.
+    Retake { since: f64, step: i64, pressed: bool },
     Finish { at: f64 },
 }
 
@@ -96,6 +108,8 @@ pub struct SketchDemo {
     /// While recording with auto speed: the slowest and fastest rate, and what limited it (app frames).
     auto_rates: (f64, f64),
     auto_reasons: Vec<(&'static str, usize)>,
+    /// The sketch recorded with auto speed (tracked, then retaken).
+    auto_sketch: Option<Entity>,
 }
 
 impl SketchDemo {
@@ -104,7 +118,7 @@ impl SketchDemo {
         let text = std::fs::read_to_string(&path).map_err(|e| tracing::error!("sketch demo: {e}")).ok()?;
         let json: serde_json::Value = serde_json::from_str(&text).ok()?;
         let truth = json["centers"].as_array()?.iter().filter_map(|c| Some([c[0].as_f64()?, c[1].as_f64()?])).collect();
-        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None, inject: Vec::new(), auto_rates: (f64::INFINITY, 0.0), auto_reasons: Vec::new() })
+        Some(Self { truth, phase: Phase::Wait, shown: Vec::new(), rng: 0x9e37_79b9_7f4a_7c15, last: 0.0, before: Vec::new(), in_view: Vec::new(), parent: None, shots: Vec::new(), shot: None, inject: Vec::new(), auto_rates: (f64::INFINITY, 0.0), auto_reasons: Vec::new(), auto_sketch: None })
     }
 
     fn normal(&mut self) -> f64 {
@@ -128,6 +142,10 @@ impl SketchDemo {
         let p = if let Phase::Edit { .. } = self.phase {
             let t = self.truth_at(EDIT_FRAME);
             [t[0] + EDIT_DX, t[1]]
+        } else if let Phase::Retake { step, .. } = self.phase {
+            // A retake: right of the sprite on the frame being held (no lag: the video is paused).
+            let t = self.truth_at(RETAKE_FRAME + step);
+            [t[0] + RETAKE_DX, t[1]]
         } else if !self.in_view.is_empty() {
             let i = self.shown.partition_point(|(t, _)| *t <= w - LAG).saturating_sub(1);
             let f = self.shown.get(i).map_or(NEST_FRAME, |s| s.1);
@@ -347,12 +365,59 @@ impl SketchDemo {
                     );
                     self.report_recording(world);
                     world.resource_mut::<AutoSpeed>().enabled = false;
-                    self.phase = Phase::Finish { at: now + 0.3 };
+                    self.auto_sketch = world.resource::<Selection>().primary();
+                    push(world, Action::Seek(TRACK_FRAME));
+                    self.phase = Phase::Track { since: now, started: false };
+                }
+            }
+            Phase::Track { since, started } => {
+                *frame = PointerFrame::default();
+                if !started {
+                    if t.frame() == TRACK_FRAME && now - since > 0.2 {
+                        push(world, Action::Track);
+                        self.phase = Phase::Track { since: now, started: true };
+                    }
+                    return false;
+                }
+                let busy = world.resource::<tt_track::runner::TrackJobs>().busy() > 0;
+                if now - since > 0.5 && !busy {
+                    self.report_tracker(world);
+                    self.shots.push(("12-tracker", now + 0.1));
+                    push(world, Action::Seek(RETAKE_FRAME));
+                    self.phase = Phase::Retake { since: now + 0.4, step: 0, pressed: false };
+                } else if now - since > 120.0 {
+                    tracing::warn!("sketch demo: the tracker did not finish in 2 minutes");
+                    self.phase = Phase::Finish { at: now };
+                }
+            }
+            Phase::Retake { since, step, pressed } => {
+                if !pressed {
+                    *frame = PointerFrame::default();
+                    if now >= since && t.frame() == RETAKE_FRAME {
+                        world.resource_mut::<Selection>().entities = self.auto_sketch.into_iter().collect();
+                        self.before = self.path(world, RETAKE_FRAME - 30..RETAKE_FRAME + 30);
+                        *frame = hold(samples, Some(now - 0.002), None);
+                        self.phase = Phase::Retake { since: now, step: 0, pressed: true };
+                    }
+                    return false;
+                }
+                let done = now - since >= RETAKE_HOLD;
+                let release = done && step == 2;
+                *frame = hold(samples, None, release.then_some(now - 0.001));
+                if release {
+                    self.shots.push(("13-retake", now + 0.2));
+                    self.phase = Phase::Finish { at: now + 0.6 };
+                } else if done {
+                    push(world, Action::StepForward);
+                    self.phase = Phase::Retake { since: now, step: step + 1, pressed: true };
                 }
             }
             Phase::Finish { at } => {
                 *frame = PointerFrame::default();
                 if now >= at {
+                    if !self.before.is_empty() && self.auto_sketch.is_some() {
+                        self.report_retake(world);
+                    }
                     return true;
                 }
             }
@@ -469,6 +534,50 @@ impl SketchDemo {
         let Some(sketch) = world.resource::<Selection>().primary() else { return Vec::new() };
         let Some(sig) = world.get::<Output>(sketch).and_then(|o| world.resource::<SignalStore>().get(o.0)) else { return Vec::new() };
         frames.map(|f| sig.get(f).map(|v| v.try_into().unwrap())).collect()
+    }
+
+    /// The tracker T made on the auto-speed sketch, against the truth.
+    fn report_tracker(&self, world: &World) {
+        let Some(tracker) = world.resource::<Selection>().primary().filter(|e| tt_track::is_tracker(world, *e)) else {
+            tracing::warn!("sketch demo: no tracker was made");
+            return;
+        };
+        let Some(sig) = world.get::<Output>(tracker).and_then(|o| world.resource::<SignalStore>().get(o.0)) else { return };
+        let guide = self.auto_sketch.and_then(|s| world.get::<Output>(s)).and_then(|o| world.resource::<SignalStore>().get(o.0));
+        let (mut e, mut g, mut lost) = (Vec::new(), Vec::new(), 0);
+        for f in 0..self.truth.len() as i64 {
+            let Some(v) = sig.get(f) else { continue };
+            let t = self.truth[f as usize];
+            e.push((v[0] as f64 - t[0]).hypot(v[1] as f64 - t[1]));
+            lost += (v[6] < 0.5) as usize;
+            if let Some(gv) = guide.and_then(|s| s.get(f)) {
+                g.push((gv[0] as f64 - t[0]).hypot(gv[1] as f64 - t[1]));
+            }
+        }
+        let q = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v.get(((v.len().max(1) - 1) as f64 * p).round() as usize).copied().unwrap_or(f64::NAN)
+        };
+        let (n, m, p95, max) = (e.len(), q(&mut e, 0.5), q(&mut e, 0.95), q(&mut e, 1.0));
+        tracing::info!(
+            "sketch demo: tracker from frame {TRACK_FRAME}: {n} frames · error median {m:.2} px, p95 {p95:.2} px, max {max:.2} px · {lost} lost · its sketch alone: median {:.2} px",
+            q(&mut g, 0.5)
+        );
+    }
+
+    /// The three frames retaken one by one, and their neighbours.
+    fn report_retake(&self, world: &World) {
+        let Some(sig) = self.auto_sketch.and_then(|s| world.get::<Output>(s)).and_then(|o| world.resource::<SignalStore>().get(o.0)) else { return };
+        let line: Vec<String> = (-2..5i64)
+            .map(|k| {
+                let f = RETAKE_FRAME + k;
+                let before = self.before.get((k + 30) as usize).copied().flatten();
+                let moved = sig.get(f).zip(before).map_or(f64::NAN, |(a, b)| a[0] as f64 - b[0] as f64);
+                let to_truth = sig.get(f).map_or(f64::NAN, |a| a[0] as f64 - self.truth_at(f)[0]);
+                format!("{f}: moved {moved:+.1} (now {to_truth:+.1} from the sprite)")
+            })
+            .collect();
+        tracing::info!("sketch demo: retook {RETAKE_FRAME}-{} one by one, {RETAKE_DX} px right · {}", RETAKE_FRAME + 2, line.join(" · "));
     }
 
     fn report_recording(&self, world: &World) {

@@ -19,6 +19,8 @@ use crate::media::{Media, OpenRequest};
 use crate::panels::viewport::PointerView;
 
 const MAX_RECENT: usize = 10;
+/// The settings' layout version (see [`SettingsFile::apply`]).
+const SETTINGS_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
 struct SessionFile {
@@ -43,6 +45,9 @@ fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SettingsFile, D::Er
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 struct SettingsFile {
+    /// [`SETTINGS_VERSION`] when written; files without it are older.
+    #[serde(default)]
+    version: u32,
     wheel: WheelMode,
     stroke_scale: f32,
     stroke_falloff: f32,
@@ -62,6 +67,7 @@ impl Default for SettingsFile {
         let s = tt_core::sketch::Stroke::default();
         let (v, p) = (ViewDefaults::default(), PointerView::default());
         Self {
+            version: SETTINGS_VERSION,
             wheel: WheelMode::default(),
             stroke_scale: s.scale,
             stroke_falloff: s.falloff,
@@ -77,6 +83,7 @@ impl Default for SettingsFile {
 impl SettingsFile {
     fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed) -> Self {
         Self {
+            version: SETTINGS_VERSION,
             wheel: d.wheel,
             stroke_scale: d.stroke.scale,
             stroke_falloff: d.stroke.falloff,
@@ -90,9 +97,13 @@ impl SettingsFile {
 
     fn apply(&self, world: &mut World) {
         let mut d = world.resource_mut::<SketchDefaults>();
-        d.wheel = self.wheel;
         d.stroke.scale = self.stroke_scale.clamp(tt_core::capture::SCALE_RANGE.0, tt_core::capture::SCALE_RANGE.1);
-        d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
+        // Version 2 made holds retakes (no falloff) and gave the wheel back to
+        // zooming: older files keep their size but take the new wheel and falloff.
+        if self.version >= 2 {
+            d.wheel = self.wheel;
+            d.stroke.falloff = self.stroke_falloff.clamp(0.0, 5.0);
+        }
         d.params = self.new_sketches.clone();
         world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
@@ -260,5 +271,18 @@ mod tests {
         // A session file from before auto speed reads with it off.
         let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
         assert_eq!(old.auto_speed, AutoSpeed::default());
+    }
+
+    #[test]
+    fn settings_from_before_retakes_take_the_new_wheel_and_falloff() {
+        let text = r#"{"wheel": "Size", "stroke_scale": 2.0, "stroke_falloff": 0.2}"#;
+        let mut world = World::new();
+        world.init_resource::<SketchDefaults>();
+        world.init_resource::<ViewDefaults>();
+        world.init_resource::<PointerView>();
+        world.init_resource::<AutoSpeed>();
+        serde_json::from_str::<SettingsFile>(text).unwrap().apply(&mut world);
+        let d = world.resource::<SketchDefaults>();
+        assert_eq!((d.wheel, d.stroke.falloff, d.stroke.scale), (WheelMode::Zoom, 0.0, 2.0));
     }
 }
