@@ -336,7 +336,7 @@ The original plan follows.
 The first automatic tracker, built the way the whole design intends: an operator entity whose inputs are a rough pass and a view, run by background jobs (DESIGN §6.2).
 
 **Built (`tt_track`):**
-- **The `track` operator.** Inputs `guide` (a sketch, or any box producer) and `space` (the view it tracks in; none = the source). Its output `[x, y, left, top, right, bottom, score]` in source px is a box, so views, overlays and the like take a tracker wherever they take a sketch. `T` tracks the selected sketches from the playhead in the view being looked at. On a selected tracker, `T` re-seeds it at the playhead. One undo step.
+- **The `track` operator.** Inputs `guide` (a sketch, or any box producer) and `space` (the view it tracks in; none = the source). Its output `[x, y, left, top, right, bottom, score]` in source px is a box, so views, overlays and the like take a tracker wherever they take a sketch. `T` tracks the selected sketches from the playhead in the view being looked at. On a selected tracker, `T` re-seeds it at the playhead (moved into the guide's frames). One undo step for all of it.
 - **Template strategy.**
   - At the anchor, a template is cut around the guide's point.
   - On every other frame:
@@ -347,19 +347,21 @@ The first automatic tracker, built the way the whole design intends: an operator
   - The patch scale comes from the guide's box: `feature` = the fraction of the box that is the subject.
 - **Jobs.**
   - Each side of the anchor is a thread with its own ffmpeg.
-  - Backward jobs decode keyframe-aligned segments (≥ 64 frames), keep only the guide's region, and track the segment in reverse, so any source GOP works backward.
-  - Rendition Auto reads the proxy only where it has a pixel per patch pixel on every frame.
-  - At most 4 jobs run at once.
-- **Invalidation (the operator machinery, unchanged):**
-  - `Footprint::Radiating(anchor)`: an edit after the anchor re-tracks from the edit onward, an edit before it from the edit backward, and nothing else.
-  - A restart resumes from the valid result just before the dirty frames.
-  - Results stay on screen as stale until replaced.
-  - A saved input stamp keeps results when a reopened project's inputs come out the same.
+  - Backward jobs decode keyframe-aligned segments (≥ 64 frames), keep only the guide's region, and track the segment in reverse, so any source GOP works backward. At most 256 patches are kept; a longer GOP is decoded again from its keyframe for each batch.
+  - Rendition Auto reads the proxy only where it has a pixel per patch pixel on every frame, on both axes (a proxy's width is rounded to even, so x and y scale separately). It keeps reading the rendition the results so far came from.
+  - At most 4 threads decode at once. Cancelled threads count until they stop; jobs held at the playhead for 1 s close their ffmpeg and don't count.
+- **What re-tracks** (DESIGN §6.2):
+  - Dirt (`Footprint::Radiating(anchor)`) triggers a new plan. The runner compares it with the plan the results came from, and re-tracks from the first frame whose guide box or view map differs, on each side of the anchor. A new anchor or tracking setting re-tracks everything; `follow_playhead` and `center_on_guide` re-track nothing.
+  - A restart resumes from the result just before the first frame to redo; a drag re-plans once, when it ends.
+  - Results stay on screen as stale until replaced, and while the guide is deleted (undoing the delete brings them back without tracking).
+  - A saved input stamp keeps results when a reopened project's inputs come out the same. Only complete results carry it (Forward and Backward trackers too), and it doesn't depend on which rendition was read.
+  - Results are saved: stamp and offset changes count as document changes (autosave, save on exit), with no undo step.
+  - Redo of `T`, and undoing a tracker's delete, track it again (an operator that comes back recomputes itself).
 - **Catch-up mode** (`follow_playhead`): jobs stop at the playhead and continue as it moves, forward and backward.
-- **Re-centring on the guide** (`center_on_guide`, on by default): a finished path is shifted by the median offset between it and the guide over the frames where the tracker saw the subject. The tracker gives the motion; the rough pass, averaged, gives where the subject is. Without it, every frame would inherit the guide's error at the anchor.
+- **Re-centring on the guide** (`center_on_guide`, on by default): once results stop arriving (finished, or held at the playhead), the path is shifted by the median offset between it and the guide over the frames where the tracker saw the subject (no shift with fewer than 3 such frames). The tracker gives the motion; the rough pass, averaged, gives where the subject is. Without it, every frame would inherit the guide's error at the anchor.
 - **UI:**
   - the viewport draws each tracker's box and path (cyan; lost frames red; stale dim);
-  - the top bar shows running trackers and their fps;
+  - the top bar shows running trackers and their fps (the app repaints while results arrive);
   - the inspector shows progress per side, lost frames, the rendition read and errors, plus a Track button on sketches.
 
 **Measured** (`crates/tt_track/tests/sprite.rs`: the sprite fixture, 1200 frames of 1080p60 H.264 with GOP 250 and B-frames; the guide wanders ~6 px off the truth in a 56 px box; anchor mid-clip, tracked both ways):
@@ -371,6 +373,7 @@ The first automatic tracker, built the way the whole design intends: an operator
 Findings on the way:
 - **The sprite fixture's truth was off by up to 1 px:** ffmpeg's overlay on yuv420 puts the sprite on even pixels. `sprite_truth.json` (the in-app demo's truth) needs the same rounding; see the xtask.
 - **A plain NCC template lost the sprite whenever it crossed from dark background to bright** (the box always holds background). Centre-weighting the correlation fixed it.
+- **Seeded ~2 px differently** (a sketch-built guide, `tests/sprite.rs`), the template slips onto the background for 3 frames near 1044, by up to 35 px, with scores ~0.8, so they don't count as lost. This is a limit of the template strategy (the Lucas–Kanade refinement or a learned tracker should help).
 
 **Next:**
 - trackers in the outliner and timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);

@@ -11,7 +11,7 @@ use tt_core::selection::Selection;
 use tt_core::signal::Signal;
 use tt_core::sketch::Through;
 use tt_core::transport::Transport;
-use tt_core::view::{ActiveView, FrameParams, SourceSize, ViewDefaults, frame_views, home_of, map_at, view_of};
+use tt_core::view::{ActiveView, FrameParams, SourceSize, SpaceMap, ViewDefaults, frame_views, home_of, map_at, view_of};
 
 mod common;
 use common::*;
@@ -184,6 +184,24 @@ fn shift_tab_backs_out_and_undo_hands_back_the_viewport() {
     d.frame(still(0.0, 0.0), Input { action: Some(Action::ExitView), ..UP });
     assert_eq!(d.core.world.resource::<ActiveView>().0, None, "then the source");
     assert_eq!(d.core.world.resource::<Selection>().primary(), Some(s1));
+}
+
+#[test]
+fn redoing_a_view_recomputes_its_framing() {
+    let mut d = Driver::new();
+    sketch_sprite(&mut d, 100, 600, false);
+    let v1 = enter(&mut d);
+    let framed = map_at(&d.core.world, Some(v1), 200);
+    let source = SpaceMap::identity(&SourceSize::default());
+    assert_ne!(framed, source, "the view frames its sketch");
+    d.frame(still(0.0, 0.0), Input { action: Some(Action::ExitView), ..UP });
+    assert_eq!(d.core.world.resource::<history::History>().undo_label(), Some("View of Sketch 1"));
+    history::undo(&mut d.core.world);
+    d.frames(2, still(0.0, 0.0), UP);
+    // Redo restores the view's output as it was when created (empty): the view must recompute.
+    history::redo(&mut d.core.world);
+    d.frames(2, still(0.0, 0.0), UP);
+    assert_eq!(map_at(&d.core.world, Some(v1), 200), framed, "the view frames its sketch again after redo");
 }
 
 #[test]

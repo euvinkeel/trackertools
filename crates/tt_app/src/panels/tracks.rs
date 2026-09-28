@@ -129,6 +129,24 @@ pub fn summary(world: &mut World) -> Option<(String, String)> {
     Some((text, tip.join("\n")))
 }
 
+/// Frames a tracker covers, and how many of them are lost: counted again only
+/// when its output or its threshold changes (not on every repaint).
+fn counts(ui: &egui::Ui, world: &World, e: Entity) -> (usize, usize) {
+    let Some(sig) = world.get::<Output>(e).and_then(|o| world.resource::<SignalStore>().get(o.0)) else { return (0, 0) };
+    let min = world.get::<Tracker>(e).map_or(0.5, |t| t.min_score);
+    let key = (sig.version(), min.to_bits());
+    let id = egui::Id::new(("tracker counts", e));
+    if let Some((k, c)) = ui.data(|d| d.get_temp::<((u64, u32), (usize, usize))>(id))
+        && k == key
+    {
+        return c;
+    }
+    let n = world.resource::<Transport>().frame_count;
+    let c = (0..n).filter_map(|f| sig.get(f)).fold((0, 0), |(c, l), v| (c + 1, l + (v[6] < min) as usize));
+    ui.data_mut(|d| d.insert_temp(id, (key, c)));
+    c
+}
+
 /// Inspector: a tracker's progress and errors; a sketch's Track button and trackers.
 pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if is_tracker(world, e) {
@@ -138,18 +156,13 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         let guide = guide_of(world, e).and_then(|g| world.get::<Name>(g)).map(|n| n.to_string());
         ui.label(egui::RichText::new(format!("follows {} · T re-seeds it at the playhead", guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
         let status = world.get::<TrackStatus>(e).cloned().unwrap_or_default();
-        let id = world.get::<Output>(e).map(|o| o.0);
-        let (covered, lost) = id.and_then(|id| world.resource::<SignalStore>().get(id)).map_or((0, 0), |sig| {
-            let min = world.get::<Tracker>(e).map_or(0.5, |t| t.min_score);
-            let n = world.resource::<Transport>().frame_count;
-            (0..n).filter_map(|f| sig.get(f)).fold((0, 0), |(c, l), v| (c + 1, l + (v[6] < min) as usize))
-        });
+        let (covered, lost) = counts(ui, world, e);
         ui.label(format!("{covered} frames tracked · {lost} lost (followed the guide){}", if status.rendition.is_empty() { String::new() } else { format!(" · reads the {}", status.rendition) }));
         for (s, forward) in [(status.forward, true), (status.backward, false)] {
             let Some(s) = s else { continue };
-            let anchor = world.get::<Tracker>(e).map_or(0, |t| t.anchor);
-            let total = (s.to - anchor).abs().max(1) as f32;
-            let done = (s.at - anchor).abs() as f32 / total;
+            // (The anchor as tracked: moved into the guide's frames.)
+            let total = (s.to - status.anchor).abs().max(1) as f32;
+            let done = (s.at - status.anchor).abs() as f32 / total;
             ui.add(egui::ProgressBar::new(done.clamp(0.0, 1.0)).text(side_line(&s, forward)));
         }
         ui.separator();

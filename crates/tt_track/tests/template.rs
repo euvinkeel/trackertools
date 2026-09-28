@@ -1,9 +1,10 @@
 //! The template tracker on synthetic frames with an exact answer: a textured
 //! blob moving on subpixel paths over a smooth background, guided by a
-//! wandering "rough pass" several pixels off.
+//! wandering "rough pass" several pixels off. Also patches resampled through
+//! a view and from a proxy, against the scene they show.
 
 use tt_core::view::{SourceSize, SpaceMap};
-use tt_track::image::{Grid, Luma, Patch, resample};
+use tt_track::image::{Grid, Luma, Patch, resample, resample_xy};
 use tt_track::ncc::{Template, best_match};
 use tt_track::template::{Settings, TEMPLATE_R, TemplateTracker};
 
@@ -16,17 +17,29 @@ fn truth(f: usize) -> [f64; 2] {
     [160.0 + 90.0 * (0.9 * t).sin() + 13.3 * (4.7 * t).sin(), 120.0 + 70.0 * (1.3 * t + 0.4).sin()]
 }
 
-/// A frame: a gentle gradient, and a blob of three signed Gaussians around `c`.
-fn render(c: [f64; 2]) -> Vec<u8> {
-    let mut out = vec![0u8; W * H];
+/// The scene at source point `p`: a gentle gradient, and a blob of three
+/// signed Gaussians around `c`.
+fn scene(p: [f64; 2], c: [f64; 2]) -> f64 {
     let g = |x: f64, y: f64, s: f64| (-(x * x + y * y) / (2.0 * s * s)).exp();
-    for y in 0..H {
-        for x in 0..W {
-            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
-            let (dx, dy) = (px - c[0], py - c[1]);
-            let blob = 90.0 * g(dx - 3.0, dy + 2.0, 3.0) - 70.0 * g(dx + 4.0, dy - 1.0, 2.5) + 50.0 * g(dx, dy - 5.0, 2.0);
-            let bg = 90.0 + 0.2 * px + 0.1 * py;
-            out[y * W + x] = (bg + blob).round().clamp(0.0, 255.0) as u8;
+    let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+    let blob = 90.0 * g(dx - 3.0, dy + 2.0, 3.0) - 70.0 * g(dx + 4.0, dy - 1.0, 2.5) + 50.0 * g(dx, dy - 5.0, 2.0);
+    90.0 + 0.2 * p[0] + 0.1 * p[1] + blob
+}
+
+/// A frame of the scene with the blob at `c`.
+fn render(c: [f64; 2]) -> Vec<u8> {
+    render_sized(c, W, H)
+}
+
+/// The same frame in a rendition of `w × h` pixels (a proxy): each pixel is
+/// the scene at its centre, in source pixels.
+fn render_sized(c: [f64; 2], w: usize, h: usize) -> Vec<u8> {
+    let (kx, ky) = (w as f64 / W as f64, h as f64 / H as f64);
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let p = [(x as f64 + 0.5) / kx, (y as f64 + 0.5) / ky];
+            out[y * w + x] = scene(p, c).round().clamp(0.0, 255.0) as u8;
         }
     }
     out
@@ -48,15 +61,42 @@ fn patch_at(frame: &[u8], centre: [f64; 2], half: f64, scale: f64) -> (Grid, Pat
 
 #[test]
 fn ncc_finds_a_template_at_subpixel_offsets() {
-    let frame = render([150.0, 110.0]);
-    let (grid, patch) = patch_at(&frame, [150.0, 110.0], 40.0, 1.0);
+    // The template: the blob in one frame. Searched for in frames where the blob moved by a known subpixel offset.
+    let c0 = [150.0, 110.0];
+    let (grid, patch) = patch_at(&render(c0), c0, 40.0, 1.0);
+    let t = Template::cut(&patch, grid.from_view(c0), TEMPLATE_R).expect("textured");
     for (dx, dy) in [(0.0, 0.0), (0.25, -0.4), (-0.5, 0.35), (3.3, -2.7)] {
-        let c = grid.from_view([150.0 + dx, 110.0 + dy]);
-        let t = Template::cut(&patch, c, TEMPLATE_R).expect("textured");
-        let m = best_match(&patch, &t, [[0.0, 0.0], [80.0, 80.0]], None).expect("found");
-        let err = ((m.pos[0] - c[0]).powi(2) + (m.pos[1] - c[1]).powi(2)).sqrt();
-        assert!(err < 0.08, "offset ({dx}, {dy}): found {:?}, expected {c:?}", m.pos);
+        let c = [c0[0] + dx, c0[1] + dy];
+        let (_, moved) = patch_at(&render(c), c0, 40.0, 1.0);
+        let m = best_match(&moved, &t, [[0.0, 0.0], [80.0, 80.0]], None).expect("found");
+        let want = grid.from_view(c);
+        let err = (m.pos[0] - want[0]).hypot(m.pos[1] - want[1]);
+        assert!(err < 0.1, "offset ({dx}, {dy}): found {:?}, expected {want:?} (error {err:.3})", m.pos);
         assert!(m.score > 0.95, "score {}", m.score);
+    }
+}
+
+#[test]
+fn patches_through_a_view_and_an_unevenly_scaled_proxy_show_the_scene() {
+    // A proxy whose width was rounded to even (as `scale=-2:720` does): kx ≠ ky.
+    let c = [200.3, 150.7];
+    let (pw, ph) = (162, 120);
+    let k = [pw as f64 / W as f64, ph as f64 / H as f64];
+    assert_ne!(k[0], k[1]);
+    // A view magnifying the source 2×: source = 0.5 · view + b.
+    let map = SpaceMap { a: 0.5, b: [120.0, 90.0], canvas: [320.0, 240.0] };
+    let at = map.from_source(c);
+    let grid = Grid { origin: [at[0] - 40.0, at[1] - 40.0], scale: 1.0 };
+    // What the view shows there, straight from the scene (no rendition, no rounding).
+    let ideal = Patch { w: 80, h: 80, data: (0..80 * 80).map(|i| scene(map.to_source(grid.to_view([(i % 80) as f64 + 0.5, (i / 80) as f64 + 0.5])), c) as f32).collect() };
+    let t = Template::cut(&ideal, grid.from_view(at), TEMPLATE_R).expect("textured");
+    let want = grid.from_view(at);
+    for (name, frame, w, h, k) in [("original", render(c), W, H, [1.0, 1.0]), ("proxy", render_sized(c, pw, ph), pw, ph, k)] {
+        let patch = resample_xy(&Luma { data: &frame, width: w, height: h }, k, &map, grid, 80, 80);
+        let m = best_match(&patch, &t, [[20.0, 20.0], [60.0, 60.0]], None).expect("found");
+        let err = (m.pos[0] - want[0]).hypot(m.pos[1] - want[1]);
+        eprintln!("{name}: the blob at {:?}, expected {want:?} (error {err:.3} view px), score {:.3}", m.pos, m.score);
+        assert!(err < 0.25, "{name}: error {err:.3} view px");
     }
 }
 

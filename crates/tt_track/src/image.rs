@@ -77,25 +77,37 @@ impl Patch {
 }
 
 /// Resample a `w × h` patch on `grid` through `map` (view → source) from a
-/// frame of a rendition `k`× the source's size. Patch pixels larger than the
-/// rendition's are averaged over their footprint, so nothing aliases.
+/// frame of a rendition `k`× the source's size ([`resample_xy`] with the
+/// same scale on both axes).
 pub fn resample(luma: &Luma, k: f64, map: &SpaceMap, grid: Grid, w: usize, h: usize) -> Patch {
-    // Rendition pixels per patch pixel: 1 tap per rendition pixel, at most 8×8.
-    let step = map.a * k / grid.scale;
-    let n = (step.ceil() as usize).clamp(1, 8);
-    let taps: Vec<f64> = (0..n).map(|s| (s as f64 + 0.5) / n as f64).collect();
-    let norm = 1.0 / (n * n) as f32;
-    // Patch point → rendition point is affine: r = (origin + p / scale) · a · k + b · k.
-    let ak = map.a * k / grid.scale;
-    let bx = (grid.origin[0] * map.a + map.b[0]) * k;
-    let by = (grid.origin[1] * map.a + map.b[1]) * k;
+    resample_xy(luma, [k, k], map, grid, w, h)
+}
+
+/// Resample a `w × h` patch on `grid` through `map` (view → source) from a
+/// frame of a rendition `k = [kx, ky]` × the source's size (per axis: a
+/// proxy's width is rounded to even, so it isn't always scaled uniformly).
+/// Patch pixels larger than the rendition's are averaged over their
+/// footprint, so nothing aliases.
+pub fn resample_xy(luma: &Luma, k: [f64; 2], map: &SpaceMap, grid: Grid, w: usize, h: usize) -> Patch {
+    // Rendition pixels per patch pixel, per axis: 1 tap per rendition pixel, at most 8.
+    let step = |k: f64| map.a * k / grid.scale;
+    let taps = |k: f64| {
+        let n = (step(k).ceil() as usize).clamp(1, 8);
+        (0..n).map(|s| (s as f64 + 0.5) / n as f64).collect::<Vec<f64>>()
+    };
+    let (tx, ty) = (taps(k[0]), taps(k[1]));
+    let norm = 1.0 / (tx.len() * ty.len()) as f32;
+    // Patch point → rendition point is affine per axis: r = ((origin + p / scale) · a + b) · k.
+    let (ax, ay) = (step(k[0]), step(k[1]));
+    let bx = (grid.origin[0] * map.a + map.b[0]) * k[0];
+    let by = (grid.origin[1] * map.a + map.b[1]) * k[1];
     let mut data = Vec::with_capacity(w * h);
     for j in 0..h {
         for i in 0..w {
             let mut acc = 0.0;
-            for &sy in &taps {
-                for &sx in &taps {
-                    acc += luma.sample(bx + (i as f64 + sx) * ak, by + (j as f64 + sy) * ak);
+            for &sy in &ty {
+                for &sx in &tx {
+                    acc += luma.sample(bx + (i as f64 + sx) * ax, by + (j as f64 + sy) * ay);
                 }
             }
             data.push(acc * norm);

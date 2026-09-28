@@ -27,7 +27,7 @@ use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
-use tt_core::history::edit;
+use tt_core::history::{Tx, edit};
 use tt_core::input::{Action, PendingActions};
 use tt_core::op::{EvalCtx, Footprint, Inputs, Operator, OperatorKind, Output};
 use tt_core::selection::Selection;
@@ -133,35 +133,47 @@ pub fn trackers_of(world: &mut World, guide: Entity) -> Vec<Entity> {
     out
 }
 
-/// Add a tracker following `guide` (any box producer), seeded at `frame`
-/// (moved into the guide's frames if outside them), tracking in `space`
-/// (a view; None = the source). One undo step; the tracker is selected.
-pub fn add_tracker(world: &mut World, guide: Entity, frame: FrameIndex, space: Option<Entity>) -> Option<Entity> {
+/// Where a tracker following `guide` seeded at `frame` starts: `frame` moved
+/// into the guide's frames. None if the guide isn't a box with frames.
+fn anchor_in(world: &World, guide: Entity, frame: FrameIndex) -> Option<FrameIndex> {
     let sig = world.resource::<SignalStore>().get(world.get::<Output>(guide)?.0)?;
     if sig.channels() < 6 {
         return None;
     }
     let (lo, hi) = sig.present_hull()?;
-    let anchor = frame.clamp(lo, hi);
+    Some(frame.clamp(lo, hi))
+}
+
+/// A tracker entity following `guide` from `anchor` in `space`, as part of an edit.
+fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Entity, anchor: FrameIndex, space: Option<Entity>) -> Entity {
+    let out = tx.create_signal(TRACK_CHANNELS);
+    let mut inputs = vec![("guide".to_string(), guide)];
+    inputs.extend(space.map(|v| ("space".to_string(), v)));
+    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), Tracker::at(anchor), runner::TrackBook::default()))
+}
+
+fn tracker_count(world: &mut World) -> usize {
+    let mut q = world.query::<&Operator>();
+    q.iter(world).filter(|o| o.kind == "track").count()
+}
+
+/// Add a tracker following `guide` (any box producer), seeded at `frame`
+/// (moved into the guide's frames if outside them), tracking in `space`
+/// (a view; None = the source). One undo step; the tracker is selected.
+pub fn add_tracker(world: &mut World, guide: Entity, frame: FrameIndex, space: Option<Entity>) -> Option<Entity> {
+    let anchor = anchor_in(world, guide, frame)?;
     let guide_name = world.get::<Name>(guide).map_or("box".to_string(), |n| n.to_string());
-    let n = {
-        let mut q = world.query::<&Operator>();
-        q.iter(world).filter(|o| o.kind == "track").count() + 1
-    };
+    let name = format!("Tracker {}", tracker_count(world) + 1);
     let mut made = None;
-    edit(world, &format!("Track {guide_name}"), |tx| {
-        let out = tx.create_signal(TRACK_CHANNELS);
-        let mut inputs = vec![("guide".to_string(), guide)];
-        inputs.extend(space.map(|v| ("space".to_string(), v)));
-        made = Some(tx.spawn((Name::new(format!("Tracker {n}")), Operator { kind: "track".into() }, Inputs(inputs), Output(out), Tracker::at(anchor), runner::TrackBook::default())));
-    });
+    edit(world, &format!("Track {guide_name}"), |tx| made = Some(spawn_tracker(tx, name, guide, anchor, space)));
     let tracker = made?;
     world.resource_mut::<Selection>().select_only(tracker);
     Some(tracker)
 }
 
 /// `T`: track each selected sketch from the playhead, in the view being
-/// looked at; on a selected tracker, re-seed it at the playhead.
+/// looked at; on a selected tracker, re-seed it at the playhead (moved into
+/// its guide's frames). One undo step for all of it.
 fn apply_track_actions(world: &mut World) {
     if world.resource_mut::<PendingActions>().take(|a| a == Action::Track).is_empty() {
         return;
@@ -169,25 +181,42 @@ fn apply_track_actions(world: &mut World) {
     let frame = world.resource::<Transport>().frame();
     let space = world.resource::<ActiveView>().0;
     let selected = world.resource::<Selection>().entities.clone();
-    let mut guides: Vec<Entity> = Vec::new();
+    // (tracker or guide, anchor)
+    let mut reseed: Vec<(Entity, FrameIndex)> = Vec::new();
+    let mut guides: Vec<(Entity, FrameIndex)> = Vec::new();
     for e in selected {
         if is_tracker(world, e) {
-            if world.get::<Tracker>(e).is_some_and(|t| t.anchor != frame) {
-                edit(world, "Re-seed tracker", |tx| tx.modify::<Tracker>(e, |t| t.anchor = frame));
+            let anchor = guide_of(world, e).and_then(|g| anchor_in(world, g, frame));
+            if let Some(a) = anchor.filter(|a| world.get::<Tracker>(e).is_some_and(|t| t.anchor != *a)) {
+                reseed.push((e, a));
             }
         } else if let Some(s) = tt_core::sketch::sketch_of(world, e)
-            && !guides.contains(&s)
+            && !guides.iter().any(|(g, _)| *g == s)
+            && let Some(a) = anchor_in(world, s, frame)
         {
-            guides.push(s);
+            guides.push((s, a));
         }
     }
+    let name_of = |world: &World, e: Entity| world.get::<Name>(e).map_or("box".to_string(), |n| n.to_string());
+    let label = match (reseed.len(), guides.as_slice()) {
+        (0, []) => return,
+        (0, [(g, _)]) => format!("Track {}", name_of(world, *g)),
+        (0, many) => format!("Track {} sketches", many.len()),
+        (_, []) => "Re-seed tracker".to_string(),
+        _ => "Track".to_string(),
+    };
+    let first = tracker_count(world) + 1;
     let mut made = Vec::new();
-    for g in guides {
-        made.extend(add_tracker(world, g, frame, space));
-    }
-    if made.len() > 1 {
-        let mut sel = world.resource_mut::<Selection>();
-        sel.entities = made;
+    edit(world, &label, |tx| {
+        for (e, a) in reseed {
+            tx.modify::<Tracker>(e, |t| t.anchor = a);
+        }
+        for (i, (g, a)) in guides.into_iter().enumerate() {
+            made.push(spawn_tracker(tx, format!("Tracker {}", first + i), g, a, space));
+        }
+    });
+    if !made.is_empty() {
+        world.resource_mut::<Selection>().entities = made;
     }
 }
 
