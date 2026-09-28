@@ -223,8 +223,9 @@ impl Stroke {
 }
 
 /// Tuning of the sketch pipeline (all re-tunable after capture).
-#[derive(Component, Reflect, Clone, Debug, PartialEq)]
+#[derive(Component, Reflect, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[reflect(Component)]
+#[serde(default)]
 pub struct SketchParams {
     /// Seconds (real time) the hand trails the subject.
     pub lag: f32,
