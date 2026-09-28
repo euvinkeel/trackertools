@@ -420,7 +420,9 @@ fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Ent
 /// The playback speed, always in view (it is the capture speed of the next
 /// stroke): a badge top-right, and a big flash in the middle when it changes.
 fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
-    const FLASH: f64 = 1.2;
+    // The flash: fully visible this long, then fading out until FLASH (seconds).
+    const FULL: f64 = 0.25;
+    const FLASH: f64 = 0.55;
     let now = world.resource::<tt_core::time::WallClock>().now;
     let mut flash = world.resource_mut::<SpeedFlash>();
     if flash.rate != Some(rate) {
@@ -438,8 +440,7 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
     painter.galley(r.min + Vec2::splat(5.0), galley, color);
 
     if age < FLASH {
-        // Full for 0.6 s, then fading out.
-        let alpha = (1.0 - ((age - 0.6) / (FLASH - 0.6)).clamp(0.0, 1.0)) as f32;
+        let alpha = (1.0 - ((age - FULL) / (FLASH - FULL)).clamp(0.0, 1.0)) as f32;
         let galley = painter.layout_no_wrap(label, FontId::proportional(96.0), color.gamma_multiply(alpha));
         let r = Align2::CENTER_CENTER.anchor_size(rect.center(), galley.size()).expand(18.0);
         painter.rect_filled(r, 12.0, Color32::from_black_alpha((170.0 * alpha) as u8));
