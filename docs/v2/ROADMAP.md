@@ -427,7 +427,7 @@ Findings on the way:
 
 ## macOS (Apple Silicon)
 
-Runs on a Mac as of 2026-09-28: the workspace compiles for `aarch64-apple-darwin`; data lives in `~/Library/Application Support/trackertools`; the scrub proxy uses VideoToolbox; CoTracker3 tries MPS. Not yet hands-on tested on a Mac. Sketching uses egui's pointer there (no high-rate input service yet). The plan for the M4 Pro's hardware (decode, a ProRes proxy, pointer input, the tracker on CPU/GPU, CoTracker on MPS/ANE): [APPLE_SILICON.md](APPLE_SILICON.md).
+Runs on a Mac as of 2026-09-28: the workspace compiles for `aarch64-apple-darwin`; data lives in `~/Library/Application Support/trackertools`; the scrub proxy uses VideoToolbox; CoTracker3 tries MPS; ffmpeg is also looked for in Homebrew's folders. A CI job builds and tests it on GitHub's Apple Silicon runner; `scripts/mac_baseline.sh` collects the plan's first measurements on a real Mac. Not yet hands-on tested on a Mac. Sketching uses egui's pointer there (no high-rate input service yet). The plan for the M4 Pro's hardware (decode, a ProRes proxy, pointer input, the tracker on CPU/GPU, CoTracker on MPS/ANE): [APPLE_SILICON.md](APPLE_SILICON.md).
 
 ---
 

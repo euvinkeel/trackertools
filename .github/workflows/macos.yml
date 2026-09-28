@@ -1,0 +1,32 @@
+# Builds and tests v2 on an Apple Silicon Mac (GitHub's macos-15 runner:
+# arm64, macOS 15). The fixtures are generated there with Homebrew's ffmpeg.
+# Timings on the runner (a shared 3-core VM) are printed, not asserted.
+name: macOS
+
+on:
+  pull_request:
+  push:
+    branches: [cloud/all]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.95
+        run: |
+          rustup toolchain install 1.95 --profile minimal --component clippy
+          rustup default 1.95
+      - name: ffmpeg
+        run: brew install ffmpeg
+      - uses: Swatinem/rust-cache@v2
+      - name: Fixtures
+        run: cargo xtask fixtures
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --release -- --nocapture

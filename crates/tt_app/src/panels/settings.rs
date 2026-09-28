@@ -91,7 +91,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         ui.label(egui::RichText::new("Projects (autosaved per video), proxies and the session live here.").weak().small());
         if ui.button("Open the folder").clicked() {
             let _ = std::fs::create_dir_all(&dir);
-            if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+            // Explorer, Finder, or the desktop's file manager.
+            let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
                 tracing::warn!("could not open {}: {e}", dir.display());
             }
         }
