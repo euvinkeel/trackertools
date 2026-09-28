@@ -75,7 +75,10 @@ v2 is a ground-up rebuild in Rust. The v1 "CoTrack editor" (`editor/`, Python + 
 - **FrameIndex** (`i64`): a position on the media's constant frame grid. The grid rule comes from v1: frame *i* is the decoded frame whose timestamp rounds to `i / fps` after subtracting the first frame's timestamp. Variable-frame-rate gaps repeat the previous frame.
 - **Rational rates.** fps is stored as a rational (e.g. 60000/1001). Conversions use `RationalTime`-style arithmetic, as in OpenTimelineIO, so there is no floating-point drift.
 - **Wall time** (`f64` seconds since the session epoch) stamps raw input.
-- **Transport** (a resource): `playing`, `rate` (fraction of real time), `direction`, loop range, playhead (FrameIndex plus a sub-frame phase).
+- **Transport** (a resource): `playing`, `rate` (fraction of real time), `reverse`, loop range, playhead (FrameIndex plus a sub-frame phase).
+- **Shuttle** (J / K / L, as in DaVinci Resolve): L plays forward and J backward at 1×; each further press in the same direction doubles the speed (2×, 4×, up to 8×), and the other key turns around at 1×. K plays or pauses. When playback stops (K, Space, a step, a seek, the end), the rate set before the shuttle (the capture speed, Q / E) and forward come back. *(Added on request: "DaVinci like playback controls".)*
+  - Playing backward, the decode service fills the frames behind the playhead a keyframe group at a time: one ffmpeg start per group, read through to the frames needed (`tt_media::player`).
+  - A stroke recorded while playing backward is played through like one played forward: every frame passed takes the moment its centre was on screen (the ClockMap is direction-agnostic). Anticipatory speed reads ahead in the direction of play.
 - **ClockMap:** the recorded mapping from wall time to video frames during a capture. It is a list of segments `{wall_start, wall_end, frame_at_start: f64, rate}`, where `rate` is frames per wall-second.
   - playing at 50% → `rate = 0.5·fps`
   - paused → `rate = 0`
@@ -559,6 +562,7 @@ Adopted from Rerun's proven design.
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; arrow keys while holding retake frame by frame; the wheel holds still while holding (or, as a setting, zooms or sets the stroke's size, falloff or both); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
   - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
+  - `J` / `K` / `L` shuttle: backward, play/pause, forward; J or L again doubles the speed, up to 8× (§3);
   - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when you change it (fully for 0.25 s, then a 0.3 s fade; auto speed's changes don't flash, §8.4);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;

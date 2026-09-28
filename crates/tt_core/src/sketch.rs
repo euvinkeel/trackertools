@@ -133,7 +133,10 @@ impl ClockMap {
             let (t0, t1) = (self.t[i], self.t[i + 1]);
             let (f0, f1) = (self.frame[i], self.frame[i + 1]);
             let span = f1 - f0;
-            let continuous = self.playing[i] && span >= 0.0 && span <= (t1 - t0) * 480.0 + 1.0;
+            // Playing backward is played through too; a jump back (a seek
+            // pauses) isn't: backward, both ends must be playing.
+            let fast = span.abs() <= (t1 - t0) * 480.0 + 1.0;
+            let continuous = self.playing[i] && fast && (span >= 0.0 || self.playing[i + 1]);
             if f0.floor() == f1.floor() && !self.playing[i] {
                 // Holding on one frame (hold-to-simulate).
                 let f = f1.floor() as FrameIndex;
@@ -147,10 +150,13 @@ impl ClockMap {
             }
             hold = None;
             if continuous {
-                if span > 0.0 {
-                    for f in (f0.floor() as FrameIndex)..=(f1.floor() as FrameIndex) {
+                if span != 0.0 {
+                    let (lo, hi) = (f0.min(f1), f0.max(f1));
+                    for f in (lo.floor() as FrameIndex)..=(hi.floor() as FrameIndex) {
                         let c = f as f64 + 0.5;
-                        if c >= f0 && c < f1 {
+                        // The segment that crosses the frame's centre (from either side) assigns it.
+                        let crossed = if span > 0.0 { c >= f0 && c < f1 } else { c <= f0 && c > f1 };
+                        if crossed {
                             assign(f, Shown::At(t0 + (c - f0) / span * (t1 - t0)), pass, 1);
                         }
                     }

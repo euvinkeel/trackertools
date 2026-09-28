@@ -90,7 +90,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         };
         button(ui, "⏮", Action::GoToStart, "Go to start");
         button(ui, "◀", Action::StepBackward, "Previous frame");
-        button(ui, if t.playing { "⏸" } else { "▶" }, Action::TogglePlay, "Play / pause");
+        button(ui, "◀", Action::ShuttleBackward, "Play backward; again: faster");
+        button(ui, if t.playing { "⏸" } else { "▶" }, Action::TogglePlay, "Play / pause (also K)");
+        button(ui, "▶▶", Action::ShuttleForward, "Play forward; again: faster");
         button(ui, "▶|", Action::StepForward, "Next frame");
         button(ui, "⏭", Action::GoToEnd, "Go to end");
         ui.separator();
@@ -197,10 +199,10 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             ui.ctx().request_repaint();
         }
     }
-    // Follow the playhead while playing: page forward when it leaves the view.
+    // Follow the playhead while playing: page on when it leaves the view (back, playing backward).
     let head = t.playhead;
     if t.playing && (head < start || head >= start + span) {
-        start = head - span * 0.05;
+        start = if t.reverse { head - span * 0.95 } else { head - span * 0.05 };
     }
     start = start.clamp(-span * 0.02, (count - span * 0.98).max(-span * 0.02));
     let scale = Scale { rect, start, span };
@@ -525,8 +527,12 @@ pub struct TimelineUi {
     pub lanes_area: Option<Rect>,
 }
 
-/// `0.25×`, `1×`, `1.5×`: at most two decimals (auto speed sets rates between the steps).
+/// `0.25×`, `1×`, `1.5×`: at most two decimals (auto speed sets rates
+/// between the steps); `◀ 2×` for a negative rate (playing backward).
 pub(crate) fn rate_label(rate: f64) -> String {
+    if rate < 0.0 {
+        return format!("◀ {}", rate_label(-rate));
+    }
     let s = format!("{rate:.2}");
     format!("{}×", s.trim_end_matches('0').trim_end_matches('.'))
 }

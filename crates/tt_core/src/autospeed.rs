@@ -224,7 +224,9 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
                 (c, b)
             }
         };
-        let ahead = (f0..=f0 + n).filter_map(|f| sig.get(f)).map(side).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
+        // (Ahead is behind while playing backward.)
+        let ahead = if t.reverse { f0 - n..=f0 } else { f0..=f0 + n };
+        let ahead = ahead.filter_map(|f| sig.get(f)).map(side).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
         if let Some(a) = ahead {
             let u = busyness(a, calm, busy);
             out = Some(out.map_or(u, |o| o.max(u)));

@@ -57,7 +57,7 @@ The original plan follows.
 | Decode service | ✅ read-ahead scaled by rate; paused backward fill one decode group at a time; stream reuse instead of respawn |
 | Frame cache | ✅ 2 GB NV12, evicts the frames farthest from the playhead; the nearest frame stands in, never a blank |
 | Viewport | ✅ NV12 → RGB shader (BT.709/601, limited/full), wheel zoom about the cursor, drag pan, nearest sampling at ≥3×. ⏳ pixel grid |
-| Transport and timeline | ✅ rates 0.1–4×, steps, zoomable/pannable timeline that follows the playhead, decode-cache strip |
+| Transport and timeline | ✅ rates 0.1–4×, steps, zoomable/pannable timeline that follows the playhead, decode-cache strip. J/K/L shuttle (DaVinci-style: backward/forward from 1×, doubling per press up to 8×; K play/pause), with backward playback decoded a keyframe group at a time |
 | Proxy | ✅ auto for GOP > 30. NVENC builds P5 in 60 s (1,153 fps); alignment verified 1:1 on every fixture + content check on P5. The viewport shows the proxy unless it would be magnified |
 | Session | ✅ `%LOCALAPPDATA%\trackertools\session.json` restores the last file and frame (the `.ttproj` project file arrives with M2) |
 
