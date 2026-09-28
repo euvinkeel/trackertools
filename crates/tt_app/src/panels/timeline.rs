@@ -4,8 +4,10 @@
 //! tick per stroke). The visible range and lane scroll are session state.
 //!
 //! - Scrub by dragging on the ruler. On the lanes, a click selects (Ctrl
-//!   toggles, Shift adds), a drag draws a box that selects what it touches,
-//!   a double-click enters that sketch's view, a right-click opens the menu.
+//!   toggles, Shift adds), a drag draws a box that selects what it touches
+//!   (past the top or bottom it scrolls the lanes; Esc drops it), a
+//!   double-click enters that sketch's view, a right-click opens the menu.
+//! - A stroke that starts scrolls its lane into view.
 //! - Wheel on the ruler or Ctrl+wheel zooms time; Shift+wheel pans time; the
 //!   wheel on the lanes scrolls them; a middle-drag pans both.
 
@@ -129,6 +131,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     painter.rect_filled(rect, 0.0, style::PANEL);
     if !t.has_media() {
         world.resource_mut::<PendingActions>().0.extend(actions);
+        world.resource_mut::<TimelineUi>().marquee = None;
         return;
     }
     let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 22.0));
@@ -171,6 +174,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         let d = response.drag_delta();
         start -= d.x as f64 * span / rect.width() as f64;
         lane_scroll -= d.y;
+    }
+    // A box dragged past the top or bottom of the lanes scrolls them.
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    if world.resource::<TimelineUi>().marquee.is_some()
+        && let Some(p) = pointer
+    {
+        let over = (p.y - lanes_area.min.y).min(0.0) + (p.y - lanes_area.max.y).max(0.0);
+        if over != 0.0 {
+            lane_scroll += over.clamp(-60.0, 60.0) * 10.0 * ui.input(|i| i.stable_dt).min(0.1);
+            ui.ctx().request_repaint();
+        }
     }
     // Follow the playhead while playing: page forward when it leaves the view.
     let head = t.playhead;
@@ -216,28 +230,39 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let origin = ui.input(|i| i.pointer.press_origin()).or_else(|| response.interact_pointer_pos());
     let mods = ui.input(|i| i.modifiers);
     let mut ui_state = std::mem::take(&mut *world.resource_mut::<TimelineUi>());
-    let marquee = ui_state.marquee.zip(ui.input(|i| i.pointer.interact_pos())).map(|(a, b)| Rect::from_two_pos(a, b));
-    let hits = lanes(&painter, world, &scale, lanes_area, &mut lane_scroll, marquee);
+    // A stroke that just started shows on its lane: scroll to it once.
+    let live = world.resource::<LiveCapture>().0.is_some();
+    let stroke_started = live && !ui_state.live;
+    ui_state.live = live;
+    let hits = lanes(&painter, world, &scale, lanes_area, &mut lane_scroll, ui_state.marquee.zip(pointer), stroke_started);
     let fitted = span >= count * 0.999 && start.abs() < 1.0;
     *world.resource_mut::<TimelineView>() =
         if fitted { TimelineView { lane_scroll, ..TimelineView::default() } } else { TimelineView { start, span: Some(span), lane_scroll } };
 
     ui_state.lanes_area = Some(lanes_area);
     let in_lanes = origin.is_some_and(|o| lanes_area.contains(o));
-    if in_lanes && response.drag_started_by(egui::PointerButton::Primary) {
-        ui_state.marquee = origin;
+    if in_lanes
+        && response.drag_started_by(egui::PointerButton::Primary)
+        && let Some(o) = origin
+    {
+        // Kept in content coordinates, so it stays on its lane while the lanes scroll.
+        ui_state.marquee = Some(Pos2::new(o.x, o.y + lane_scroll));
     }
-    if let Some(m) = marquee {
-        painter.rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
-        if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
-            let hit = hits.in_box(m);
-            let mut sel = world.resource_mut::<Selection>();
-            if !(mods.shift || mods.ctrl || mods.command) {
-                sel.clear();
-            }
-            for e in hit {
-                if !sel.is_selected(e) {
-                    sel.entities.push(e);
+    if let Some(m) = hits.marquee {
+        painter.with_clip_rect(lanes_area).rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
+        let down = ui.input(|i| i.pointer.primary_down());
+        if response.drag_stopped() || !down {
+            // Stopped with the button still down (Esc): no selection.
+            if !down {
+                let hit = hits.in_box(m);
+                let mut sel = world.resource_mut::<Selection>();
+                if !(mods.shift || mods.ctrl || mods.command) {
+                    sel.clear();
+                }
+                for e in hit {
+                    if !sel.is_selected(e) {
+                        sel.entities.push(e);
+                    }
                 }
             }
             ui_state.marquee = None;
@@ -269,7 +294,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     *world.resource_mut::<TimelineUi>() = ui_state;
     // Right-click: select what's under it, then the entity menu.
     if response.secondary_clicked()
-        && let Some(e) = response.interact_pointer_pos().and_then(|p| hits.at(p))
+        && let Some(e) = response.interact_pointer_pos().filter(|p| lanes_area.contains(*p)).and_then(|p| hits.at(p))
     {
         menu::right_clicked(world, e);
     }
@@ -305,13 +330,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
 const LANE_H: f32 = 18.0;
 
-/// What the lanes put where (screen), for clicks and box selection.
+/// What the lanes put where (screen), for clicks and box selection. Clicks
+/// only count inside the lanes area (lanes are clipped to it); a box's far
+/// corner stays inside it, but its anchor may have scrolled away.
 #[derive(Default)]
 struct Hits {
-    /// `(sketch, its lane's label area, its coverage bars)`.
+    /// `(sketch, its lane (clipped), its label area, its coverage bars)`.
     lanes: Vec<(Entity, Rect, Rect, Vec<Rect>)>,
     /// `(stroke, its tick)`, under selected sketches.
     ticks: Vec<(Entity, Rect)>,
+    /// The box being dragged, as drawn this frame.
+    marquee: Option<Rect>,
 }
 
 impl Hits {
@@ -336,18 +365,26 @@ impl Hits {
 /// selected sketch, a tick per stroke. A stroke in progress shows on the lane
 /// of the sketch it edits (visited frames solid, frames its falloff moves
 /// dim), or on a lane of its own for a new sketch. The lanes scroll
-/// vertically under the fixed ruler; `scroll` is clamped here.
-fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, scroll: &mut f32, marquee: Option<Rect>) -> Hits {
+/// vertically under the fixed ruler; `scroll` is clamped here, and brought to
+/// the live stroke's lane when `stroke_started`. `marquee`: a box's anchor (in
+/// content coordinates) and the pointer.
+fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, scroll: &mut f32, marquee: Option<(Pos2, Pos2)>, stroke_started: bool) -> Hits {
     let tree = super::outliner::sketch_tree(world);
     let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
     let live = world.resource::<LiveCapture>().0.as_ref();
     let new_lane = live.is_some_and(|l| l.target.is_none());
     let content_h = (tree.len() + usize::from(new_lane)) as f32 * LANE_H + 6.0;
+    if stroke_started && let Some(l) = live {
+        let i = l.target.and_then(|t| tree.iter().position(|(e, _)| *e == t)).unwrap_or(tree.len());
+        let y = i as f32 * LANE_H;
+        *scroll = scroll.max(y + LANE_H - area.height()).min(y);
+    }
     *scroll = scroll.clamp(0.0, (content_h - area.height()).max(0.0));
+    let marquee = marquee.map(|(a, b)| Rect::from_two_pos(Pos2::new(a.x, a.y - *scroll), b.clamp(area.min, area.max)));
     let painter = painter.with_clip_rect(area);
     let visible = (scale.start.floor() as FrameIndex).max(0)..(scale.start + scale.span).ceil() as FrameIndex;
-    let mut hits = Hits::default();
+    let mut hits = Hits { marquee, ..Hits::default() };
     let bar = |y0: f32, y1: f32, a: FrameIndex, b: FrameIndex| -> Option<Rect> {
         let (x0, x1) = (scale.x(a as f64).max(scale.rect.min.x), scale.x(b as f64).min(scale.rect.max.x));
         (x1 > x0).then(|| Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), y0..=y1))
@@ -388,12 +425,13 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, 
     for (i, (e, depth)) in tree.iter().enumerate() {
         let y = area.min.y + i as f32 * LANE_H - *scroll;
         let lane = Rect::from_min_size(Pos2::new(area.min.x, y), Vec2::new(area.width(), LANE_H));
-        if lane.max.y < area.min.y || lane.min.y > area.max.y {
+        // Off screen, a lane only matters to a box that swept it before the lanes scrolled.
+        if (lane.max.y < area.min.y || lane.min.y > area.max.y) && marquee.is_none() {
             continue;
         }
         let name = world.get::<Name>(*e).map_or("sketch".into(), |n| n.to_string());
         let label_pos = Pos2::new(lane.min.x + 6.0 + *depth as f32 * 10.0, y + 7.0);
-        let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), style::TEXT);
+        let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
         let label = Rect::from_min_size(label_pos - Vec2::new(0.0, galley.size().y / 2.0), galley.size()).expand(2.0);
         let mut bars = Vec::new();
         if let Some(sig) = world.get::<Output>(*e).and_then(|o| store.get(o.0)) {
@@ -431,7 +469,7 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, 
             live_bars(y, l);
         }
         painter.galley(label.min + Vec2::splat(2.0), galley, if selected { style::TEXT } else { style::MUTED });
-        hits.lanes.push((*e, lane, label, bars.into_iter().map(|(b, _)| b).collect()));
+        hits.lanes.push((*e, lane.intersect(area), label, bars.into_iter().map(|(b, _)| b).collect()));
     }
     let y = area.min.y + tree.len() as f32 * LANE_H - *scroll;
     if let Some(l) = live.filter(|l| l.target.is_none()) {
@@ -452,7 +490,10 @@ fn lanes(painter: &egui::Painter, world: &mut World, scale: &Scale, area: Rect, 
 /// Timeline pointer state (a box being dragged over the lanes).
 #[derive(Resource, Debug, Default)]
 pub struct TimelineUi {
+    /// The box's anchor, in content coordinates (screen y + lane scroll).
     marquee: Option<Pos2>,
+    /// A stroke was in progress last frame.
+    live: bool,
     /// Where the lanes were drawn (the demo aims at it).
     pub lanes_area: Option<Rect>,
 }
