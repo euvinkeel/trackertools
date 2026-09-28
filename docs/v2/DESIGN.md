@@ -487,7 +487,7 @@ Adopted from Rerun's proven design.
   - Each command is one undo step (`tt_core::commands`).
   - A box keeps its start on the content: dragged past the edge it scrolls the list, and what it swept stays in it. Esc drops it.
   - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and unfolds and scrolls to what is selected elsewhere (only when it is out of view).
-  - The Timeline scrubs from the ruler (a click seeks). Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
+  - The Timeline scrubs from the ruler (a click seeks). With snapping on (`N`, or the header's "snap"; Ctrl while scrubbing inverts it), the playhead snaps within 8 points to the first and last frame of every sketch, stroke, view and tracker, marked on the ruler. The right-click menu can send the playhead to the selected thing's start or end. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
 - **Settings tab** (beside the Inspector), remembered in the session file (scripted runs, the demo and benchmarks, neither use nor save it):
   - the **Brush** tab: the next stroke's size and falloff, what the wheel does, anticipatory speed on/off, and the box of the selected sketch (or of new sketches): padding and smallest box in px of the space drawn on (video pixels on the source, view pixels inside a view, with the conversion shown), jiggle gain, hand lag, presets. Before a stroke, a dashed outline at the cursor shows the box a still hand would get;
   - the size and falloff the next stroke starts with;

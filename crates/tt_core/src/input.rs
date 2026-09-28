@@ -53,6 +53,8 @@ pub enum Action {
     Rename,
     /// Track the selected sketches from the playhead (re-seed selected trackers there).
     Track,
+    /// Scrubbing snaps the playhead to the edges of timeline objects, or stops snapping.
+    ToggleSnap,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -135,6 +137,7 @@ impl Default for Keymap {
                 (b(Key::Letter('a'), Mods::NONE, false), SelectAll),
                 (b(Key::F2, Mods::NONE, false), Rename),
                 (b(Key::Letter('t'), Mods::NONE, false), Track),
+                (b(Key::Letter('n'), Mods::NONE, false), ToggleSnap),
             ],
         }
     }

@@ -21,6 +21,7 @@ use crate::op::{Inputs, Operator, Output};
 use crate::selection::Selection;
 use crate::signal::{Signal, SignalStore};
 use crate::sketch::{BOX_CHANNELS, Capture, ClockMap, SketchParams, Stroke, Through, is_sketch, sketch_of};
+use crate::time::FrameIndex;
 use crate::view::view_of;
 
 /// The entity the outliner should start renaming (F2); the outliner takes it.
@@ -192,6 +193,53 @@ pub fn select_all(world: &mut World) {
     world.resource_mut::<Selection>().entities = all;
 }
 
+/// Playhead snapping (N): scrubbing snaps to the edges of timeline objects
+/// (a session setting; Ctrl while scrubbing does the opposite).
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq)]
+pub struct TimeSnap {
+    pub enabled: bool,
+}
+
+/// The frames an entity spans on the timeline, first and last: a stroke the
+/// frames it visited, anything else with an output its frames with a value.
+pub fn time_span(world: &World, e: Entity) -> Option<(FrameIndex, FrameIndex)> {
+    if world.get::<Disabled>(e).is_some() {
+        return None;
+    }
+    if world.get::<Capture>(e).is_some() {
+        let (first, shown) = world.get::<ClockMap>(e)?.frame_times()?;
+        let a = shown.iter().position(Option::is_some)?;
+        let b = shown.iter().rposition(Option::is_some)?;
+        return Some((first + a as FrameIndex, first + b as FrameIndex));
+    }
+    let out = world.get::<Output>(e)?;
+    world.resource::<SignalStore>().get(out.0)?.present_hull()
+}
+
+/// Every live object's first and last frame, sorted and without repeats:
+/// what the playhead snaps to.
+pub fn snap_points(world: &mut World) -> Vec<FrameIndex> {
+    let mut q = world.query_filtered::<Entity, (Or<(With<Operator>, With<Capture>)>, Without<Disabled>)>();
+    let entities: Vec<Entity> = q.iter(world).collect();
+    let mut out: Vec<FrameIndex> = entities.into_iter().filter_map(|e| time_span(world, e)).flat_map(|(a, b)| [a, b]).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The snap point nearest `f` within `reach` frames, if any.
+pub fn snap(points: &[FrameIndex], f: FrameIndex, reach: FrameIndex) -> Option<FrameIndex> {
+    let i = points.partition_point(|p| *p < f);
+    [i.checked_sub(1), Some(i)].into_iter().flatten().filter_map(|i| points.get(i).copied()).filter(|p| (p - f).abs() <= reach).min_by_key(|p| (p - f).abs())
+}
+
+fn apply_snap_actions(mut actions: ResMut<PendingActions>, mut snap: ResMut<TimeSnap>) {
+    for _ in actions.take(|a| a == Action::ToggleSnap) {
+        snap.enabled = !snap.enabled;
+        tracing::info!("playhead snapping {}", if snap.enabled { "on" } else { "off" });
+    }
+}
+
 fn apply_command_actions(world: &mut World) {
     let actions = world.resource_mut::<PendingActions>().take(|a| matches!(a, Action::Delete | Action::Duplicate | Action::SelectAll | Action::Rename));
     // A stroke in progress keeps its sketch and view (the menu greys these out too).
@@ -217,6 +265,10 @@ pub struct CommandsModule;
 
 impl Module for CommandsModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<RenameRequest>(Class::Session).init_resource::<RenameRequest>().add_systems(apply_command_actions.in_set(Set::Intents));
+        app.declare::<RenameRequest>(Class::Session)
+            .declare::<TimeSnap>(Class::Session)
+            .init_resource::<RenameRequest>()
+            .init_resource::<TimeSnap>()
+            .add_systems((apply_command_actions, apply_snap_actions).in_set(Set::Intents));
     }
 }

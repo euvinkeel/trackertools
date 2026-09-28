@@ -286,3 +286,30 @@ fn select_all_rename_and_duplicate_keys() {
     history::undo(&mut d.core.world);
     assert_eq!(d.core.world.get::<Name>(a).map(|n| n.to_string()).as_deref(), Some("Sketch 1"));
 }
+
+#[test]
+fn the_playhead_snaps_to_the_edges_of_timeline_objects() {
+    use tt_core::commands::{TimeSnap, snap, snap_points, time_span};
+    let mut d = Driver::new();
+    let line = |t: f64| [200.0 + 60.0 * t, 300.0];
+    d.core.world.resource_mut::<Transport>().seek(100);
+    d.frame(line, PRESS);
+    d.frame(line, Input { action: Some(Action::TogglePlay), ..HOLD });
+    d.frames(300, line, HOLD);
+    d.frame(line, Input { action: Some(Action::TogglePlay), ..UP });
+    let s = d.sketches()[0];
+    let (a, b) = time_span(&d.core.world, s).expect("the sketch has frames");
+    assert!(d.value(s, a).is_some() && d.value(s, b).is_some() && d.value(s, b + 1).is_none(), "{a}..={b}");
+    let stroke = tt_core::commands::strokes_of(&d.core.world, s)[0];
+    let (sa, sb) = time_span(&d.core.world, stroke).expect("the stroke visited frames");
+    assert_eq!(sa, 100, "the stroke starts where it was pressed");
+    assert!(sb >= b, "and its visits reach the sketch's end ({sb} vs {b})");
+    let points = snap_points(&mut d.core.world);
+    assert!(points.contains(&a) && points.contains(&b) && points.windows(2).all(|w| w[0] < w[1]), "{points:?}");
+    assert_eq!(snap(&points, a + 3, 5), Some(a));
+    assert_eq!(snap(&points, a + 9, 5), None, "beyond the reach nothing snaps");
+    // N toggles it.
+    assert!(!d.core.world.resource::<TimeSnap>().enabled);
+    d.frame(line, Input { action: Some(Action::ToggleSnap), ..UP });
+    assert!(d.core.world.resource::<TimeSnap>().enabled);
+}

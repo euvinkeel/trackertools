@@ -73,6 +73,19 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             }
         }
     }
+    // Where the selected thing is on the timeline.
+    if let Some((a, b)) = primary.and_then(|p| tt_core::commands::time_span(world, p)) {
+        ui.separator();
+        if ui.button(format!("Go to its start (frame {a})")).clicked() {
+            push = Some(Action::Seek(a));
+            ui.close();
+        }
+        if ui.button(format!("Go to its end (frame {b})")).clicked() {
+            push = Some(Action::Seek(b));
+            ui.close();
+        }
+        ui.separator();
+    }
     if ui.button(format!("Select all{}", chord(Action::SelectAll))).clicked() {
         push = Some(Action::SelectAll);
         ui.close();

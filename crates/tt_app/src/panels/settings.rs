@@ -140,5 +140,6 @@ fn describe(action: Action) -> &'static str {
         SelectAll => "Select all sketches",
         Rename => "Rename the selection",
         Track => "Track the selected sketch from here (on a tracker: re-seed it here)",
+        ToggleSnap => "Snap the playhead to the start and end of things on the timeline while scrubbing (Ctrl inverts)",
     }
 }

@@ -112,6 +112,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         if ui.selectable_label(t.looping, "⟲ loop").clicked() {
             actions.push(Action::ToggleLoop);
         }
+        let snapping = world.resource::<tt_core::commands::TimeSnap>().enabled;
+        if ui
+            .selectable_label(snapping, "snap")
+            .on_hover_text(format!(
+                "Scrubbing snaps the playhead to the start and end of sketches, strokes and trackers ({}; Ctrl while scrubbing does the opposite)",
+                keymap.chord_for(Action::ToggleSnap).unwrap_or_default()
+            ))
+            .clicked()
+        {
+            actions.push(Action::ToggleSnap);
+        }
         ui.separator();
         ui.monospace(format!("{} / {}", t.frame(), t.last_frame()));
         ui.monospace(timecode(t.frame(), t.fps));
@@ -308,8 +319,24 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
     painter.line_segment([Pos2::new(x0, rect.min.y), Pos2::new(x0, rect.max.y)], Stroke::new(1.5, style::ACCENT));
 
-    // Scrub with the primary button, from the ruler.
-    let to_frame = |x: f32| (scale.frame_at(x).floor() as FrameIndex).clamp(0, t.last_frame());
+    // Scrub with the primary button, from the ruler; snapping (N, Ctrl inverts)
+    // pulls the playhead to the edges of timeline objects within 8 points.
+    let snapping = world.resource::<tt_core::commands::TimeSnap>().enabled != ui.input(|i| i.modifiers.ctrl);
+    let points = if snapping { tt_core::commands::snap_points(world) } else { Vec::new() };
+    if snapping {
+        for p in &points {
+            let x = scale.x(*p as f64 + 0.5);
+            if rect.x_range().contains(x) {
+                let y = lanes_area.min.y;
+                painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 3.0, y - 5.0), Pos2::new(x + 3.0, y - 5.0), Pos2::new(x, y)], style::ACCENT.gamma_multiply(0.6), Stroke::NONE));
+            }
+        }
+    }
+    let reach = ((8.0 / scale.px_per_frame().max(1e-6)).round() as FrameIndex).max(1);
+    let to_frame = |x: f32| {
+        let f = (scale.frame_at(x).floor() as FrameIndex).clamp(0, t.last_frame());
+        tt_core::commands::snap(&points, f, reach).unwrap_or(f)
+    };
     if let Some(pos) = response.hover_pos().filter(|p| p.y < lanes_area.min.y) {
         let f = to_frame(pos.x);
         response.clone().on_hover_text_at_pointer(format!("{f}  ·  {}", timecode(f, t.fps)));
