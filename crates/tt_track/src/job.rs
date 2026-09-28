@@ -23,7 +23,7 @@ use tt_core::view::SpaceMap;
 use tt_media::{DecodeOptions, FrameStream, VideoIndex};
 
 use crate::TRACK_CHANNELS;
-use crate::image::{Grid, Luma, Patch, resample};
+use crate::image::{Grid, Luma, Patch, resample_xy};
 use crate::template::{Settings, TEMPLATE_R, TemplateTracker};
 
 /// Which way a job runs from the anchor.
@@ -180,7 +180,7 @@ impl Worker {
         let grid = Grid { origin: [b[0] - w as f64 / 2.0 / s.scale, b[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
         let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
-        (grid, resample(&luma, s.k, map, grid, w, h))
+        (grid, resample_xy(&luma, s.k, map, grid, w, h))
     }
 
     fn decode_one(&self, f: FrameIndex) -> Result<Vec<u8>> {

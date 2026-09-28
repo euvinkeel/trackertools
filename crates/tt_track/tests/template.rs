@@ -4,7 +4,7 @@
 //! a view and from a proxy, against the scene they show.
 
 use tt_core::view::{SourceSize, SpaceMap};
-use tt_track::image::{Grid, Luma, Patch, resample};
+use tt_track::image::{Grid, Luma, Patch, resample, resample_xy};
 use tt_track::ncc::{Template, best_match};
 use tt_track::template::{Settings, TEMPLATE_R, TemplateTracker};
 
@@ -56,7 +56,7 @@ fn patch_at(frame: &[u8], centre: [f64; 2], half: f64, scale: f64) -> (Grid, Pat
     let map = SpaceMap::identity(&SourceSize { width: W as f64, height: H as f64 });
     let side = (2.0 * half * scale).ceil() as usize;
     let grid = Grid { origin: [centre[0] - side as f64 / 2.0 / scale, centre[1] - side as f64 / 2.0 / scale], scale };
-    (grid, resample(&Luma { data: frame, width: W, height: H }, [1.0, 1.0], &map, grid, side, side))
+    (grid, resample(&Luma { data: frame, width: W, height: H }, 1.0, &map, grid, side, side))
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn patches_through_a_view_and_an_unevenly_scaled_proxy_show_the_scene() {
     let t = Template::cut(&ideal, grid.from_view(at), TEMPLATE_R).expect("textured");
     let want = grid.from_view(at);
     for (name, frame, w, h, k) in [("original", render(c), W, H, [1.0, 1.0]), ("proxy", render_sized(c, pw, ph), pw, ph, k)] {
-        let patch = resample(&Luma { data: &frame, width: w, height: h }, k, &map, grid, 80, 80);
+        let patch = resample_xy(&Luma { data: &frame, width: w, height: h }, k, &map, grid, 80, 80);
         let m = best_match(&patch, &t, [[20.0, 20.0], [60.0, 60.0]], None).expect("found");
         let err = (m.pos[0] - want[0]).hypot(m.pos[1] - want[1]);
         eprintln!("{name}: the blob at {:?}, expected {want:?} (error {err:.3} view px), score {:.3}", m.pos, m.score);

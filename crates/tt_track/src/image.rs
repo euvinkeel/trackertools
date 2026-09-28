@@ -77,11 +77,18 @@ impl Patch {
 }
 
 /// Resample a `w × h` patch on `grid` through `map` (view → source) from a
+/// frame of a rendition `k`× the source's size ([`resample_xy`] with the
+/// same scale on both axes).
+pub fn resample(luma: &Luma, k: f64, map: &SpaceMap, grid: Grid, w: usize, h: usize) -> Patch {
+    resample_xy(luma, [k, k], map, grid, w, h)
+}
+
+/// Resample a `w × h` patch on `grid` through `map` (view → source) from a
 /// frame of a rendition `k = [kx, ky]` × the source's size (per axis: a
 /// proxy's width is rounded to even, so it isn't always scaled uniformly).
 /// Patch pixels larger than the rendition's are averaged over their
 /// footprint, so nothing aliases.
-pub fn resample(luma: &Luma, k: [f64; 2], map: &SpaceMap, grid: Grid, w: usize, h: usize) -> Patch {
+pub fn resample_xy(luma: &Luma, k: [f64; 2], map: &SpaceMap, grid: Grid, w: usize, h: usize) -> Patch {
     // Rendition pixels per patch pixel, per axis: 1 tap per rendition pixel, at most 8.
     let step = |k: f64| map.a * k / grid.scale;
     let taps = |k: f64| {
