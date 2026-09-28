@@ -100,11 +100,20 @@ pub struct Tracker {
     /// Shift the finished path onto the guide's average position (the median
     /// offset), instead of wherever the guide was at the anchor.
     pub center_on_guide: bool,
+    /// Track each stretch between two looks from both ends and keep, frame
+    /// by frame, the better pass (a look placed where it missed mends the
+    /// frames before it too). Off: each side tracks one way.
+    #[reflect(default = "yes")]
+    pub fuse: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Tracker {
     pub fn at(anchor: FrameIndex) -> Self {
-        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false }
+        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false, fuse: true }
     }
 }
 

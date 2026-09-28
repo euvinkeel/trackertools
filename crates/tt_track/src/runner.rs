@@ -56,7 +56,7 @@ use crate::{Direction, Rendition, TRACK_CHANNELS, Tracker, guide_of};
 
 /// Part of every stamp: bump it when a change to the tracking makes saved
 /// results out of date (they re-track when their project is opened).
-const ALGO_VERSION: u64 = 2;
+const ALGO_VERSION: u64 = 3;
 
 /// The video trackers read (set by the host when media opens and when its proxy is ready).
 #[derive(Resource, Clone)]
@@ -244,7 +244,7 @@ impl Plan {
         let same_seed = self.anchor == old.anchor
             && close(self.scale, old.scale)
             && Arc::ptr_eq(&self.video, &old.video)
-            && (p.feature, p.search, p.adapt, p.min_score) == (q.feature, q.search, q.adapt, q.min_score)
+            && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && self.looks == old.looks
             && self.seed == old.seed;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
@@ -569,6 +569,7 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         decode: footage.decode.clone(),
         looks: plan.looks.clone(),
         seed: plan.seed,
+        fuse: p.fuse,
     };
     let shared = Arc::new(Shared::new(catch_up_limit(world, op, side), from));
     let (tx, rx) = channel();
@@ -783,7 +784,7 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         h.update(&x.to_le_bytes());
     };
     let p = &params;
-    for x in [ALGO_VERSION as f64, anchor as f64, p.direction as u8 as f64, p.rendition as u8 as f64, p.feature as f64, p.search as f64, p.adapt as f64, p.min_score as f64] {
+    for x in [ALGO_VERSION as f64, anchor as f64, p.direction as u8 as f64, p.rendition as u8 as f64, p.feature as f64, p.search as f64, p.adapt as f64, p.min_score as f64, p.fuse as u8 as f64] {
         put(x);
     }
     for x in [lo as f64, hi as f64, original.width as f64, original.height as f64, original.frames.len() as f64] {

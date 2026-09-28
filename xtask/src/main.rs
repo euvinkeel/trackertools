@@ -1,11 +1,14 @@
 //! Developer tasks. `cargo xtask fixtures [--force]` generates the test clips
 //! into `fixtures/` (gitignored) with ffmpeg's lavfi sources, so tests never
-//! depend on files outside the repo (a v1 lesson).
+//! depend on files outside the repo (a v1 lesson). The cursor clip
+//! (`cursor.rs`) is rendered here and piped to ffmpeg.
 //!
 //! Every counter clip carries a burned-in frame number and a binary frame-index
 //! barcode (16 cells along the bottom-left; cell b is white when bit b of the
 //! source frame index is set), so decoding tests can read the true frame index
 //! from pixels without OCR.
+
+mod cursor;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -184,6 +187,9 @@ fn fixtures(force: bool) -> Result<()> {
     std::fs::write(out.join("sprite_truth.json"), serde_json::to_string(&serde_json::json!({ "centers": truth }))?)?;
 
     clips.push(clip(sprite_file, "h264", sprite_frames, 250, 3, false, vec![], "sprite over blurred testsrc2; see sprite_truth.json"));
+
+    // A mouse cursor over footage that makes trackers miss (tt_track's accuracy tests).
+    cursor::make(&out, &ffmpeg(), force)?;
     let manifest = Manifest {
         generator: "cargo xtask fixtures",
         ffmpeg: version,

@@ -394,13 +394,22 @@ Findings on the way:
 - Trackers have lanes (frames, score, flagged frames, job progress), and so do views. Drag a lane's end to trim or extend it: one undo step per drag, snapping to the playhead and other ends. The right-click menu: *Starts here*, *Ends here*, *Untrim*.
 - Tracker jobs stop at the span's edges (they still start at the anchor). Trimmed results stay; extending brings back what it had without tracking, and resumes from the nearest result where it had nothing (tests/span.rs: extending 800 → 1000 resumes at 801).
 
+**Accuracy** (fully headless; DESIGN §6.3 has the tables):
+- **The cursor fixture:** `cargo xtask fixtures` renders a cursor over five kinds of trouble (changing stripes, bright scenery, icon changes, flicks, an identical look-alike) with its exact hotspot; `tests/cursor.rs` tracks it end to end and reports each stretch.
+- **Where the rough pass is early or late** (the flicks: 82% → 100% within 3 px, max 179 → 0.2 px): patches cover the guide's boxes ±8 frames; the tracker also searches around where it was going itself; placements outside the guide's box rank lower, and a near match outside it widens the search.
+- **Lucas–Kanade** after the correlation peak (median 0.14 → 0.08 px on the cursor fixture; synthetic subpixel motion 0.016–0.061 → 0.007–0.012 px).
+- **Forward/backward fuse** (`fuse`, on by default): each stretch between two pins is also tracked back from the later one, and the better pass kept per frame (a Viterbi over the two, with the guide as the judge). A look placed where it slipped onto the look-alike: 97.3% → 98.0% on that stretch.
+- **Faster** despite all of it (52 → ~90 fps on the fixture): the last look first, and coarse-to-fine search in large windows.
+- `ALGO_VERSION` 3: saved trackers re-track once.
+- `tests/real_footage.rs` prints "on the cursor" itself now (≥ 12 pixels of luma ≥ 220 within 14 px).
+- Tried and dropped: a matched blur before Lucas–Kanade (exact on an ideal square between pixels, worse on both encoded fixtures).
+
 **Next:**
+- run `tests/real_footage.rs` on the user's footage with the new tracker (baseline: 100.0% on the cursor, ~90 fps);
 - Tab into a tracker's view (stabilization);
 - unguided trackers (search around the last position and velocity);
 - tracker results feeding anticipatory speed's look-ahead;
-- a Lucas–Kanade refinement for hard-edged features (NCC peaks lean toward whole pixels);
 - colour (chroma) in the match;
-- the forward/backward fuse;
 - learned trackers (CoTracker3 / TAPNext worker, SAM 2.1) behind the same operator and job protocol.
 
 ---
