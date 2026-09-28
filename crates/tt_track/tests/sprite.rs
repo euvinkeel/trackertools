@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use tt_core::history::{History, edit, redo, undo};
-use tt_core::input::{Action, PendingActions};
+
 use tt_core::op::{Dirty, Inputs, Invalidations, OpError, Operator, Output};
 use tt_core::signal::{FrameState, SignalStore};
 use tt_core::sketch::{BOX_CHANNELS, Capture, ClockMap, STREAM_CHANNELS, SketchParams, Stroke};
@@ -446,16 +446,15 @@ fn undo_redo_and_undeleting_a_tracker_complete_it() {
     assert_ne!(core.world.get::<TrackBook>(op).expect("book").stamp, 0);
 }
 
-/// T on a tracker at frame 0 (before its guide's frames … here the guide's
-/// first frame): the anchor becomes the first frame, so nothing runs
-/// backward. The old backward job must stop, not keep writing its results.
+/// Re-seeding a tracker from a look on the guide's first frame: nothing runs
+/// backward any more. The old backward job must stop, not keep writing its
+/// results.
 #[test]
 fn reseeding_at_the_guides_start_stops_the_backward_job() {
     let Some((mut core, guide)) = setup() else { return };
     let op = add_tracker(&mut core.world, guide, 600, None).expect("tracker");
     run(&mut core, op, Duration::from_secs(60), |w| status(w, op).backward.is_some_and(|s| s.at < 560));
-    core.world.resource_mut::<Transport>().seek(0);
-    core.world.resource_mut::<PendingActions>().push(Action::Track);
+    tt_track::reseed_with_look(&mut core.world, op, tt_track::look::Look::new(0, truth(0), [10.5, 10.5])).expect("look");
     core.run_pre_ui();
     assert_eq!(core.world.get::<Tracker>(op).expect("tracker").anchor, 0);
     assert_eq!(core.world.resource::<History>().undo_label(), Some("Re-seed tracker"));
@@ -470,7 +469,6 @@ fn reseeding_at_the_guides_start_stops_the_backward_job() {
     }
     let out = output(&core.world, op);
     assert!(out.iter().all(Option::is_some) && all_valid(&out));
-    // (The re-seed's look is cut where the last run put the tracker on frame 0.)
     let e = errors(&out, 0);
     assert!(e[e.len() / 2] < 0.5, "median {:.3}", e[e.len() / 2]);
 }
@@ -570,4 +568,27 @@ fn frames_the_guide_misses_are_flagged_not_removed() {
         assert!(marked >= 40, "{shift} px off: flagged {want} on {marked} of 50");
         assert!((600..700).chain(790..900).all(|f| out.get(f).is_some_and(|v| tt_track::flags(v) == 0)), "the rest are trusted");
     }
+}
+
+/// A look is a pin: on its frame, the tracker is where the user showed the
+/// subject, and it tracks on from there. Looks agree on one point: dragged
+/// 4 px right of the sprite's centre, the second look is aligned to the
+/// first (the centre), so the path neither jumps there nor after.
+#[test]
+fn a_look_pins_its_frame_and_tracking_goes_on_from_it() {
+    use tt_track::look::Look;
+    let Some((mut core, guide)) = setup() else { return };
+    let op = tt_track::add_tracker_with_look(&mut core.world, guide, Look::new(600, truth(600), [10.5, 10.5])).expect("tracker");
+    let at = [truth(800)[0] + 4.0, truth(800)[1]];
+    tt_track::add_look(&mut core.world, op, Look::new(800, at, [10.5, 10.5])).expect("look");
+    run(&mut core, op, Duration::from_secs(180), |_| false);
+    let sig = core.world.resource::<SignalStore>().get(core.world.get::<Output>(op).expect("output").0).expect("signal");
+    let v = sig.get(800).expect("frame 800");
+    let err = |f: i64| sig.get(f).map_or(f64::INFINITY, |v| (v[0] as f64 - truth(f)[0]).hypot(v[1] as f64 - truth(f)[1]));
+    println!("pinned frame 800: ({:.3}, {:.3}); the look was at ({:.3}, {:.3}), the sprite at {:?}; error {:.3} px, score {}, flags {}", v[0], v[1], at[0], at[1], truth(800), err(800), v[6], tt_track::flags(v));
+    assert!(err(800) < 0.35, "pinned on the sprite's centre, the point the first look defines");
+    assert_eq!((v[6], tt_track::flags(v)), (1.0, 0));
+    let worst = (600..1000).map(err).fold(0.0, f64::max);
+    println!("frames 600-999: worst error {worst:.2} px");
+    assert!(worst < 1.0, "no jumps between the looks");
 }

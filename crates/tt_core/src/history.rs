@@ -288,6 +288,18 @@ fn set_enabled(w: &mut World, e: Entity, enabled: bool) {
         if recompute {
             inv.recompute(e, frames);
         }
+    } else {
+        // An input with no output of its own (a tracker's look): the
+        // operators reading it recompute.
+        let mut q = w.query::<(Entity, &crate::op::Inputs)>();
+        let readers: Vec<Entity> = q.iter(w).filter(|(_, i)| i.0.iter().any(|(_, p)| *p == e)).map(|(r, _)| r).collect();
+        if !readers.is_empty() {
+            let frames = crate::op::extent(w);
+            let mut inv = w.resource_mut::<Invalidations>();
+            for r in readers {
+                inv.recompute(r, frames.clone());
+            }
+        }
     }
     w.resource_mut::<crate::op::OpGraph>().mark_stale();
 }

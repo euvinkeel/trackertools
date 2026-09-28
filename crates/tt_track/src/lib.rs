@@ -209,7 +209,26 @@ pub fn add_tracker_with_look(world: &mut World, guide: Entity, look: Look) -> Op
     Some(tracker)
 }
 
-/// Another look for `tracker` (one undo step); it re-tracks with all of them.
+/// Start `tracker` again from `look` (one undo step): the look goes first
+/// (it seeds) and its frame becomes the anchor.
+pub fn reseed_with_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity> {
+    let n = look::looks_of(world, tracker).len() + 1;
+    let frame = look.frame;
+    let mut made = None;
+    edit(world, "Re-seed tracker", |tx| {
+        let e = tx.spawn((Name::new(format!("Look {n}")), look));
+        tx.modify::<Inputs>(tracker, |i| {
+            let at = i.0.iter().position(|(s, _)| s == "look").unwrap_or(i.0.len());
+            i.0.insert(at, ("look".to_string(), e));
+        });
+        tx.modify::<Tracker>(tracker, |t| t.anchor = frame);
+        made = Some(e);
+    });
+    made
+}
+
+/// Another look for `tracker` (one undo step); it re-tracks with all of
+/// them, pinned on the look's frame.
 pub fn add_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity> {
     let n = look::looks_of(world, tracker).len() + 1;
     let mut made = None;
@@ -252,21 +271,23 @@ fn apply_track_actions(world: &mut World) {
     let frame = world.resource::<Transport>().frame();
     let space = world.resource::<ActiveView>().0;
     let selected = world.resource::<Selection>().entities.clone();
-    // A re-seed starts the tracker from its look on that frame: the look
-    // there, or a new one (first, so it seeds) where the tracker shows the
-    // subject now, the size of its first look.
-    let mut reseed: Vec<(Entity, FrameIndex, Option<Look>)> = Vec::new();
+    // A re-seed starts the tracker from the look on that frame (a painted
+    // one first), which moves first so it seeds. With no look there, the
+    // Track tool asks for one: the tracker's own position there may be
+    // wrong, so it never makes a look from it (it once seeded trackers on
+    // background that way).
+    let mut reseed: Vec<(Entity, FrameIndex, Entity)> = Vec::new();
+    let mut show: Option<Entity> = None;
     let mut guides: Vec<(Entity, Look)> = Vec::new();
     for e in selected {
         if is_tracker(world, e) {
-            let anchor = guide_of(world, e).and_then(|g| anchor_in(world, g, frame));
-            if let Some(a) = anchor.filter(|a| world.get::<Tracker>(e).is_some_and(|t| t.anchor != *a)) {
-                let looks = look::looks_of(world, e);
-                let has = looks.iter().any(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == a));
-                let at = world.get::<Output>(e).and_then(|o| world.resource::<SignalStore>().get(o.0)?.get(a).map(|v| [v[0] as f64, v[1] as f64]));
-                let at = at.or_else(|| guide_of(world, e).and_then(|g| look_from_guide(world, g, a)).map(|l| l.center()));
-                let half = looks.first().and_then(|l| world.get::<Look>(*l)).map_or([12.0, 12.0], Look::half);
-                reseed.push((e, a, (!has).then_some(()).and(at).map(|c| Look::new(a, c, half))));
+            let Some(a) = guide_of(world, e).and_then(|g| anchor_in(world, g, frame)) else { continue };
+            let here: Vec<Entity> = look::looks_of(world, e).into_iter().filter(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == a)).collect();
+            match here.iter().find(|l| world.get::<Look>(**l).is_some_and(|l| l.painted().is_some())).or(here.first()) {
+                // Already its anchor and first look: nothing to do.
+                Some(l) if world.get::<Tracker>(e).is_some_and(|t| t.anchor == a) && look::looks_of(world, e).first() == Some(l) => {}
+                Some(l) => reseed.push((e, a, *l)),
+                None => show = Some(e),
             }
         } else if let Some(s) = tt_core::sketch::sketch_of(world, e)
             && !guides.iter().any(|(g, _)| *g == s)
@@ -276,6 +297,13 @@ fn apply_track_actions(world: &mut World) {
         }
     }
     let name_of = |world: &World, e: Entity| world.get::<Name>(e).map_or("box".to_string(), |n| n.to_string());
+    if let Some(t) = show.filter(|_| reseed.is_empty() && guides.is_empty()) {
+        world.resource_mut::<Selection>().select_only(t);
+        world.resource_mut::<tt_core::tool::ActiveTool>().0 = tt_core::tool::Tool::Track;
+        let mut tool = world.resource_mut::<tool::TrackTool>();
+        (tool.reseed, tool.refused) = (Some(t), None);
+        return;
+    }
     let label = match (reseed.len(), guides.as_slice()) {
         (0, []) => return,
         (0, [(g, _)]) => format!("Track {}", name_of(world, *g)),
@@ -286,15 +314,14 @@ fn apply_track_actions(world: &mut World) {
     let first = tracker_count(world) + 1;
     let mut made = Vec::new();
     edit(world, &label, |tx| {
-        for (e, a, look) in reseed {
+        for (e, a, l) in reseed {
             tx.modify::<Tracker>(e, |t| t.anchor = a);
-            if let Some(look) = look {
-                let l = tx.spawn((Name::new(format!("Look (frame {a})")), look));
-                tx.modify::<Inputs>(e, |i| {
-                    let at = i.0.iter().position(|(s, _)| s == "look").unwrap_or(i.0.len());
-                    i.0.insert(at, ("look".to_string(), l));
-                });
-            }
+            tx.modify::<Inputs>(e, |i| {
+                let Some(from) = i.0.iter().position(|(s, p)| s == "look" && *p == l) else { return };
+                let item = i.0.remove(from);
+                let at = i.0.iter().position(|(s, _)| s == "look").unwrap_or(i.0.len());
+                i.0.insert(at, item);
+            });
         }
         for (i, (g, look)) in guides.into_iter().enumerate() {
             made.push(spawn_tracker(tx, format!("Tracker {}", first + i), g, look, space, false));
@@ -322,6 +349,10 @@ impl Module for TrackModule {
             .component::<Look>(Class::Document)
             .declare::<tool::TrackTool>(Class::Session)
             .init_resource::<tool::TrackTool>()
+            .declare::<look::LookDefaults>(Class::Session)
+            .init_resource::<look::LookDefaults>()
+            .declare::<look::LookMasker>(Class::Session)
+            .init_resource::<look::LookMasker>()
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .declare::<TrackStatus>(Class::Derived)

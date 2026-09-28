@@ -4,7 +4,7 @@
 
 use tt_core::view::{SourceSize, SpaceMap};
 use tt_track::image::{Grid, Luma, Patch, resample};
-use tt_track::ncc::{Mask, Template, best_match};
+use tt_track::ncc::{Mask, Template, best_match, photometric};
 
 const W: usize = 200;
 const H: usize = 160;
@@ -89,4 +89,41 @@ fn an_empty_mask_is_no_template() {
     let (grid, patch) = patch_of(&render([60.0, 50.0], 0));
     let empty = vec![0u8; 16];
     assert!(Template::cut_rect(&patch, grid.from_view([66.0, 59.0]), [8, 11], Some(Mask { cells: &empty, w: 4, h: 4 })).is_none());
+}
+
+/// A dim, low-contrast copy of the cursor's shape (what dark foliage with a
+/// similar gradient amounts to) correlates perfectly, but it isn't the
+/// cursor: its brightness and contrast are nothing like the cursor's, so it
+/// scores low, and the real one wins wherever both are in the search.
+#[test]
+fn a_dim_look_alike_does_not_score_like_the_bright_cursor() {
+    let (bright, dim) = ([40.0, 40.0], [140.0, 100.0]);
+    let mut frame = vec![20u8; W * H];
+    for y in 0..H {
+        for x in 0..W {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            if in_arrow(px, py, bright) {
+                frame[y * W + x] = 240;
+            } else if in_arrow(px, py, dim) {
+                frame[y * W + x] = 30; // the same shape, a tenth of the contrast, near black
+            }
+        }
+    }
+    let (grid, patch) = patch_of(&frame);
+    let cells = arrow_mask(32);
+    let masked = Template::cut_rect(&patch, grid.from_view([bright[0] + 6.0, bright[1] + 9.0]), [8, 11], Some(Mask { cells: &cells, w: 32, h: 32 })).expect("textured");
+    let plain = Template::cut_rect(&patch, grid.from_view([bright[0] + 6.0, bright[1] + 9.0]), [8, 11], None).expect("textured");
+    let around = |c: [f64; 2]| [[c[0] + 6.0 - 4.0, c[1] + 9.0 - 4.0], [c[0] + 6.0 + 4.0, c[1] + 9.0 + 4.0]];
+    for (name, t) in [("masked", &masked), ("plain", &plain)] {
+        let at_dim = best_match(&patch, t, around(dim), None).expect("placed").score;
+        let whole = best_match(&patch, t, [[f64::NEG_INFINITY; 2], [f64::INFINITY; 2]], None).expect("found");
+        println!("{name}: the dim look-alike scores {at_dim:.2}; over the whole frame the best is at {:?} ({:.2})", whole.pos, whole.score);
+        assert!(at_dim < 0.3, "{name}: the dim look-alike scores {at_dim:.2}");
+        assert!((whole.pos[0] - bright[0] - 6.0).abs() < 1.0 && (whole.pos[1] - bright[1] - 9.0).abs() < 1.0, "{name}: {:?}", whole.pos);
+        assert!(whole.score > 0.8, "{name}: {:.2}", whole.score);
+    }
+    // The factor itself: like the template, it costs nothing; 2x either way, still nothing.
+    assert_eq!(photometric(&masked, masked.mean, masked.sd), 1.0);
+    assert_eq!(photometric(&masked, masked.mean, masked.sd * 2.0), 1.0);
+    assert!(photometric(&masked, masked.mean, masked.sd * 0.1) < 0.25);
 }

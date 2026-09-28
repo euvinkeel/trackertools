@@ -23,6 +23,7 @@ use tt_core::view::SpaceMap;
 use tt_media::{DecodeOptions, FrameStream, VideoIndex};
 
 use crate::image::{Grid, Luma, Patch, resample_xy};
+use crate::ncc::best_match;
 use crate::template::{LookTemplate, Settings, TEMPLATE_R, TemplateTracker};
 use crate::{LOST, OUTSIDE, TRACK_CHANNELS};
 
@@ -34,6 +35,15 @@ pub struct LookSpec {
     pub half: [f64; 2],
     pub mask: Option<Vec<u8>>,
 }
+
+/// The look on frame `f` that counts there (a painted one first), if any.
+pub fn look_on(looks: &[LookSpec], f: FrameIndex) -> Option<usize> {
+    let on = || looks.iter().enumerate().filter(|(_, l)| l.frame == f);
+    on().find(|(_, l)| l.mask.is_some()).or_else(|| on().next()).map(|(i, _)| i)
+}
+
+/// A look matching another this well on its frame is aligned to it.
+const ALIGN_SCORE: f32 = 0.75;
 
 /// Which way a job runs from the anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -140,7 +150,7 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
         .name(format!("tracker {:?}", spec.side))
         .spawn(move || {
             let _alive = alive;
-            let mut worker = Worker { spec, shared, tx: tx.clone(), out: Vec::new(), flushed: Instant::now(), half: [TEMPLATE_R as f64; 2], margin: TEMPLATE_R as f64 + 2.0 };
+            let mut worker = Worker { spec, shared, tx: tx.clone(), out: Vec::new(), flushed: Instant::now(), half: [TEMPLATE_R as f64; 2], margin: TEMPLATE_R as f64 + 2.0, offsets: Vec::new() };
             let result = worker.run();
             worker.flush();
             let _ = tx.send(match result {
@@ -160,6 +170,8 @@ struct Worker {
     /// The output box's half-size, and the patch margin the templates need (patch px).
     half: [f64; 2],
     margin: f64,
+    /// Per look (the spec's order): its centre minus the tracked point, view px.
+    offsets: Vec<[f64; 2]>,
 }
 
 impl Worker {
@@ -177,6 +189,30 @@ impl Worker {
 
     fn guide(&self, f: FrameIndex) -> [f64; 6] {
         self.spec.guide[(f - self.spec.lo) as usize]
+    }
+
+    /// Where the user showed the subject on frame `f` (a look there, a
+    /// painted one first: the tracked point on it, view px), if they did.
+    fn pin(&self, f: FrameIndex) -> Option<[f64; 2]> {
+        let i = look_on(&self.spec.looks, f)?;
+        let c = self.map(f).from_source(self.spec.looks[i].center);
+        let o = self.offsets.get(i).copied().unwrap_or_default();
+        Some([c[0] - o[0], c[1] - o[1]])
+    }
+
+    /// One frame: pinned where a look says, else tracked in its patch.
+    fn track(&mut self, tracker: &mut TemplateTracker, f: FrameIndex, grid: Grid, patch: &Patch) {
+        let guide = self.guide_point(f);
+        match self.pin(f) {
+            Some(c) => {
+                tracker.pin(c, guide);
+                self.emit(f, c, 1.0, false);
+            }
+            None => {
+                let step = tracker.step(patch, grid, guide);
+                self.emit(f, step.pos, step.score, step.lost);
+            }
+        }
     }
 
     /// The guide's point on frame `f`, view px.
@@ -199,7 +235,7 @@ impl Worker {
         (grid, resample_xy(&luma, s.k, map, grid, w, h))
     }
 
-    /// A patch just big enough for a look's template, around view point `c` on frame `f`.
+    /// A patch just big enough for a template of half-size `r`, around view point `c` on frame `f`.
     fn patch_around(&self, frame: &[u8], f: FrameIndex, c: [f64; 2], r: [usize; 2]) -> (Grid, Patch) {
         let (map, s) = (self.map(f), &self.spec);
         let (w, h) = (2 * (r[0] + 4) + 1, 2 * (r[1] + 4) + 1);
@@ -209,30 +245,59 @@ impl Worker {
         (grid, resample_xy(&luma, s.k, map, grid, w, h))
     }
 
-    /// The looks' templates, each cut from its own frame through the view.
+    /// The looks' templates, each cut from its own frame through the view,
+    /// and aligned on one point. The seed look (on the anchor) defines it;
+    /// every other look, nearest the anchor first, is matched on its own
+    /// frame (within its own half-size of where the user put it) against
+    /// the looks aligned before it. Where one matches well, the look takes
+    /// that point: looks dragged a little differently around the same
+    /// cursor all report the same point on it. A look nothing matches
+    /// (another icon) keeps its own centre.
     fn look_templates(&mut self) -> Result<Vec<LookTemplate>> {
         let looks = self.spec.looks.clone();
+        let anchor = self.spec.anchor;
+        let seed = look_on(&looks, anchor).unwrap_or(0);
+        let mut order: Vec<usize> = (0..looks.len()).collect();
+        order.sort_by_key(|i| (*i != seed, (looks[*i].frame - anchor).abs(), *i));
         let mut frames: Vec<(FrameIndex, Vec<u8>)> = Vec::new();
-        let mut out = Vec::new();
-        for look in looks.iter() {
+        let mut out: Vec<(usize, LookTemplate)> = Vec::new();
+        self.offsets = vec![[0.0, 0.0]; looks.len()];
+        for i in order {
+            let look = &looks[i];
             if !frames.iter().any(|(f, _)| *f == look.frame) {
                 let frame = self.decode_one(look.frame)?;
                 frames.push((look.frame, frame));
             }
             if self.cancelled() {
-                return Ok(out);
+                return Ok(Vec::new());
             }
             let frame = &frames.iter().find(|(f, _)| *f == look.frame).expect("decoded").1;
             let map = self.map(look.frame);
             let c = map.from_source(look.center);
             let r = [look.half[0], look.half[1]].map(|h| ((h / map.a * self.spec.scale).round() as usize).max(2));
-            let (grid, patch) = self.patch_around(frame, look.frame, c, r);
-            match LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone()) {
-                Some(t) => out.push(t),
-                None => tracing::warn!("a look on frame {} has no detail to follow (flat or an empty mask); skipped", look.frame),
+            let reach = r[0].max(r[1]);
+            let (grid, patch) = self.patch_around(frame, look.frame, c, [r[0] + reach, r[1] + reach]);
+            let Some(mut t) = LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone()) else {
+                tracing::warn!("a look on frame {} has no detail to follow (flat or an empty mask); skipped", look.frame);
+                continue;
+            };
+            let at = grid.from_view(c);
+            let window = [[at[0] - reach as f64, at[1] - reach as f64], [at[0] + reach as f64, at[1] + reach as f64]];
+            let aligned = out
+                .iter()
+                .filter_map(|(_, a)| best_match(&patch, &a.template, window, None).map(|m| (m, a.offset)))
+                .filter(|(m, _)| m.score >= ALIGN_SCORE)
+                .max_by(|a, b| a.0.score.total_cmp(&b.0.score));
+            if let Some((m, o)) = aligned {
+                // There, the other look's centre is at m (its point at m − o): this look's offset from that point.
+                let p = grid.to_view(m.pos);
+                t.offset = [c[0] - (p[0] - o[0]), c[1] - (p[1] - o[1])];
             }
+            self.offsets[i] = t.offset;
+            out.push((i, t));
         }
-        Ok(out)
+        out.sort_by_key(|(i, _)| *i);
+        Ok(out.into_iter().map(|(_, t)| t).collect())
     }
 
     fn decode_one(&self, f: FrameIndex) -> Result<Vec<u8>> {
@@ -375,8 +440,7 @@ impl Worker {
             }
             self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
             let (grid, patch) = self.patch(&buf, f);
-            let step = tracker.step(&patch, grid, self.guide_point(f));
-            self.emit(f, step.pos, step.score, step.lost);
+            self.track(tracker, f, grid, &patch);
         }
         Ok(())
     }
@@ -406,8 +470,7 @@ impl Worker {
                     return Ok(());
                 }
                 let (grid, patch) = &patches[(f - lo) as usize];
-                let step = tracker.step(patch, *grid, self.guide_point(f));
-                self.emit(f, step.pos, step.score, step.lost);
+                self.track(tracker, f, *grid, patch);
             }
             hi = lo - 1;
         }

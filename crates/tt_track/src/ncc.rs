@@ -3,6 +3,13 @@
 //! it, after removing each one's brightness and contrast (−1 … 1), so a
 //! lighting change doesn't move the peak.
 //!
+//! Correlation alone sees only the *shape* of light and dark: a dim, nearly
+//! flat patch with a similar gradient scores like a bright white cursor. So
+//! the score is also scaled down where the pixels under the template differ
+//! a lot in contrast from the template's (more than 2× either way), and, for
+//! a painted template, in brightness: those pixels are the subject's own,
+//! and a screen recording doesn't relight a cursor ([`photometric`]).
+//!
 //! The correlation is *weighted*. By default the weights are a Gaussian over
 //! the template (centre-weighting): a box around a subject always holds some
 //! background, and the background changes as the subject moves across it.
@@ -24,6 +31,11 @@ pub struct Template {
     pub data: Vec<f32>,
     weights: Vec<f32>,
     kernel: Vec<f32>,
+    /// The weighted mean and spread of the pixels it was cut from (grey levels).
+    pub mean: f32,
+    pub sd: f32,
+    /// Weighted by a painted mask (its pixels are the subject's own).
+    pub masked: bool,
 }
 
 /// Which pixels of a rectangle are the subject: a `w × h` grid of cells
@@ -72,6 +84,29 @@ fn weights(rx: usize, ry: usize, mask: Option<Mask>) -> Option<Vec<f32>> {
 /// Below this standard deviation (grey levels) a template is flat: there is
 /// nothing in it to follow.
 const FLAT: f32 = 0.5;
+/// Contrast within this ratio of the template's (either way) costs nothing.
+const CONTRAST_SLACK: f32 = 0.5;
+/// A painted template's brightness may differ by this many of its spreads
+/// for free, and the score is gone this many spreads further.
+const BRIGHTNESS_SLACK: f32 = 1.0;
+const BRIGHTNESS_FADE: f32 = 2.0;
+
+/// How much of a placement's correlation counts (0 … 1), from the weighted
+/// mean and spread of the pixels under `t`: 1 while they are like the
+/// template's, less as the contrast differs by more than 2× either way (in
+/// proportion), or a painted template's brightness by more than one of its
+/// spreads.
+pub fn photometric(t: &Template, mean: f32, sd: f32) -> f32 {
+    let ratio = sd.min(t.sd) / sd.max(t.sd).max(1e-6);
+    let contrast = (ratio / CONTRAST_SLACK).min(1.0);
+    let brightness = if t.masked {
+        let d = (mean - t.mean).abs() / t.sd.max(FLAT);
+        (1.0 - (d - BRIGHTNESS_SLACK).max(0.0) / BRIGHTNESS_FADE).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    contrast * brightness
+}
 
 impl Template {
     /// A square, centre-weighted template cut from `patch` with its centre
@@ -89,10 +124,11 @@ impl Template {
                 data.push(patch.sample(c[0] + i as f64 - rx as f64, c[1] + j as f64 - ry as f64));
             }
         }
-        Self::normalized(rx, ry, data, weights(rx, ry, mask)?)
+        let masked = mask.is_some();
+        Self::normalized(rx, ry, data, weights(rx, ry, mask)?, masked)
     }
 
-    fn normalized(rx: usize, ry: usize, mut data: Vec<f32>, weights: Vec<f32>) -> Option<Template> {
+    fn normalized(rx: usize, ry: usize, mut data: Vec<f32>, weights: Vec<f32>, masked: bool) -> Option<Template> {
         let mean: f32 = data.iter().zip(&weights).map(|(v, w)| v * w).sum();
         data.iter_mut().for_each(|v| *v -= mean);
         let sd = data.iter().zip(&weights).map(|(v, w)| w * v * v).sum::<f32>().sqrt();
@@ -101,7 +137,7 @@ impl Template {
         }
         data.iter_mut().for_each(|v| *v /= sd);
         let kernel = data.iter().zip(&weights).map(|(v, w)| v * w).collect();
-        Some(Template { rx, ry, data, weights, kernel })
+        Some(Template { rx, ry, data, weights, kernel, mean, sd, masked })
     }
 
     /// `(1 − t) · a + t · b`, renormalized: an appearance between the two
@@ -112,7 +148,14 @@ impl Template {
         }
         let data = a.data.iter().zip(&b.data).map(|(x, y)| (1.0 - t) * x + t * y).collect();
         // Both are unit-norm; a blend of two flat-free templates is flat only if they cancel.
-        Self::normalized(a.rx, a.ry, data, a.weights.clone()).unwrap_or_else(|| a.clone())
+        match Self::normalized(a.rx, a.ry, data, a.weights.clone(), a.masked) {
+            Some(mut m) => {
+                // (Normalized data have mean 0 and spread 1: the blend's own are the pixels'.)
+                (m.mean, m.sd) = ((1.0 - t) * a.mean + t * b.mean, (1.0 - t) * a.sd + t * b.sd);
+                m
+            }
+            None => a.clone(),
+        }
     }
 
     fn size(&self) -> (usize, usize) {
@@ -125,12 +168,13 @@ impl Template {
 pub struct Match {
     /// Patch point of the template's centre (subpixel).
     pub pos: [f64; 2],
-    /// Normalized cross-correlation there (−1 … 1).
+    /// Normalized cross-correlation there (−1 … 1), times [`photometric`].
     pub score: f32,
 }
 
 /// A preference for placements near a predicted centre: `weight · (d / radius)²`
-/// is subtracted when ranking placements (the reported score is the raw one).
+/// is subtracted when ranking placements, up to `weight` at `radius` and
+/// beyond (the reported score is the raw one).
 #[derive(Clone, Copy, Debug)]
 pub struct Prior {
     pub centre: [f64; 2],
@@ -181,7 +225,8 @@ pub fn best_match(patch: &Patch, t: &Template, window: [[f64; 2]; 2], prior: Opt
             if var < FLAT * FLAT {
                 continue; // flat under the template: no evidence either way
             }
-            scores[dv * nu + du] = (cov / var.sqrt()).min(1.0);
+            let sd = var.sqrt();
+            scores[dv * nu + du] = (cov / sd).min(1.0) * photometric(t, mean + reference, sd);
         }
     }
 
@@ -192,7 +237,7 @@ pub fn best_match(patch: &Patch, t: &Template, window: [[f64; 2]; 2], prior: Opt
             Some(p) => {
                 let c = centre(du, dv);
                 let d2 = ((c[0] - p.centre[0]).powi(2) + (c[1] - p.centre[1]).powi(2)) / p.radius.max(1e-6).powi(2);
-                s - p.weight * d2 as f32
+                s - p.weight * d2.min(1.0) as f32
             }
             None => s,
         }

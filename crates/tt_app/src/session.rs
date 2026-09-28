@@ -13,6 +13,7 @@ use tt_core::sketch::SketchParams;
 use tt_core::time::{FrameIndex, WallClock};
 use tt_core::transport::Transport;
 use tt_core::view::ViewDefaults;
+use tt_track::look::LookDefaults;
 use tt_core::{AppBuilder, Class, Module, Set};
 
 use crate::media::{Media, OpenRequest};
@@ -61,6 +62,8 @@ struct SettingsFile {
     clear_radius: f32,
     /// Anticipatory speed: on/off and its knobs.
     auto_speed: AutoSpeed,
+    /// New tracker looks get their mask painted automatically.
+    auto_mask_looks: bool,
 }
 
 impl Default for SettingsFile {
@@ -78,12 +81,13 @@ impl Default for SettingsFile {
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
             auto_speed: AutoSpeed::default(),
+            auto_mask_looks: LookDefaults::default().auto_mask,
         }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed) -> Self {
+    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed, l: &LookDefaults) -> Self {
         Self {
             version: SETTINGS_VERSION,
             wheel: d.wheel,
@@ -95,6 +99,7 @@ impl SettingsFile {
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
             auto_speed: a.clone(),
+            auto_mask_looks: l.auto_mask,
         }
     }
 
@@ -121,6 +126,9 @@ impl SettingsFile {
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
         // Version 3 turned anticipatory speed on by default.
         *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };
+        if let Some(mut l) = world.get_resource_mut::<LookDefaults>() {
+            l.auto_mask = self.auto_mask_looks;
+        }
     }
 }
 
@@ -187,8 +195,8 @@ impl Session {
 }
 
 /// The Settings tab's values, kept in the session file.
-fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, auto: Res<AutoSpeed>, mut session: ResMut<Session>) {
-    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto);
+fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, auto: Res<AutoSpeed>, looks: Res<LookDefaults>, mut session: ResMut<Session>) {
+    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto, &looks);
     if session.file.settings != settings && !session.scripted {
         session.file.settings = settings;
     }
@@ -260,7 +268,7 @@ mod tests {
     #[test]
     fn the_preset_new_sketches_use_is_remembered() {
         let chosen = SketchDefaults { params: SketchParams::preset("Loose").unwrap(), ..SketchDefaults::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default())).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default(), &LookDefaults::default())).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();
@@ -273,7 +281,7 @@ mod tests {
     #[test]
     fn auto_speed_and_its_knobs_are_remembered() {
         let knobs = AutoSpeed { enabled: true, comfort: 450.0, look_ahead: 0.0, ..AutoSpeed::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs)).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs, &LookDefaults::default())).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();

@@ -57,6 +57,15 @@ fn cells(world: &World, look: &Look) -> Option<Vec<Color32>> {
     )
 }
 
+/// A new look's mask, painted automatically (`tt_track::look::LookMasker`):
+/// the cells that differ from its rectangle's border. None when its frame
+/// isn't decoded or too little stands out (it stays centre-weighted).
+pub fn auto_mask_look(world: &World, look: &Look) -> Option<Vec<u8>> {
+    let mask = auto_mask(&cells(world, look)?);
+    let on = mask.iter().filter(|c| **c > 0).count();
+    (on >= 6 && on < mask.len() * 9 / 10).then_some(mask)
+}
+
 /// Cells that differ from the rectangle's border colour: the subject on a plain background.
 fn auto_mask(colors: &[Color32]) -> Vec<u8> {
     let border: Vec<Color32> = (0..MASK_N * MASK_N).filter(|k| k % MASK_N == 0 || k % MASK_N == MASK_N - 1 || k / MASK_N == 0 || k / MASK_N == MASK_N - 1).map(|k| colors[k]).collect();

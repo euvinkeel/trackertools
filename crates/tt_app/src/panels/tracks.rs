@@ -172,11 +172,13 @@ pub fn draw_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, wo
         }
     }
     let world_ref: &World = world;
-    let adding = world_ref.resource::<Selection>().primary().is_some_and(|e| is_tracker(world_ref, e));
-    let text = format!(
-        "TRACK · drag around what to follow (its pattern) · click: a point, the dashed box's size (wheel) · {}· T/Esc exits",
-        if adding { "Shift+drag: another look for the selected tracker " } else { "" }
-    );
+    let selected = world_ref.resource::<Selection>().primary().filter(|e| is_tracker(world_ref, *e));
+    let name = selected.and_then(|e| world_ref.get::<Name>(e)).map_or("the tracker".to_string(), |n| n.to_string());
+    let text = match (selected, tool.reseed) {
+        (Some(t), Some(r)) if t == r => format!("TRACK · drag around the subject on this frame: {name} starts again from it · T/Esc exits"),
+        (Some(_), _) => format!("TRACK · drag around the subject where {name} missed it: a new look, pinned here · Shift+drag: a new tracker · T/Esc exits"),
+        _ => "TRACK · drag around what to follow (its pattern) · click: a point, the dashed box's size (wheel) · T/Esc exits".to_string(),
+    };
     let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), TRACK);
     let r = Align2::LEFT_TOP.anchor_size(map.panel.left_top() + Vec2::new(15.0, 65.0), galley.size()).expand(5.0);
     painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
@@ -219,26 +221,33 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             ui.colored_label(LOST, format!("⚠ {}", err.0));
         }
         let guide = guide_of(world, e).and_then(|g| world.get::<Name>(g)).map(|n| n.to_string());
-        ui.label(egui::RichText::new(format!("searches inside {} · Track tool + Shift: another look · \"Re-seed here\" starts it again from the playhead", guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
+        ui.label(egui::RichText::new(format!("searches inside {} · where it misses: Track tool, drag around the subject (a new look, pinned there) · \"Re-seed here\" starts it again from the playhead", guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
         let status = world.get::<TrackStatus>(e).cloned().unwrap_or_default();
         let (covered, lost) = counts(ui, world, e);
         ui.label(format!("{covered} frames tracked · {lost} flagged (lost, or outside the sketch){}", if status.rendition.is_empty() { String::new() } else { format!(" · reads the {}", status.rendition) }));
         // Its looks: select one to paint its mask.
         let looks = looks_of(world, e);
+        let mut remove = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Looks:");
             for l in &looks {
                 let Some(look) = world.get::<Look>(*l) else { continue };
-                let painted = if look.painted().is_some() { " · masked" } else { "" };
+                let painted = if look.painted().is_some() { " · masked" } else { " · unpainted" };
                 let label = format!("frame {} · {:.0}×{:.0}{painted}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h);
-                if ui.button(label).on_hover_text("Select it to paint which pixels are the subject; the playhead goes to its frame").clicked() {
-                    let f = look.frame;
+                let f = look.frame;
+                if ui.button(label).on_hover_text("Select it to see and paint which pixels are the subject; the playhead goes to its frame").clicked() {
                     world.resource_mut::<Selection>().select_only(*l);
                     world.resource_mut::<PendingActions>().push(Action::Seek(f));
                 }
+                if ui.small_button("✕").on_hover_text("Remove this look (it re-tracks without it)").clicked() {
+                    remove = Some(*l);
+                }
             }
         });
-        if ui.button("Re-seed here").on_hover_text("Start it again from the playhead: a new look where it shows the subject now").clicked() {
+        if let Some(l) = remove {
+            tt_core::commands::delete(world, &[l]);
+        }
+        if ui.button("Re-seed here").on_hover_text("Start it again from the playhead, from your look on this frame (with none here, drag around the subject first)").clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }
         for (s, forward) in [(status.forward, true), (status.backward, false)] {

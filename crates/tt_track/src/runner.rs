@@ -51,7 +51,7 @@ use crate::{Direction, Rendition, TRACK_CHANNELS, Tracker, guide_of};
 
 /// Part of every stamp: bump it when a change to the tracking makes saved
 /// results out of date (they re-track when their project is opened).
-const ALGO_VERSION: u64 = 1;
+const ALGO_VERSION: u64 = 2;
 
 /// The video trackers read (set by the host when media opens and when its proxy is ready).
 #[derive(Resource, Clone)]
@@ -689,7 +689,6 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         return Err("the guide is not a box".into());
     }
     let (lo, hi) = sig.present_hull().ok_or("the guide has no frames yet")?;
-    let anchor = params.anchor.clamp(lo, hi);
 
     // The guide's boxes over its whole span, gaps interpolated.
     let mut boxes: Vec<Option<[f64; 6]>> = (lo..=hi).map(|f| sig.get(f).map(|v| std::array::from_fn(|c| v[c] as f64))).collect();
@@ -705,7 +704,11 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         .filter(|l| (lo..=hi).contains(&l.frame))
         .map(|l| LookSpec { frame: l.frame, center: l.center(), half: l.half(), mask: l.painted().map(<[u8]>::to_vec) })
         .collect();
-    let seed = looks.iter().find(|l| l.frame == anchor).map(|l| l.center);
+    // It starts on its anchor frame, from the look there (a painted one
+    // first); with no look there (it was deleted), from its first look.
+    let anchor = params.anchor.clamp(lo, hi);
+    let anchor = if looks.is_empty() || looks.iter().any(|l| l.frame == anchor) { anchor } else { looks[0].frame };
+    let seed = crate::job::look_on(&looks, anchor).map(|i| looks[i].center);
 
     // Patch scale: the first look's larger half-size spans `LOOK_PX` patch
     // pixels; with no looks (an older tracker), the feature (a fraction of

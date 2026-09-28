@@ -380,6 +380,15 @@ Findings on the way:
 - **Validity is a flag:** `flags` marks lost (below `min_score`, now 0.6) and outside (the point left the guide's box). Raw values stay; views and re-centring skip flagged frames; the overlay draws them red. Older 7-channel results are replaced.
 - Measured: a placed look tracks at median 0.08 px (max 0.20); a masked cursor arrow over a changing background at ≤ 0.53 px, where the unmasked one gets lost.
 
+**Fixes after hands-on use** ("it's totally missing the white cursor and marking it found", at 0.97 on dark foliage; DESIGN §6.3):
+- *Re-seed here* no longer makes a look where the tracker is (that is how foliage became the seed); with no look on the frame it asks for one (the Track tool).
+- Scores also require similar contrast (and, painted, brightness): a dim look-alike no longer scores like a white cursor.
+- Every look pins its frame; all looks agree on one point (aligned against each other when jobs start), so patches don't make the path jump.
+- The search widens from the prediction to the whole guide box when nothing near is good enough.
+- With a tracker selected, the Track tool's drag patches it; new looks are masked automatically (a setting).
+- Deleting or restoring a look re-tracks.
+- On the user's footage (frames 37619–40235): on the cursor 84.6% → 100.0%, at ~90 fps (DESIGN §6.3 table).
+
 **Next:**
 - trackers in the timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);
 - unguided trackers (search around the last position and velocity);

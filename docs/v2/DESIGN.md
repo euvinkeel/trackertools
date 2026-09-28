@@ -220,20 +220,35 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 | **Look** | a pattern the subject can look like: a frame, a rectangle there (source px), and an optional painted **mask** (which pixels are the subject) | the tracker's `look` inputs, like a sketch's strokes |
 
 - **The first look is the seed.** Its frame is the anchor, and the tracker's point there is exactly its centre, where the user put it. Re-centring on the guide is off for placed trackers.
-- **Every look is a template.** The rectangle is resampled through the tracker's view. Weights are the mask where painted, the centre-weighting where not. On each frame the best-matching look wins, blended with the last frame's appearance (`adapt`). A cursor that changes icon is several looks on one tracker. The mask keeps the background behind the cursor from counting.
+- **Every look is a template.** The rectangle is resampled through the tracker's view. Weights are the mask where painted, the centre-weighting where not. On each frame the best-matching look wins, blended with the last frame's appearance (`adapt`). A cursor that changes icon is several looks on one tracker. The mask keeps the background behind the cursor from counting. New looks get their mask painted automatically (the cells that stand out from the rectangle's border; a setting, on by default).
+- **A match must look alike, not just correlate.** Normalized correlation sees only the shape of light and dark, so a dim patch of foliage with a similar gradient scored 0.97 against a white cursor. The score is now scaled down where the pixels' contrast differs from the look's by more than 2× either way (in proportion), and, for a painted look, where their brightness differs by more than one of its spreads: a screen recording never relights the cursor's own pixels (`ncc::photometric`).
+- **Every look is a pin.** On a look's frame the tracker is where the user showed the subject (score 1), and tracking goes on from there, in both directions. Patching a tracker where it misses is adding a look there.
+- **One point for all looks.** A look's centre is wherever its rectangle happened to be, so looks disagreed by a few pixels on where the point is, and the path jumped when another look matched best. When jobs start, every look is matched on its own frame (within its half-size of where it was put) against the looks aligned before it, starting from the seed, then nearest the anchor first. Where one matches (score ≥ 0.75), the look takes on that point; a look nothing matches (another icon) keeps its own centre. Pins land on the aligned point too.
+- **Search:** within 40 patch px of the prediction first (the guide's point plus the last offset); where nothing there reaches `min_score`, the whole patch (the guide's box × `search`), because on a flick the hand, and so the prediction, lags.
 - **Validity is a flag, never a deletion.** Output `[x, y, left, top, right, bottom, score, flags]`. `flags` marks *lost* (score below `min_score`) and *outside* (the point left the guide's box: the rough pass says the subject isn't there). Raw values stay. Consumers (views framed on the tracker, re-centring, export) skip flagged frames; the overlay and timeline draw them red. Changing the rule re-flags, it doesn't re-track.
 - **Unguided trackers** (planned). Without a sketch, the search would be around the last position and velocity, within `search` × the pattern's size. For now the tool asks for a sketch first ("Draw a sketch over the subject first (D)"): it makes the search region and the prediction far better.
 
 **The Track tool** (`T`; `T` or `Esc` leaves it):
 - **drag** a rectangle on the video: a new tracker with that look on the shown frame;
 - **click**: a point tracker with the brush-sized pattern (the wheel sizes it, a dashed box shows it);
-- `Shift`+drag with a tracker selected: another look for it, on this frame;
-- the guide is the selected sketch, else the smallest sketch whose box holds the rectangle's centre on this frame;
+- with a **tracker selected**, a drag or click **patches** it: another look, on this frame, where the subject really is (the path is pinned there; a new icon is learned too). `Shift` makes a new tracker instead. *(Changed after hands-on use: "my workflow is to just kinda patch wherever it seems to miss".)*
+- the guide is the selected sketch (or the selected tracker's guide), else the smallest sketch whose box holds the rectangle's centre on this frame;
 - the tracker works in the guide's own view (created if needed), so the pattern is cut and matched where the subject sits still.
 
 **The Look editor** (a panel): the selected look's pixels, magnified. Paint the mask (left paints the subject, right erases; a drag is one undo step); *Auto* (the cells that differ from the rectangle's border: a cursor on a plain background), *Fill*, *Invert*, *Clear* (back to centre-weighting). Editing a look re-tracks.
 
-Also: guide-seeded trackers (*Track its centre* on a sketch, `T`) keep re-centring on the guide; *Re-seed here* on a tracker adds a look where the tracker shows the subject on the playhead's frame and starts from it.
+Also: guide-seeded trackers (*Track its centre* on a sketch, `T`) keep re-centring on the guide. *Re-seed here* (`T` on a tracker) starts it again from its look on the playhead's frame (a painted one first), which moves first. With no look there, it switches to the Track tool and the next drag is that look. *(Fixed after hands-on use: re-seeding used to make a look wherever the tracker was on that frame. Where the tracker had drifted onto dark foliage, that look was foliage, and it became the seed, so the tracker followed foliage at 0.97.)* Deleting or restoring a look re-tracks (any input without an output of its own recomputes its readers when it is deleted or restored).
+
+**On real footage** (the user's 1080p60 gameplay, their Tracker 1: 5 painted looks, frames 37619–40235, replayed headless by `tests/real_footage.rs`; "on the cursor" = at least 12 near-white pixels within 14 px of the point):
+
+| | on the cursor | longest miss | speed |
+|---|---|---|---|
+| the sketch alone (the guide) | 78.8% | 48 frames | |
+| the tracker before these changes (its saved result) | 84.6% | 160 frames | |
+| after, with its 3 re-seed looks of foliage still in | 99.6% | 9 frames (at those looks) | 72 fps |
+| after, those 3 looks deleted | 100.0% (1 frame off) | 1 frame | 93 fps |
+
+Frame to frame, the point's offset from the cursor's white body changes by a median of 0.30 px (p95 1.08). Before the changes it was 0.36 px (p95 1.43), and that was only on the frames where the tracker was on the cursor at all.
 
 Measured (`tests/sprite.rs`, `tests/masks.rs`, the in-app demo):
 - a placed look on the sprite fixture: median 0.08 px, max 0.20 against the truth, no re-centring;

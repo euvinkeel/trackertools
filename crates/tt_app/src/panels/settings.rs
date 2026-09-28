@@ -30,6 +30,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         auto_speed(ui, world);
 
         ui.separator();
+        ui.heading("Trackers");
+        let mut auto_mask = world.resource::<tt_track::look::LookDefaults>().auto_mask;
+        if ui
+            .checkbox(&mut auto_mask, "Paint a new look's mask automatically")
+            .on_hover_text("When you drag a look, the pixels that stand out from its rectangle's border (a cursor over the game) become its mask, so only they count. You can still repaint it in the Look editor.")
+            .changed()
+        {
+            world.resource_mut::<tt_track::look::LookDefaults>().auto_mask = auto_mask;
+        }
+
+        ui.separator();
         ui.heading("Views");
         ui.label("New views (Tab into a sketch)");
         let (pan, lock) = {

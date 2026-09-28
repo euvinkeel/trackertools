@@ -53,10 +53,45 @@ impl Look {
     }
 }
 
-/// A tracker's looks, in order (the first is the seed).
+/// How new looks start (a user setting; the app remembers it).
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct LookDefaults {
+    /// Paint a new look's mask from its pixels ([`LookMasker`]), so only the
+    /// subject counts without a trip to the Look editor.
+    pub auto_mask: bool,
+}
+
+impl Default for LookDefaults {
+    fn default() -> Self {
+        Self { auto_mask: true }
+    }
+}
+
+/// Paints a look's mask from its pixels (None: nothing stands out, or its
+/// frame isn't decoded). The app installs it: it has the decoded frames.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct LookMasker(pub Option<MaskFn>);
+
+/// Paints a look's mask from the pixels of its frame (see [`LookMasker`]).
+pub type MaskFn = fn(&World, &Look) -> Option<Vec<u8>>;
+
+/// `look` with its mask painted automatically, if the setting is on and a masker can.
+pub fn auto_masked(world: &World, mut look: Look) -> Look {
+    let on = world.get_resource::<LookDefaults>().is_some_and(|d| d.auto_mask);
+    if on
+        && look.painted().is_none()
+        && let Some(mask) = world.get_resource::<LookMasker>().and_then(|m| m.0).and_then(|f| f(world, &look))
+    {
+        look.mask = mask;
+    }
+    look
+}
+
+/// A tracker's looks, in order (the first is the seed): live ones (not
+/// deleted, nor references a reopened project couldn't resolve).
 pub fn looks_of(world: &World, tracker: Entity) -> Vec<Entity> {
     world
         .get::<Inputs>(tracker)
-        .map(|i| i.0.iter().filter(|(s, _)| s == "look").map(|(_, e)| *e).filter(|e| world.get::<bevy_ecs::entity_disabling::Disabled>(*e).is_none()).collect())
+        .map(|i| i.0.iter().filter(|(s, _)| s == "look").map(|(_, e)| *e).filter(|e| world.get::<Look>(*e).is_some() && world.get::<bevy_ecs::entity_disabling::Disabled>(*e).is_none()).collect())
         .unwrap_or_default()
 }
