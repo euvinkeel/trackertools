@@ -206,6 +206,32 @@ It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)
 
 Strategies (template now; learned models later) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. A Python worker for CoTracker3, TAPNext or SAM 2.1 slots in as another job backend.
 
+### 6.3 Defining a tracker: looks, the Track tool, validity
+
+*(Planned after hands-on use: "I have no idea what point it's selecting… it just appears somewhere." A tracker's point came from the sketch and its pattern from a fraction of the sketch's box, and re-centring moved it again afterwards, so the user controlled none of it.)*
+
+A tracker is defined by what the user shows it. State stays flat, and every part stays re-tunable and removable:
+
+| Entity | Is | Connected by |
+|---|---|---|
+| **Tracker** (`track` operator) | anchor frame, direction, search, adapt, min score, rendition… | inputs `guide` (a sketch: the search region and the motion prior; optional), `space` (the view it works in: by default the guide's own stabilized view), `look` (one per look, in order) |
+| **Look** | a pattern the subject can look like: a frame, a rectangle there (source px), and an optional painted **mask** (which pixels are the subject) | the tracker's `look` inputs, like a sketch's strokes |
+
+- **The first look is the seed.** Its frame is the anchor, and the tracker's point there is exactly its centre, where the user put it. Re-centring on the guide is off for placed trackers.
+- **Every look is a template.** The rectangle is resampled through the tracker's view. Weights are the mask where painted, the centre-weighting where not. On each frame the best-matching look wins, blended with the last frame's appearance (`adapt`). A cursor that changes icon is several looks on one tracker. The mask keeps the background behind the cursor from counting.
+- **Validity is a flag, never a deletion.** Output `[x, y, left, top, right, bottom, score, flags]`. `flags` marks *lost* (score below `min_score`) and *outside* (the point left the guide's box: the rough pass says the subject isn't there). Raw values stay. Consumers (views framed on the tracker, re-centring, export) skip flagged frames; the overlay and timeline draw them red. Changing the rule re-flags, it doesn't re-track.
+- **Unguided trackers** are allowed. Without a sketch, the search is around the last position and velocity, within `search` × the pattern's size. A sketch makes the search region and the prediction far better, and the tool says so.
+
+**The Track tool** (`T`; `T` or `Esc` leaves it):
+- **drag** a rectangle on the video: a new tracker with that look on the shown frame;
+- **click**: a point tracker with the brush-sized pattern (the wheel sizes it, a dashed box shows it);
+- `Shift`+drag with a tracker selected: another look for it, on this frame;
+- the guide is the selected sketch, else the smallest sketch whose box holds the rectangle on this frame, else none.
+
+**The Look editor** (a panel): the selected look's pixels, magnified. Paint the mask (left paints the subject, right erases); *fill* and *clear*.
+
+Learned point trackers (CoTracker3 / TAPNext: click a point, the model predicts where it goes) sit behind the same entities as another `method`. Their seeds are the looks' centres, their search region is the guide, and they work through the same view.
+
 **Result caching** (planned for after M4): results keyed by `(kind, params hash, input chunk versions)` in a content-addressed store. Undo and redo then re-link earlier results instead of recomputing, and A/B-ing parameters becomes free.
 
 ---

@@ -3,38 +3,70 @@
 //! it, after removing each one's brightness and contrast (−1 … 1), so a
 //! lighting change doesn't move the peak.
 //!
-//! The correlation is *centre-weighted* (a Gaussian over the template): a
-//! box around a subject always holds some background, and the background
-//! changes as the subject moves across it. Weighting keeps the subject in
-//! charge of the score.
+//! The correlation is *weighted*. By default the weights are a Gaussian over
+//! the template (centre-weighting): a box around a subject always holds some
+//! background, and the background changes as the subject moves across it.
+//! A painted mask replaces them: only the pixels that are the subject count
+//! (a cursor over whatever is behind it).
 
 use crate::image::Patch;
 
-/// The weighting's width, as a fraction of the template's half-size.
+/// The centre-weighting's width, as a fraction of the template's half-size.
 const SIGMA: f64 = 0.45;
 
-/// A square template of side `2 r + 1`: values with zero weighted mean and
-/// unit weighted norm, and the kernel `weight · value` that correlates them.
+/// A rectangular template of `(2 rx + 1) × (2 ry + 1)` pixels: values with
+/// zero weighted mean and unit weighted norm, its weights (summing to 1),
+/// and the kernel `weight · value` that correlates them.
 #[derive(Clone, Debug)]
 pub struct Template {
-    pub r: usize,
+    pub rx: usize,
+    pub ry: usize,
     pub data: Vec<f32>,
+    weights: Vec<f32>,
     kernel: Vec<f32>,
 }
 
-/// Gaussian weights over a `(2 r + 1)²` template, summing to 1.
-fn weights(r: usize) -> Vec<f32> {
-    let side = 2 * r + 1;
-    let s2 = 2.0 * (SIGMA * r.max(1) as f64).powi(2);
-    let mut w: Vec<f64> = (0..side * side)
+/// Which pixels of a rectangle are the subject: a `w × h` grid of cells
+/// (0–255) laid over it, row-major.
+#[derive(Clone, Copy, Debug)]
+pub struct Mask<'a> {
+    pub cells: &'a [u8],
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Mask<'_> {
+    /// The cell under relative position `(u, v)` in `[0, 1)²`, 0–1.
+    fn at(&self, u: f64, v: f64) -> f32 {
+        let i = ((u * self.w as f64) as usize).min(self.w - 1);
+        let j = ((v * self.h as f64) as usize).min(self.h - 1);
+        self.cells[j * self.w + i] as f32 / 255.0
+    }
+}
+
+/// Weights over a `(2 rx + 1) × (2 ry + 1)` template, summing to 1: the
+/// mask's where given, else a Gaussian. None if the mask is empty.
+fn weights(rx: usize, ry: usize, mask: Option<Mask>) -> Option<Vec<f32>> {
+    let (sx, sy) = (2 * rx + 1, 2 * ry + 1);
+    let (gx, gy) = (2.0 * (SIGMA * rx.max(1) as f64).powi(2), 2.0 * (SIGMA * ry.max(1) as f64).powi(2));
+    let mut w: Vec<f64> = (0..sx * sy)
         .map(|k| {
-            let (i, j) = ((k % side) as f64 - r as f64, (k / side) as f64 - r as f64);
-            (-(i * i + j * j) / s2).exp()
+            let (i, j) = (k % sx, k / sx);
+            match mask {
+                Some(m) => m.at((i as f64 + 0.5) / sx as f64, (j as f64 + 0.5) / sy as f64) as f64,
+                None => {
+                    let (x, y) = (i as f64 - rx as f64, j as f64 - ry as f64);
+                    (-(x * x / gx) - y * y / gy).exp()
+                }
+            }
         })
         .collect();
     let sum: f64 = w.iter().sum();
+    if sum <= 1e-9 {
+        return None;
+    }
     w.iter_mut().for_each(|v| *v /= sum);
-    w.into_iter().map(|v| v as f32).collect()
+    Some(w.into_iter().map(|v| v as f32).collect())
 }
 
 /// Below this standard deviation (grey levels) a template is flat: there is
@@ -42,41 +74,49 @@ fn weights(r: usize) -> Vec<f32> {
 const FLAT: f32 = 0.5;
 
 impl Template {
-    /// Cut from `patch` with its centre pixel's centre at patch point `c`
-    /// (bilinear, so `c` may be fractional). None if the cut is flat.
+    /// A square, centre-weighted template cut from `patch` with its centre
+    /// pixel's centre at patch point `c` (bilinear, so `c` may be
+    /// fractional). None if the cut is flat.
     pub fn cut(patch: &Patch, c: [f64; 2], r: usize) -> Option<Template> {
-        let side = 2 * r + 1;
-        let mut data = Vec::with_capacity(side * side);
-        for j in 0..side {
-            for i in 0..side {
-                data.push(patch.sample(c[0] + i as f64 - r as f64, c[1] + j as f64 - r as f64));
-            }
-        }
-        Self::normalized(r, data)
+        Self::cut_rect(patch, c, [r, r], None)
     }
 
-    fn normalized(r: usize, mut data: Vec<f32>) -> Option<Template> {
-        let w = weights(r);
-        let mean: f32 = data.iter().zip(&w).map(|(v, w)| v * w).sum();
+    /// A `(2 rx + 1) × (2 ry + 1)` template, weighted by `mask` if given.
+    pub fn cut_rect(patch: &Patch, c: [f64; 2], [rx, ry]: [usize; 2], mask: Option<Mask>) -> Option<Template> {
+        let mut data = Vec::with_capacity((2 * rx + 1) * (2 * ry + 1));
+        for j in 0..2 * ry + 1 {
+            for i in 0..2 * rx + 1 {
+                data.push(patch.sample(c[0] + i as f64 - rx as f64, c[1] + j as f64 - ry as f64));
+            }
+        }
+        Self::normalized(rx, ry, data, weights(rx, ry, mask)?)
+    }
+
+    fn normalized(rx: usize, ry: usize, mut data: Vec<f32>, weights: Vec<f32>) -> Option<Template> {
+        let mean: f32 = data.iter().zip(&weights).map(|(v, w)| v * w).sum();
         data.iter_mut().for_each(|v| *v -= mean);
-        let sd = data.iter().zip(&w).map(|(v, w)| w * v * v).sum::<f32>().sqrt();
+        let sd = data.iter().zip(&weights).map(|(v, w)| w * v * v).sum::<f32>().sqrt();
         if sd < FLAT {
             return None;
         }
         data.iter_mut().for_each(|v| *v /= sd);
-        let kernel = data.iter().zip(&w).map(|(v, w)| v * w).collect();
-        Some(Template { r, data, kernel })
+        let kernel = data.iter().zip(&weights).map(|(v, w)| v * w).collect();
+        Some(Template { rx, ry, data, weights, kernel })
     }
 
-    /// `(1 − t) · a + t · b`, renormalized: an appearance between the two.
+    /// `(1 − t) · a + t · b`, renormalized: an appearance between the two
+    /// (with `a`'s weights; both must be the same size).
     pub fn blend(a: &Template, b: &Template, t: f32) -> Template {
+        if (a.rx, a.ry) != (b.rx, b.ry) {
+            return a.clone();
+        }
         let data = a.data.iter().zip(&b.data).map(|(x, y)| (1.0 - t) * x + t * y).collect();
         // Both are unit-norm; a blend of two flat-free templates is flat only if they cancel.
-        Self::normalized(a.r, data).unwrap_or_else(|| a.clone())
+        Self::normalized(a.rx, a.ry, data, a.weights.clone()).unwrap_or_else(|| a.clone())
     }
 
-    fn side(&self) -> usize {
-        2 * self.r + 1
+    fn size(&self) -> (usize, usize) {
+        (2 * self.rx + 1, 2 * self.ry + 1)
     }
 }
 
@@ -101,21 +141,20 @@ pub struct Prior {
 /// Search `patch` for `t`, over template centres inside `window` (patch
 /// points `[min, max]`, clipped to where the template fits).
 pub fn best_match(patch: &Patch, t: &Template, window: [[f64; 2]; 2], prior: Option<Prior>) -> Option<Match> {
-    let (side, r) = (t.side(), t.r as f64);
-    if patch.w < side || patch.h < side {
+    let ((sx, sy), (rx, ry)) = (t.size(), (t.rx as f64, t.ry as f64));
+    if patch.w < sx || patch.h < sy {
         return None;
     }
     // Top-left placement u ↔ centre u + r + 0.5.
-    let lo = |c: f64| (c - r - 0.5).ceil().max(0.0) as usize;
-    let hi = |c: f64, n: usize| ((c - r - 0.5).floor()).min((n - side) as f64);
-    let (u0, v0) = (lo(window[0][0]), lo(window[0][1]));
-    let (u1, v1) = (hi(window[1][0], patch.w), hi(window[1][1], patch.h));
+    let lo = |c: f64, r: f64| (c - r - 0.5).ceil().max(0.0) as usize;
+    let hi = |c: f64, r: f64, n: usize, side: usize| ((c - r - 0.5).floor()).min((n - side) as f64);
+    let (u0, v0) = (lo(window[0][0], rx), lo(window[0][1], ry));
+    let (u1, v1) = (hi(window[1][0], rx, patch.w, sx), hi(window[1][1], ry, patch.h, sy));
     if u1 < u0 as f64 || v1 < v0 as f64 {
         return None;
     }
     let (u1, v1) = (u1 as usize, v1 as usize);
     let (nu, nv) = (u1 - u0 + 1, v1 - v0 + 1);
-    let w = weights(t.r);
     // Pixels relative to their mean, so the variance below doesn't cancel away in f32.
     let reference = patch.data.iter().sum::<f32>() / patch.data.len() as f32;
 
@@ -127,10 +166,10 @@ pub fn best_match(patch: &Patch, t: &Template, window: [[f64; 2]; 2], prior: Opt
             // their correlation with it (its weighted mean is zero, so
             // Σ kernel · p = the covariance).
             let (mut mean, mut sq, mut cov) = (0.0f32, 0.0f32, 0.0f32);
-            for j in 0..side {
-                let row = &patch.data[(v + j) * patch.w + u..(v + j) * patch.w + u + side];
-                let wrow = &w[j * side..(j + 1) * side];
-                let krow = &t.kernel[j * side..(j + 1) * side];
+            for j in 0..sy {
+                let row = &patch.data[(v + j) * patch.w + u..(v + j) * patch.w + u + sx];
+                let wrow = &t.weights[j * sx..(j + 1) * sx];
+                let krow = &t.kernel[j * sx..(j + 1) * sx];
                 for ((p, w), k) in row.iter().zip(wrow).zip(krow) {
                     let p = p - reference;
                     mean += w * p;
@@ -146,7 +185,7 @@ pub fn best_match(patch: &Patch, t: &Template, window: [[f64; 2]; 2], prior: Opt
         }
     }
 
-    let centre = |du: usize, dv: usize| [(u0 + du) as f64 + r + 0.5, (v0 + dv) as f64 + r + 0.5];
+    let centre = |du: usize, dv: usize| [(u0 + du) as f64 + rx + 0.5, (v0 + dv) as f64 + ry + 0.5];
     let rank = |du: usize, dv: usize| {
         let s = scores[dv * nu + du];
         match prior {
