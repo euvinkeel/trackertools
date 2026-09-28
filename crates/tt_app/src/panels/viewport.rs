@@ -11,6 +11,7 @@
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
+use tt_core::autospeed::AutoSpeedState;
 use tt_core::transport::Transport;
 use tt_core::view::{ActiveView, SpaceMap, chain, map_at, sketch_framed};
 use tt_core::{AppBuilder, Class, Module, Set};
@@ -464,17 +465,26 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
     const FULL: f64 = 0.25;
     const FLASH: f64 = 0.55;
     let now = world.resource::<tt_core::time::WallClock>().now;
+    let (auto, wrote, reason) = {
+        let a = world.resource::<AutoSpeedState>();
+        (a.acting(), a.wrote, a.reason)
+    };
     let mut flash = world.resource_mut::<SpeedFlash>();
     if flash.rate != Some(rate) {
-        // Not on the first frame (opening a video isn't a change).
-        flash.changed_at = if flash.rate.is_some() { now } else { f64::NEG_INFINITY };
+        // Not on the first frame (opening a video isn't a change), and not for
+        // auto speed's changes: only yours flash.
+        if flash.rate.is_some() && wrote != Some(rate) {
+            flash.changed_at = now;
+        }
         flash.rate = Some(rate);
     }
     let age = now - flash.changed_at;
     let label = super::timeline::rate_label(rate);
     let color = if (rate - 1.0).abs() < 1e-9 { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) };
 
-    let galley = painter.layout_no_wrap(format!("{label} speed"), FontId::proportional(20.0), color);
+    // While auto speed drives it, the live rate and what limits it.
+    let (badge, color) = if auto { (format!("auto ×{rate:.2} · {reason}"), style::ACCENT) } else { (format!("{label} speed"), color) };
+    let galley = painter.layout_no_wrap(badge, FontId::proportional(20.0), color);
     let r = Align2::RIGHT_TOP.anchor_size(rect.right_top() + Vec2::new(-10.0, 8.0), galley.size()).expand(5.0);
     painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
     painter.galley(r.min + Vec2::splat(5.0), galley, color);

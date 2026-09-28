@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
+use tt_core::autospeed::AutoSpeed;
 use tt_core::capture::{SketchDefaults, WheelMode};
 use tt_core::input::{Action, PendingActions};
 use tt_core::sketch::SketchParams;
@@ -52,6 +53,8 @@ struct SettingsFile {
     /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
     hide_pointer: bool,
     clear_radius: f32,
+    /// Anticipatory speed: on/off and its knobs.
+    auto_speed: AutoSpeed,
 }
 
 impl Default for SettingsFile {
@@ -66,12 +69,13 @@ impl Default for SettingsFile {
             view_lock_zoom: v.params.lock_zoom,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
+            auto_speed: AutoSpeed::default(),
         }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView) -> Self {
+    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed) -> Self {
         Self {
             wheel: d.wheel,
             stroke_scale: d.stroke.scale,
@@ -80,6 +84,7 @@ impl SettingsFile {
             view_lock_zoom: v.params.lock_zoom,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
+            auto_speed: a.clone(),
         }
     }
 
@@ -91,6 +96,7 @@ impl SettingsFile {
         d.params = self.new_sketches.clone();
         world.resource_mut::<ViewDefaults>().params.lock_zoom = self.view_lock_zoom;
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
+        *world.resource_mut::<AutoSpeed>() = self.auto_speed.clone();
     }
 }
 
@@ -157,8 +163,8 @@ impl Session {
 }
 
 /// The Settings tab's values, kept in the session file.
-fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, mut session: ResMut<Session>) {
-    let settings = SettingsFile::of(&defaults, &views, &pointer);
+fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, auto: Res<AutoSpeed>, mut session: ResMut<Session>) {
+    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto);
     if session.file.settings != settings && !session.scripted {
         session.file.settings = settings;
     }
@@ -230,12 +236,29 @@ mod tests {
     #[test]
     fn the_preset_new_sketches_use_is_remembered() {
         let chosen = SketchDefaults { params: SketchParams::preset("Loose").unwrap(), ..SketchDefaults::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default())).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default())).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();
         world.init_resource::<PointerView>();
+        world.init_resource::<AutoSpeed>();
         serde_json::from_str::<SettingsFile>(&text).unwrap().apply(&mut world);
         assert_eq!(world.resource::<SketchDefaults>().params, chosen.params);
+    }
+
+    #[test]
+    fn auto_speed_and_its_knobs_are_remembered() {
+        let knobs = AutoSpeed { enabled: true, comfort: 450.0, look_ahead: 0.0, ..AutoSpeed::default() };
+        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs)).unwrap();
+        let mut world = World::new();
+        world.init_resource::<SketchDefaults>();
+        world.init_resource::<ViewDefaults>();
+        world.init_resource::<PointerView>();
+        world.init_resource::<AutoSpeed>();
+        serde_json::from_str::<SettingsFile>(&text).unwrap().apply(&mut world);
+        assert_eq!(*world.resource::<AutoSpeed>(), knobs);
+        // A session file from before auto speed reads with it off.
+        let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
+        assert_eq!(old.auto_speed, AutoSpeed::default());
     }
 }

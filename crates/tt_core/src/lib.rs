@@ -6,6 +6,7 @@
 //! all of it is testable with `cargo test`. See docs/v2/DESIGN.md.
 
 pub mod app;
+pub mod autospeed;
 pub mod capture;
 pub mod commands;
 pub mod history;
@@ -40,6 +41,7 @@ impl Module for CoreModules {
             .add_module(sketch::SketchModule)
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)
+            .add_module(autospeed::AutoSpeedModule)
             .add_module(view::ViewModule)
             .add_module(commands::CommandsModule)
             .add_module(persist::PersistModule);

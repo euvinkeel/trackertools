@@ -498,8 +498,10 @@ pub struct TimelineUi {
     pub lanes_area: Option<Rect>,
 }
 
+/// `0.25×`, `1×`, `1.5×`: at most two decimals (auto speed sets rates between the steps).
 pub(crate) fn rate_label(rate: f64) -> String {
-    if rate >= 1.0 { format!("{rate:.0}×") } else { format!("{rate}×") }
+    let s = format!("{rate:.2}");
+    format!("{}×", s.trim_end_matches('0').trim_end_matches('.'))
 }
 
 /// A "nice" tick spacing in frames with labels at least ~80 px apart.

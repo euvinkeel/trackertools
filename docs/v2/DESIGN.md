@@ -304,6 +304,25 @@ Every stage's output signal is inspectable: raw, lag-shifted, smoothed, extent. 
 4. The frame takes the hand's state at the end of the hold, with no lag shift, since the hand has settled on what is shown. Before `lag` has passed, it uses the time the hand needed to get there, `start + lag`.
 5. It combines with stepping: keep holding, press `→` to step a frame, and keep shaping, sculpting a box frame by frame through a difficult passage. On an existing sketch, each held frame's change spreads to its neighbours through the falloff (§8.1).
 
+### 8.4 Anticipatory speed
+
+*(The user's idea, after hands-on use: a box that suddenly grows after being small for a while foretells erratic motion; one that stays small and still means the subject is still and can be sped through.)* With the Settings switch on, while a stroke records **and** the video plays, the playback rate is set for you, continuously (`tt_core::autospeed`):
+
+- **Hand:** its velocity over the last 0.1 s (a least-squares line through the samples, in screen points), divided by the rate it was seeing `lag` earlier, is the subject's on-screen speed at 1×. The comfortable rate is `comfort` / that.
+- **Jiggle:** the samples' RMS spread around that line over the last `jiggle_window`, as a box side in screen points, against a *calm* size that follows a shrinking box within 0.3 s and a growing one within 3 s. Growth beyond 1.5× (tremor-sized boxes floored at 10 pt) multiplies the rate by (growth / 1.5)^−`jiggle`.
+- **Ahead** (editing an existing sketch): its output over the next `look_ahead` of video, through the shown view, in screen points. `look_ahead()` turns any box signal into a per-frame speed and growth, so tracker results can feed it later. Each frame's comfortable rate binds fully from a braking margin before it arrives (3 × `slow_down` at the current rate), ramping up to `fastest` at the window's end, so playback arrives slowed without crawling through the whole window.
+- **Target** = clamp(min(min(`fastest`, hand) × jiggle, ahead), `slowest`, `fastest`); a still, calm hand lets it rise toward `fastest`. The rate follows it exponentially in log-rate: within `slow_down` going down, `speed_up` going up.
+- The release (commit or cancel) restores the rate you had set. Any other rate change during the stroke (Q/E) hands the rate back to you until the release; Q/E step from the rate shown. The badge reads `auto ×0.35 · fast hand` (or `jiggle`, `ahead`, `calm`), and automatic changes never flash.
+- The ClockMap records every frame's playhead against wall time, so the pipeline needs nothing for a varying rate.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `slowest` / `fastest` | ×0.1 / ×2 | the range it moves in |
+| `comfort` | 300 pt/s | the fastest the hand should have to move on screen |
+| `jiggle` | 1.0 | how strongly box growth slows it (1: ×3 growth halves the rate; 0 = off) |
+| `slow_down` / `speed_up` | 0.1 s / 1.0 s | response times, real time |
+| `look_ahead` | 0.75 s | of video read ahead in the sketch being edited (0 = off) |
+
 ---
 
 ## 9. Flagship: smoothing as non-destructive modifiers
@@ -466,6 +485,7 @@ Adopted from Rerun's proven design.
   - the size and falloff the next stroke starts with;
   - the preset new sketches use;
   - while holding a stroke: hide the pointer, and the clear window's radius (§8.1);
+  - anticipatory speed: on/off and its knobs (§8.4);
   - whether new views keep a steady zoom (§10);
   - every key, generated from the keymap;
   - where the data folder is.
@@ -474,7 +494,7 @@ Adopted from Rerun's proven design.
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; the wheel while holding sets the stroke's size, falloff or both (a setting; a move-only stroke's falloff); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
   - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
-  - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when it changes (fully for 0.25 s, then a 0.3 s fade);
+  - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when you change it (fully for 0.25 s, then a 0.3 s fade; auto speed's changes don't flash, §8.4);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;
   - `X` delete;
