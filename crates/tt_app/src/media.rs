@@ -214,7 +214,7 @@ fn poll_proxy(media: Option<ResMut<Media>>, footage: Option<ResMut<tt_track::Foo
 
 fn request_frames(media: Option<ResMut<Media>>, active: Res<ActiveSource>, t: Res<Transport>) {
     let Some(mut media) = media else { return };
-    let want = Want { frame: media.presented(t.frame()), playing: t.playing, rate: t.rate };
+    let want = Want { frame: media.presented(t.frame()), playing: t.playing, rate: t.rate, reverse: t.reverse };
     match (active.0, &mut media.proxy) {
         (Which::Proxy, ProxyState::Ready(proxy)) => proxy.player.want(want),
         _ => media.original.player.want(want),

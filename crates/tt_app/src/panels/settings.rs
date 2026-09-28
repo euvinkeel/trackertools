@@ -197,6 +197,8 @@ fn describe(action: Action) -> &'static str {
         GoToEnd => "Go to the end",
         FasterPlayback => "Faster playback (= capture speed)",
         SlowerPlayback => "Slower playback (= capture speed)",
+        ShuttleForward => "Play forward; again: twice as fast (up to 8×)",
+        ShuttleBackward => "Play backward; again: twice as fast (up to 8×)",
         FrameAll => "Fit the video in the viewport",
         OpenFile => "Open a video",
         Undo => "Undo",
