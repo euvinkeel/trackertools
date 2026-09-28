@@ -1,0 +1,229 @@
+//! Timeline: transport controls and a zoomable, scrubbable ruler. The visible
+//! range is session state in the world. A thin strip under the ruler shows
+//! which frames the decode service holds in its cache. Lanes arrive with
+//! captures (M3).
+
+use bevy_ecs::prelude::*;
+use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use tt_core::input::{Action, Keymap, PendingActions};
+use tt_core::time::{FrameIndex, Rational, timecode};
+use tt_core::transport::{RATES, Transport};
+use tt_core::{AppBuilder, Class, Module};
+
+use crate::media::{ActiveSource, Media};
+use crate::style;
+
+/// Visible range of the timeline: `span` frames starting at `start`.
+/// `None` span = fit the whole clip.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct TimelineView {
+    pub start: f64,
+    pub span: Option<f64>,
+}
+
+pub struct TimelineModule;
+
+impl Module for TimelineModule {
+    fn build(&self, app: &mut AppBuilder) {
+        app.declare::<TimelineView>(Class::Session).init_resource::<TimelineView>();
+    }
+}
+
+/// Frame ↔ screen mapping for one draw.
+#[derive(Clone, Copy)]
+struct Scale {
+    rect: Rect,
+    start: f64,
+    span: f64,
+}
+
+impl Scale {
+    fn x(&self, f: f64) -> f32 {
+        self.rect.min.x + ((f - self.start) / self.span) as f32 * self.rect.width()
+    }
+
+    fn frame_at(&self, x: f32) -> f64 {
+        self.start + ((x - self.rect.min.x) / self.rect.width()) as f64 * self.span
+    }
+
+    fn px_per_frame(&self) -> f64 {
+        self.rect.width() as f64 / self.span
+    }
+}
+
+pub fn ui(ui: &mut egui::Ui, world: &mut World) {
+    let t = world.resource::<Transport>().clone();
+    let keymap = world.resource::<Keymap>();
+    let mut actions = Vec::new();
+    let mut fit = false;
+
+    ui.horizontal(|ui| {
+        let mut button = |ui: &mut egui::Ui, text: &str, action: Action, what: &str| {
+            let tip = match keymap.chord_for(action) {
+                Some(chord) => format!("{what} ({chord})"),
+                None => what.to_string(),
+            };
+            if ui.button(text).on_hover_text(tip).clicked() {
+                actions.push(action);
+            }
+        };
+        button(ui, "⏮", Action::GoToStart, "Go to start");
+        button(ui, "◀", Action::StepBackward, "Previous frame");
+        button(ui, if t.playing { "⏸" } else { "▶" }, Action::TogglePlay, "Play / pause");
+        button(ui, "▶|", Action::StepForward, "Next frame");
+        button(ui, "⏭", Action::GoToEnd, "Go to end");
+        ui.separator();
+
+        egui::ComboBox::from_id_salt("rate").width(64.0).selected_text(rate_label(t.rate)).show_ui(ui, |ui| {
+            for (i, r) in RATES.iter().enumerate() {
+                if ui.selectable_label((r - t.rate).abs() < 1e-9, rate_label(*r)).clicked() {
+                    actions.push(Action::SetRate(i as u8));
+                }
+            }
+        });
+        if ui.selectable_label(t.looping, "⟲ loop").clicked() {
+            actions.push(Action::ToggleLoop);
+        }
+        ui.separator();
+        ui.monospace(format!("{} / {}", t.frame(), t.last_frame()));
+        ui.monospace(timecode(t.frame(), t.fps));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            fit = ui.button("Fit").on_hover_text("Show the whole clip").clicked();
+            ui.label(egui::RichText::new("wheel: zoom · shift+wheel / middle-drag: pan").weak().small());
+        });
+    });
+
+    let height = ui.available_height().max(44.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, style::PANEL);
+    if !t.has_media() {
+        world.resource_mut::<PendingActions>().0.extend(actions);
+        return;
+    }
+
+    // Visible range (session state), with zoom/pan/follow applied.
+    let count = t.frame_count as f64;
+    let mut view = *world.resource::<TimelineView>();
+    if fit {
+        view = TimelineView::default();
+    }
+    let min_span = (rect.width() as f64 / 40.0).max(4.0); // at most 40 px per frame
+    let mut span = view.span.unwrap_or(count).clamp(min_span, count * 1.05);
+    let mut start = if view.span.is_none() { 0.0 } else { view.start };
+    if let Some(pos) = response.hover_pos() {
+        let (delta, shift) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
+        let pan_px = delta.x + if shift { delta.y } else { 0.0 };
+        if !shift && delta.y != 0.0 {
+            let under = Scale { rect, start, span }.frame_at(pos.x);
+            let new_span = (span * (-delta.y as f64 * 0.003).exp()).clamp(min_span, count * 1.05);
+            start = under - (under - start) * new_span / span;
+            span = new_span;
+        }
+        start -= pan_px as f64 * span / rect.width() as f64;
+    }
+    if response.dragged_by(egui::PointerButton::Middle) {
+        start -= response.drag_delta().x as f64 * span / rect.width() as f64;
+    }
+    // Follow the playhead while playing: page forward when it leaves the view.
+    let head = t.playhead;
+    if t.playing && (head < start || head >= start + span) {
+        start = head - span * 0.05;
+    }
+    start = start.clamp(-span * 0.02, (count - span * 0.98).max(-span * 0.02));
+    let fitted = span >= count * 0.999 && start.abs() < 1.0;
+    *world.resource_mut::<TimelineView>() = if fitted { TimelineView::default() } else { TimelineView { start, span: Some(span) } };
+    let scale = Scale { rect, start, span };
+
+    // Ruler.
+    let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 22.0));
+    painter.rect_filled(band, 0.0, style::RULER);
+    let step = tick_step(scale.px_per_frame(), t.fps);
+    let mut f = (start / step as f64).ceil() as FrameIndex * step;
+    while (f as f64) < start + span && f < t.frame_count {
+        let x = scale.x(f as f64);
+        painter.line_segment([Pos2::new(x, band.max.y - 8.0), Pos2::new(x, band.max.y)], Stroke::new(1.0, style::TICK));
+        painter.text(Pos2::new(x + 3.0, band.min.y + 3.0), Align2::LEFT_TOP, tick_label(f, t.fps, step), FontId::monospace(10.0), style::MUTED);
+        f += step;
+    }
+    // Clip end.
+    let end_x = scale.x(count);
+    if end_x < rect.max.x {
+        painter.rect_filled(Rect::from_x_y_ranges(end_x..=rect.max.x, rect.y_range()), 0.0, style::BG);
+    }
+
+    // Decode cache coverage (active rendition).
+    let strip = Rect::from_min_size(Pos2::new(rect.min.x, band.max.y + 1.0), Vec2::new(rect.width(), 3.0));
+    if let Some(media) = world.get_resource::<Media>() {
+        let which = world.resource::<ActiveSource>().0;
+        if let Some(src) = media.source(which) {
+            for (a, b) in src.player.cached_ranges() {
+                let (ga, gb) = (media.index().grid_of[a] as f64, media.index().grid_of[b] as f64 + 1.0);
+                let (x0, x1) = (scale.x(ga).max(strip.min.x), scale.x(gb).min(strip.max.x));
+                if x1 > x0 {
+                    painter.rect_filled(Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), strip.y_range()), 0.0, style::ACCENT.gamma_multiply(0.45));
+                }
+            }
+        }
+    }
+    painter.text(
+        Pos2::new(rect.min.x + 8.0, strip.max.y + 10.0),
+        Align2::LEFT_TOP,
+        "lanes for captures and trackers arrive in M3",
+        FontId::proportional(11.0),
+        style::MUTED,
+    );
+
+    // Playhead: a frame-wide band when frames are wide enough to see, else a line.
+    let shown = t.frame() as f64;
+    let (x0, x1) = (scale.x(shown), scale.x(shown + 1.0));
+    if x1 - x0 >= 3.0 {
+        painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, rect.y_range()), 0.0, style::ACCENT.gamma_multiply(0.25));
+    }
+    painter.line_segment([Pos2::new(x0, rect.min.y), Pos2::new(x0, rect.max.y)], Stroke::new(1.5, style::ACCENT));
+
+    // Scrub with the primary button.
+    let to_frame = |x: f32| (scale.frame_at(x).floor() as FrameIndex).clamp(0, t.last_frame());
+    if let Some(pos) = response.hover_pos() {
+        let f = to_frame(pos.x);
+        response.clone().on_hover_text_at_pointer(format!("{f}  ·  {}", timecode(f, t.fps)));
+    }
+    if (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let f = to_frame(pos.x);
+        if f != t.frame() || t.playing {
+            actions.push(Action::Seek(f));
+        }
+    }
+
+    world.resource_mut::<PendingActions>().0.extend(actions);
+}
+
+fn rate_label(rate: f64) -> String {
+    if rate >= 1.0 { format!("{rate:.0}×") } else { format!("{rate}×") }
+}
+
+/// A "nice" tick spacing in frames with labels at least ~80 px apart.
+fn tick_step(px_per_frame: f64, fps: Rational) -> FrameIndex {
+    let fps_i = fps.as_f64().round().max(1.0) as FrameIndex;
+    let candidates = [1, 2, 5, 10]
+        .into_iter()
+        .chain([1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600].into_iter().map(|s| s * fps_i));
+    for step in candidates {
+        if step as f64 * px_per_frame >= 80.0 {
+            return step;
+        }
+    }
+    3600 * fps_i
+}
+
+fn tick_label(f: FrameIndex, fps: Rational, step: FrameIndex) -> String {
+    let fps_i = fps.as_f64().round().max(1.0) as FrameIndex;
+    if step < fps_i {
+        f.to_string()
+    } else {
+        let s = fps.frame_to_seconds(f).round() as i64;
+        if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
+    }
+}

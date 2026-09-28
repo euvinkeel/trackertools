@@ -1,0 +1,33 @@
+# trackertools v2 — Rust workspace. See docs/v2/DESIGN.md and docs/v2/ROADMAP.md.
+# v1 (editor/, cotracker/) is legacy Python + browser code and is not part of this workspace.
+
+[workspace]
+resolver = "3"
+members = ["crates/tt_core", "crates/tt_media", "crates/tt_app", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+# Pinned exactly: bevy and egui rename APIs between releases (DESIGN §16).
+[workspace.dependencies]
+tt_core = { path = "crates/tt_core" }
+tt_media = { path = "crates/tt_media" }
+bevy_ecs = "=0.19.1"
+bevy_reflect = "=0.19.1"
+egui = "=0.36.2"
+eframe = "=0.36.2"
+egui_tiles = "=0.17.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Video and GUI code is unusable unoptimized; keep our own crates fast to rebuild.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

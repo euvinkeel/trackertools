@@ -1,0 +1,13 @@
+[package]
+name = "tt_core"
+description = "Headless core of trackertools: world, modules, time, transport (and later signals, operators, undo)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bevy_ecs.workspace = true
+bevy_reflect.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
