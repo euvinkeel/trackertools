@@ -5,7 +5,7 @@
 
 use bevy_ecs::prelude::*;
 use tt_core::capture::LiveCapture;
-use tt_core::commands::{RenameRequest, strokes_of};
+use tt_core::commands::strokes_of;
 use tt_core::input::{Action, Keymap, PendingActions};
 use tt_core::selection::Selection;
 use tt_core::sketch::{Capture, is_sketch, sketch_of};
@@ -45,7 +45,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             ui.close();
         }
         if ui.add_enabled(primary.is_some(), egui::Button::new(format!("Rename…{}", chord(Action::Rename)))).clicked() {
-            world.resource_mut::<RenameRequest>().0 = primary;
+            push = Some(Action::Rename);
             ui.close();
         }
         if ui.add_enabled(any_sketch && !busy, egui::Button::new(format!("Duplicate{}", chord(Action::Duplicate)))).on_hover_text("Copy the sketch with all its strokes").clicked() {
