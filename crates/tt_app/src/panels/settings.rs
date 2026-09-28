@@ -130,6 +130,7 @@ fn describe(action: Action) -> &'static str {
         OpenFile => "Open a video",
         Undo => "Undo",
         Redo => "Redo",
+        Tool(tt_core::tool::Tool::Track) => "Track tool on/off: drag a pattern or click a point on the video",
         Tool(_) => "Sketch tool on/off",
         Cancel => "Cancel the stroke, or leave the tool",
         DeselectAll => "Deselect all",

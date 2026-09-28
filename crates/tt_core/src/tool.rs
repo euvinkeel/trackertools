@@ -20,6 +20,8 @@ pub enum Tool {
     Select,
     /// Press and hold on the viewport to follow something (capture.rs).
     Sketch,
+    /// Show a tracker what to follow: drag a pattern, click a point (tt_track).
+    Track,
 }
 
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +98,10 @@ fn apply_tool_actions(mut actions: ResMut<PendingActions>, mut active: ResMut<Ac
 /// A click (in any tool) selects the sketch whose region is under it, or clears the selection.
 fn select_on_click(world: &mut World) {
     let Some(pos) = world.resource::<PointerFrame>().click else { return };
+    // In the Track tool a click places a tracker.
+    if world.resource::<ActiveTool>().0 == Tool::Track {
+        return;
+    }
     let frame = world.resource::<crate::transport::Transport>().frame();
     // The pointer is in the shown space's pixels; sketches live in source pixels.
     let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);

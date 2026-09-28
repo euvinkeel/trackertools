@@ -136,7 +136,7 @@ impl Default for Keymap {
                 (b(Key::Letter('d'), Mods::SHIFT, false), Duplicate),
                 (b(Key::Letter('a'), Mods::NONE, false), SelectAll),
                 (b(Key::F2, Mods::NONE, false), Rename),
-                (b(Key::Letter('t'), Mods::NONE, false), Track),
+                (b(Key::Letter('t'), Mods::NONE, false), Tool(crate::tool::Tool::Track)),
                 (b(Key::Letter('n'), Mods::NONE, false), ToggleSnap),
             ],
         }
