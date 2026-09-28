@@ -96,7 +96,7 @@ pub(crate) fn stamp_created<C: Component>(
     }
     counter.last = Some(e);
     let stamp = counter.stamp();
-    commands.entity(e).insert_if_new(stamp);
+    commands.entity(e).try_insert_if_new(stamp); // the entity may be gone by the time commands apply
 }
 
 /// Sort document entities by creation ([`Created`]; unstamped ones last).
