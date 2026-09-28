@@ -184,12 +184,14 @@ Operator inputs and outputs are **typed ports**. This is the whole "node system"
 Some operators are too slow to evaluate inline because they read pixels. Their kind says `job()`. Evaluation then leaves their dirty frames alone, and their dependents run on whatever results exist so far (stale-while-revalidate).
 
 A runner system in `Set::Jobs` owns them. It does four things:
-- waits until the operator's inputs are evaluated;
-- snapshots those inputs into jobs (plain data sent to threads);
+- waits until the operator's inputs are evaluated (and a drag has ended);
+- snapshots those inputs into a plan, and jobs (plain data sent to threads);
 - writes the results as they arrive;
 - reports each changed range as an `output_changed`, so dependents update chunk by chunk.
 
-New dirt on a job's frames cancels the job and restarts it.
+Dirt only says "look again". The runner compares the new plan with the one the results came from, and re-tracks from the first frame whose inputs differ, on each side of the anchor. So a stroke on a guide re-tracks from the stroke, although a sketch reports its whole extent as changed. A job whose inputs are unchanged keeps running; the others are cancelled and restarted.
+
+Results are document data written outside edits: `History::touch` marks them for saving, with no undo step. An operator that comes back (redo, an undone delete) recomputes itself.
 
 **The tracker** (`tt_track`) is the first such operator. Inputs:
 - `guide`: a box producer, normally a sketch;
@@ -202,7 +204,7 @@ The rough pass is what makes it robust:
 - it predicts from the guide's motion;
 - where it can't see the subject, it follows the guide.
 
-It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)`. A saved hash of its inputs lets a reopened project keep results instead of re-tracking.
+It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)`. A saved hash of its inputs, set only on complete results, lets a reopened project keep them instead of re-tracking.
 
 Strategies (template now; learned models later) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. A Python worker for CoTracker3, TAPNext or SAM 2.1 slots in as another job backend.
 
