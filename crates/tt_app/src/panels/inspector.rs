@@ -35,6 +35,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 
 fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.heading(crate::panels::outliner::label(world, e));
+    super::tracks::inspector(ui, world, e);
     if world.get::<SketchParams>(e).is_some() {
         sketch_presets(ui, world, e);
     }
@@ -57,8 +58,9 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             .iter()
             .filter_map(|r| {
                 let class = metas.get(r.type_id())?.class;
-                // Derived state isn't edited; the name is the heading.
-                if class == Class::Derived || r.type_id() == std::any::TypeId::of::<bevy_ecs::name::Name>() {
+                // Derived state isn't edited; the name is the heading; a tracker's stamp is bookkeeping.
+                let hidden = [std::any::TypeId::of::<bevy_ecs::name::Name>(), std::any::TypeId::of::<tt_track::runner::TrackStamp>()];
+                if class == Class::Derived || hidden.contains(&r.type_id()) {
                     return None;
                 }
                 let rc = r.data::<ReflectComponent>()?;

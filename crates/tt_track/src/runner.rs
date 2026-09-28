@@ -72,6 +72,10 @@ impl TrackStatus {
     }
 }
 
+/// Jobs running at once, across trackers (each decodes with its own ffmpeg);
+/// more wait their turn.
+pub const MAX_JOBS: usize = 4;
+
 #[derive(Resource, Default)]
 pub struct TrackJobs {
     running: HashMap<(Entity, Side), Running>,
@@ -194,6 +198,11 @@ fn drain(world: &mut World, op: Entity) {
 
 fn start_dirty(world: &mut World, op: Entity, footage: &Footage) {
     if world.get::<Dirty>(op).is_none_or(|d| d.0.is_empty()) {
+        return;
+    }
+    // Wait for a free slot (restarting this tracker's own jobs doesn't need one).
+    let others = world.resource::<TrackJobs>().running.keys().filter(|(e, _)| *e != op).count();
+    if others >= MAX_JOBS {
         return;
     }
     // Wait for the guide and the view to finish evaluating.

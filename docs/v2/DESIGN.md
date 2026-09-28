@@ -179,6 +179,33 @@ Operator inputs and outputs are **typed ports**. This is the whole "node system"
 - **Coarse-to-fine is plain composition.** Tracker A runs on the ¼ proxy. Its Track feeds tracker B's *guide* input, and B refines at full resolution in a small window. That's classic pyramid tracking, built from two ordinary operators and needing no special feature.
 - **A graph view** (egui-snarl) can visualize and edit these connections later. Day-to-day, connections are made by tools and commands ("add tracker to this view", "track at ½"), not by wiring nodes.
 
+### 6.2 Job operators: trackers (as built, M6)
+
+Some operators are too slow to evaluate inline because they read pixels. Their kind says `job()`. Evaluation then leaves their dirty frames alone, and their dependents run on whatever results exist so far (stale-while-revalidate).
+
+A runner system in `Set::Jobs` owns them. It does four things:
+- waits until the operator's inputs are evaluated;
+- snapshots those inputs into jobs (plain data sent to threads);
+- writes the results as they arrive;
+- reports each changed range as an `output_changed`, so dependents update chunk by chunk.
+
+New dirt on a job's frames cancels the job and restarts it.
+
+**The tracker** (`tt_track`) is the first such operator. Inputs:
+- `guide`: a box producer, normally a sketch;
+- `space`: a view.
+
+Output: `[x, y, left, top, right, bottom, score]`.
+
+The rough pass is what makes it robust:
+- the tracker only searches the guide's box;
+- it predicts from the guide's motion;
+- where it can't see the subject, it follows the guide.
+
+It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)`. A saved hash of its inputs lets a reopened project keep results instead of re-tracking.
+
+Strategies (template now; learned models later) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. A Python worker for CoTracker3, TAPNext or SAM 2.1 slots in as another job backend.
+
 **Result caching** (planned for after M4): results keyed by `(kind, params hash, input chunk versions)` in a content-addressed store. Undo and redo then re-link earlier results instead of recomputing, and A/B-ing parameters becomes free.
 
 ---

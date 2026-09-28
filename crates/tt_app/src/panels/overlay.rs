@@ -34,6 +34,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     let selected = picked.last().and_then(|e| sketch_of(world, *e));
     let mut q = world.query::<(Entity, &Operator, &Output)>();
     let sketches: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "sketch").map(|(e, _, o)| (e, o.0)).collect();
+    let trackers = super::tracks::list(world);
     let world: &World = world;
     // The shown space's framing around the playhead, looked up once per frame drawn.
     // (The playhead's frame uses the framing as shown, which may be easing in.)
@@ -63,6 +64,8 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let stale = editing != Some(*e) && sig.state(frame) == FrameState::Stale;
         region(painter, map, to_canvas(frame, v), color, stale);
     }
+
+    super::tracks::draw(painter, map, world, &trackers, frame, &space);
 
     if let Some(live) = live {
         if live.target.is_none() {

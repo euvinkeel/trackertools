@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 tt_core.workspace = true
 tt_media.workspace = true
+tt_track.workspace = true
 bevy_ecs.workspace = true
 bevy_reflect.workspace = true
 egui.workspace = true

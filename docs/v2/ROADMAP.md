@@ -318,6 +318,53 @@ The original plan follows.
 - Re-tuning a level-1 sketch updates levels 2–3 live, marking stale ranges until re-derived.
 - A position picked inside a level-3 view lifts to source space within 0.1 px of the analytic transform.
 
+## M6 · Trackers: started 2026-09-27
+
+The first automatic tracker, built the way the whole design intends: an operator entity whose inputs are a rough pass and a view, run by background jobs (DESIGN §6.2).
+
+**Built (`tt_track`):**
+- **The `track` operator.** Inputs `guide` (a sketch, or any box producer) and `space` (the view it tracks in; none = the source). Its output `[x, y, left, top, right, bottom, score]` in source px is a box, so views, overlays and the like take a tracker wherever they take a sketch. `T` tracks the selected sketches from the playhead in the view being looked at. On a selected tracker, `T` re-seeds it at the playhead. One undo step.
+- **Template strategy.**
+  - At the anchor, a template is cut around the guide's point.
+  - On every other frame:
+    - the prediction is the guide's point plus the last offset;
+    - a centre-weighted NCC search runs within the guide's box, with a gentle preference for the prediction;
+    - the appearance blends the anchor's look with the last frame's (`adapt`).
+  - Below `min_score`, a frame is *lost*: it follows the guide and is drawn red. The tracker re-locks when the look returns.
+  - The patch scale comes from the guide's box: `feature` = the fraction of the box that is the subject.
+- **Jobs.**
+  - Each side of the anchor is a thread with its own ffmpeg.
+  - Backward jobs decode keyframe-aligned segments (≥ 64 frames), keep only the guide's region, and track the segment in reverse, so any source GOP works backward.
+  - Rendition Auto reads the proxy only where it has a pixel per patch pixel on every frame.
+  - At most 4 jobs run at once.
+- **Invalidation (the operator machinery, unchanged):**
+  - `Footprint::Radiating(anchor)`: an edit after the anchor re-tracks from the edit onward, an edit before it from the edit backward, and nothing else.
+  - A restart resumes from the valid result just before the dirty frames.
+  - Results stay on screen as stale until replaced.
+  - A saved input stamp keeps results when a reopened project's inputs come out the same.
+- **Catch-up mode** (`follow_playhead`): jobs stop at the playhead and continue as it moves, forward and backward.
+- **UI:**
+  - the viewport draws each tracker's box and path (cyan; lost frames red; stale dim);
+  - the top bar shows running trackers and their fps;
+  - the inspector shows progress per side, lost frames, the rendition read and errors, plus a Track button on sketches.
+
+**Measured** (`crates/tt_track/tests/sprite.rs`: the sprite fixture, 1200 frames of 1080p60 H.264 with GOP 250 and B-frames; the guide wanders ~6 px off the truth in a 56 px box; anchor mid-clip, tracked both ways):
+- error after removing the anchor's offset: **median 0.31 px, p95 0.80, max 0.87**, with no lost frames, at ~500 fps (both sides together);
+- the rough pass alone is ~1.5 px median;
+- synthetic subpixel motion (`tests/template.rs`): median 0.02–0.06 px.
+
+Findings on the way:
+- **The sprite fixture's truth was off by up to 1 px:** ffmpeg's overlay on yuv420 puts the sprite on even pixels. `sprite_truth.json` (the in-app demo's truth) needs the same rounding; see the xtask.
+- **A plain NCC template lost the sprite whenever it crossed from dark background to bright** (the box always holds background). Centre-weighting the correlation fixed it.
+
+**Next:**
+- trackers in the outliner and timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);
+- re-centring the result on the guide (the track's shape, the rough pass's average position);
+- a Lucas–Kanade refinement for hard-edged features (NCC peaks lean toward whole pixels);
+- colour (chroma) in the match;
+- the forward/backward fuse;
+- learned trackers (CoTracker3 / TAPNext worker, SAM 2.1) behind the same operator and job protocol.
+
 ---
 
 ## After the first target (to be re-planned)
@@ -325,7 +372,7 @@ The original plan follows.
 | Milestone | Scope |
 |---|---|
 | **M5 · Keys & curves** | Keys operator as a Track ("human animation is a tracker"), curve editor, dope-sheet editing, finetune-style offset layers |
-| **M6 · Trackers** | **FrameSource** entities with Auto rendition selection (a mip level per view and model input) and on-demand ½ / ¼ tracking renditions; coarse-to-fine via guide inputs; template matcher (Rust / GPU); learned trackers via a Python worker (v1's CoTracker3 engine; TAPNext as the permissive option) over a narrow job protocol (seeds + view transform in, result chunks out); trackers attach to any view; **reverse** jobs (backward decode by keyframe interval) with a forward/backward fuse; **catch-up-to-playhead** mode; stale-while-revalidate |
+| **M6 · Trackers** *(started: see above)* | **FrameSource** entities with Auto rendition selection (a mip level per view and model input) and on-demand ½ / ¼ tracking renditions; coarse-to-fine via guide inputs; template matcher (Rust / GPU); learned trackers via a Python worker (v1's CoTracker3 engine; TAPNext as the permissive option) over a narrow job protocol (seeds + view transform in, result chunks out); trackers attach to any view; **reverse** jobs (backward decode by keyframe interval) with a forward/backward fuse; **catch-up-to-playhead** mode; stale-while-revalidate |
 | **M7 · Targets & quality** | Combine / Contribution (pushed position, from v1), drift and motion-consistency checks, automatic ends |
 | **M8 · Export** | JSON / CSV, AE keyframe clipboard text, Fusion `.setting` (validated in Resolve this time), Nuke `.chan` |
 | **Later** | Result caching (content-addressed), audio, zero-copy hardware decode, operator graph view |

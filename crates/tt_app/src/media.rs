@@ -150,6 +150,12 @@ fn open_requested(world: &mut World) {
         start_proxy(&index)
     };
     let original = Source { player: Player::new(index.clone(), DecodeOptions::default(), CACHE_BYTES), index };
+    // Trackers read the same files with decoders of their own.
+    let proxy_index = match &proxy {
+        ProxyState::Ready(p) => Some(p.index.clone()),
+        _ => None,
+    };
+    world.insert_resource(tt_track::Footage { original: original.index.clone(), proxy: proxy_index, decode: DecodeOptions::default() });
     world.insert_resource(tt_core::view::SourceSize { width: original.index.width as f64, height: original.index.height as f64 });
     world.insert_resource(Media { name, original, proxy, color, generation });
     world.insert_resource(ActiveSource(Which::Original));
@@ -187,7 +193,7 @@ fn proxy_source(index: VideoIndex) -> Source {
     Source { player: Player::new(index.clone(), DecodeOptions::default(), PROXY_CACHE_BYTES), index }
 }
 
-fn poll_proxy(media: Option<ResMut<Media>>) {
+fn poll_proxy(media: Option<ResMut<Media>>, footage: Option<ResMut<tt_track::Footage>>) {
     let Some(mut media) = media else { return };
     if !matches!(&media.proxy, ProxyState::Building { job, .. } if job.is_finished()) {
         return;
@@ -201,6 +207,9 @@ fn poll_proxy(media: Option<ResMut<Media>>) {
         }
         Err(_) => ProxyState::Failed("proxy thread panicked".into()),
     };
+    if let (ProxyState::Ready(p), Some(mut footage)) = (&media.proxy, footage) {
+        footage.proxy = Some(p.index.clone());
+    }
 }
 
 fn request_frames(media: Option<ResMut<Media>>, active: Res<ActiveSource>, t: Res<Transport>) {

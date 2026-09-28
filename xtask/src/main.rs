@@ -59,7 +59,8 @@ struct SpriteInfo {
     file: String,
     truth: String,
     size: u32,
-    /// x_topleft = floor(expr_x(t)), t = frame / fps; centre = topleft + size / 2 (continuous pixels).
+    /// x_topleft = floor(expr_x(t)) rounded down to even (yuv420 overlay), t = frame / fps;
+    /// centre = topleft + size / 2 (continuous pixels).
     expr_x: &'static str,
     expr_y: &'static str,
 }
@@ -171,10 +172,13 @@ fn fixtures(force: bool) -> Result<()> {
         println!("skip  {sprite_file} (exists)");
     }
     let half = SPRITE_SIZE as f64 / 2.0;
+    // overlay on yuv420 places the sprite on even pixels (chroma alignment):
+    // its corner is the expression rounded down to even.
+    let even = |v: f64| 2.0 * (v.floor() / 2.0).floor();
     let truth: Vec<[f64; 2]> = (0..sprite_frames)
         .map(|f| {
             let t = f as f64 / FPS as f64;
-            [sprite_x(t).floor() + half, sprite_y(t).floor() + half]
+            [even(sprite_x(t)) + half, even(sprite_y(t)) + half]
         })
         .collect();
     std::fs::write(out.join("sprite_truth.json"), serde_json::to_string(&serde_json::json!({ "centers": truth }))?)?;

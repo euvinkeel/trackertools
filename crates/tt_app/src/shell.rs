@@ -92,7 +92,8 @@ impl Shell {
             .add_module(ViewportModule)
             .add_module(TimelineModule)
             .add_module(SessionModule)
-            .add_module(crate::project::ProjectModule);
+            .add_module(crate::project::ProjectModule)
+            .add_module(tt_track::TrackModule);
         let mut core = app.build();
 
         // Until a video is open, a one-minute demo clock keeps the transport live.
