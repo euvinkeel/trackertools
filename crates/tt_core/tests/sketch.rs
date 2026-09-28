@@ -353,7 +353,8 @@ fn hold_jiggle_size() {
             clock.push(w, 150.0, false);
             w += 1.0 / 175.0;
         }
-        let (_, frames) = tt_core::sketch::stroke_frames(&samples, &clock, &SketchParams::default(), FPS).unwrap();
+        let p = SketchParams::default();
+        let (_, frames) = tt_core::sketch::stroke_frames(&samples, &clock, &p, p.lag as f64, FPS).unwrap();
         let b = frames[0].unwrap();
         println!("hold {secs} s: box {:.0}×{:.0}, point x {:.1}", b[4] - b[2], b[5] - b[3], b[0]);
     }

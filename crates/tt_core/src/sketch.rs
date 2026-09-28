@@ -30,7 +30,8 @@
 //!    steadiness cutoff alone, so it doesn't chase the jiggle) over
 //!    `jiggle_window`, × 2.2 × `gain` + `pad`, at least `min_half`;
 //! 5. to video frames: each frame takes the path at the wall time it was
-//!    shown, shifted by `lag` (the hand trails what it follows); a paused
+//!    shown, shifted by the stroke's `lag` (the hand trails what it follows,
+//!    by the same real time at any playback rate); a paused
 //!    stretch maps to one frame and keeps the state at the end of the hold
 //!    (no lag shift: the hand has settled);
 //!    Light smoothing of the point and of the jiggle box's extents around
@@ -202,15 +203,23 @@ pub struct Stroke {
     /// wheel while holding, by default).
     #[reflect(default = "one")]
     pub scale: f32,
+    /// Seconds (real time) the hand trailed the subject during this stroke.
+    /// Taken from the sketch's `lag` when the stroke is drawn.
+    #[reflect(default = "default_lag")]
+    pub lag: f32,
 }
 
 fn one() -> f32 {
     1.0
 }
 
+fn default_lag() -> f32 {
+    0.25
+}
+
 impl Default for Stroke {
     fn default() -> Self {
-        Self { falloff: 0.2, influence: 1.0, size: 1.0, scale: 1.0 }
+        Self { falloff: 0.2, influence: 1.0, size: 1.0, scale: 1.0, lag: default_lag() }
     }
 }
 
@@ -226,7 +235,8 @@ impl Stroke {
 #[derive(Component, Reflect, Clone, Debug, PartialEq)]
 #[reflect(Component)]
 pub struct SketchParams {
-    /// Seconds (real time) the hand trails the subject.
+    /// Lag given to new strokes on this sketch: seconds (real time) the hand
+    /// trails the subject. Each stroke keeps its own (`Stroke::lag`).
     pub lag: f32,
     /// One Euro minimum cutoff (Hz): lower = steadier when the hand is slow.
     pub steadiness: f32,
@@ -461,12 +471,13 @@ fn at(series: &[[f64; 2]], t0: f64, hz: f64, t: f64) -> [f64; 2] {
     [series[i][0] + (series[j][0] - series[i][0]) * u, series[i][1] + (series[j][1] - series[i][1]) * u]
 }
 
-/// The whole pipeline for one stroke on its own: [`stroke_frames`], then
-/// the region's motion union ([`union_at`]). `samples` are `(t, x, y)` sorted
-/// by t. Returns `(first_frame, frames)` with `[x, y, left, top, right,
-/// bottom]` per frame; `None` entries are frames the capture didn't visit.
+/// The whole pipeline for one stroke on its own (with the lag `p.lag`):
+/// [`stroke_frames`], then the region's motion union ([`union_at`]).
+/// `samples` are `(t, x, y)` sorted by t. Returns `(first_frame, frames)`
+/// with `[x, y, left, top, right, bottom]` per frame; `None` entries are
+/// frames the capture didn't visit.
 pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fps: f64) -> Option<Boxes> {
-    let (first, frames) = stroke_frames(samples, clock, p, fps)?;
+    let (first, frames) = stroke_frames(samples, clock, p, p.lag as f64, fps)?;
     let (before, after) = union_reach(p, fps);
     let get = |f: FrameIndex| frames.get(usize::try_from(f - first).ok()?).copied().flatten();
     let out = (0..frames.len()).map(|i| union_at(get, first + i as FrameIndex, before, after)).collect();
@@ -478,11 +489,12 @@ pub fn sketch_boxes(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fp
 /// union, which is applied to the whole sketch after its strokes are
 /// layered, [`union_at`]).
 ///
-/// A played frame takes the hand at the moment it was shown plus `lag`, a
-/// held (paused) frame the hand at the end of the hold; either way its box is
-/// the smoothed point ± the jiggle size then, so the same jiggle reads as the
-/// same size whether the video was playing or paused.
-pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, fps: f64) -> Option<Boxes> {
+/// A played frame takes the hand at the moment it was shown plus `lag` (the
+/// stroke's, in wall seconds: at any playback rate the hand trails by the
+/// same real time), a held (paused) frame the hand at the end of the hold;
+/// either way its box is the smoothed point ± the jiggle size then, so the
+/// same jiggle reads as the same size whether the video was playing or paused.
+pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, lag: f64, fps: f64) -> Option<Boxes> {
     if samples.len() < 2 {
         return None;
     }
@@ -518,7 +530,6 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, f
     // - A held frame takes the end of the hold (the hand has settled on it),
     //   but at least `lag` after the hold began (it had to get there first).
     let (first, shown) = clock.frame_times()?;
-    let lag = p.lag as f64;
     let (start, end) = (samples[0][0], samples[samples.len() - 1][0]);
     let frames: Vec<Option<[f64; 6]>> = shown
         .iter()
@@ -823,14 +834,14 @@ pub fn stroke_boxes(world: &World, e: Entity, params: &SketchParams, fps: f64) -
     }
     let (info, clock) = (entity.get::<Capture>()?, entity.get::<ClockMap>()?);
     let stream = world.resource::<SignalStore>().get(entity.get::<Output>()?.0)?;
-    let (first, mut frames) = stroke_frames(&read_stream(stream, info.samples), clock, params, fps)?;
+    let stroke = entity.get::<Stroke>().cloned().unwrap_or_default();
+    let (first, mut frames) = stroke_frames(&read_stream(stream, info.samples), clock, params, stroke.lag as f64, fps)?;
     // Drawn inside a view: from the view's pixels to the source, frame by frame.
     if let Some(through) = entity.get::<Through>().and_then(|t| world.resource::<SignalStore>().get(t.0)) {
         for (i, v) in frames.iter_mut().enumerate() {
             *v = v.zip(through.get(first + i as FrameIndex)).map(|(b, m)| through_map(m).box_to_source(b));
         }
     }
-    let stroke = entity.get::<Stroke>().cloned().unwrap_or_default();
     for v in frames.iter_mut().flatten() {
         *v = stroke.scaled(*v);
     }

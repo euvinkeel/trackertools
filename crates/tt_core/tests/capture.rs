@@ -5,7 +5,7 @@ use tt_core::capture::LiveCapture;
 use tt_core::history::{self, History};
 use tt_core::input::Action;
 use tt_core::selection::Selection;
-use tt_core::sketch::{Capture, falloff_weight};
+use tt_core::sketch::{Capture, Stroke, falloff_weight};
 use tt_core::tool::{ActiveTool, PointerFrame, Tool};
 use tt_core::transport::Transport;
 
@@ -348,4 +348,137 @@ fn a_paused_jiggle_sizes_the_box_like_the_same_jiggle_during_playback() {
     );
     assert!((0.75..=1.33).contains(&(w_hold / w_play)), "width: paused {w_hold:.0} vs playing {w_play:.0}");
     assert!((0.75..=1.33).contains(&(h_hold / h_play)), "height: paused {h_hold:.0} vs playing {h_play:.0}");
+}
+
+// ---- the hand's lag, per stroke --------------------------------------------------------------
+
+/// The sprite fixture's centre (source pixels) at video time t (as in tests/sketch.rs).
+fn sprite(t: f64) -> [f64; 2] {
+    [
+        (950.0 + 500.0 * (0.9 * t).sin() + 60.0 * (5.3 * t).sin()).floor() + 10.5,
+        (530.0 + 300.0 * (1.3 * t + 0.7).sin() + 40.0 * (4.1 * t).sin()).floor() + 10.5,
+    ]
+}
+
+/// Record the sprite at `rate` from frame `from` for `wall` seconds of playback:
+/// the hand follows the frame that was on screen 0.25 s (real time) earlier,
+/// with tremor. `new` starts a new sketch. Returns the sketch.
+fn follow_sprite(d: &mut Driver, rate: f64, from: i64, wall: f64, new: bool) -> bevy_ecs::entity::Entity {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    d.core.world.resource_mut::<Transport>().seek(from);
+    d.core.world.resource_mut::<Transport>().rate = rate;
+    // (wall time, playhead) after every app frame: what was on screen when.
+    let shown = Rc::new(RefCell::new(vec![(d.now - 1.0, from as f64), (d.now, from as f64)]));
+    let hand = {
+        let shown = shown.clone();
+        move |t: f64| {
+            let s = shown.borrow();
+            let w = t - 0.25;
+            let i = s.partition_point(|(t, _)| *t <= w).clamp(1, s.len() - 1);
+            let ((t0, p0), (t1, p1)) = (s[i - 1], s[i]);
+            let playhead = if w >= t1 { p1 } else { p0 + (p1 - p0) * ((w - t0) / (t1 - t0)).clamp(0.0, 1.0) };
+            let p = sprite(playhead.floor() / 60.0);
+            let tremor = |ph: f64| 1.5 * ((9.0 * std::f64::consts::TAU * t + ph).sin() * 0.6 + (12.3 * std::f64::consts::TAU * t + 2.0 * ph).sin() * 0.4);
+            [p[0] + tremor(0.0), p[1] + tremor(1.3)]
+        }
+    };
+    let step = |d: &mut Driver, input: Input| {
+        d.frame(&hand, input);
+        shown.borrow_mut().push((d.now, d.transport().playhead));
+    };
+    step(d, Input { shift: new, ..PRESS });
+    step(d, Input { action: Some(Action::TogglePlay), ..HOLD });
+    for _ in 0..(wall * UI_HZ) as usize {
+        step(d, HOLD);
+    }
+    step(d, Input { action: Some(Action::TogglePlay), ..HOLD });
+    for _ in 0..60 {
+        step(d, HOLD); // a beat past the end: the hand catches up
+    }
+    step(d, UP);
+    d.core.world.resource::<Selection>().primary().expect("the sketch is selected")
+}
+
+/// Median point error against the sprite over `frames` (those with a value).
+fn sprite_error(d: &Driver, s: bevy_ecs::entity::Entity, frames: std::ops::Range<i64>) -> (f64, usize) {
+    let mut e: Vec<f64> = frames
+        .filter_map(|f| {
+            let v = d.value(s, f)?;
+            let t = sprite(f as f64 / 60.0);
+            Some((v[0] as f64 - t[0]).hypot(v[1] as f64 - t[1]))
+        })
+        .collect();
+    e.sort_by(f64::total_cmp);
+    (e.get(e.len() / 2).copied().unwrap_or(f64::NAN), e.len())
+}
+
+/// A sketch's strokes (capture entities), in layer order.
+fn strokes_of(d: &Driver, s: bevy_ecs::entity::Entity) -> Vec<bevy_ecs::entity::Entity> {
+    d.core.world.get::<tt_core::op::Inputs>(s).unwrap().0.iter().filter(|(slot, _)| slot == "stroke").map(|(_, e)| *e).collect()
+}
+
+fn set_lag(d: &mut Driver, capture: bevy_ecs::entity::Entity, lag: f32) {
+    history::edit(&mut d.core.world, "Edit Stroke", |tx| tx.modify::<Stroke>(capture, |s| s.lag = lag));
+    d.frames(2, still(0.0, 0.0), UP);
+}
+
+#[test]
+fn the_lag_is_real_time_at_any_playback_speed() {
+    for rate in [2.0, 0.5] {
+        let mut d = Driver::new();
+        let s = follow_sprite(&mut d, rate, 50, 4.0, true);
+        let (median, n) = sprite_error(&d, s, 0..600);
+        // The same stroke if its lag were counted in video time (0.25 s of video).
+        let stroke = strokes_of(&d, s)[0];
+        assert_eq!(d.core.world.get::<Stroke>(stroke).unwrap().lag, 0.25, "the stroke took the sketch's lag");
+        set_lag(&mut d, stroke, (0.25 / rate) as f32);
+        let (video_lag, _) = sprite_error(&d, s, 0..600);
+        println!("at {rate}×: {n} frames, median point error {median:.2} px with 0.25 s of real time; {video_lag:.2} px with 0.25 s of video");
+        assert!(n as f64 > 4.0 * rate * 60.0 * 0.9, "{n} frames");
+        assert!(median < 3.0, "at {rate}×: {median:.2} px (measured 2.33 at 2×, 1.51 at ½× when set)");
+        assert!(video_lag > 3.0 * median, "at {rate}×, a video-time lag is far off: {video_lag:.2} vs {median:.2} px");
+    }
+}
+
+#[test]
+fn changing_one_strokes_lag_moves_only_its_frames() {
+    let mut d = Driver::new();
+    d.core.world.resource_mut::<Transport>().rate = 1.0;
+    let s = follow_sprite(&mut d, 1.0, 50, 1.5, true);
+    let s2 = follow_sprite(&mut d, 1.0, 300, 1.5, false);
+    assert_eq!(s, s2, "the second stroke went onto the selected sketch");
+    let [first, second] = strokes_of(&d, s)[..] else { panic!("two strokes") };
+    let before: Vec<Option<[f32; 6]>> = (0..600).map(|f| d.value(s, f)).collect();
+    set_lag(&mut d, second, 0.4);
+    let after: Vec<Option<[f32; 6]>> = (0..600).map(|f| d.value(s, f)).collect();
+    assert_eq!(before[..250], after[..250], "the first stroke's frames stay exactly");
+    let moved = (300..390).filter(|f| before[*f as usize].is_some() && before[*f as usize] != after[*f as usize]).count();
+    assert!(moved > 80, "the second stroke's frames moved: {moved} of 90");
+    assert_eq!(d.core.world.get::<Stroke>(first).unwrap().lag, 0.25);
+    history::undo(&mut d.core.world);
+    d.frames(2, still(0.0, 0.0), UP);
+    assert_eq!((0..600).map(|f| d.value(s, f)).collect::<Vec<_>>(), before, "undo restores the path");
+}
+
+#[test]
+fn a_new_stroke_takes_its_sketchs_lag() {
+    use tt_core::capture::SketchDefaults;
+    use tt_core::sketch::SketchParams;
+    let mut d = Driver::new();
+    d.core.world.resource_mut::<SketchDefaults>().params.lag = 0.3;
+    hold_at(&mut d, 50, 300.0, 300.0, 60, HOLD);
+    let s = d.sketches()[0];
+    assert_eq!(d.core.world.get::<SketchParams>(s).unwrap().lag, 0.3, "a new sketch takes the default lag");
+    history::edit(&mut d.core.world, "Edit SketchParams", |tx| tx.modify::<SketchParams>(s, |p| p.lag = 0.15));
+    hold_at(&mut d, 70, 300.0, 300.0, 60, HOLD);
+    let lags: Vec<f32> = strokes_of(&d, s).iter().map(|c| d.core.world.get::<Stroke>(*c).unwrap().lag).collect();
+    assert_eq!(lags, vec![0.3, 0.15], "each stroke keeps the lag its sketch had when it was drawn");
+}
+
+#[test]
+fn a_stroke_saved_before_its_lag_existed_loads_with_the_default() {
+    let mut d = Driver::new();
+    let s: Stroke = load_component(&mut d.core.world, "(falloff: 0.5, influence: 1.0, size: 1.0, scale: 2.0)");
+    assert_eq!((s.falloff, s.scale, s.lag), (0.5, 2.0, 0.25));
 }
