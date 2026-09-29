@@ -1,0 +1,494 @@
+//! Outliner: the document as a tree. Each sketch lists the sketches drawn
+//! inside its view (nested under it) and its strokes (folded under "n
+//! strokes"); other document entities follow. Type in the box to filter.
+//!
+//! - Click selects, Ctrl+click toggles, Shift+click selects the range from
+//!   the last click.
+//! - Drag on the list draws a box that selects every row it touches (Shift or
+//!   Ctrl add to the selection); past the top or bottom it scrolls the list,
+//!   Esc drops it. A click beside a label is on its row; a click on empty
+//!   space deselects.
+//! - Double-click or F2 renames; right-click opens the entity menu.
+//! - The wheel or a middle-drag scrolls; a selection made elsewhere (the
+//!   viewport, the timeline) unfolds and scrolls into view.
+
+use std::collections::{HashMap, HashSet};
+
+use bevy_ecs::entity_disabling::Disabled;
+use bevy_ecs::name::Name;
+use bevy_ecs::prelude::*;
+use egui::{Pos2, Rect, Sense};
+use tt_core::ComponentMetas;
+use tt_core::app::ModuleList;
+use tt_core::commands::{RenameRequest, rename, strokes_of};
+use tt_core::meta::{Created, creation_order};
+use tt_core::op::{OpError, Operator};
+use tt_core::selection::Selection;
+use tt_core::sketch::{Capture, sketch_of};
+use tt_core::view::{home_of, sketch_framed};
+
+use super::menu;
+use crate::style;
+
+/// A human label: the Name component, else the operator kind, else the id.
+pub fn label(world: &World, e: Entity) -> String {
+    if let Some(n) = world.get::<Name>(e) {
+        return n.as_str().to_string();
+    }
+    if let Some(op) = world.get::<Operator>(e) {
+        return format!("{} ({e})", op.kind);
+    }
+    format!("Entity {e}")
+}
+
+/// The outliner's own state (session; not part of the document).
+#[derive(Resource, Default)]
+pub struct OutlinerState {
+    filter: String,
+    /// Sketches folded shut.
+    folded: HashSet<Entity>,
+    /// Sketches whose strokes are shown.
+    strokes_open: HashSet<Entity>,
+    /// The row being renamed, its text, and whether it has had focus yet.
+    renaming: Option<(Entity, String, bool)>,
+    /// Where the last plain or Ctrl click was (Shift+click selects from here).
+    anchor: Option<Entity>,
+    /// A box being dragged: its start, in the list's content coordinates
+    /// (so it stays on its row while the list scrolls).
+    marquee: Option<Pos2>,
+    scroll: f32,
+    /// The primary selection as the outliner last left it; a different one
+    /// was made elsewhere.
+    last_primary: Option<Entity>,
+    /// A row to scroll into view once it is drawn.
+    scroll_to: Option<Entity>,
+    /// Where the list and its first row were drawn (the demo aims at them).
+    pub list_area: Option<Rect>,
+    pub first_row: Option<Rect>,
+}
+
+/// Sketches in tree order: `(sketch, depth)`, nested sketches under the one
+/// whose view they were drawn in. (The timeline's lanes use the same order.)
+pub fn sketch_tree(world: &mut World) -> Vec<(Entity, usize)> {
+    let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
+    let mut sketches: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "sketch").map(|(e, _)| e).collect();
+    creation_order(world, &mut sketches);
+    let live: HashSet<Entity> = sketches.iter().copied().collect();
+    let mut children: HashMap<Entity, Vec<Entity>> = HashMap::new();
+    let mut roots = Vec::new();
+    for &s in &sketches {
+        match parent_sketch(world, s).filter(|p| live.contains(p) && *p != s) {
+            Some(p) => children.entry(p).or_default().push(s),
+            None => roots.push(s),
+        }
+    }
+    fn walk(s: Entity, depth: usize, children: &HashMap<Entity, Vec<Entity>>, seen: &mut HashSet<Entity>, out: &mut Vec<(Entity, usize)>) {
+        if !seen.insert(s) {
+            return;
+        }
+        out.push((s, depth));
+        for c in children.get(&s).into_iter().flatten() {
+            walk(*c, depth + 1, children, seen, out);
+        }
+    }
+    let (mut out, mut seen) = (Vec::new(), HashSet::new());
+    // Sketches in a parent cycle (only a damaged file makes one) have no root: listed anyway.
+    for s in roots.into_iter().chain(sketches.iter().copied()) {
+        walk(s, 0, &children, &mut seen, &mut out);
+    }
+    out
+}
+
+/// The sketch whose view `s` was drawn in.
+fn parent_sketch(world: &World, s: Entity) -> Option<Entity> {
+    home_of(world, s).and_then(|v| sketch_framed(world, v))
+}
+
+/// Unfold what hides `e`'s row: a stroke's list of strokes, and every sketch it is nested under.
+fn reveal(world: &mut World, st: &mut OutlinerState, e: Entity) {
+    // A look: its tracker; a tracker: its guide sketch.
+    let mut e = e;
+    if world.get::<tt_track::look::Look>(e).is_some() {
+        let mut q = world.query::<(Entity, &tt_core::op::Inputs)>();
+        if let Some(t) = q.iter(world).find(|(_, i)| i.0.iter().any(|(s, p)| s == "look" && *p == e)).map(|(t, _)| t) {
+            st.folded.remove(&t);
+            e = t;
+        }
+    }
+    if tt_track::is_tracker(world, e)
+        && let Some(g) = tt_track::guide_of(world, e)
+    {
+        e = g;
+        st.folded.remove(&g);
+    }
+    let mut s = Some(e);
+    if world.get::<Capture>(e).is_some() {
+        s = sketch_of(world, e);
+        if let Some(s) = s {
+            st.strokes_open.insert(s);
+            st.folded.remove(&s);
+        }
+    }
+    for _ in 0..64 {
+        let Some(p) = s.and_then(|s| parent_sketch(world, s)) else { break };
+        st.folded.remove(&p);
+        s = Some(p);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Row {
+    /// An entity at a depth; `fold`: Some(open) if it can fold.
+    Entity { e: Entity, depth: usize, fold: Option<bool> },
+    /// "n strokes" under a sketch.
+    Strokes { sketch: Entity, n: usize, depth: usize, open: bool },
+}
+
+fn rows(world: &mut World, st: &OutlinerState) -> Vec<Row> {
+    let tree = sketch_tree(world);
+    let filter = st.filter.trim().to_lowercase();
+    let matches = |w: &World, e: Entity| filter.is_empty() || label(w, e).to_lowercase().contains(&filter);
+    // With a filter: a row shows if it matches or anything under it does (all unfolded).
+    let subtree = |i: usize| {
+        let (_, d) = tree[i];
+        let end = tree[i + 1..].iter().position(|(_, dd)| *dd <= d).map_or(tree.len(), |k| i + 1 + k);
+        &tree[i..end]
+    };
+    let mut out = Vec::new();
+    let mut hidden_below: Option<usize> = None;
+    for (i, &(s, depth)) in tree.iter().enumerate() {
+        if let Some(d) = hidden_below {
+            if depth > d {
+                continue;
+            }
+            hidden_below = None;
+        }
+        let strokes = strokes_of(world, s);
+        if !filter.is_empty() {
+            let any = subtree(i).iter().any(|(e, _)| matches(world, *e) || strokes_of(world, *e).iter().any(|c| matches(world, *c)));
+            if !any {
+                hidden_below = Some(depth);
+                continue;
+            }
+        }
+        let open = !filter.is_empty() || !st.folded.contains(&s);
+        let trackers = tt_track::trackers_of(world, s);
+        let has_children = !strokes.is_empty() || !trackers.is_empty() || tree.get(i + 1).is_some_and(|(_, d)| *d > depth);
+        out.push(Row::Entity { e: s, depth, fold: has_children.then_some(open) });
+        if !open {
+            hidden_below = Some(depth);
+            continue;
+        }
+        if !strokes.is_empty() {
+            let shown: Vec<Entity> = strokes.iter().copied().filter(|c| filter.is_empty() || matches(world, *c) || matches(world, s)).collect();
+            if !shown.is_empty() {
+                let strokes_open = !filter.is_empty() || st.strokes_open.contains(&s);
+                out.push(Row::Strokes { sketch: s, n: strokes.len(), depth: depth + 1, open: strokes_open });
+                if strokes_open {
+                    out.extend(shown.into_iter().map(|c| Row::Entity { e: c, depth: depth + 2, fold: None }));
+                }
+            }
+        }
+        // Its trackers, each with its looks.
+        for tr in trackers {
+            let looks = tt_track::look::looks_of(world, tr);
+            let show = filter.is_empty() || matches(world, tr) || matches(world, s) || looks.iter().any(|l| matches(world, *l));
+            if !show {
+                continue;
+            }
+            let tr_open = !filter.is_empty() || !st.folded.contains(&tr);
+            out.push(Row::Entity { e: tr, depth: depth + 1, fold: (!looks.is_empty()).then_some(tr_open) });
+            if tr_open {
+                out.extend(looks.into_iter().map(|l| Row::Entity { e: l, depth: depth + 2, fold: None }));
+            }
+        }
+        // (Nested sketches follow in tree order at depth + 1.)
+    }
+    // Everything else in the document.
+    for e in other_entities(world) {
+        if matches(world, e) {
+            out.push(Row::Entity { e, depth: 0, fold: None });
+        }
+    }
+    out
+}
+
+pub fn ui(ui: &mut egui::Ui, world: &mut World) {
+    let mut st = std::mem::take(&mut *world.resource_mut::<OutlinerState>());
+
+    // Rename requested by F2 or the menu (dropped below if its row still isn't drawn).
+    if let Some(e) = world.resource_mut::<RenameRequest>().0.take() {
+        reveal(world, &mut st, e);
+        st.renaming = Some((e, label(world, e), false));
+    }
+    // A selection made elsewhere: unfold to it and scroll it into view.
+    let primary = world.resource::<Selection>().primary();
+    if primary != st.last_primary {
+        st.scroll_to = primary;
+        if let Some(p) = primary {
+            reveal(world, &mut st, p);
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("🔍 Filter by name").desired_width(ui.available_width() - 28.0));
+        if ui.add_enabled(!st.filter.is_empty(), egui::Button::new("✖").small()).on_hover_text("Clear the filter").clicked() {
+            st.filter.clear();
+        }
+    });
+
+    let rows = rows(world, &st);
+    let area = ui.available_rect_before_wrap();
+    // Under the rows: box selection, clicks beside a label, and middle-drag scrolling.
+    let bg = ui.interact(area, ui.id().with("outliner-bg"), Sense::click_and_drag());
+    let mut set_scroll = bg.dragged_by(egui::PointerButton::Middle);
+    if set_scroll {
+        st.scroll = (st.scroll - bg.drag_delta().y).max(0.0);
+    }
+    let selection = world.resource::<Selection>().clone();
+    let mods = ui.input(|i| i.modifiers);
+    let adding = mods.shift || mods.ctrl || mods.command;
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    // A box dragged past the top or bottom of the list scrolls it.
+    if st.marquee.is_some()
+        && let Some(p) = pointer
+    {
+        let over = (p.y - area.min.y).min(0.0) + (p.y - area.max.y).max(0.0);
+        if over != 0.0 {
+            st.scroll = (st.scroll + over.clamp(-60.0, 60.0) * 10.0 * ui.input(|i| i.stable_dt).min(0.1)).max(0.0);
+            set_scroll = true;
+            ui.ctx().request_repaint();
+        }
+    }
+    let anchor = st.marquee;
+    // The box this frame (screen): from its anchor to the pointer, kept inside the list.
+    let mut marquee: Option<Rect> = None;
+    let mut content_top = area.min.y;
+    let mut row_rects: Vec<(Entity, Rect)> = Vec::new();
+    let mut click: Option<Entity> = None;
+    let mut toggle_fold: Option<Entity> = None;
+    let mut toggle_strokes: Option<Entity> = None;
+    let mut menu_for: Option<(Entity, egui::Response)> = None;
+    let mut commit_rename: Option<(Entity, String)> = None;
+    let mut scrolled_to = false;
+    let requested_rename = st.renaming.as_ref().filter(|(_, _, focused)| !focused).map(|(e, _, _)| *e);
+
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_salt("outliner-scroll")
+        .auto_shrink([false; 2])
+        .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR | egui::containers::scroll_area::ScrollSource::MOUSE_WHEEL);
+    if set_scroll {
+        scroll = scroll.vertical_scroll_offset(st.scroll);
+    }
+    let out = scroll.show(ui, |ui| {
+        content_top = ui.max_rect().min.y;
+        marquee = anchor.zip(pointer).map(|(a, b)| Rect::from_two_pos(Pos2::new(a.x, a.y + content_top), b.clamp(area.min, area.max)));
+        if rows.is_empty() {
+            let text = if st.filter.is_empty() { "Nothing yet · press D, then hold on the video to sketch." } else { "Nothing matches the filter." };
+            ui.label(egui::RichText::new(text).weak());
+        }
+        for row in &rows {
+            match *row {
+                Row::Entity { e, depth, fold } => {
+                    // Behind the row: the box's preview (known once the row is laid out).
+                    let preview = ui.painter().add(egui::Shape::Noop);
+                    let r = ui.horizontal(|ui| {
+                        ui.add_space(depth as f32 * 14.0);
+                        match fold {
+                            Some(open) => {
+                                if ui.add(egui::Button::new(if open { "⏷" } else { "⏵" }).frame(false).small()).clicked() {
+                                    toggle_fold = Some(e);
+                                }
+                            }
+                            None => ui.add_space(18.0),
+                        }
+                        if let Some((re, text, focused)) = st.renaming.as_mut().filter(|(re, _, _)| *re == e) {
+                            let te = ui.add(egui::TextEdit::singleline(text).desired_width(150.0));
+                            if !*focused {
+                                te.request_focus();
+                                *focused = true;
+                            } else if te.lost_focus() {
+                                if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                    commit_rename = Some((*re, text.clone()));
+                                }
+                                commit_rename.get_or_insert((Entity::PLACEHOLDER, String::new()));
+                            }
+                            return None;
+                        }
+                        let error = world.get::<OpError>(e).map(|err| err.0.clone());
+                        let is_stroke = world.get::<Capture>(e).is_some();
+                        let mut rt = egui::RichText::new(label(world, e));
+                        if is_stroke {
+                            rt = rt.color(style::MUTED);
+                        }
+                        if error.is_some() {
+                            rt = rt.color(egui::Color32::from_rgb(0xf4, 0x3f, 0x5e));
+                        }
+                        // While a plain box is dragged, it alone shows what will be selected.
+                        let r = ui.selectable_label(selection.is_selected(e) && (anchor.is_none() || adding), rt);
+                        let r = match error {
+                            Some(err) => r.on_hover_text(err),
+                            None => r,
+                        };
+                        Some(r)
+                    });
+                    // The row across the list, gaps included: what clicks and boxes hit.
+                    let full = Rect::from_x_y_ranges(area.x_range(), r.response.rect.y_range()).expand2(egui::vec2(0.0, ui.spacing().item_spacing.y / 2.0));
+                    if marquee.is_some_and(|m| full.intersects(m)) {
+                        ui.painter().set(preview, egui::Shape::rect_filled(full.shrink2(egui::vec2(0.0, 1.0)), 2.0, ui.visuals().selection.bg_fill));
+                    }
+                    row_rects.push((e, full));
+                    if let Some(r) = r.inner {
+                        if st.scroll_to == Some(e) {
+                            r.scroll_to_me(None);
+                            scrolled_to = true;
+                        }
+                        if r.double_clicked() {
+                            st.renaming = Some((e, label(world, e), false));
+                        } else if r.clicked() {
+                            click = Some(e);
+                        }
+                        if r.secondary_clicked() || r.context_menu_opened() {
+                            menu_for = Some((e, r));
+                        }
+                    }
+                }
+                Row::Strokes { sketch, n, depth, open } => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(depth as f32 * 14.0);
+                        let text = format!("{} {n} stroke{}", if open { "⏷" } else { "⏵" }, if n == 1 { "" } else { "s" });
+                        if ui.add(egui::Button::new(egui::RichText::new(text).color(style::MUTED)).frame(false).small()).clicked() {
+                            toggle_strokes = Some(sketch);
+                        }
+                    });
+                }
+            }
+        }
+
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Dev: modules & types").default_open(false).show(ui, |ui| {
+            for name in &world.resource::<ModuleList>().0 {
+                ui.monospace(short(name));
+            }
+            ui.separator();
+            let mut metas: Vec<_> = world.resource::<ComponentMetas>().iter().cloned().collect();
+            metas.sort_by_key(|m| m.name);
+            for m in metas {
+                ui.horizontal(|ui| {
+                    ui.monospace(short(m.name));
+                    ui.label(egui::RichText::new(format!("{:?}", m.class)).weak());
+                });
+            }
+        });
+    });
+    st.scroll = out.state.offset.y;
+    if scrolled_to {
+        st.scroll_to = None;
+    }
+    st.list_area = Some(area);
+    st.first_row = row_rects.first().map(|(_, r)| *r);
+    // A requested rename whose row isn't drawn (filtered out) is dropped rather than grabbing the keyboard later.
+    if st.renaming.as_ref().is_some_and(|(e, _, focused)| !focused && requested_rename == Some(*e)) {
+        st.renaming = None;
+    }
+
+    // Box selection.
+    if bg.drag_started_by(egui::PointerButton::Primary) {
+        st.marquee = ui.input(|i| i.pointer.press_origin()).map(|p| Pos2::new(p.x, p.y - content_top));
+    }
+    if let Some(m) = marquee {
+        ui.painter_at(area).rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), egui::Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
+        let down = ui.input(|i| i.pointer.primary_down());
+        if bg.drag_stopped() || !down {
+            // Stopped with the button still down (Esc): no selection.
+            if !down {
+                let hit: Vec<Entity> = row_rects.iter().filter(|(_, r)| r.intersects(m)).map(|(e, _)| *e).collect();
+                let mut sel = world.resource_mut::<Selection>();
+                if !adding {
+                    sel.clear();
+                }
+                for e in hit {
+                    if !sel.is_selected(e) {
+                        sel.entities.push(e);
+                    }
+                }
+            }
+            st.marquee = None;
+        }
+    } else if bg.clicked() {
+        // Beside a row's label is still that row; empty space deselects.
+        match bg.interact_pointer_pos().and_then(|p| row_rects.iter().find(|(_, r)| r.contains(p))) {
+            Some((e, _)) => click = Some(*e),
+            None if !adding => world.resource_mut::<Selection>().clear(),
+            None => {}
+        }
+    }
+
+    // Clicks on rows.
+    if let Some(e) = click {
+        let visible: Vec<Entity> = row_rects.iter().map(|(e, _)| *e).collect();
+        let mut sel = world.resource_mut::<Selection>();
+        if mods.shift
+            && let Some(a) = st.anchor
+            && let (Some(i), Some(j)) = (visible.iter().position(|x| *x == a), visible.iter().position(|x| *x == e))
+        {
+            let range = &visible[i.min(j)..=i.max(j)];
+            if !(mods.ctrl || mods.command) {
+                sel.clear();
+            }
+            for x in range {
+                if !sel.is_selected(*x) {
+                    sel.entities.push(*x);
+                }
+            }
+            // Keep the clicked row primary.
+            sel.entities.retain(|x| *x != e);
+            sel.entities.push(e);
+        } else if mods.ctrl || mods.command {
+            sel.toggle(e);
+            st.anchor = Some(e);
+        } else {
+            sel.select_only(e);
+            st.anchor = Some(e);
+        }
+    }
+    if let Some(s) = toggle_fold
+        && !st.folded.remove(&s)
+    {
+        st.folded.insert(s);
+    }
+    if let Some(s) = toggle_strokes
+        && !st.strokes_open.remove(&s)
+    {
+        st.strokes_open.insert(s);
+    }
+    if let Some((e, text)) = commit_rename {
+        if e != Entity::PLACEHOLDER {
+            rename(world, e, &text);
+        }
+        st.renaming = None;
+    }
+    if let Some((e, r)) = menu_for {
+        if r.secondary_clicked() {
+            menu::right_clicked(world, e);
+        }
+        r.context_menu(|ui| menu::entity_menu(ui, world));
+    }
+    // What the outliner selected itself doesn't scroll it.
+    st.last_primary = world.resource::<Selection>().primary();
+    *world.resource_mut::<OutlinerState>() = st;
+}
+
+/// Enabled document entities (every one carries [`Created`]) that aren't
+/// sketches, strokes or views.
+fn other_entities(world: &mut World) -> Vec<Entity> {
+    let mut q = world.query_filtered::<(Entity, Option<&Operator>), (With<Created>, Without<Capture>, Without<tt_track::look::Look>, Without<Disabled>)>();
+    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame" || o.kind == "track")).map(|(e, _)| e).collect();
+    creation_order(world, &mut out);
+    out
+}
+
+/// `tt_core::transport::TransportModule` → `TransportModule`.
+fn short(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
+}

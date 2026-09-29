@@ -14,3 +14,9 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust (v2)
+/target/
+
+# Generated test clips (cargo xtask fixtures)
+/fixtures/

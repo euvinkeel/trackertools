@@ -1,0 +1,16 @@
+[package]
+name = "tt_media"
+description = "Media for trackertools: container index, decoders, frame cache, renditions (M1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tt_core.workspace = true
+re_mp4 = "=0.5.1"
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+md-5 = "0.10"
+serde_json.workspace = true

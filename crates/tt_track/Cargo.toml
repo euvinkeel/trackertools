@@ -1,0 +1,20 @@
+[package]
+name = "tt_track"
+description = "Automatic trackers for trackertools (M6): operators that read pixels in background jobs, guided by sketches."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tt_core.workspace = true
+tt_media.workspace = true
+bevy_ecs.workspace = true
+bevy_reflect.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+blake3 = "1.8.7"
+serde_json.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+ron = "0.12.2"
