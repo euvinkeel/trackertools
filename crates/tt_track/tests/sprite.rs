@@ -536,14 +536,15 @@ fn a_placed_look_tracks_exactly_where_it_was_put() {
     assert_eq!(flagged, 0);
 }
 
-/// Where the rough pass is wrong, frames are flagged, never removed: 36 px
-/// off (the sprite beyond where it searches) they are lost; 30 px off (just
-/// past the box's edge, still in reach) the sprite is found and flagged
-/// outside the guide's box.
+/// Where the rough pass is wrong, frames are flagged, never removed: 120 px
+/// off (the sprite far beyond where it searches) they are lost; 30 or 36 px
+/// off (past the box's edge, but where the tracker last saw it and in the
+/// guide's boxes a few frames away) the sprite is found and flagged outside
+/// the guide's box.
 #[test]
 fn frames_the_guide_misses_are_flagged_not_removed() {
     use tt_track::look::Look;
-    for (shift, want) in [(36.0f32, tt_track::LOST), (30.0, tt_track::OUTSIDE)] {
+    for (shift, want) in [(120.0f32, tt_track::LOST), (36.0, tt_track::OUTSIDE), (30.0, tt_track::OUTSIDE)] {
         let Some((mut core, guide)) = setup() else { return };
         let sig = core.world.get::<Output>(guide).expect("output").0;
         {
@@ -567,6 +568,10 @@ fn frames_the_guide_misses_are_flagged_not_removed() {
         assert!(flags.iter().all(|f| *f != 0), "{shift} px off: every frame the guide misses is flagged");
         assert!(marked >= 40, "{shift} px off: flagged {want} on {marked} of 50");
         assert!((600..700).chain(790..900).all(|f| out.get(f).is_some_and(|v| tt_track::flags(v) == 0)), "the rest are trusted");
+        if want == tt_track::OUTSIDE {
+            let off = (705..755).map(|f| out.get(f).map_or(f64::INFINITY, |v| (v[0] as f64 - truth(f)[0]).hypot(v[1] as f64 - truth(f)[1]))).fold(0.0, f64::max);
+            assert!(off < 1.0, "{shift} px off: still on the sprite (at most {off:.2} px away)");
+        }
     }
 }
 

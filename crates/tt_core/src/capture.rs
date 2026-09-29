@@ -297,9 +297,9 @@ pub fn sketch_tool(world: &mut World) {
         live.clock.push(t_now, t.playhead, t.playing);
         if live.drawn_in.is_some() {
             // Playback shows every frame in between; a jump (seek, step, scrub) only its landing.
-            let continuous = was_playing && (0..=64).contains(&(t.frame() - prev));
+            let continuous = was_playing && (t.frame() - prev).abs() <= 64;
             let from = if continuous { prev } else { t.frame() };
-            for f in from..=t.frame() {
+            for f in from.min(t.frame())..=from.max(t.frame()) {
                 if !live.through.contains_key(&f) || f == t.frame() {
                     let m = map_at(world, live.drawn_in, f);
                     live.through.insert(f, m);

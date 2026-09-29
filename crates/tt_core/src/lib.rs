@@ -18,6 +18,7 @@ pub mod ranges;
 pub mod selection;
 pub mod signal;
 pub mod sketch;
+pub mod span;
 pub mod time;
 pub mod tool;
 pub mod transport;
@@ -39,6 +40,7 @@ impl Module for CoreModules {
             .add_module(selection::SelectionModule)
             .add_module(NamesModule)
             .add_module(sketch::SketchModule)
+            .add_module(span::SpanModule)
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)
             .add_module(autospeed::AutoSpeedModule)

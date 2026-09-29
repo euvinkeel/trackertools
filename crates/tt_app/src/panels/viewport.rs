@@ -345,7 +345,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
     }
     response.context_menu(|ui| super::menu::entity_menu(ui, world));
-    speed(&painter, rect, t.rate, world);
+    // (Negative while playing backward: the badge shows ◀.)
+    speed(&painter, rect, if t.playing && t.reverse { -t.rate } else { t.rate }, world);
     let media = world.resource::<Media>();
     if let Some(pos) = response.hover_pos() {
         let src = space.to_source(mapping.to_canvas(pos));
@@ -488,7 +489,7 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
     if flash.rate != Some(rate) {
         // Not on the first frame (opening a video isn't a change), and not for
         // auto speed's changes: only yours flash.
-        if flash.rate.is_some() && wrote != Some(rate) {
+        if flash.rate.is_some() && wrote != Some(rate.abs()) {
             flash.changed_at = now;
         }
         flash.rate = Some(rate);

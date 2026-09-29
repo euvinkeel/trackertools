@@ -4,6 +4,12 @@
 //! rate, and the displayed frame is `floor(playhead)`. Frames are chosen per
 //! app frame from the clock — never "one decode per UI frame" — so playback
 //! speed does not depend on the display's refresh rate.
+//!
+//! Shuttle (J / K / L, as in DaVinci Resolve and most NLEs): L plays forward
+//! and J backward, at 1×; pressed again in the same direction, twice as
+//! fast each time, up to [`SHUTTLE_MAX`]; the other one turns around at 1×.
+//! K plays or pauses. When playback stops, the rate you had set before the
+//! shuttle (the capture speed, Q / E) comes back, and so does forward.
 
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
@@ -17,6 +23,8 @@ use crate::time::{FrameIndex, Rational, WallClock};
 pub const RATES: [f64; 6] = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0];
 /// Frames moved by JumpForward/JumpBackward.
 pub const JUMP: FrameIndex = 10;
+/// The fastest shuttle speed (J / L pressed again and again).
+pub const SHUTTLE_MAX: f64 = 8.0;
 
 #[derive(Resource, Debug, Clone, Reflect)]
 #[reflect(Resource)]
@@ -30,11 +38,15 @@ pub struct Transport {
     /// Fraction of real time (1.0 = normal speed).
     pub rate: f64,
     pub looping: bool,
+    /// Playing backward (J).
+    pub reverse: bool,
+    /// While shuttling (J / L): the rate to go back to when playback stops.
+    pub shuttle: Option<f64>,
 }
 
 impl Default for Transport {
     fn default() -> Self {
-        Self { fps: Rational::default(), frame_count: 0, playhead: 0.0, playing: false, rate: 1.0, looping: true }
+        Self { fps: Rational::default(), frame_count: 0, playhead: 0.0, playing: false, rate: 1.0, looping: true, reverse: false, shuttle: None }
     }
 }
 
@@ -73,12 +85,42 @@ impl Transport {
         self.playing = !self.playing;
     }
 
+    /// Shuttle forward (L) or backward (J): see the module docs.
+    pub fn shuttle(&mut self, forward: bool) {
+        if !self.has_media() {
+            return;
+        }
+        let same = self.playing && self.reverse != forward;
+        self.shuttle = Some(self.shuttle.unwrap_or(self.rate));
+        self.rate = if same { (self.rate * 2.0).clamp(1.0, SHUTTLE_MAX) } else { 1.0 };
+        if !self.playing {
+            // From an end, it starts over from the other one.
+            if forward && self.frame() >= self.last_frame() {
+                self.playhead = 0.0;
+            } else if !forward && self.playhead <= 0.0 {
+                self.playhead = self.frame_count as f64 - 1e-6;
+            }
+        }
+        self.reverse = !forward;
+        self.playing = true;
+    }
+
+    /// Stopped: the shuttle ends; the rate set before it and forward come back.
+    fn settle(&mut self) {
+        if !self.playing {
+            self.reverse = false;
+            if let Some(r) = self.shuttle.take() {
+                self.rate = r;
+            }
+        }
+    }
+
     /// The next rate in [`RATES`] up or down from the current one (which auto
-    /// speed may have set anywhere in between).
+    /// speed, or the shuttle, may have set anywhere in between).
     pub fn change_rate(&mut self, faster: bool) {
         let r = self.rate;
         self.rate = if faster {
-            RATES.iter().copied().find(|x| *x > r + 1e-9).unwrap_or(RATES[RATES.len() - 1])
+            RATES.iter().copied().find(|x| *x > r + 1e-9).unwrap_or(r.max(RATES[RATES.len() - 1]))
         } else {
             RATES.iter().rev().copied().find(|x| *x < r - 1e-9).unwrap_or(RATES[0])
         };
@@ -89,14 +131,16 @@ impl Transport {
         if !self.playing || !self.has_media() {
             return;
         }
-        self.playhead += dt * self.fps.as_f64() * self.rate;
+        let sign = if self.reverse { -1.0 } else { 1.0 };
+        self.playhead += sign * dt * self.fps.as_f64() * self.rate;
         let end = self.frame_count as f64;
-        if self.playhead >= end {
+        if self.playhead >= end || self.playhead < 0.0 {
             if self.looping {
                 self.playhead = self.playhead.rem_euclid(end);
             } else {
-                self.playhead = self.last_frame() as f64;
+                self.playhead = if self.reverse { 0.0 } else { self.last_frame() as f64 };
                 self.playing = false;
+                self.settle();
             }
         }
     }
@@ -108,9 +152,12 @@ fn apply_transport_actions(mut actions: ResMut<PendingActions>, mut t: ResMut<Tr
         matches!(
             a,
             Seek(_) | SetRate(_) | ToggleLoop | TogglePlay | StepForward | StepBackward | JumpForward | JumpBackward
-                | GoToStart | GoToEnd | FasterPlayback | SlowerPlayback
+                | GoToStart | GoToEnd | FasterPlayback | SlowerPlayback | ShuttleForward | ShuttleBackward
         )
     });
+    if mine.is_empty() {
+        return;
+    }
     for a in mine {
         match a {
             Seek(f) => t.seek(f),
@@ -128,8 +175,11 @@ fn apply_transport_actions(mut actions: ResMut<PendingActions>, mut t: ResMut<Tr
             }
             FasterPlayback => t.change_rate(true),
             SlowerPlayback => t.change_rate(false),
+            ShuttleForward => t.shuttle(true),
+            ShuttleBackward => t.shuttle(false),
             _ => {}
         }
+        t.settle();
     }
 }
 
@@ -155,6 +205,7 @@ impl Module for TransportModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_ecs::system::RunSystemOnce;
 
     fn transport(frames: FrameIndex) -> Transport {
         Transport { frame_count: frames, fps: Rational::new(60, 1), ..Default::default() }
@@ -205,6 +256,57 @@ mod tests {
         t.toggle_play();
         assert!(t.playing);
         assert_eq!(t.frame(), 0);
+    }
+
+    /// J / K / L as in DaVinci Resolve: each press in a direction doubles the
+    /// speed (from 1×, up to 8×), the other direction turns around at 1×, and
+    /// stopping brings back the rate set before (the capture speed) and forward.
+    #[test]
+    fn shuttle_speeds_up_turns_around_and_restores_the_rate() {
+        let mut t = transport(600);
+        t.rate = 0.25; // the capture speed, set with Q
+        t.seek(300);
+        let mut press = |a: Action| {
+            let mut q = PendingActions::default();
+            q.push(a);
+            let mut w = World::new();
+            w.insert_resource(q);
+            w.insert_resource(t.clone());
+            w.run_system_once(apply_transport_actions).expect("ran");
+            t = w.resource::<Transport>().clone();
+            (t.playing, t.reverse, t.rate)
+        };
+        assert_eq!(press(Action::ShuttleForward), (true, false, 1.0), "L: forward at 1×");
+        assert_eq!(press(Action::ShuttleForward), (true, false, 2.0));
+        assert_eq!(press(Action::ShuttleForward), (true, false, 4.0));
+        assert_eq!(press(Action::ShuttleForward), (true, false, 8.0));
+        assert_eq!(press(Action::ShuttleForward), (true, false, 8.0), "at most 8×");
+        assert_eq!(press(Action::ShuttleBackward), (true, true, 1.0), "J turns around at 1×");
+        assert_eq!(press(Action::ShuttleBackward), (true, true, 2.0));
+        assert_eq!(press(Action::TogglePlay), (false, false, 0.25), "K stops: your rate and forward are back");
+        assert_eq!(press(Action::TogglePlay), (true, false, 0.25), "K again plays at it");
+        // L while plain playback runs speeds it up (from at least 1×).
+        assert_eq!(press(Action::ShuttleForward), (true, false, 1.0));
+        assert_eq!(press(Action::StepForward), (false, false, 0.25), "a step pauses, which ends the shuttle too");
+    }
+
+    #[test]
+    fn plays_backward_and_loops_or_stops_at_the_start() {
+        let mut t = transport(100);
+        t.shuttle(false);
+        assert!(t.playing && t.reverse);
+        t.playhead = 10.0;
+        t.advance(0.1); // 6 frames back at 60 fps
+        assert_eq!(t.frame(), 4);
+        t.advance(0.1);
+        assert_eq!(t.frame(), 98, "loops round to the end");
+        t.looping = false;
+        t.playhead = 3.0;
+        t.advance(0.1);
+        assert_eq!((t.frame(), t.playing, t.reverse, t.rate), (0, false, false, 1.0), "stops at the start; the shuttle ends");
+        // From the start, J starts over from the end.
+        t.shuttle(false);
+        assert_eq!(t.frame(), 99);
     }
 
     #[test]

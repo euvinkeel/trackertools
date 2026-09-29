@@ -19,6 +19,11 @@
 //! - A [`TrackBook`] (saved) stamps the inputs complete results came from, so
 //!   a reopened project keeps them instead of tracking again. The stamp is 0
 //!   while results are incomplete or mixed.
+//! - A tracker's span (`tt_core::span::Span`, its lifetime on the timeline)
+//!   says where its jobs stop: they still start at the anchor (the path
+//!   depends on where it began), but track nothing past the span's edges.
+//!   Results outside the span stay (hidden from consumers), so extending the
+//!   span brings back the frames it had without tracking them again.
 //! - When the results stop coming in (finished, or parked at the playhead),
 //!   the path is shifted onto the guide's: by the median offset between the
 //!   two over the frames it saw the subject. The tracker gives the motion's
@@ -51,7 +56,7 @@ use crate::{Direction, Rendition, TRACK_CHANNELS, Tracker, guide_of};
 
 /// Part of every stamp: bump it when a change to the tracking makes saved
 /// results out of date (they re-track when their project is opened).
-const ALGO_VERSION: u64 = 2;
+const ALGO_VERSION: u64 = 3;
 
 /// The video trackers read (set by the host when media opens and when its proxy is ready).
 #[derive(Resource, Clone)]
@@ -177,6 +182,8 @@ struct Basis {
 struct Plan {
     lo: FrameIndex,
     hi: FrameIndex,
+    /// The tracker's span: jobs track nothing outside it (but for the lead-in from the anchor).
+    span: Range<FrameIndex>,
     /// `params.anchor` moved into the guide's frames.
     anchor: FrameIndex,
     params: Tracker,
@@ -192,9 +199,9 @@ struct Plan {
 }
 
 impl Plan {
-    /// Frames a side produces: forward from the anchor (the anchor itself
-    /// included), backward the frames before it.
-    fn side(&self, side: Side) -> Range<FrameIndex> {
+    /// Frames a side may produce, before the span: forward from the anchor
+    /// (the anchor itself included), backward the frames before it.
+    fn reach(&self, side: Side) -> Range<FrameIndex> {
         match (side, self.params.direction) {
             (Side::Forward, Direction::Backward) => self.anchor..self.anchor + 1,
             (Side::Forward, _) => self.anchor..self.hi + 1,
@@ -203,9 +210,23 @@ impl Plan {
         }
     }
 
-    /// Frames the tracker produces.
+    /// Frames a side's jobs produce: its reach, up to the span's far edge.
+    fn side(&self, side: Side) -> Range<FrameIndex> {
+        let r = self.reach(side);
+        match side {
+            Side::Forward => r.start..r.end.min(self.span.end).max(r.start + 1).min(r.end),
+            Side::Backward => r.start.max(self.span.start).min(r.end)..r.end,
+        }
+    }
+
+    /// Frames the tracker produces (what its results are complete over).
     fn produced(&self) -> Range<FrameIndex> {
         self.side(Side::Backward).start..self.side(Side::Forward).end
+    }
+
+    /// Frames it may have results on, span or not: anything else is cleared.
+    fn reachable(&self) -> Range<FrameIndex> {
+        self.reach(Side::Backward).start..self.reach(Side::Forward).end
     }
 
     /// The guide's box and the view's mapping on frame `f`.
@@ -223,7 +244,9 @@ impl Plan {
         let same_seed = self.anchor == old.anchor
             && close(self.scale, old.scale)
             && Arc::ptr_eq(&self.video, &old.video)
-            && (p.feature, p.search, p.adapt, p.min_score) == (q.feature, q.search, q.adapt, q.min_score)
+            && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
+            && p.matching == q.matching
+            && p.method == q.method
             && self.looks == old.looks
             && self.seed == old.seed;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
@@ -428,12 +451,13 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     world.entity_mut(op).remove::<OpError>();
 
     // What still holds: results of the basis whose inputs didn't change or,
-    // with no basis (a reopened project), saved results whose stamp matches.
-    let produced = plan.produced();
+    // with no basis (a reopened project), saved results whose stamp matches
+    // (the stamp vouches for the span only: outside it they may be older).
+    let (produced, reachable) = (plan.produced(), plan.reachable());
     let present: RangeSet = {
         let sig = world.resource::<SignalStore>().get(out);
         let mut set = RangeSet::new();
-        for (r, _) in sig.map(|s| s.runs(produced.clone())).unwrap_or_default() {
+        for (r, _) in sig.map(|s| s.runs(reachable.clone())).unwrap_or_default() {
             set.insert(r);
         }
         set
@@ -441,7 +465,7 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     let kept = old.as_ref().map_or(plan.anchor..plan.anchor, |b| plan.kept(&b.plan));
     let done = match &old {
         Some(b) => intersection(&b.done.intersect(&kept), &present),
-        None if world.get::<TrackBook>(op).is_some_and(|b| b.stamp == plan.stamp) && present.len() == produced.end - produced.start => present,
+        None if world.get::<TrackBook>(op).is_some_and(|b| b.stamp == plan.stamp) && present.intersect(&produced).len() == produced.end - produced.start => present.intersect(&produced),
         None => RangeSet::new(),
     };
 
@@ -462,16 +486,16 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     }
 
     // The output: what holds is valid, the rest stale until replaced, and
-    // nothing outside the frames the tracker produces.
+    // nothing outside the frames the tracker can reach (its span only hides).
     let mut cleared = Vec::new();
     if let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out) {
-        for r in [extent.start..produced.start, produced.end..extent.end] {
+        for r in [extent.start..reachable.start, reachable.end..extent.end] {
             if !r.is_empty() && !sig.runs(r.clone()).is_empty() {
                 sig.clear(r.clone());
                 cleared.push(r);
             }
         }
-        sig.mark_stale(produced.clone());
+        sig.mark_stale(reachable.clone());
         for r in done.ranges() {
             sig.mark_valid(r.clone());
         }
@@ -479,6 +503,10 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     let mut inv = world.resource_mut::<Invalidations>();
     for r in cleared {
         inv.output_changed(op, r);
+    }
+    let reach = tt_core::span::Reach(reachable.start, reachable.end - 1);
+    if world.get::<tt_core::span::Reach>(op) != Some(&reach) {
+        world.entity_mut(op).insert(reach);
     }
     world.resource_mut::<TrackJobs>().basis.insert(op, Basis { plan, done, failed: false, unsettled: true });
 }
@@ -536,13 +564,15 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         maps: plan.maps.clone(),
         scale: plan.scale,
         search: p.search.max(0.1) as f64,
-        settings: Settings { adapt: p.adapt.clamp(0.0, 1.0), min_score: p.min_score.clamp(-1.0, 1.0) },
+        settings: Settings { adapt: p.adapt.clamp(0.0, 1.0), min_score: p.min_score.clamp(-1.0, 1.0), tolerance: p.matching.tolerance() },
         video: plan.video.clone(),
         k: plan.k,
         grid: footage.original.clone(),
         decode: footage.decode.clone(),
         looks: plan.looks.clone(),
         seed: plan.seed,
+        fuse: p.fuse,
+        method: p.method,
     };
     let shared = Arc::new(Shared::new(catch_up_limit(world, op, side), from));
     let (tx, rx) = channel();
@@ -684,7 +714,8 @@ fn update_status(world: &mut World, op: Entity) {
 fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Result<Plan, String> {
     let params = world.get::<Tracker>(op).cloned().ok_or("no tracker settings")?;
     let guide = guide_of(world, op).filter(|g| world.get::<Disabled>(*g).is_none()).ok_or("the guide was deleted")?;
-    let sig = world.get::<Output>(guide).and_then(|o| world.resource::<SignalStore>().get(o.0)).ok_or("the guide has no output")?;
+    // (Through the guide's span: a trimmed sketch guides only where it lives.)
+    let sig = tt_core::span::output(world, guide).ok_or("the guide has no output")?;
     if sig.channels() < 6 {
         return Err("the guide is not a box".into());
     }
@@ -756,7 +787,11 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         h.update(&x.to_le_bytes());
     };
     let p = &params;
-    for x in [ALGO_VERSION as f64, anchor as f64, p.direction as u8 as f64, p.rendition as u8 as f64, p.feature as f64, p.search as f64, p.adapt as f64, p.min_score as f64] {
+    for x in [ALGO_VERSION as f64, anchor as f64, p.direction as u8 as f64, p.rendition as u8 as f64, p.feature as f64, p.search as f64, p.adapt as f64, p.min_score as f64, p.fuse as u8 as f64] {
+        put(x);
+    }
+    let m = &p.matching;
+    for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64, p.method as u8 as f64] {
         put(x);
     }
     for x in [lo as f64, hi as f64, original.width as f64, original.height as f64, original.frames.len() as f64] {
@@ -775,7 +810,8 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     h.update(original.path.to_string_lossy().as_bytes());
     let stamp = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"));
 
-    Ok(Plan { lo, hi, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed })
+    let span = tt_core::span::span_of(world, op).range();
+    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed })
 }
 
 /// Fill gaps by linear interpolation; ends hold the nearest value.

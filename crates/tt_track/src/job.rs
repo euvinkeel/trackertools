@@ -7,6 +7,10 @@
 //!   (small: only the guide's region; at most [`MAX_PATCHES`] at a time), and
 //!   track each segment in reverse. Any strategy runs backward this way,
 //!   however long the source's GOPs.
+//! - Both track each stretch between two pins (looks' frames) from both
+//!   ends: they keep its patches, and on reaching the next pin track the
+//!   stretch back from it and send again the frames where the other pass
+//!   was better (`template::fuse`; up to [`MAX_STRETCH_BYTES`] of patches).
 //! - Both stop at a *limit* the runner moves (catch-up-to-playhead mode) and
 //!   stop at once when cancelled (an input changed; the runner restarts them).
 //!   Held at the limit for a while, a job lets go of its decoder (*parked*).
@@ -22,10 +26,14 @@ use tt_core::time::FrameIndex;
 use tt_core::view::SpaceMap;
 use tt_media::{DecodeOptions, FrameStream, VideoIndex};
 
-use crate::image::{Grid, Luma, Patch, resample_xy};
+use crate::image::{Grid, Luma, Patch, chroma_planes, resample_xy, with_colour};
 use crate::ncc::best_match;
-use crate::template::{LookTemplate, Settings, TEMPLATE_R, TemplateTracker};
-use crate::{LOST, OUTSIDE, TRACK_CHANNELS};
+use crate::template::{Estimate, LookTemplate, Settings, TEMPLATE_R, TemplateTracker, fuse, off_box};
+use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
+
+mod learned;
+
+pub use learned::worker_command;
 
 /// A look, as a job reads it: a frame, a rectangle there (source px), a mask.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,8 +67,16 @@ const SEGMENT: FrameIndex = 64;
 pub const MAX_PATCHES: FrameIndex = 256;
 /// Held at the limit this long, a job closes its decoder (reopened on resume).
 const PARK_AFTER: Duration = Duration::from_millis(1000);
+/// A patch covers the guide's boxes this many frames either side.
+const NEIGHBOURS: FrameIndex = 8;
 /// Largest patch half-size, patch pixels.
 const MAX_HALF: f64 = 200.0;
+/// Patches kept for tracking a stretch back from its far pin; a longer
+/// stretch is tracked one way only.
+pub const MAX_STRETCH_BYTES: usize = 256 << 20;
+/// Tracking a stretch back stops after this many frames in a row where it
+/// agrees with the first pass (within half a view pixel).
+const CONVERGED: usize = 12;
 /// Results are sent every this many frames or this often.
 const FLUSH_FRAMES: usize = 8;
 const FLUSH_EVERY: Duration = Duration::from_millis(40);
@@ -98,6 +114,10 @@ pub struct JobSpec {
     pub looks: Arc<Vec<LookSpec>>,
     /// Where the tracker starts on the anchor frame (source px); none: the guide's point.
     pub seed: Option<[f64; 2]>,
+    /// Track each stretch between pins from both ends ([`template::fuse`](crate::template::fuse)).
+    pub fuse: bool,
+    /// Templates, or a learned point tracker ([`learned`]).
+    pub method: Method,
 }
 
 /// State shared between a job and the runner.
@@ -150,8 +170,22 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
         .name(format!("tracker {:?}", spec.side))
         .spawn(move || {
             let _alive = alive;
-            let mut worker = Worker { spec, shared, tx: tx.clone(), out: Vec::new(), flushed: Instant::now(), half: [TEMPLATE_R as f64; 2], margin: TEMPLATE_R as f64 + 2.0, offsets: Vec::new() };
-            let result = worker.run();
+            let mut worker = Worker {
+                spec,
+                shared,
+                tx: tx.clone(),
+                out: Vec::new(),
+                flushed: Instant::now(),
+                half: [TEMPLATE_R as f64; 2],
+                margin: TEMPLATE_R as f64 + 2.0,
+                offsets: Vec::new(),
+                stretch: Vec::new(),
+                stretch_bytes: Some(0),
+            };
+            let result = match worker.spec.method {
+                Method::Template => worker.run(),
+                Method::CoTracker => worker.run_learned(),
+            };
             worker.flush();
             let _ = tx.send(match result {
                 Ok(()) => Msg::Finished,
@@ -172,6 +206,11 @@ struct Worker {
     margin: f64,
     /// Per look (the spec's order): its centre minus the tracked point, view px.
     offsets: Vec<[f64; 2]>,
+    /// The frames tracked since the last pin, with their patches and
+    /// estimates (to track back from the next pin); `stretch_bytes` counts
+    /// their patches, and None = over [`MAX_STRETCH_BYTES`] (not kept).
+    stretch: Vec<(FrameIndex, Grid, Patch, Estimate)>,
+    stretch_bytes: Option<usize>,
 }
 
 impl Worker {
@@ -200,19 +239,84 @@ impl Worker {
         Some([c[0] - o[0], c[1] - o[1]])
     }
 
-    /// One frame: pinned where a look says, else tracked in its patch.
+    /// One frame: pinned where a look says, else tracked in its patch. On a
+    /// pin, the stretch since the last one is tracked back from it too.
     fn track(&mut self, tracker: &mut TemplateTracker, f: FrameIndex, grid: Grid, patch: &Patch) {
         let guide = self.guide_point(f);
         match self.pin(f) {
             Some(c) => {
                 tracker.pin(c, guide);
                 self.emit(f, c, 1.0, false);
+                if self.spec.fuse {
+                    self.track_back(tracker);
+                }
+                (self.stretch, self.stretch_bytes) = (Vec::new(), Some(0));
             }
             None => {
-                let step = tracker.step(patch, grid, guide);
+                let step = tracker.step_in(patch, grid, self.guide_box(f));
                 self.emit(f, step.pos, step.score, step.lost);
+                if self.spec.fuse
+                    && let Some(bytes) = self.stretch_bytes
+                {
+                    let bytes = bytes + patch.bytes();
+                    if bytes > MAX_STRETCH_BYTES {
+                        (self.stretch, self.stretch_bytes) = (Vec::new(), None);
+                    } else {
+                        let e = Estimate { pos: step.pos, score: step.score, lost: step.lost, off: off_box(step.pos, &self.guide_box(f)) };
+                        self.stretch.push((f, grid, patch.clone(), e));
+                        self.stretch_bytes = Some(bytes);
+                    }
+                }
             }
         }
+    }
+
+    /// The stretch kept since the last pin, tracked back from the pin just
+    /// reached (`tracker`, as it stands there) and fused with the first
+    /// pass: frames that change are sent again.
+    fn track_back(&mut self, tracker: &TemplateTracker) {
+        let stretch = std::mem::take(&mut self.stretch);
+        if stretch.is_empty() {
+            return;
+        }
+        let mut back = tracker.clone();
+        let mut other: Vec<Estimate> = Vec::with_capacity(stretch.len());
+        // Once both passes agree for a while, they follow the same thing:
+        // the rest of the way back would be the first pass again.
+        let mut agreeing = 0;
+        for (f, grid, patch, first) in stretch.iter().rev() {
+            if self.cancelled() {
+                return;
+            }
+            if agreeing >= CONVERGED {
+                other.push(*first);
+                continue;
+            }
+            let step = back.step_in(patch, *grid, self.guide_box(*f));
+            let e = Estimate { pos: step.pos, score: step.score, lost: step.lost, off: off_box(step.pos, &self.guide_box(*f)) };
+            let same = !e.lost && !first.lost && (e.pos[0] - first.pos[0]).hypot(e.pos[1] - first.pos[1]) <= 0.5;
+            agreeing = if same { agreeing + 1 } else { 0 };
+            other.push(e);
+        }
+        other.reverse();
+        let first: Vec<Estimate> = stretch.iter().map(|(_, _, _, e)| *e).collect();
+        for ((f, _, _, a), e) in stretch.iter().zip(fuse(&first, &other)) {
+            if e != *a {
+                self.emit_again(*f, e.pos, e.score, e.lost);
+            }
+        }
+    }
+
+    /// The guide's box on frame `f`, view px.
+    fn guide_box(&self, f: FrameIndex) -> [f64; 6] {
+        self.map(f).box_from_source(self.guide(f))
+    }
+
+    /// Whether view point `pos` on frame `f` is outside the guide's box.
+    fn outside(&self, f: FrameIndex, pos: [f64; 2]) -> bool {
+        let [x, y] = self.map(f).to_source(pos);
+        let g = self.guide(f);
+        !(g[2]..=g[4]).contains(&x) || !(g[3]..=g[5]).contains(&y)
     }
 
     /// The guide's point on frame `f`, view px.
@@ -221,18 +325,44 @@ impl Worker {
         self.map(f).from_source([g[0], g[1]])
     }
 
-    /// The patch tracked on frame `f`: the guide's box (× `search`) around its point, plus the template's margin.
+    /// The patch tracked on frame `f`: the guide's boxes (× `search`) on the
+    /// frames around it, plus the template's margin. A rough pass is late or
+    /// early by a few frames where the subject starts or stops (a sketch's
+    /// smoothing can't follow a flick), so the subject on frame `f` is inside
+    /// the guide's box of some frame near `f`, not always of `f` itself.
     fn patch(&self, frame: &[u8], f: FrameIndex) -> (Grid, Patch) {
         let (map, s) = (self.map(f), &self.spec);
-        let b = map.box_from_source(self.guide(f));
+        let last = s.lo + s.guide.len() as FrameIndex - 1;
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for g in (f - NEIGHBOURS).max(s.lo)..=(f + NEIGHBOURS).min(last) {
+            let b = map.box_from_source(self.guide(g));
+            let (hw, hh) = ((b[0] - b[2]).max(b[4] - b[0]) * s.search, (b[1] - b[3]).max(b[5] - b[1]) * s.search);
+            lo = [lo[0].min(b[0] - hw), lo[1].min(b[1] - hh)];
+            hi = [hi[0].max(b[0] + hw), hi[1].max(b[1] + hh)];
+        }
         let margin = self.margin;
-        let half = |h: f64| (h * s.search * s.scale + margin).clamp(margin + 16.0, MAX_HALF + margin);
-        let (hw, hh) = (half((b[0] - b[2]).max(b[4] - b[0])), half((b[1] - b[3]).max(b[5] - b[1])));
+        let half = |h: f64| (h * s.scale + margin).clamp(margin + 16.0, MAX_HALF + margin);
+        let (hw, hh) = (half((hi[0] - lo[0]) / 2.0), half((hi[1] - lo[1]) / 2.0));
+        // Centred on the neighbours' boxes; where that is too big, on this frame's point.
+        let b = map.box_from_source(self.guide(f));
+        let centre = |i: usize, h: f64| if h < MAX_HALF + margin { (lo[i] + hi[i]) / 2.0 } else { b[i] };
+        let c = [centre(0, hw), centre(1, hh)];
         let (w, h) = ((2.0 * hw).ceil() as usize, (2.0 * hh).ceil() as usize);
-        let grid = Grid { origin: [b[0] - w as f64 / 2.0 / s.scale, b[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
+        let grid = Grid { origin: [c[0] - w as f64 / 2.0 / s.scale, c[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
         let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
-        (grid, resample_xy(&luma, s.k, map, grid, w, h))
+        (grid, self.dress(frame, map, grid, resample_xy(&luma, s.k, map, grid, w, h)))
+    }
+
+    /// `patch` (luma, resampled from `frame` on `grid`) with what the
+    /// tracker's tolerance also compares: the colour.
+    fn dress(&self, frame: &[u8], map: &SpaceMap, grid: Grid, patch: Patch) -> Patch {
+        let (s, tolerance) = (&self.spec, self.spec.settings.tolerance);
+        let (vw, vh) = (s.video.width as usize, s.video.height as usize);
+        match tolerance.colour {
+            Some(_) => with_colour(patch, &chroma_planes(frame, vw, vh), vw, vh, s.k, map, grid),
+            None => patch,
+        }
     }
 
     /// A patch just big enough for a template of half-size `r`, around view point `c` on frame `f`.
@@ -242,7 +372,7 @@ impl Worker {
         let grid = Grid { origin: [c[0] - w as f64 / 2.0 / s.scale, c[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
         let luma = Luma { data: &frame[..vw * vh], width: vw, height: vh };
-        (grid, resample_xy(&luma, s.k, map, grid, w, h))
+        (grid, self.dress(frame, map, grid, resample_xy(&luma, s.k, map, grid, w, h)))
     }
 
     /// The looks' templates, each cut from its own frame through the view,
@@ -277,7 +407,7 @@ impl Worker {
             let r = [look.half[0], look.half[1]].map(|h| ((h / map.a * self.spec.scale).round() as usize).max(2));
             let reach = r[0].max(r[1]);
             let (grid, patch) = self.patch_around(frame, look.frame, c, [r[0] + reach, r[1] + reach]);
-            let Some(mut t) = LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone()) else {
+            let Some(mut t) = LookTemplate::cut(&patch, grid.from_view(c), r, look.mask.clone(), self.spec.settings.tolerance) else {
                 tracing::warn!("a look on frame {} has no detail to follow (flat or an empty mask); skipped", look.frame);
                 continue;
             };
@@ -320,14 +450,17 @@ impl Worker {
     }
 
     fn emit(&mut self, f: FrameIndex, pos: [f64; 2], score: f32, lost: bool) {
+        self.emit_again(f, pos, score, lost);
+        self.shared.at.store(f, Ordering::Relaxed);
+    }
+
+    /// Send frame `f`'s result (again, after a fuse: progress stays where it is).
+    fn emit_again(&mut self, f: FrameIndex, pos: [f64; 2], score: f32, lost: bool) {
         let map = self.map(f);
         let [x, y] = map.to_source(pos);
         let [hx, hy] = self.half.map(|h| (h + 0.5) / self.spec.scale * map.a);
-        let g = self.guide(f);
-        let outside = !(g[2]..=g[4]).contains(&x) || !(g[3]..=g[5]).contains(&y);
-        let flags = if lost { LOST } else { 0 } | if outside { OUTSIDE } else { 0 };
+        let flags = if lost { LOST } else { 0 } | if self.outside(f, pos) { OUTSIDE } else { 0 };
         self.out.push((f, [x, y, x - hx, y - hy, x + hx, y + hy, score as f64, flags as f64].map(|v| v as f32)));
-        self.shared.at.store(f, Ordering::Relaxed);
         if self.out.len() >= FLUSH_FRAMES || self.flushed.elapsed() >= FLUSH_EVERY {
             self.flush();
         }
@@ -416,6 +549,9 @@ impl Worker {
             }
             None => anchor - 1,
         };
+        if self.spec.resume.is_none() {
+            tracker.start_at(seed);
+        }
         if self.cancelled() {
             return Ok(());
         }

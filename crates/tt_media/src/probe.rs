@@ -25,7 +25,7 @@ impl ColorInfo {
 
 pub fn probe_color(path: &Path, height: u32) -> ColorInfo {
     let fallback = ColorInfo::default_for_height(height);
-    let ffprobe = std::env::var_os("FFPROBE").unwrap_or_else(|| "ffprobe".into());
+    let ffprobe = crate::ffmpeg::tool("ffprobe", "FFPROBE");
     let mut cmd = Command::new(ffprobe);
     cmd.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_space,color_range", "-of", "default=nw=1"])
         .arg(path);

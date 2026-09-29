@@ -75,7 +75,10 @@ v2 is a ground-up rebuild in Rust. The v1 "CoTrack editor" (`editor/`, Python + 
 - **FrameIndex** (`i64`): a position on the media's constant frame grid. The grid rule comes from v1: frame *i* is the decoded frame whose timestamp rounds to `i / fps` after subtracting the first frame's timestamp. Variable-frame-rate gaps repeat the previous frame.
 - **Rational rates.** fps is stored as a rational (e.g. 60000/1001). Conversions use `RationalTime`-style arithmetic, as in OpenTimelineIO, so there is no floating-point drift.
 - **Wall time** (`f64` seconds since the session epoch) stamps raw input.
-- **Transport** (a resource): `playing`, `rate` (fraction of real time), `direction`, loop range, playhead (FrameIndex plus a sub-frame phase).
+- **Transport** (a resource): `playing`, `rate` (fraction of real time), `reverse`, loop range, playhead (FrameIndex plus a sub-frame phase).
+- **Shuttle** (J / K / L, as in DaVinci Resolve): L plays forward and J backward at 1×; each further press in the same direction doubles the speed (2×, 4×, up to 8×), and the other key turns around at 1×. K plays or pauses. When playback stops (K, Space, a step, a seek, the end), the rate set before the shuttle (the capture speed, Q / E) and forward come back. *(Added on request: "DaVinci like playback controls".)*
+  - Playing backward, the decode service fills the frames behind the playhead a keyframe group at a time: one ffmpeg start per group, read through to the frames needed (`tt_media::player`).
+  - A stroke recorded while playing backward is played through like one played forward: every frame passed takes the moment its centre was on screen (the ClockMap is direction-agnostic). Anticipatory speed reads ahead in the direction of play.
 - **ClockMap:** the recorded mapping from wall time to video frames during a capture. It is a list of segments `{wall_start, wall_end, frame_at_start: f64, rate}`, where `rate` is frames per wall-second.
   - playing at 50% → `rate = 0.5·fps`
   - paused → `rate = 0`
@@ -113,6 +116,19 @@ Big data lives in the `SignalStore` resource, outside the ECS archetypes. Compon
 - **Keys:** sparse keyframes (a small component) with per-key interpolation (hold, linear, bezier with handles). Keys are *not* a signal; the `Keys` operator (§7) turns them into one.
 - **Coverage and staleness.** Each output signal records per frame: *absent*, *valid* or *stale*. Stale means an input changed and the value is kept for display (drawn with stale styling) until recomputed: stale-while-revalidate. Expensive results (trackers) are never deleted just because something upstream moved.
 - **Summaries.** For the timeline, each signal maintains a multi-resolution pyramid of per-block summaries (coverage, min/max, worst status per 2^k frames). This fixes v1's aliasing, where one sample per pixel column on a 69k-frame clip hid short failures.
+
+### 5.1 Lifetimes (spans)
+
+*(Built after hands-on use: lifetimes on the timeline were "sorely missing".)* Any timeline object (a tracker, a sketch, a view) can be told when it begins and ends. That is a **`Span { first, last }`** component on the entity (`tt_core::span`), each edge optional: an untrimmed edge follows the data, so a sketch that gets a stroke past its end still grows there.
+
+- **Non-destructive.** The span never touches the entity's signal. Readers see the output through it (`span::output`, and `EvalCtx::input` for operators: a cheap copy that shares every chunk but the two at the edges), so nothing outside the span reaches a view, an overlay, snapping, anticipatory speed, a tracker reading its guide, or (later) export. Extending the span brings the frames back as they were.
+- **Edits** are ordinary document edits: one undo step each, a timeline drag one gesture. A changed span re-derives what reads the entity, like any change to its output.
+- **Trackers** don't spend jobs outside their span. Jobs still start at the anchor (the path depends on where it began), so an anchor before the span tracks up to it as a lead-in; nothing past the far edges is tracked. Trimmed results stay (hidden); extended again, the frames it already had come back without tracking, and frames it never had are tracked from the nearest result. The tracker's `Reach` (derived: its guide's frames in the directions it runs) is how far its ends can be dragged; dragging an end onto its reach, or onto the end of a sketch's data, untrims that side.
+- **A trimmed guide** guides only where it lives: its tracker plans over the trimmed frames.
+- **A trimmed view** holds its nearest framing outside its span, as outside its sketch.
+- **On the timeline** every lane's ends are its span's (§14). The frames outside are drawn faint; the right-click menu has *Starts here* / *Ends here* (at the playhead) and *Untrim*.
+
+Measured (`tt_core/tests/span.rs`, `tt_track/tests/span.rs`, the timeline's headless egui test): a sketch trimmed at both ends leaves its own signal chunk-for-chunk identical while its view re-derives over exactly the trimmed frames; a tracker spanned 400–800 around an anchor at 600 tracks exactly 401 frames, extending the end to 1000 resumes the forward job at 801 (not at the anchor) and leaves frames 400–800 bit-identical, and trimming it back to 700 and undoing starts no job and restores every frame valid; a drag on a lane's end snaps to the playhead and undoes in one step.
 
 ---
 
@@ -206,7 +222,7 @@ The rough pass is what makes it robust:
 
 It runs forward and backward from its anchor, with `Footprint::Radiating(anchor)`. A saved hash of its inputs, set only on complete results, lets a reopened project keep them instead of re-tracking.
 
-Strategies (template now; learned models later) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. A Python worker for CoTracker3, TAPNext or SAM 2.1 slots in as another job backend.
+Strategies (templates, and CoTracker3 in a Python worker: §6.3) sit behind the same operator and job protocol. The protocol: guide boxes and view maps per frame, a rendition, an anchor and a direction go in; result chunks come out. TAPNext or SAM 2.1 would slot in as further workers.
 
 ### 6.3 Defining a tracker: looks, the Track tool, validity
 
@@ -222,9 +238,15 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 - **The first look is the seed.** Its frame is the anchor, and the tracker's point there is exactly its centre, where the user put it. Re-centring on the guide is off for placed trackers.
 - **Every look is a template.** The rectangle is resampled through the tracker's view. Weights are the mask where painted, the centre-weighting where not. On each frame the best-matching look wins, blended with the last frame's appearance (`adapt`). A cursor that changes icon is several looks on one tracker. The mask keeps the background behind the cursor from counting. New looks get their mask painted automatically (the cells that stand out from the rectangle's border; a setting, on by default).
 - **A match must look alike, not just correlate.** Normalized correlation sees only the shape of light and dark, so a dim patch of foliage with a similar gradient scored 0.97 against a white cursor. The score is now scaled down where the pixels' contrast differs from the look's by more than 2× either way (in proportion), and, for a painted look, where their brightness differs by more than one of its spreads: a screen recording never relights the cursor's own pixels (`ncc::photometric`).
+- **How alike is alike enough** is per tracker (`Tracker::matching`, in the inspector). The defaults are the behaviour from before these options:
+  - `contrast` (2): the contrast may differ by this factor either way for free, then counts less in proportion. Raise it where the whole picture dims or brightens with the subject (a pause menu's backdrop over a game's own cursor). The default stays 2× because the same check is what keeps a dim look-alike (the foliage) from scoring like the cursor.
+  - `brightness` (1): a painted look's brightness may differ by this many of its spreads for free; it is gone two spreads further.
+  - `colour` (off) and `colour_slack` (20 chroma levels): compare the colour too. The mean chroma (U, V) under a placement must be within the slack of the look's, and the score is gone at twice it. A white cursor and a yellow marker of the same shape are nearly twins in brightness (0.99 to each other), and colour tells them apart (0.38). Chroma comes from the decoded NV12 frame (half the resolution each way, resampled through the tracker's view like luma). It is only computed where a placement scores at least 0.4 without it, since it can only lower the score.
 - **Every look is a pin.** On a look's frame the tracker is where the user showed the subject (score 1), and tracking goes on from there, in both directions. Patching a tracker where it misses is adding a look there.
 - **One point for all looks.** A look's centre is wherever its rectangle happened to be, so looks disagreed by a few pixels on where the point is, and the path jumped when another look matched best. When jobs start, every look is matched on its own frame (within its half-size of where it was put) against the looks aligned before it, starting from the seed, then nearest the anchor first. Where one matches (score ≥ 0.75), the look takes on that point; a look nothing matches (another icon) keeps its own centre. Pins land on the aligned point too.
-- **Search:** within 40 patch px of the prediction first (the guide's point plus the last offset); where nothing there reaches `min_score`, the whole patch (the guide's box × `search`), because on a flick the hand, and so the prediction, lags.
+- **Search:** within 40 patch px of two predictions first: the guide's point plus the last offset, and where the tracker itself was going (its last position plus half its last step). Where nothing there reaches `min_score`, or only outside the guide's box, the whole patch. The patch covers the guide's boxes (× `search`) on the frames ±8 around this one: a rough pass is early or late where the subject starts or stops (a sketch's zero-phase smoothing moves before a flick and keeps moving after it), so a resting cursor sits outside the guide's box of its own frame but inside one a few frames away. Placements are ranked by score, less up to 0.3 for lying outside the guide's box (in proportion, up to its half-size out), so a look-alike the guide has left behind loses to the subject where it still is. The look that matched last is searched first; the others only when it scores below 0.9 (an icon change), and a window of more than 81 × 81 placements is searched coarse to fine (every other placement, then all of them around the best three).
+- **Subpixel:** the correlation's peak (a parabola per axis) is refined by Lucas–Kanade: Gauss–Newton on the weighted difference to a gain and offset of the template, so it ignores brightness and contrast like the correlation (`ncc::refine`).
+- **Both ways** (`fuse`, on by default): a job keeps the patches since the last pin (up to 256 MB), and on reaching the next pin tracks that stretch back from it. Per frame, the fused path takes the better pass: where they agree (within 1 view px) their mean; elsewhere the least-cost path through the two (a frame's cost: 1 − score, +1 lost, +0.5 per guide-box half-size outside the box; switching passes costs 0.6, except where they agree). The pass back stops once it has agreed with the first for 12 frames in a row. So a look placed where the tracker slipped mends the frames before it as well as after. Frames that change are sent again (progress doesn't move back).
 - **Validity is a flag, never a deletion.** Output `[x, y, left, top, right, bottom, score, flags]`. `flags` marks *lost* (score below `min_score`) and *outside* (the point left the guide's box: the rough pass says the subject isn't there). Raw values stay. Consumers (views framed on the tracker, re-centring, export) skip flagged frames; the overlay and timeline draw them red. Changing the rule re-flags, it doesn't re-track.
 - **Unguided trackers** (planned). Without a sketch, the search would be around the last position and velocity, within `search` × the pattern's size. For now the tool asks for a sketch first ("Draw a sketch over the subject first (D)"): it makes the search region and the prediction far better.
 
@@ -250,13 +272,42 @@ Also: guide-seeded trackers (*Track its centre* on a sketch, `T`) keep re-centri
 
 Frame to frame, the point's offset from the cursor's white body changes by a median of 0.30 px (p95 1.08). Before the changes it was 0.36 px (p95 1.43), and that was only on the frames where the tracker was on the cursor at all.
 
-Measured (`tests/sprite.rs`, `tests/masks.rs`, the in-app demo):
-- a placed look on the sprite fixture: median 0.08 px, max 0.20 against the truth, no re-centring;
+**The cursor fixture** (`cargo xtask fixtures` renders it; `tests/cursor.rs`): 750 frames of 960×540 H.264 (GOP 250, B-frames) of a cursor with its exact hotspot per frame. It has five stretches: stripes that change every frame, pale bright scenery, dark foliage where the cursor turns into a hand and an I-beam, a floor it flicks across (3–5 frames, up to ~190 px per frame), and a desktop with a second, identical arrow the cursor rests on and flicks away from. The guide is a sketch-like rough pass (the path smoothed with σ 4 frames, a slow wander of a few px, a box growing with speed); the looks are masked rectangles on frame 5 and on a frame of each other icon.
+
+| | changing | bright | icons | flicks | look-alike | all: median / within 3 px | speed |
+|---|---|---|---|---|---|---|---|
+| before | 100% | 100% | 99.3% (max 8.2 px) | **82.0%** (max 179 px) | 96.0% | 0.14 px / 95.5% | 52 fps |
+| after | 100% | 100% | 100% | **100%** (max 0.20 px) | 97.3% | 0.08 px / 99.5% | ~90 fps |
+| after, a look at 648 where it slipped (one way / both ways) | | | | | 97.3% / 98.0% | | 85 / 75 fps |
+
+**Matching options** on the same fixture, extended by two stretches: bright scenery with a static *yellow* arrow the cursor rests on and flicks away from, and a floor dimmed to 30% (cursor included) for 90 frames. These are the settings `tests/cursor.rs` compares, with no stretch worse than the default:
+
+| | colour (yellow twin) | dimmed | speed |
+|---|---|---|---|
+| default | 99.3% (one frame on the twin, 153 px off) | 62.0% (all 90 dimmed frames lost) | ~90 fps |
+| `colour` on (slack 20) | **100%** | 62.0% | ~10% slower |
+| `contrast` 3 | 99.3% | **100%** | same |
+
+Also measured: a colour slack of 12 caught the twin too, but lost the cursor over a saturated blue panel (4:2:0 chroma blurs the surroundings into a 12 px cursor's colour): the look-alike stretch fell from 97.3% to 92.0%. `brightness` 2 changed nothing. An *edges* channel (the correlation of luma gradient magnitudes, mixed in) helped on no stretch, flagged more frames and cost 2.5× the time, so it isn't offered.
+
+(Within 3 px of the point the look's centre defines; the misses left are three frames where the cursor flicks off the identical arrow at ~110 px per frame, which fool both passes. Speeds are from shared cloud machines.)
+
+Measured (`tests/sprite.rs`, `tests/masks.rs`, `tests/template.rs`, the in-app demo):
+- after the changes above (before → after): a placed look on the sprite, median 0.080 → 0.072 px (max 0.187 → 0.198); a sketch-built guide, median 0.319 → 0.284 px (max 0.785 → 0.897); both ways from a guide point and re-centred, median 0.211 → 0.187 px (max 0.560 → 0.419); synthetic subpixel motion (a blob), median 0.016–0.061 → 0.007–0.012 px. The sprite sits on whole pixels, as a screen cursor does. Refining through a matched blur (to remove bilinear resampling's pull toward whole pixels) was exact on an ideal square between pixels but worse here (0.100–0.109 px for the placed look), so it isn't used;
+- (before the changes above) a placed look on the sprite fixture: median 0.08 px, max 0.20 against the truth, no re-centring;
 - the demo's Track tool (a 24 px square dragged on frame 340, inside a sketch ~2.6 px off): median 0.08 px, max 0.21;
 - a masked, antialiased cursor arrow crossing a changing background: worst score 0.77, error ≤ 0.53 px (unmasked, the score drops to 0.43: lost);
-- frames outside the guide are flagged, and their raw positions kept.
+- frames outside the guide are flagged, and their raw positions kept. With the wider search, a sprite 30 or 36 px outside a wrong guide's box is kept (flagged *outside*); 120 px off, it is lost.
 
-Learned point trackers (CoTracker3 / TAPNext: click a point, the model predicts where it goes) sit behind the same entities as another `method`. Their seeds are the looks' centres, their search region is the guide, and they work through the same view.
+**Learned point trackers** sit behind the same entities as another `method` (`Tracker::method`: *Template* or *CoTracker*). CoTracker3 (v1's original tracker type; Meta's `scaled_online.pth`, CC-BY-NC, not in the repository) is built:
+- The job is the same one: the runner, the plan, spans, catch-up, the looks and their alignment, pins, the output and its flags are shared. Only the per-frame work differs (`job/learned.rs`).
+- **Frames in Rust.** The job decodes as always and resamples each frame through the tracker's view into the model's input: a 512 × 384 RGB crop (luma and the NV12 chroma, BT.709 for HD, BT.601 below, limited range). The crop has one scale for the job, so the guide's box (× `search`, the largest on the job's frames) fits with a margin, and is centred on the guide's point on every frame. The rough pass stabilizes what the model sees.
+- **Direction is the frame source's.** A backward job decodes keyframe-aligned segments and sends them reversed; the model only ever runs forward.
+- **Seeds** are the looks' aligned points, each queried on its own frame; the start is the anchor's look, or where the tracker was when a job resumes. On each frame the latest seed behind it answers (a fresher seed has drifted less), and a look's own frame is pinned where the user put it. The score is the model's visibility × confidence; below `min_score` a frame is flagged lost, keeping the model's estimate.
+- **The model runs in a Python worker** (`editor/cotracker_worker.py`, one process per job). It reuses v1's online engine (`editor/engine.py`: the rolling window, CUDA graphs on a GPU) and speaks JSON lines plus raw frames over stdin/stdout. Python is `TT_PYTHON`, else the repository's `.venv` (as v1 set it up), else `python3`/`python`. The weights are `TT_COTRACKER_WEIGHTS`, else torch hub's cache, where v1 downloaded them.
+- Catch-up works, but the model finalizes frames half a window (8) at a time, so the last few before the playhead wait for more.
+- Measured on a CPU (the cloud; the user's RTX 4090 is far faster): the sprite fixture tracked both ways over frames 590–650 from a look at 600, through a guide ~5 px off, median 0.26 px, max 0.99, none flagged, at ~1.2 fps including two model loads (`tests/cotracker.rs`); a blob in the worker alone, median 0.58 px (`editor/tests/test_cotracker_worker.py`). Both skip without torch or the weights.
+- **On the cursor fixture it is no match for the templates** (`TT_COTRACKER=1`, CPU, ~1 fps). Changing stripes and bright scenery: 100% within 3 px but a median of 0.7–1.2 px (templates 0.08); icons 73%; from the flicks on, 0–2%, and it never comes back. Two reasons. The crop's one scale per job comes from the largest guide box, so on a flick's big box the 12 px cursor shrinks to a few model pixels. And a point tracker never re-detects: only a look re-seeds it. Next: a scale per stretch, and letting the template method re-seed it where it loses the subject (a Target combining both, M7).
 
 **Result caching** (planned for after M4): results keyed by `(kind, params hash, input chunk versions)` in a content-addressed store. Undo and redo then re-link earlier results instead of recomputing, and A/B-ing parameters becomes free.
 
@@ -544,7 +595,9 @@ Adopted from Rerun's proven design.
   - Each command is one undo step (`tt_core::commands`).
   - A box keeps its start on the content: dragged past the edge it scrolls the list, and what it swept stays in it. Esc drops it.
   - The Outliner is a tree: sketches, the sketches drawn in their views, and their strokes (folded). It has a filter box, middle-drag scrolling, and unfolds and scrolls to what is selected elsewhere (only when it is out of view).
-  - The Timeline scrubs from the ruler (a click seeks). With snapping on (`N`, or the header's "snap"; Ctrl while scrubbing inverts it), the playhead snaps within 8 points to the first and last frame of every sketch, stroke, view and tracker, marked on the ruler. The right-click menu can send the playhead to the selected thing's start or end. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
+  - The Timeline scrubs from the ruler (a click seeks). With snapping on (`N`, or the header's "snap"; Ctrl while scrubbing inverts it), the playhead snaps within 8 points to the first and last frame of every sketch, stroke, view and tracker (their lifetimes' ends, §5.1), marked on the ruler. The right-click menu can send the playhead to the selected thing's start or end. Its lanes follow the tree, scroll vertically (wheel, middle-drag, scrollbar), show a starting stroke's lane, and a double-click enters a sketch's view.
+  - **Lanes:** each sketch, then its view and its trackers (indented), then the sketches nested in its view. A tracker's lane shows its frames, its score as a line along the bottom (per pixel column, the lowest score there, so a one-frame dip shows on a long clip), its flagged frames in red, and each running job: an outline over what it still has to track and a mark where it is (grey while it waits for the playhead).
+  - **Lifetimes:** drag either end of a lane to say when that object begins and ends (§5.1); the pointer turns into a resize arrow within 5 points of an end. With snapping on, an end snaps to the playhead and to the other objects' ends. One undo step per drag; frames outside the lifetime stay, drawn faint.
 - **Settings tab** (beside the Inspector), remembered in the session file (scripted runs, the demo and benchmarks, neither use nor save it):
   - the **Brush** tab: the next stroke's size and falloff, what the wheel does, anticipatory speed on/off, and the box of the selected sketch (or of new sketches): padding and smallest box in px of the space drawn on (video pixels on the source, view pixels inside a view, with the conversion shown), jiggle gain, hand lag, presets. Before a stroke, a dashed outline at the cursor shows the box a still hand would get;
   - the size and falloff the next stroke starts with;
@@ -559,6 +612,7 @@ Adopted from Rerun's proven design.
   - `D` Sketch tool; click selects; `Shift`+hold starts a new sketch; `Ctrl`+hold moves only; arrow keys while holding retake frame by frame; the wheel holds still while holding (or, as a setting, zooms or sets the stroke's size, falloff or both); `Esc` cancels the stroke or leaves the tool;
   - `Alt+A` deselects, `A` selects all sketches;
   - `X` / `Delete` deletes the selection (a sketch with its strokes and view; a stroke leaves its sketch), `Shift+D` duplicates sketches with their strokes (both wait for a stroke to end), `F2` renames;
+  - `J` / `K` / `L` shuttle: backward, play/pause, forward; J or L again doubles the speed, up to 8× (§3);
   - `Q` / `E` slower / faster playback (it is also the capture speed; `[` / `]` work too). The speed is always shown in a badge top-right in the viewport, amber when not 1×, and flashes large in the middle when you change it (fully for 0.25 s, then a 0.3 s fade; auto speed's changes don't flash, §8.4);
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `G` / `S` grab / scale selected;

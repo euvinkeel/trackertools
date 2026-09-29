@@ -88,7 +88,7 @@ fn patches_through_a_view_and_an_unevenly_scaled_proxy_show_the_scene() {
     let at = map.from_source(c);
     let grid = Grid { origin: [at[0] - 40.0, at[1] - 40.0], scale: 1.0 };
     // What the view shows there, straight from the scene (no rendition, no rounding).
-    let ideal = Patch { w: 80, h: 80, data: (0..80 * 80).map(|i| scene(map.to_source(grid.to_view([(i % 80) as f64 + 0.5, (i / 80) as f64 + 0.5])), c) as f32).collect() };
+    let ideal = Patch::new(80, 80, (0..80 * 80).map(|i| scene(map.to_source(grid.to_view([(i % 80) as f64 + 0.5, (i / 80) as f64 + 0.5])), c) as f32).collect());
     let t = Template::cut(&ideal, grid.from_view(at), TEMPLATE_R).expect("textured");
     let want = grid.from_view(at);
     for (name, frame, w, h, k) in [("original", render(c), W, H, [1.0, 1.0]), ("proxy", render_sized(c, pw, ph), pw, ph, k)] {
@@ -111,7 +111,7 @@ fn flat_patches_are_not_trackable() {
 /// errors (px) after removing the anchor's offset, which the tracker inherits
 /// by definition.
 fn track(scale: f64) -> Vec<f64> {
-    let settings = Settings { adapt: 0.25, min_score: 0.5 };
+    let settings = Settings { adapt: 0.25, min_score: 0.5, tolerance: Default::default() };
     let frame0 = render(truth(0));
     let (grid, patch) = patch_at(&frame0, guide(0), 30.0, scale);
     let mut tracker = TemplateTracker::seed(&patch, grid, guide(0), settings).expect("seeded");
@@ -140,4 +140,38 @@ fn follows_a_moving_blob_through_a_wandering_guide() {
         eprintln!("scale {scale}: median {median:.3} px, max {max:.3} px");
         assert!(median < 0.12 && max < 0.25, "scale {scale}: median {median:.3}, max {max:.3}");
     }
+}
+
+/// A hard-edged square (area-sampled, like a sprite or a cursor on screen)
+/// shifted by fractions of a pixel. Both the correlation's parabola and
+/// Lucas–Kanade land within a tenth of a pixel. (Here, between pixels, the
+/// parabola is the closer of the two: bilinear resampling pulls LK toward
+/// whole pixels by up to ~0.09 px. On the encoded fixtures, where subjects
+/// sit on whole pixels or move smoothly, LK is the better one: see
+/// `ncc::refine`.)
+#[test]
+fn both_subpixel_estimates_find_hard_edges_between_pixels() {
+    // The patch: a 9 px square at `c`, each pixel its covered area.
+    let square = |c: [f64; 2]| {
+        let cover = |a: f64, b: f64, lo: f64, hi: f64| (b.min(hi) - a.max(lo)).max(0.0);
+        let data = (0..60 * 60)
+            .map(|i| {
+                let (x, y) = ((i % 60) as f64, (i / 60) as f64);
+                (40.0 + 180.0 * cover(x, x + 1.0, c[0] - 4.5, c[0] + 4.5) * cover(y, y + 1.0, c[1] - 4.5, c[1] + 4.5)) as f32
+            })
+            .collect();
+        Patch::new(60, 60, data)
+    };
+    let t = Template::cut(&square([30.0, 30.0]), [30.0, 30.0], 8).expect("textured");
+    let (mut ncc, mut lk) = (0.0f64, 0.0f64);
+    for (dx, dy) in [(0.25, 0.0), (0.5, -0.3), (-0.35, 0.15), (0.1, 0.4), (-0.45, -0.45)] {
+        let c = [30.0 + dx, 30.0 + dy];
+        let patch = square(c);
+        let m = best_match(&patch, &t, [[20.0, 20.0], [40.0, 40.0]], None).expect("found");
+        let r = tt_track::ncc::refine(&patch, &t, m.pos);
+        ncc = ncc.max((m.pos[0] - c[0]).hypot(m.pos[1] - c[1]));
+        lk = lk.max((r[0] - c[0]).hypot(r[1] - c[1]));
+    }
+    eprintln!("largest error: parabola {ncc:.3} px, Lucas-Kanade {lk:.3} px");
+    assert!(ncc < 0.1 && lk < 0.1, "parabola {ncc:.3} px, Lucas-Kanade {lk:.3} px");
 }

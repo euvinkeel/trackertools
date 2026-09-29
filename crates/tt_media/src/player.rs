@@ -8,6 +8,7 @@
 //! 1. the wanted frame and a read-ahead window (larger while playing, scaled by rate);
 //! 2. while paused, the frames just behind the playhead, filled one decode
 //!    group (keyframe → target) at a time so backward steps hit the cache;
+//!    while playing backward, the same, over a window scaled by rate;
 //! 3. otherwise it sleeps until the next request.
 //!
 //! Spawning an ffmpeg stream costs ~100–300 ms (spike S1), so a running stream
@@ -37,6 +38,8 @@ pub struct Want {
     pub playing: bool,
     /// Playback rate (fraction of real time).
     pub rate: f64,
+    /// Playing backward: the frames to read ahead are the ones behind.
+    pub reverse: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -123,7 +126,7 @@ struct Worker {
 
 impl Worker {
     fn run(mut self, rx: Receiver<Want>) {
-        let mut want = Want { frame: 0, playing: false, rate: 1.0 };
+        let mut want = Want { frame: 0, playing: false, rate: 1.0, reverse: false };
         loop {
             // Newest request wins.
             loop {
@@ -154,24 +157,37 @@ impl Worker {
     fn step(&mut self, want: Want) -> anyhow::Result<bool> {
         let n = self.index.frames.len();
         let fps = self.index.fps.as_f64();
-        let ahead = if want.playing { ((fps * want.rate * 0.75) as usize).max(30) } else { AHEAD_PAUSED };
+        let forward = want.playing && !want.reverse;
+        let backward = want.playing && want.reverse;
+        let ahead = if forward {
+            ((fps * want.rate * 0.75) as usize).max(30)
+        } else if backward {
+            0 // ahead is behind (2.)
+        } else {
+            AHEAD_PAUSED
+        };
         let last = (want.frame + ahead).min(n - 1);
 
-        // 1. The wanted frame and the read-ahead window.
+        // 1. The wanted frame and the read-ahead window. Playing backward, a
+        //    missing wanted frame is decoded from its group's keyframe (on the
+        //    way there, the group's other frames are cached too).
         let missing_ahead = {
             let cache = self.shared.cache.lock().unwrap();
             (want.frame..=last).find(|p| !cache.contains(*p))
         };
         if let Some(m) = missing_ahead {
-            self.read_toward(m, m, want.frame)?;
+            let start = if backward { self.index.group_start(m) } else { m };
+            self.read_toward(start, m, want.frame)?;
             return Ok(true);
         }
 
-        // 2. Paused: the frames just behind the playhead, a decode group at a time.
-        if !want.playing && want.frame > 0 {
+        // 2. Paused or playing backward: the frames just behind the playhead,
+        //    nearest first, a decode group at a time.
+        if !forward && want.frame > 0 {
+            let behind = if want.playing { ((fps * want.rate * 1.5) as usize).max(BEHIND_PAUSED) } else { BEHIND_PAUSED };
             let missing_behind = {
                 let cache = self.shared.cache.lock().unwrap();
-                (want.frame.saturating_sub(BEHIND_PAUSED)..want.frame).rev().find(|p| !cache.contains(*p))
+                (want.frame.saturating_sub(behind)..want.frame).rev().find(|p| !cache.contains(*p))
             };
             if let Some(m) = missing_behind {
                 let start = self.index.group_start(m);
@@ -186,7 +202,8 @@ impl Worker {
     /// if it will get there soon, otherwise (re)start one at `start`
     /// (≤ target). Reads exactly one frame.
     fn read_toward(&mut self, start: usize, target: usize, playhead: usize) -> anyhow::Result<()> {
-        let reusable = self.stream.as_ref().is_some_and(|s| s.position() <= target && target - s.position() <= REUSE_GAP);
+        // (A stream already past `start` is where a new one would be, only further on.)
+        let reusable = self.stream.as_ref().is_some_and(|s| s.position() <= target && (target - s.position() <= REUSE_GAP || s.position() >= start));
         if !reusable {
             let t = Instant::now();
             self.stream = Some(FrameStream::start(&self.index, start, &self.opts)?);

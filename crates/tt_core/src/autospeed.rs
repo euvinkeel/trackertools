@@ -211,8 +211,12 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
     let mut out: Option<f64> = None;
     for source in foresight_sources(world, live, knobs.foresight) {
         let Some(sig) = world.get::<Output>(source).and_then(|o| store.get(o.0)) else { continue };
+        // Only the frames the sketch is alive on (its span) count, for its normal and ahead.
+        let span = crate::span::span_of(world, source);
+        let sig = crate::span::clip(sig, span);
+        let key = sig.version() ^ (span.range().start as u64).rotate_left(17) ^ (span.range().end as u64).rotate_left(41);
         let (calm, busy) = match refs.get(&source) {
-            Some((v, c, b)) if *v == sig.version() => (*c, *b),
+            Some((v, c, b)) if *v == key => (*c, *b),
             _ => {
                 let Some((lo, hi)) = sig.present_hull() else { continue };
                 let mut sides: Vec<f64> = (lo..=hi).filter_map(|f| sig.get(f)).map(side).collect();
@@ -220,11 +224,13 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
                     continue;
                 }
                 let (c, b) = percentiles(&mut sides);
-                refs.insert(source, (sig.version(), c, b));
+                refs.insert(source, (key, c, b));
                 (c, b)
             }
         };
-        let ahead = (f0..=f0 + n).filter_map(|f| sig.get(f)).map(side).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
+        // (Ahead is behind while playing backward.)
+        let ahead = if t.reverse { f0 - n..=f0 } else { f0..=f0 + n };
+        let ahead = ahead.filter_map(|f| sig.get(f)).map(side).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
         if let Some(a) = ahead {
             let u = busyness(a, calm, busy);
             out = Some(out.map_or(u, |o| o.max(u)));

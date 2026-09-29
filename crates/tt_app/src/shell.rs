@@ -117,6 +117,13 @@ impl Shell {
         let epoch = Instant::now();
         let pointer = PointerService::start(epoch);
         let sketch_demo = crate::demo::SketchDemo::start();
+        // A scripted run (autoplay, bench, demo) on a video that isn't there
+        // would wait forever for it: say so and quit instead.
+        let scripted = autoplay.is_some() || bench.is_some() || sketch_demo.is_some();
+        if let Some(path) = std::env::args_os().nth(1).filter(|p| scripted && !std::path::Path::new(p).exists()) {
+            tracing::error!("{} not found: nothing to run on (cargo xtask fixtures makes the test clips)", std::path::Path::new(&path).display());
+            std::process::exit(2);
+        }
         Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), was_typing: false, autoplay, bench, sketch_demo }
     }
 

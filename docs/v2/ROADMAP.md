@@ -57,7 +57,7 @@ The original plan follows.
 | Decode service | ✅ read-ahead scaled by rate; paused backward fill one decode group at a time; stream reuse instead of respawn |
 | Frame cache | ✅ 2 GB NV12, evicts the frames farthest from the playhead; the nearest frame stands in, never a blank |
 | Viewport | ✅ NV12 → RGB shader (BT.709/601, limited/full), wheel zoom about the cursor, drag pan, nearest sampling at ≥3×. ⏳ pixel grid |
-| Transport and timeline | ✅ rates 0.1–4×, steps, zoomable/pannable timeline that follows the playhead, decode-cache strip |
+| Transport and timeline | ✅ rates 0.1–4×, steps, zoomable/pannable timeline that follows the playhead, decode-cache strip. J/K/L shuttle (DaVinci-style: backward/forward from 1×, doubling per press up to 8×; K play/pause), with backward playback decoded a keyframe group at a time |
 | Proxy | ✅ auto for GOP > 30. NVENC builds P5 in 60 s (1,153 fps); alignment verified 1:1 on every fixture + content check on P5. The viewport shows the proxy unless it would be magnified |
 | Session | ✅ `%LOCALAPPDATA%\trackertools\session.json` restores the last file and frame (the `.ttproj` project file arrives with M2) |
 
@@ -389,14 +389,45 @@ Findings on the way:
 - Deleting or restoring a look re-tracks.
 - On the user's footage (frames 37619–40235): on the cursor 84.6% → 100.0%, at ~90 fps (DESIGN §6.3 table).
 
+**Lifetimes on the timeline** (DESIGN §5.1, after hands-on use: "sorely missing"):
+- A `Span { first, last }` component (`tt_core::span`) on any timeline object; readers see its output through it (`span::output`, `EvalCtx::input`), the data itself never changes. Views, overlays, snapping, anticipatory speed and trackers' guides respect it.
+- Trackers have lanes (frames, score, flagged frames, job progress), and so do views. Drag a lane's end to trim or extend it: one undo step per drag, snapping to the playhead and other ends. The right-click menu: *Starts here*, *Ends here*, *Untrim*.
+- Tracker jobs stop at the span's edges (they still start at the anchor). Trimmed results stay; extending brings back what it had without tracking, and resumes from the nearest result where it had nothing (tests/span.rs: extending 800 → 1000 resumes at 801).
+
+**Accuracy** (fully headless; DESIGN §6.3 has the tables):
+- **The cursor fixture:** `cargo xtask fixtures` renders a cursor over five kinds of trouble (changing stripes, bright scenery, icon changes, flicks, an identical look-alike) with its exact hotspot; `tests/cursor.rs` tracks it end to end and reports each stretch.
+- **Where the rough pass is early or late** (the flicks: 82% → 100% within 3 px, max 179 → 0.2 px): patches cover the guide's boxes ±8 frames; the tracker also searches around where it was going itself; placements outside the guide's box rank lower, and a near match outside it widens the search.
+- **Lucas–Kanade** after the correlation peak (median 0.14 → 0.08 px on the cursor fixture; synthetic subpixel motion 0.016–0.061 → 0.007–0.012 px).
+- **Forward/backward fuse** (`fuse`, on by default): each stretch between two pins is also tracked back from the later one, and the better pass kept per frame (a Viterbi over the two, with the guide as the judge). A look placed where it slipped onto the look-alike: 97.3% → 98.0% on that stretch.
+- **Faster** despite all of it (52 → ~90 fps on the fixture): the last look first, and coarse-to-fine search in large windows.
+- `ALGO_VERSION` 3: saved trackers re-track once.
+- `tests/real_footage.rs` prints "on the cursor" itself now (≥ 12 pixels of luma ≥ 220 within 14 px).
+- Tried and dropped: a matched blur before Lucas–Kanade (exact on an ideal square between pixels, worse on both encoded fixtures).
+
+**Matching options** (per tracker, in the inspector; DESIGN §6.3):
+- `contrast` and `brightness` slack (`ncc::photometric`'s constants, now settings), and `colour` (compare chroma too, from the NV12 frame).
+- The cursor fixture gained two stretches for them: a yellow twin of the cursor on bright scenery (colour: 99.3% → 100%) and a picture dimmed to 30% (contrast 3×: 62% → 100%). Neither option is worse anywhere; defaults unchanged.
+- Tried and not offered: an edges (gradient magnitude) channel; no gain, 2.5× slower.
+- Old saves load with the defaults (`Tracker` gains `fuse` and `matching`).
+
+**CoTracker3 as a tracker method** (DESIGN §6.3; v1's original tracker type, back):
+- `Tracker::method`: *Template* or *CoTracker*. The job resamples frames through the view into 512 × 384 RGB crops that follow the guide, backward jobs send them reversed, and a Python worker (`editor/cotracker_worker.py`) runs v1's online engine over them. The seeds are the looks' aligned points, and looks pin their frames.
+- `tests/cotracker.rs` (sprite, both ways, CPU): median 0.26 px, max 0.99. The worker alone: `editor/tests/test_cotracker_worker.py`. Both skip without torch or the weights.
+- On the cursor fixture it loses the cursor at the flicks and doesn't recover (39% within 3 px overall, templates 94–99%): one crop scale per job, and no re-detection. ⏳ a scale per stretch; templates re-seeding it where it loses the subject.
+- ⏳ one worker per job (the model loads for each; a pooled worker would save that), and TAPNext / SAM 2.1 behind the same worker protocol.
+
 **Next:**
-- trackers in the timeline (lanes with score and job progress), and Tab into a tracker's view (stabilization);
+- run `tests/real_footage.rs` on the user's footage with the new tracker (baseline: 100.0% on the cursor, ~90 fps);
+- Tab into a tracker's view (stabilization);
 - unguided trackers (search around the last position and velocity);
 - tracker results feeding anticipatory speed's look-ahead;
-- a Lucas–Kanade refinement for hard-edged features (NCC peaks lean toward whole pixels);
-- colour (chroma) in the match;
-- the forward/backward fuse;
-- learned trackers (CoTracker3 / TAPNext worker, SAM 2.1) behind the same operator and job protocol.
+- more learned trackers (TAPNext, SAM 2.1) behind the same worker protocol.
+
+---
+
+## macOS (Apple Silicon)
+
+Runs on a Mac as of 2026-09-28, measured on an M4 Pro (macOS 27): everything builds and every test passes. The tracker runs at 233 fps on the cursor fixture (same accuracy as elsewhere), backward playback finds 100% of frames, and seeks and steps take one 120 Hz refresh. Data lives in `~/Library/Application Support/trackertools`; the scrub proxy uses VideoToolbox; CoTracker3 tries MPS (not yet measured); ffmpeg is also looked for in Homebrew's folders; `scripts/mac_baseline.sh` re-measures. Sketching uses egui's pointer there, one sample per refresh: a high-rate pointer service is the next Mac step. The measurements and the plan: [APPLE_SILICON.md](APPLE_SILICON.md).
 
 ---
 

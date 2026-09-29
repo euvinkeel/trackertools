@@ -29,6 +29,10 @@ pub enum Action {
     GoToEnd,
     FasterPlayback,
     SlowerPlayback,
+    /// L: play forward; again, twice as fast (DaVinci-style shuttle).
+    ShuttleForward,
+    /// J: play backward; again, twice as fast.
+    ShuttleBackward,
     FrameAll,
     OpenFile,
     Undo,
@@ -120,6 +124,10 @@ impl Default for Keymap {
                 (b(Key::Letter('q'), Mods::NONE, false), SlowerPlayback),
                 (b(Key::Letter(']'), Mods::NONE, false), FasterPlayback),
                 (b(Key::Letter('['), Mods::NONE, false), SlowerPlayback),
+                // Shuttle, as in DaVinci Resolve: J backward, K play/pause, L forward.
+                (b(Key::Letter('l'), Mods::NONE, false), ShuttleForward),
+                (b(Key::Letter('j'), Mods::NONE, false), ShuttleBackward),
+                (b(Key::Letter('k'), Mods::NONE, false), TogglePlay),
                 (b(Key::Letter('o'), Mods::CTRL, false), OpenFile),
                 (b(Key::Letter('z'), Mods::CTRL, true), Undo),
                 (b(Key::Letter('z'), Mods { ctrl: true, shift: true, alt: false }, true), Redo),

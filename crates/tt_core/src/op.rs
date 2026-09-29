@@ -93,10 +93,12 @@ pub struct EvalCtx<'w> {
     pub entity: Entity,
     pub store: &'w SignalStore,
     pub extent: Range<FrameIndex>,
+    /// Inputs trimmed by a span (`span::Span`), as the operator sees them.
+    clipped: HashMap<Entity, Signal>,
 }
 
 impl EvalCtx<'_> {
-    /// The signal connected to input `slot`.
+    /// The signal connected to input `slot`, without the frames outside its producer's span.
     pub fn input(&self, slot: &str) -> Option<&Signal> {
         let inputs = self.world.get::<Inputs>(self.entity)?;
         let (_, producer) = inputs.0.iter().find(|(s, _)| s == slot)?;
@@ -104,8 +106,25 @@ impl EvalCtx<'_> {
         if self.world.get::<bevy_ecs::entity_disabling::Disabled>(*producer).is_some() {
             return None;
         }
+        if let Some(s) = self.clipped.get(producer) {
+            return Some(s);
+        }
         let out = self.world.get::<Output>(*producer)?;
         self.store.get(out.0)
+    }
+
+    /// Copies of the inputs of `op` that a span trims (cheap: shared chunks).
+    fn clip_inputs(world: &World, store: &SignalStore, op: Entity) -> HashMap<Entity, Signal> {
+        let mut out = HashMap::new();
+        for (_, p) in world.get::<Inputs>(op).map(|i| i.0.as_slice()).unwrap_or_default() {
+            let span = crate::span::span_of(world, *p);
+            if span.is_trimmed()
+                && let Some(sig) = world.get::<Output>(*p).and_then(|o| store.get(o.0))
+            {
+                out.insert(*p, sig.clipped(span.range()));
+            }
+        }
+        out
     }
 
     /// The producer entity connected to input `slot` (None if disconnected or deleted).
@@ -390,7 +409,8 @@ fn evaluate(world: &mut World) {
             let Some(mut out) = world.resource_mut::<SignalStore>().remove(out_id) else { break };
             let result = {
                 let store = world.resource::<SignalStore>();
-                let ctx = EvalCtx { world, entity: op, store, extent: extent.clone() };
+                let clipped = EvalCtx::clip_inputs(world, store, op);
+                let ctx = EvalCtx { world, entity: op, store, extent: extent.clone(), clipped };
                 kind.evaluate(&ctx, range.clone(), &mut out)
             };
             world.resource_mut::<SignalStore>().insert(out_id, out);

@@ -102,7 +102,9 @@ impl SpaceMap {
 /// covers, a view holds the nearest framing, so it never vanishes.
 pub fn map_at(world: &World, view: Option<Entity>, f: FrameIndex) -> SpaceMap {
     let size = world.get_resource::<SourceSize>().copied().unwrap_or_default();
-    let Some(sig) = view.filter(|v| is_live(world, *v)).and_then(|v| signal_of(world, v)) else { return SpaceMap::identity(&size) };
+    let Some((v, sig)) = view.filter(|v| is_live(world, *v)).and_then(|v| Some((v, signal_of(world, v)?))) else { return SpaceMap::identity(&size) };
+    // A trimmed view holds its nearest framing inside its span.
+    let f = crate::span::span_of(world, v).clamp(f);
     match nearest(sig, f) {
         Some(v) => SpaceMap::of_view(v),
         None => SpaceMap::identity(&size),
@@ -311,6 +313,8 @@ pub fn frame_views(sketch: &Signal, parent: Option<&Signal>, p: &FrameParams, fp
             })
         })
         .collect();
+    // (Every frame flagged: nothing to frame.)
+    known.iter().any(Option::is_some).then_some(())?;
     fill_gaps(&mut known);
     let pts: Vec<[f64; 4]> = known.into_iter().map(|v| v.expect("filled")).collect();
 
@@ -410,9 +414,14 @@ pub fn zoom_envelope(need: &[f64], p: &FrameParams, fps: f64) -> Vec<f64> {
     env.iter().zip(need).map(|(e, v)| e.exp().max(*v)).collect()
 }
 
-/// Linear interpolation across `None` runs between known values (ends held).
+/// Linear interpolation across `None` runs between known values; the ends
+/// hold the nearest known value (a tracker's first frames may be flagged).
 fn fill_gaps(v: &mut [Option<[f64; 4]>]) {
     let known: Vec<usize> = (0..v.len()).filter(|i| v[*i].is_some()).collect();
+    let (Some(&first), Some(&last)) = (known.first(), known.last()) else { return };
+    let (head, tail) = (v[first], v[last]);
+    v[..first].fill(head);
+    v[last + 1..].fill(tail);
     for w in known.windows(2) {
         let (a, b) = (w[0], w[1]);
         let (va, vb) = (v[a].unwrap(), v[b].unwrap());
@@ -550,6 +559,22 @@ mod tests {
         assert!(crop[600] < 450.0, "settled back: {:.0}", crop[600]);
         let steps: Vec<f64> = crop[360..600].windows(2).map(|w| w[0] / w[1]).collect();
         assert!(steps.iter().all(|s| *s >= 0.999), "zooming back in never overshoots");
+    }
+
+    #[test]
+    fn a_tracker_flagged_at_its_ends_still_frames() {
+        // `[x, y, l, t, r, b, score, flags]`: frames 0-2 and 8-9 flagged lost.
+        let mut s = Signal::new(8);
+        for f in 0..10 {
+            let flags = if (3..=7).contains(&f) { 0.0 } else { 1.0 };
+            s.set(f, &[500.0, 300.0, 480.0, 280.0, 520.0, 320.0, 0.9, flags]);
+        }
+        let (first, frames) = frame_views(&s, None, &FrameParams::default(), 60.0, &SourceSize::default()).expect("framed");
+        assert_eq!((first, frames.len()), (0, 10));
+        assert!(frames.iter().all(|v| (v[0] - 500.0).abs() < 1e-6));
+        let mut all = Signal::new(8);
+        all.set(0, &[500.0, 300.0, 480.0, 280.0, 520.0, 320.0, 0.1, 1.0]);
+        assert!(frame_views(&all, None, &FrameParams::default(), 60.0, &SourceSize::default()).is_none());
     }
 
     #[test]

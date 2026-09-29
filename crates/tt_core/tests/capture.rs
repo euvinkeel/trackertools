@@ -573,3 +573,23 @@ fn a_stroke_saved_before_its_lag_existed_loads_with_the_default() {
     let s: Stroke = load_component(&mut d.core.world, "(falloff: 0.5, influence: 1.0, size: 1.0, scale: 2.0)");
     assert_eq!((s.falloff, s.scale, s.lag), (0.5, 2.0, 0.25));
 }
+
+/// Playing backward (J) is played through like playing forward: every frame
+/// passed takes the moment its centre was on screen, none is a jump.
+#[test]
+fn a_clock_map_played_backward_visits_every_frame() {
+    use tt_core::sketch::{ClockMap, Shown};
+    let mut clock = ClockMap::default();
+    // 1 s at 60 fps backward, from frame 100.0 down to 40.0, sampled at 1 kHz.
+    for i in 0..=1000 {
+        let t = i as f64 / 1000.0;
+        clock.push(t, 100.0 - 60.0 * t, true);
+    }
+    let (first, shown) = clock.frame_times().expect("visited");
+    assert_eq!(first, 40);
+    for f in 40..100 {
+        let Some(Shown::At(t)) = shown[(f - first) as usize] else { panic!("frame {f}: {:?}", shown[(f - first) as usize]) };
+        let want = (100.0 - (f as f64 + 0.5)) / 60.0;
+        assert!((t - want).abs() < 1e-3, "frame {f} at {t:.4} s, its centre was on screen at {want:.4} s");
+    }
+}

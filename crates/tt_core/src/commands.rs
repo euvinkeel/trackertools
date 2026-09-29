@@ -201,26 +201,22 @@ pub struct TimeSnap {
 }
 
 /// The frames an entity spans on the timeline, first and last: a stroke the
-/// frames it visited, anything else with an output its frames with a value.
+/// frames it visited, anything else with an output its frames with a value;
+/// both trimmed by its span (`span::Span`).
 pub fn time_span(world: &World, e: Entity) -> Option<(FrameIndex, FrameIndex)> {
-    if world.get::<Disabled>(e).is_some() {
-        return None;
-    }
-    if world.get::<Capture>(e).is_some() {
-        let (first, shown) = world.get::<ClockMap>(e)?.frame_times()?;
-        let a = shown.iter().position(Option::is_some)?;
-        let b = shown.iter().rposition(Option::is_some)?;
-        return Some((first + a as FrameIndex, first + b as FrameIndex));
-    }
-    let out = world.get::<Output>(e)?;
-    world.resource::<SignalStore>().get(out.0)?.present_hull()
+    crate::span::live_span(world, e)
 }
 
 /// Every live object's first and last frame, sorted and without repeats:
 /// what the playhead snaps to.
 pub fn snap_points(world: &mut World) -> Vec<FrameIndex> {
+    snap_points_except(world, None)
+}
+
+/// [`snap_points`] of everything but `except` (an end being dragged snaps to the others).
+pub fn snap_points_except(world: &mut World, except: Option<Entity>) -> Vec<FrameIndex> {
     let mut q = world.query_filtered::<Entity, (Or<(With<Operator>, With<Capture>)>, Without<Disabled>)>();
-    let entities: Vec<Entity> = q.iter(world).collect();
+    let entities: Vec<Entity> = q.iter(world).filter(|e| Some(*e) != except).collect();
     let mut out: Vec<FrameIndex> = entities.into_iter().filter_map(|e| time_span(world, e)).flat_map(|(a, b)| [a, b]).collect();
     out.sort_unstable();
     out.dedup();

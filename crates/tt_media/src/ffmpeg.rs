@@ -8,7 +8,7 @@
 //! the n-th frame read is `frames[first + n]` of the [`VideoIndex`].
 
 use std::io::{BufRead, BufReader, ErrorKind, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +18,7 @@ use crate::index::VideoIndex;
 
 #[derive(Clone, Debug)]
 pub struct DecodeOptions {
-    /// ffmpeg executable (`FFMPEG` env var, else `ffmpeg` on PATH).
+    /// ffmpeg executable (see [`tool`]).
     pub ffmpeg: PathBuf,
     /// Hardware decoder (`cuda`, `d3d11va`, …); frames are copied back to NV12.
     pub hwaccel: Option<String>,
@@ -26,9 +26,27 @@ pub struct DecodeOptions {
 
 impl Default for DecodeOptions {
     fn default() -> Self {
-        let ffmpeg = std::env::var_os("FFMPEG").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("ffmpeg"));
-        Self { ffmpeg, hwaccel: None }
+        Self { ffmpeg: tool("ffmpeg", "FFMPEG"), hwaccel: None }
     }
+}
+
+/// An ffmpeg executable (`ffmpeg`, `ffprobe`): the environment variable `var`
+/// if set, else `name` on PATH. On macOS, when PATH doesn't have it, also
+/// Homebrew's folders: an app opened from Finder or the Dock gets a minimal
+/// PATH without them.
+pub fn tool(name: &str, var: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()));
+    if !on_path && cfg!(target_os = "macos") {
+        let brew = ["/opt/homebrew/bin", "/usr/local/bin"].iter().map(|d| Path::new(d).join(name)).find(|p| p.is_file());
+        if let Some(path) = brew {
+            return path;
+        }
+    }
+    PathBuf::from(name)
 }
 
 pub struct FrameStream {
@@ -158,5 +176,19 @@ impl Drop for FrameStream {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tool_is_the_variable_if_set_else_its_name_or_a_found_path() {
+        // A variable nothing else reads, so tests running in parallel don't see it.
+        unsafe { std::env::set_var("TT_TEST_TOOL", "/some/ffmpeg") };
+        assert_eq!(tool("ffmpeg", "TT_TEST_TOOL"), PathBuf::from("/some/ffmpeg"));
+        let found = tool("tt-no-such-tool", "TT_TEST_TOOL_UNSET");
+        assert_eq!(found, PathBuf::from("tt-no-such-tool"));
     }
 }

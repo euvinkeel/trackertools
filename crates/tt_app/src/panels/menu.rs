@@ -73,7 +73,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             }
         }
     }
-    // Where the selected thing is on the timeline.
+    // Where the selected thing is on the timeline, and its lifetime.
     if let Some((a, b)) = primary.and_then(|p| tt_core::commands::time_span(world, p)) {
         ui.separator();
         if ui.button(format!("Go to its start (frame {a})")).clicked() {
@@ -84,6 +84,25 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             push = Some(Action::Seek(b));
             ui.close();
         }
+    }
+    if let Some(p) = primary.filter(|p| tt_core::span::extent_of(world, *p).is_some() && world.get::<Capture>(*p).is_none()) {
+        use tt_core::span::{Edge, move_edge, set_span, span_of};
+        let here = world.resource::<tt_core::transport::Transport>().frame();
+        let tip = "Its lifetime: nothing outside it is shown, used or tracked, and nothing is deleted (drag its ends on the timeline)";
+        if ui.button(format!("Starts here (frame {here})")).on_hover_text(tip).clicked() {
+            move_edge(world, p, Edge::First, here);
+            ui.close();
+        }
+        if ui.button(format!("Ends here (frame {here})")).on_hover_text(tip).clicked() {
+            move_edge(world, p, Edge::Last, here);
+            ui.close();
+        }
+        if span_of(world, p).is_trimmed() && ui.button("Untrim (its whole length)").clicked() {
+            set_span(world, p, tt_core::span::Span::default());
+            ui.close();
+        }
+        ui.separator();
+    } else if primary.is_some() {
         ui.separator();
     }
     if ui.button(format!("Select all{}", chord(Action::SelectAll))).clicked() {

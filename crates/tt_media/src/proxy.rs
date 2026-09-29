@@ -32,14 +32,25 @@ pub fn source_key(source: &Path) -> Result<String> {
     Ok(format!("{hash:016x}"))
 }
 
-/// The per-user data directory (`%LOCALAPPDATA%\trackertools`): session,
-/// projects, proxies. `TT_DATA_DIR` overrides it, so dev and benchmark runs
-/// never read or write the user's own data.
+/// The per-user data directory: session, projects, proxies.
+/// `%LOCALAPPDATA%\trackertools` on Windows, `~/Library/Application
+/// Support/trackertools` on macOS, `$XDG_DATA_HOME/trackertools` (or
+/// `~/.local/share/trackertools`) elsewhere; never the temp folder, which
+/// macOS clears. `TT_DATA_DIR` overrides it, so dev and benchmark runs never
+/// read or write the user's own data.
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("TT_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("trackertools")
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = if cfg!(windows) {
+        var("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|h| h.join("Library/Application Support"))
+    } else {
+        var("XDG_DATA_HOME").or_else(|| var("HOME").map(|h| h.join(".local/share")))
+    };
+    base.unwrap_or_else(std::env::temp_dir).join("trackertools")
 }
 
 /// Where a source's scrub proxy lives.
@@ -69,10 +80,13 @@ pub fn build(source: &VideoIndex, out: &Path, opts: &DecodeOptions, progress: Ar
     let filter = format!("{scale}format=nv12");
 
     let mut last_error = String::new();
-    let encoders: [&[&str]; 2] = [
-        &["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
-        &["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"],
-    ];
+    // The GPU's encoder first (NVIDIA's; on a Mac, Apple's media engine), then x264.
+    let hardware: &[&str] = if cfg!(target_os = "macos") {
+        &["-c:v", "h264_videotoolbox", "-q:v", "65", "-realtime", "0"]
+    } else {
+        &["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+    };
+    let encoders: [&[&str]; 2] = [hardware, &["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]];
     for encoder in encoders {
         progress.store(0, Ordering::Relaxed);
         let mut cmd = Command::new(&opts.ffmpeg);
