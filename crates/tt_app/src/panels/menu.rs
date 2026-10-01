@@ -105,6 +105,17 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     } else if primary.is_some() {
         ui.separator();
     }
+    let trackers: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e)).collect();
+    if let [a, b] = trackers[..] {
+        let tip = "Two trackers as a Fusion Transform that holds both points still in position and rotation, as they are on this frame. \
+                   In Resolve's Fusion page: select MediaIn1, press Ctrl+V (Cmd+V on a Mac), and make sure the Transform sits between MediaIn1 and MediaOut1.";
+        if ui.button("Copy Resolve stabilizer (Fusion)").on_hover_text(tip).clicked() {
+            let status = copy_stabilizer(ui.ctx(), world, a, b);
+            world.resource_mut::<crate::media::StatusLine>().0 = Some(status);
+            ui.close();
+        }
+        ui.separator();
+    }
     if ui.button(format!("Select all{}", chord(Action::SelectAll))).clicked() {
         push = Some(Action::SelectAll);
         ui.close();
@@ -116,4 +127,24 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     if let Some(a) = push {
         world.resource_mut::<PendingActions>().push(a);
     }
+}
+
+/// Copies the Fusion stabilizer for trackers `a` and `b` (tt_track::export),
+/// held as they are on the current frame, and saves it as a `.setting` in the
+/// data folder too. Returns the status line's message and whether it's an error.
+fn copy_stabilizer(ctx: &egui::Context, world: &World, a: Entity, b: Entity) -> (String, bool) {
+    use tt_track::export::{fusion_setting, good_points, steady};
+    let size = world.resource::<tt_core::view::SourceSize>();
+    let here = world.resource::<tt_core::transport::Transport>().frame();
+    let keys = steady(&good_points(world, a), &good_points(world, b), [size.width, size.height], here);
+    let Some(first) = keys.first() else { return ("The two trackers have no frame where both points are good".into(), true) };
+    let reference = keys.iter().find(|k| k.frame == here).map_or(first.frame, |k| k.frame);
+    let text = fusion_setting("Stabilize", &keys, 0);
+    ctx.copy_text(text.clone());
+    let name = |e: Entity| world.get::<Name>(e).map_or_else(|| "tracker".to_string(), |n| n.to_string());
+    let dir = tt_media::proxy::data_dir().join("exports");
+    let file = dir.join(format!("stabilize {} + {}.setting", name(a), name(b)).replace(['/', '\\', ':'], "_"));
+    let saved = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, &text)).map_or_else(|e| format!(" (not saved: {e})"), |()| format!("; saved {}", file.display()));
+    let (lo, hi) = (first.frame, keys.last().map_or(first.frame, |k| k.frame));
+    (format!("Copied a Fusion stabilizer: {} keys, frames {lo}–{hi}, held as on frame {reference}{saved}", keys.len()), false)
 }

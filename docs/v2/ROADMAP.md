@@ -438,7 +438,7 @@ Runs on a Mac as of 2026-09-28, measured on an M4 Pro (macOS 27): everything bui
 | **M5 · Keys & curves** | Keys operator as a Track ("human animation is a tracker"), curve editor, dope-sheet editing, finetune-style offset layers |
 | **M6 · Trackers** *(started: see above)* | **FrameSource** entities with Auto rendition selection (a mip level per view and model input) and on-demand ½ / ¼ tracking renditions; coarse-to-fine via guide inputs; template matcher (Rust / GPU); learned trackers via a Python worker (v1's CoTracker3 engine; TAPNext as the permissive option) over a narrow job protocol (seeds + view transform in, result chunks out); trackers attach to any view; **reverse** jobs (backward decode by keyframe interval) with a forward/backward fuse; **catch-up-to-playhead** mode; stale-while-revalidate |
 | **M7 · Targets & quality** | Combine / Contribution (pushed position, from v1), drift and motion-consistency checks, automatic ends |
-| **M8 · Export** | JSON / CSV, AE keyframe clipboard text, Fusion `.setting` (validated in Resolve this time), Nuke `.chan` |
+| **M8 · Export** | JSON / CSV, AE keyframe clipboard text, Fusion `.setting` (validated in Resolve this time), Nuke `.chan`. *Started early:* two trackers → a Fusion stabilizer (position + rotation) on the clipboard, measured in `tests/stabilize.rs` (DESIGN §6.3) |
 | **Later** | Result caching (content-addressed), audio, zero-copy hardware decode, operator graph view |
 
 ---

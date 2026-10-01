@@ -22,6 +22,7 @@
 //! from the anchor, keeps old results on screen as stale until new ones
 //! arrive, and can hold them to the playhead (catch-up mode).
 
+pub mod export;
 pub mod image;
 pub mod job;
 pub mod look;
