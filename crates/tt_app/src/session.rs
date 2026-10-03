@@ -13,10 +13,12 @@ use tt_core::sketch::SketchParams;
 use tt_core::time::{FrameIndex, WallClock};
 use tt_core::transport::Transport;
 use tt_core::view::ViewDefaults;
+use tt_track::export::StabilizerDefaults;
 use tt_track::look::LookDefaults;
 use tt_core::{AppBuilder, Class, Module, Set};
 
 use crate::media::{Media, OpenRequest};
+use crate::update::Updater;
 use crate::panels::viewport::PointerView;
 
 const MAX_RECENT: usize = 10;
@@ -64,12 +66,17 @@ struct SettingsFile {
     auto_speed: AutoSpeed,
     /// New tracker looks get their mask painted automatically.
     auto_mask_looks: bool,
+    /// The Resolve stabilizer's spring smoothing, seconds.
+    stabilize_smooth_position: f32,
+    stabilize_smooth_rotation: f32,
+    /// Look for a new version at start.
+    check_for_updates: bool,
 }
 
 impl Default for SettingsFile {
     fn default() -> Self {
         let s = tt_core::sketch::Stroke::default();
-        let (v, p) = (ViewDefaults::default(), PointerView::default());
+        let (v, p, st) = (ViewDefaults::default(), PointerView::default(), StabilizerDefaults::default());
         Self {
             version: SETTINGS_VERSION,
             wheel: WheelMode::default(),
@@ -82,12 +89,15 @@ impl Default for SettingsFile {
             clear_radius: p.clear_radius,
             auto_speed: AutoSpeed::default(),
             auto_mask_looks: LookDefaults::default().auto_mask,
+            stabilize_smooth_position: st.smooth_position,
+            stabilize_smooth_rotation: st.smooth_rotation,
+            check_for_updates: Updater::default().check_on_start,
         }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed, l: &LookDefaults) -> Self {
+    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed, l: &LookDefaults, st: &StabilizerDefaults, u: &Updater) -> Self {
         Self {
             version: SETTINGS_VERSION,
             wheel: d.wheel,
@@ -100,6 +110,9 @@ impl SettingsFile {
             clear_radius: p.clear_radius,
             auto_speed: a.clone(),
             auto_mask_looks: l.auto_mask,
+            stabilize_smooth_position: st.smooth_position,
+            stabilize_smooth_rotation: st.smooth_rotation,
+            check_for_updates: u.check_on_start,
         }
     }
 
@@ -128,6 +141,13 @@ impl SettingsFile {
         *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };
         if let Some(mut l) = world.get_resource_mut::<LookDefaults>() {
             l.auto_mask = self.auto_mask_looks;
+        }
+        if let Some(mut u) = world.get_resource_mut::<Updater>() {
+            u.check_on_start = self.check_for_updates;
+        }
+        if let Some(mut st) = world.get_resource_mut::<StabilizerDefaults>() {
+            st.smooth_position = self.stabilize_smooth_position.clamp(0.0, 2.0);
+            st.smooth_rotation = self.stabilize_smooth_rotation.clamp(0.0, 2.0);
         }
     }
 }
@@ -195,8 +215,18 @@ impl Session {
 }
 
 /// The Settings tab's values, kept in the session file.
-fn track_settings(defaults: Res<SketchDefaults>, views: Res<ViewDefaults>, pointer: Res<PointerView>, auto: Res<AutoSpeed>, looks: Res<LookDefaults>, mut session: ResMut<Session>) {
-    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto, &looks);
+#[allow(clippy::too_many_arguments)]
+fn track_settings(
+    defaults: Res<SketchDefaults>,
+    views: Res<ViewDefaults>,
+    pointer: Res<PointerView>,
+    auto: Res<AutoSpeed>,
+    looks: Res<LookDefaults>,
+    stabilizer: Res<StabilizerDefaults>,
+    updater: Res<Updater>,
+    mut session: ResMut<Session>,
+) {
+    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto, &looks, &stabilizer, &updater);
     if session.file.settings != settings && !session.scripted {
         session.file.settings = settings;
     }
@@ -268,7 +298,7 @@ mod tests {
     #[test]
     fn the_preset_new_sketches_use_is_remembered() {
         let chosen = SketchDefaults { params: SketchParams::preset("Loose").unwrap(), ..SketchDefaults::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default(), &LookDefaults::default())).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default(), &LookDefaults::default(), &StabilizerDefaults::default(), &Updater::default())).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();
@@ -281,7 +311,7 @@ mod tests {
     #[test]
     fn auto_speed_and_its_knobs_are_remembered() {
         let knobs = AutoSpeed { enabled: true, comfort: 450.0, look_ahead: 0.0, ..AutoSpeed::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs, &LookDefaults::default())).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs, &LookDefaults::default(), &StabilizerDefaults::default(), &Updater::default())).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();
@@ -292,6 +322,32 @@ mod tests {
         // A session file from before auto speed reads with it off.
         let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
         assert_eq!(old.auto_speed, AutoSpeed::default());
+    }
+
+    #[test]
+    fn the_stabilizers_smoothing_is_remembered() {
+        let chosen = StabilizerDefaults { smooth_position: 0.2, smooth_rotation: 0.4 };
+        let text = serde_json::to_string(&SettingsFile::of(
+            &SketchDefaults::default(),
+            &ViewDefaults::default(),
+            &PointerView::default(),
+            &AutoSpeed::default(),
+            &LookDefaults::default(),
+            &chosen,
+            &Updater::default(),
+        ))
+        .unwrap();
+        let mut world = World::new();
+        world.init_resource::<SketchDefaults>();
+        world.init_resource::<ViewDefaults>();
+        world.init_resource::<PointerView>();
+        world.init_resource::<AutoSpeed>();
+        world.init_resource::<StabilizerDefaults>();
+        serde_json::from_str::<SettingsFile>(&text).unwrap().apply(&mut world);
+        assert_eq!(*world.resource::<StabilizerDefaults>(), chosen);
+        // A session file from before it reads with the defaults.
+        let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
+        assert_eq!((old.stabilize_smooth_position, old.stabilize_smooth_rotation), (0.0, 0.05));
     }
 
     #[test]

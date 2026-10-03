@@ -10,6 +10,8 @@ pub const TICK: Color32 = Color32::from_rgb(0x5b, 0x65, 0x75);
 pub const TEXT: Color32 = Color32::from_rgb(0xd8, 0xde, 0xe9);
 pub const MUTED: Color32 = Color32::from_rgb(0x7d, 0x87, 0x96);
 pub const ACCENT: Color32 = Color32::from_rgb(0x22, 0xd3, 0xee);
+/// The in and out points (what an export covers): its handles, bar and badges.
+pub const RANGE: Color32 = Color32::from_rgb(0xe2, 0xe8, 0xf0);
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());

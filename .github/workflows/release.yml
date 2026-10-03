@@ -1,0 +1,70 @@
+# Builds the Windows app and publishes it as a GitHub release when a version
+# tag is pushed (git tag v0.2.0 && git push origin v0.2.0). The tag is the
+# version: the app is built with TT_VERSION set to it, and Settings > Updates
+# in every released copy finds the new release and installs it in one click
+# (crates/tt_app/src/update.rs). Run it by hand for an existing tag from
+# Actions > Release > Run workflow.
+#
+# The zip holds trackertools.exe, ffmpeg.exe and ffprobe.exe (gyan.dev's
+# release "essentials" build, GPL: its license goes along) and a README for
+# people who didn't build it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to release (it must exist), e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Rust 1.95
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:TT_VERSION = $env:TAG
+          cargo build -p tt_app --release
+      - name: Package
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip ffmpeg
+          $bin = (Get-ChildItem ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          $license = Get-ChildItem ffmpeg -Recurse -Filter LICENSE* | Select-Object -First 1
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item target/release/trackertools.exe pkg/
+          Copy-Item (Join-Path $bin ffmpeg.exe), (Join-Path $bin ffprobe.exe) pkg/
+          Copy-Item $license.FullName pkg/FFMPEG-LICENSE.txt
+          Copy-Item packaging/README.txt pkg/
+          Compress-Archive -Path pkg/* -DestinationPath trackertools-windows-x64.zip
+          Get-ChildItem pkg, trackertools-windows-x64.zip | Format-Table Name, Length
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG trackertools-windows-x64.zip --clobber
+          } else {
+            gh release create $env:TAG trackertools-windows-x64.zip --title "trackertools $env:TAG" --generate-notes
+          }

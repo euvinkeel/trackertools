@@ -437,8 +437,8 @@ Runs on a Mac as of 2026-09-28, measured on an M4 Pro (macOS 27): everything bui
 |---|---|
 | **M5 · Keys & curves** | Keys operator as a Track ("human animation is a tracker"), curve editor, dope-sheet editing, finetune-style offset layers |
 | **M6 · Trackers** *(started: see above)* | **FrameSource** entities with Auto rendition selection (a mip level per view and model input) and on-demand ½ / ¼ tracking renditions; coarse-to-fine via guide inputs; template matcher (Rust / GPU); learned trackers via a Python worker (v1's CoTracker3 engine; TAPNext as the permissive option) over a narrow job protocol (seeds + view transform in, result chunks out); trackers attach to any view; **reverse** jobs (backward decode by keyframe interval) with a forward/backward fuse; **catch-up-to-playhead** mode; stale-while-revalidate |
-| **M7 · Targets & quality** | Combine / Contribution (pushed position, from v1), drift and motion-consistency checks, automatic ends |
-| **M8 · Export** | JSON / CSV, AE keyframe clipboard text, Fusion `.setting` (validated in Resolve this time), Nuke `.chan` |
+| **M7 · Targets & quality** | *Started:* subjects (`tt_core::subject`): pushed position from v1, turning with two or more members, offset keys dragged in the Select tool, exported to Resolve. Next: weights and influence per member, drift and motion-consistency checks, automatic ends |
+| **M8 · Export** | JSON / CSV, AE keyframe clipboard text, Fusion `.setting` (validated in Resolve this time), Nuke `.chan`. *Started early:* two trackers → a Fusion stabilizer (position + rotation) on the clipboard that finds its own frame in Resolve (trims, other rates, Fusion Clips), measured in `tests/stabilize.rs` and in Resolve itself by `scripts/resolve_stabilizer_proof.py` (DESIGN §6.3); stabilized and tracking-target videos rendered here (`tt_media::render`) over the in and out points (`tt_core::marks`, I / O on the timeline) |
 | **Later** | Result caching (content-addressed), audio, zero-copy hardware decode, operator graph view |
 
 ---

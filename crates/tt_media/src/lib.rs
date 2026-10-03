@@ -7,6 +7,7 @@ pub mod index;
 pub mod player;
 pub mod probe;
 pub mod proxy;
+pub mod render;
 
 pub use cache::{FrameCache, FrameData};
 pub use probe::{ColorInfo, Matrix, probe_color};

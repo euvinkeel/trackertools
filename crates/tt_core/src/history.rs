@@ -173,6 +173,15 @@ impl Tx<'_> {
         });
     }
 
+    /// Change a resource in place: document state kept in a resource (the
+    /// project's [`ProjectMeta`](crate::persist::ProjectMeta) entries).
+    pub fn modify_resource<R: Resource + Component<Mutability = bevy_ecs::component::Mutable> + Clone>(&mut self, f: impl FnOnce(&mut R)) {
+        let Some(before) = self.world.get_resource::<R>().cloned() else { return };
+        f(&mut self.world.resource_mut::<R>());
+        let after = self.world.resource::<R>().clone();
+        self.steps.push(Step { undo: Arc::new(move |w| w.insert_resource(before.clone())), redo: Arc::new(move |w| w.insert_resource(after.clone())) });
+    }
+
     /// Set a component to a reflected value — the generic inspector's edit,
     /// for any registered component type, with no per-type code. Returns
     /// false if the entity lacks the component or the type isn't registered.

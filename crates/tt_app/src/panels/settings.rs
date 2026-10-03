@@ -11,6 +11,9 @@ use crate::style;
 
 pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        updates(ui, world);
+
+        ui.separator();
         ui.heading("Sketching");
         ui.label(egui::RichText::new("The next stroke's size, falloff, the wheel and the box are in the Brush tab.").color(style::MUTED).small());
         ui.add_space(6.0);
@@ -96,6 +99,74 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
                 tracing::warn!("could not open {}: {e}", dir.display());
             }
+        }
+    });
+}
+
+/// Updates (crate::update): this copy's version, a check, and the new
+/// version in one click. Worded for people who don't build it themselves.
+fn updates(ui: &mut egui::Ui, world: &mut World) {
+    use crate::update::{State, Updater, installable, version};
+    let up = world.resource::<Updater>().clone();
+    ui.heading("Updates");
+    ui.label(format!("You have trackertools {}.", version()));
+    match up.state() {
+        State::Idle => {}
+        State::Checking => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Looking for a new version\u{2026}");
+            });
+        }
+        State::UpToDate => {
+            ui.label(egui::RichText::new("\u{2714} This is the latest version.").color(style::ACCENT));
+        }
+        State::Available(release) => {
+            ui.label(egui::RichText::new(format!("A new version is out: {}", release.version)).strong().color(style::ACCENT));
+            if !installable() {
+                ui.label(egui::RichText::new("This copy was built from the source code: update it with git pull and cargo build.").color(style::MUTED).small());
+            } else if release.download.is_some() {
+                if ui
+                    .button(format!("Update to {} and restart", release.version))
+                    .on_hover_text("Downloads the new version, saves your work, and restarts trackertools with it. It takes about a minute.")
+                    .clicked()
+                {
+                    up.update(release.clone());
+                }
+            } else {
+                ui.label(egui::RichText::new("There's no download for this kind of computer yet.").color(style::MUTED));
+            }
+            if !release.notes.is_empty() {
+                ui.collapsing("What's new", |ui| {
+                    ui.label(&release.notes);
+                });
+            }
+            if !release.page.is_empty() {
+                ui.hyperlink_to("See it on GitHub", &release.page);
+            }
+        }
+        State::Downloading { release, got, total } => {
+            ui.label(format!("Downloading version {}\u{2026}", release.version));
+            let part = if total > 0 { got as f32 / total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(part).show_percentage().desired_width(240.0));
+        }
+        State::Ready { .. } | State::Restarting => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Installing, then restarting\u{2026}");
+            });
+        }
+        State::Failed(problem) => {
+            ui.label(egui::RichText::new(&problem.what).color(egui::Color32::from_rgb(0xf4, 0x3f, 0x5e))).on_hover_text(&problem.details);
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!up.busy(), egui::Button::new("Check for updates")).clicked() {
+            up.check(false);
+        }
+        let mut on_start = up.check_on_start;
+        if ui.checkbox(&mut on_start, "Check when trackertools starts").changed() {
+            world.resource_mut::<Updater>().check_on_start = on_start;
         }
     });
 }
@@ -217,5 +288,10 @@ fn describe(action: Action) -> &'static str {
         Rename => "Rename the selection",
         Track => "Track the selected sketch from here (on a tracker: re-seed it here)",
         ToggleSnap => "Snap the playhead to the start and end of things on the timeline while scrubbing (Ctrl inverts)",
+        MarkIn => "Mark the in point here: the first frame an export renders",
+        MarkOut => "Mark the out point here: the last frame an export renders",
+        ClearMarks => "Clear the in and out points (exports render the whole video)",
+        GoToIn => "Go to the in point",
+        GoToOut => "Go to the out point",
     }
 }

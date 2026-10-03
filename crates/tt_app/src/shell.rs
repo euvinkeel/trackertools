@@ -88,15 +88,20 @@ impl Shell {
             video::VideoRenderer::install(rs);
         }
         let mut app = AppBuilder::new();
+        // Modules build as they're added, and the session applies the remembered
+        // settings to resources that exist by then: everything with a setting
+        // (the trackers', the updater's) comes before it.
         app.add_module(CoreModules)
             .add_module(layout::LayoutModule)
             .add_module(MediaModule)
             .add_module(ViewportModule)
             .add_module(TimelineModule)
+            .add_module(tt_track::TrackModule)
+            .add_module(crate::update::UpdateModule)
             .add_module(SessionModule)
-            .add_module(crate::project::ProjectModule)
-            .add_module(tt_track::TrackModule);
+            .add_module(crate::project::ProjectModule);
         let mut core = app.build();
+        crate::update::on_start(&core.world);
 
         // Until a video is open, a one-minute demo clock keeps the transport live.
         core.world.resource_mut::<Transport>().frame_count = 60 * 60;
@@ -261,6 +266,8 @@ impl eframe::App for Shell {
     fn on_exit(&mut self) {
         crate::project::save_if_dirty(&mut self.core.world);
         self.core.world.resource_mut::<Session>().save();
+        // Saved: if an update was just installed, start the new version.
+        crate::update::restart_if_updated(&self.core.world);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

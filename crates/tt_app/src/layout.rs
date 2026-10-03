@@ -68,6 +68,8 @@ impl Module for LayoutModule {
             .init_resource::<Layout>()
             .declare::<crate::panels::outliner::OutlinerState>(Class::Session)
             .init_resource::<crate::panels::outliner::OutlinerState>()
+            .declare::<crate::panels::export::ExportWindow>(Class::Session)
+            .init_resource::<crate::panels::export::ExportWindow>()
             .declare::<crate::panels::look_editor::LookBrush>(Class::Session)
             .init_resource::<crate::panels::look_editor::LookBrush>()
             .insert_resource(tt_track::look::LookMasker(Some(crate::panels::look_editor::auto_mask_look)));

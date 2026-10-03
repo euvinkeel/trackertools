@@ -12,6 +12,7 @@ mod session;
 mod reflect_ui;
 mod shell;
 mod style;
+mod update;
 mod video;
 
 fn main() -> eframe::Result {

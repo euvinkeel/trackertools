@@ -59,6 +59,16 @@ pub enum Action {
     Track,
     /// Scrubbing snaps the playhead to the edges of timeline objects, or stops snapping.
     ToggleSnap,
+    /// Mark the in point (an export's first frame) at the playhead (`crate::marks`).
+    MarkIn,
+    /// Mark the out point (an export's last frame) at the playhead.
+    MarkOut,
+    /// Clear the in and out points.
+    ClearMarks,
+    /// Go to the in point (the start, if none).
+    GoToIn,
+    /// Go to the out point (the end, if none).
+    GoToOut,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -146,6 +156,12 @@ impl Default for Keymap {
                 (b(Key::F2, Mods::NONE, false), Rename),
                 (b(Key::Letter('t'), Mods::NONE, false), Tool(crate::tool::Tool::Track)),
                 (b(Key::Letter('n'), Mods::NONE, false), ToggleSnap),
+                // In and out points, as in DaVinci Resolve.
+                (b(Key::Letter('i'), Mods::NONE, false), MarkIn),
+                (b(Key::Letter('o'), Mods::NONE, false), MarkOut),
+                (b(Key::Letter('x'), Mods { ctrl: false, shift: false, alt: true }, false), ClearMarks),
+                (b(Key::Letter('i'), Mods::SHIFT, false), GoToIn),
+                (b(Key::Letter('o'), Mods::SHIFT, false), GoToOut),
             ],
         }
     }

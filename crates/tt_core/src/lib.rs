@@ -11,6 +11,7 @@ pub mod capture;
 pub mod commands;
 pub mod history;
 pub mod input;
+pub mod marks;
 pub mod meta;
 pub mod op;
 pub mod persist;
@@ -19,6 +20,7 @@ pub mod selection;
 pub mod signal;
 pub mod sketch;
 pub mod span;
+pub mod subject;
 pub mod time;
 pub mod tool;
 pub mod transport;
@@ -40,12 +42,14 @@ impl Module for CoreModules {
             .add_module(selection::SelectionModule)
             .add_module(NamesModule)
             .add_module(sketch::SketchModule)
+            .add_module(subject::SubjectModule)
             .add_module(span::SpanModule)
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)
             .add_module(autospeed::AutoSpeedModule)
             .add_module(view::ViewModule)
             .add_module(commands::CommandsModule)
+            .add_module(marks::MarksModule)
             .add_module(persist::PersistModule);
     }
 }
