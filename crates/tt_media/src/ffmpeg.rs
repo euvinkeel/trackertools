@@ -30,16 +30,29 @@ impl Default for DecodeOptions {
     }
 }
 
+/// The folder FFmpeg was installed into (the app's setup) or chosen from:
+/// where [`tool`] looks first, after the environment variable.
+static DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Set (or forget) the folder [`tool`] looks in first.
+pub fn set_dir(dir: Option<PathBuf>) {
+    *DIR.write().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
 /// An ffmpeg executable (`ffmpeg`, `ffprobe`): the environment variable `var`
-/// if set, else `name` on PATH. On macOS, when PATH doesn't have it, also
-/// Homebrew's folders: an app opened from Finder or the Dock gets a minimal
-/// PATH without them.
+/// if set, else the folder given to [`set_dir`], next to this program, or
+/// `name` on PATH. On macOS, when PATH doesn't have it, also Homebrew's
+/// folders: an app opened from Finder or the Dock gets a minimal PATH
+/// without them.
 pub fn tool(name: &str, var: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(var).filter(|v| !v.is_empty()) {
         return PathBuf::from(path);
     }
     let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    // A copy next to the program first: a release ships its own.
+    if let Some(chosen) = DIR.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|d| d.join(&exe)).filter(|p| p.is_file()) {
+        return chosen;
+    }
+    // A copy next to the program: a build that ships its own.
     if let Some(beside) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(&exe))).filter(|p| p.is_file()) {
         return beside;
     }

@@ -33,6 +33,8 @@ use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
 
 mod learned;
 
+pub use learned::availability as cotracker_availability;
+
 pub use learned::worker_command;
 
 /// A look, as a job reads it: a frame, a rectangle there (source px), a mask.

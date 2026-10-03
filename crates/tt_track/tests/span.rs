@@ -1,8 +1,10 @@
 //! A tracker's lifetime (`tt_core::span::Span`) on the sprite fixture: its
 //! jobs stop at the span's edges, trimming keeps its results (hidden),
 //! extending brings them back without tracking them again, and extending
-//! into frames it never had resumes from the nearest result. Skipped when the
-//! fixture hasn't been generated (`cargo xtask fixtures`).
+//! into frames it never had resumes from the nearest result. And which way
+//! it tracks is asked (`TrackRun`): a new one waits, switching keeps every
+//! result, a pause stops it. Skipped when the fixture hasn't been generated
+//! (`cargo xtask fixtures`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +50,8 @@ fn setup() -> Option<(Core, Entity)> {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     let index = Arc::new(VideoIndex::open(&fixture).expect("fixture opens"));
     let w = &mut core.world;
     {
@@ -173,4 +177,62 @@ fn a_trimmed_guide_limits_the_tracker() {
     run(&mut core, op, Duration::from_secs(180));
     assert_eq!(coverage(&core.world, op), Some(0..FRAMES));
     assert!(on_sprite(&values(&core.world, op), 0..FRAMES));
+}
+
+/// As in the app: a new tracker waits until asked which way to track; each
+/// way keeps what the other tracked; tracking only backward still has the
+/// anchor's frame; Pause stops a running job and keeps what it did.
+#[test]
+fn a_tracker_tracks_only_the_way_it_is_asked() {
+    use tt_track::{TrackRun, set_run};
+    let Some((mut core, guide)) = setup() else { return };
+    core.world.resource_mut::<tt_track::NewTrackers>().run = TrackRun::Paused;
+    let op = tt_track::add_tracker_with_look(&mut core.world, guide, Look::new(600, truth(600), [10.5, 10.5])).expect("tracker");
+    set_span(&mut core.world, op, Span::new(450, 750));
+    for _ in 0..10 {
+        core.run_pre_ui();
+        assert_eq!(core.world.resource::<TrackJobs>().busy(), 0, "a new tracker waits");
+    }
+    assert_eq!(coverage(&core.world, op), None, "nothing tracked before it is asked");
+
+    set_run(&mut core.world, op, TrackRun::Forward);
+    run(&mut core, op, Duration::from_secs(180));
+    assert_eq!(coverage(&core.world, op), Some(600..751), "forward: from its look to the span's end");
+    set_run(&mut core.world, op, TrackRun::Backward);
+    run(&mut core, op, Duration::from_secs(180));
+    assert_eq!(coverage(&core.world, op), Some(450..751), "then backward: the forward results stay");
+    assert!(on_sprite(&values(&core.world, op), 450..751));
+
+    // Only backward, from the start: the anchor's frame comes too.
+    let other = tt_track::add_tracker_with_look(&mut core.world, guide, Look::new(600, truth(600), [10.5, 10.5])).expect("tracker");
+    set_span(&mut core.world, other, Span::new(500, 700));
+    set_run(&mut core.world, other, TrackRun::Backward);
+    run(&mut core, other, Duration::from_secs(180));
+    assert_eq!(coverage(&core.world, other), Some(500..601), "backward, and its anchor");
+
+    // More to track forward; Pause stops it where it is, and it stays stopped.
+    move_edge(&mut core.world, op, Edge::Last, 1150);
+    set_run(&mut core.world, op, TrackRun::Forward);
+    let start = Instant::now();
+    while coverage(&core.world, op).is_none_or(|c| c.end < 800) {
+        assert!(start.elapsed() < Duration::from_secs(120), "tracking forward again");
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    set_run(&mut core.world, op, TrackRun::Paused);
+    core.run_pre_ui();
+    assert_eq!(core.world.resource::<TrackJobs>().busy(), 0, "paused: its job stopped");
+    let paused_at = coverage(&core.world, op).expect("results").end;
+    assert!(paused_at < 1151, "stopped before the end: {paused_at}");
+    for _ in 0..20 {
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(coverage(&core.world, op).map(|c| c.end), Some(paused_at), "nothing more after the pause");
+    assert!(settled(&core.world, op), "paused: nothing to do");
+    // Asked again, it goes on from there to the end.
+    set_run(&mut core.world, op, TrackRun::Forward);
+    run(&mut core, op, Duration::from_secs(180));
+    assert_eq!(coverage(&core.world, op), Some(450..1151));
+    assert!(on_sprite(&values(&core.world, op), 450..1151));
 }

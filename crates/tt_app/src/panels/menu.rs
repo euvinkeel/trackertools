@@ -105,6 +105,18 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     } else if primary.is_some() {
         ui.separator();
     }
+    // Trackers: which way they track (nothing runs until asked), or pause.
+    let trackers: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e)).collect();
+    if let Some(first) = trackers.first() {
+        let now = tt_track::run_of(world, *first);
+        for (run, _, item, tip) in super::tracks::RUNS {
+            if ui.add_enabled(now != run || trackers.len() > 1, egui::Button::new(item)).on_hover_text(tip).clicked() {
+                super::tracks::ask(world, &trackers, run);
+                ui.close();
+            }
+        }
+        ui.separator();
+    }
     // Subjects (tt_core::subject): one position and angle that several points carry together.
     let subjects: Vec<Entity> = selection.iter().copied().filter(|e| tt_core::subject::is_subject(world, *e)).collect();
     // The points: trackers, and sketches (a sketch's point is the hand's path).

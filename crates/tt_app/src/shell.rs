@@ -82,7 +82,8 @@ impl StepBench {
 }
 
 impl Shell {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `ready`: FFmpeg was found (else the setup shows first; `crate::setup`).
+    pub fn new(cc: &eframe::CreationContext<'_>, ready: bool) -> Self {
         style::apply(&cc.egui_ctx);
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             video::VideoRenderer::install(rs);
@@ -98,10 +99,24 @@ impl Shell {
             .add_module(TimelineModule)
             .add_module(tt_track::TrackModule)
             .add_module(crate::update::UpdateModule)
+            .add_module(crate::setup::SetupModule)
             .add_module(SessionModule)
             .add_module(crate::project::ProjectModule);
         let mut core = app.build();
         crate::update::on_start(&core.world);
+        {
+            let mut doctor = core.world.resource_mut::<crate::setup::Doctor>();
+            doctor.graphics = cc.wgpu_render_state.as_ref().map(|rs| {
+                let i = rs.adapter.get_info();
+                let driver = if i.driver.is_empty() { String::new() } else { format!(", driver {} {}", i.driver, i.driver_info) };
+                format!("{} ({:?}{driver})", i.name, i.backend)
+            });
+            doctor.setup = !ready;
+            doctor.last_run_failed = crate::setup::last_run_failed();
+            if !ready {
+                doctor.recheck();
+            }
+        }
 
         // Until a video is open, a one-minute demo clock keeps the transport live.
         core.world.resource_mut::<Transport>().frame_count = 60 * 60;
@@ -130,6 +145,23 @@ impl Shell {
             std::process::exit(2);
         }
         Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), was_typing: false, autoplay, bench, sketch_demo }
+    }
+
+    /// Setup is done: the window becomes the app's.
+    fn start_app(&mut self, ctx: &egui::Context) {
+        self.core.world.resource_mut::<crate::setup::Doctor>().setup = false;
+        tracing::info!("setup done: starting the app");
+        // The app's size, within the screen.
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
+        let size = monitor.map_or(egui::vec2(1600.0, 950.0), |m| egui::vec2(1600f32.min(m.x * 0.92), 950f32.min(m.y * 0.88)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("trackertools".into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(900f32.min(size.x), 560f32.min(size.y))));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        if let Some(m) = monitor {
+            let at = ((m - size) / 2.0).max(egui::Vec2::ZERO);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(at.x, at.y)));
+        }
+        ctx.request_repaint();
     }
 
     fn drive_bench(&mut self, ctx: &egui::Context, now: f64) {
@@ -186,6 +218,10 @@ impl Shell {
 
 impl eframe::App for Shell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The setup comes first: the app waits (a video it would reopen needs FFmpeg).
+        if self.core.world.resource::<crate::setup::Doctor>().setup {
+            return;
+        }
         let now = self.epoch.elapsed().as_secs_f64();
         self.core.world.resource_mut::<WallClock>().tick(now);
 
@@ -271,6 +307,13 @@ impl eframe::App for Shell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.core.world.resource::<crate::setup::Doctor>().setup {
+            let start = crate::setup::screen(ui, &mut self.core.world.resource_mut::<crate::setup::Doctor>());
+            if start {
+                self.start_app(ui.ctx());
+            }
+            return;
+        }
         panels::draw(ui, &mut self.core.world);
         self.was_typing = ui.ctx().egui_wants_keyboard_input();
 

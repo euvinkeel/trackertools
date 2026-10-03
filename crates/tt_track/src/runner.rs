@@ -11,7 +11,9 @@
 //!   re-tracks from ~700 on, even though a sketch reports its whole extent as
 //!   changed; a recompute that changes nothing re-tracks nothing.
 //! - Each side of the anchor with frames left to do gets a job, resuming from
-//!   the result just before them. A running job stays if its inputs didn't
+//!   the result just before them, if the tracker is asked to track that way
+//!   ([`crate::TrackRun`]: forward, backward, both, or paused). Pausing or
+//!   turning stops the jobs it no longer asks for; their results stay. A running job stays if its inputs didn't
 //!   change and it covers exactly what is left on its side; otherwise it is
 //!   cancelled and replaced.
 //! - Results land as they arrive; old ones stay on screen as stale until
@@ -52,7 +54,7 @@ use tt_media::{DecodeOptions, VideoIndex};
 use crate::job::{JobSpec, LookSpec, Msg, Shared, Side, spawn};
 use crate::look::Look;
 use crate::template::{LOOK_PX, Settings, TEMPLATE_R};
-use crate::{Direction, Rendition, TRACK_CHANNELS, Tracker, guide_of};
+use crate::{Direction, Rendition, TRACK_CHANNELS, TrackRun, Tracker, guide_of, run_of};
 
 /// Part of every stamp: bump it when a change to the tracking makes saved
 /// results out of date (they re-track when their project is opened).
@@ -219,6 +221,21 @@ impl Plan {
         }
     }
 
+    /// The frames of a side `run` asks for: all of it if it tracks that way;
+    /// tracking only backward, the forward side's first frame (the anchor)
+    /// too, so the path has its start; else none.
+    fn wanted(&self, side: Side, run: TrackRun) -> Range<FrameIndex> {
+        let r = self.side(side);
+        let on = if side == Side::Forward { run.forward() } else { run.backward() };
+        if on {
+            r
+        } else if side == Side::Forward && run.backward() {
+            r.start..(r.start + 1).min(r.end)
+        } else {
+            r.start..r.start
+        }
+    }
+
     /// Frames the tracker produces (what its results are complete over).
     fn produced(&self) -> Range<FrameIndex> {
         self.side(Side::Backward).start..self.side(Side::Forward).end
@@ -325,6 +342,7 @@ pub fn run_trackers(world: &mut World) {
     for op in live {
         drain(world, op);
         replan(world, op, &footage);
+        stop_unwanted(world, op);
         let waiting = start_jobs(world, op, &footage);
         settle(world, op);
         update_status(world, op);
@@ -473,9 +491,10 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     // side is exactly what it will produce (a new anchor, direction, setting
     // or edit on its frames replaces it).
     {
+        let run = run_of(world, op);
         let mut jobs = world.resource_mut::<TrackJobs>();
         for side in [Side::Forward, Side::Backward] {
-            let todo = difference(&RangeSet::from_range(plan.side(side)), &done);
+            let todo = difference(&RangeSet::from_range(plan.wanted(side, run)), &done);
             let stays = jobs.running.get(&(op, side)).is_some_and(|job| {
                 job.owned == todo && job.owned.hull().is_none_or(|h| kept.start <= h.start && h.end <= kept.end)
             });
@@ -511,8 +530,24 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     world.resource_mut::<TrackJobs>().basis.insert(op, Basis { plan, done, failed: false, unsettled: true });
 }
 
-/// Start a job on each side that has frames to do and no job. True if some
-/// work is waiting (for a free slot, or for new dirt to be planned first).
+/// Stop the jobs the tracker's run state no longer asks for (paused, or
+/// turned the other way): dropping one cancels it; its results so far stay.
+fn stop_unwanted(world: &mut World, op: Entity) {
+    let run = run_of(world, op);
+    let Some(plan) = world.resource::<TrackJobs>().basis.get(&op).map(|b| b.plan.clone()) else { return };
+    let mut jobs = world.resource_mut::<TrackJobs>();
+    for side in [Side::Forward, Side::Backward] {
+        let want = plan.wanted(side, run);
+        let unwanted = jobs.running.get(&(op, side)).is_some_and(|j| want.is_empty() || j.owned.hull().is_some_and(|h| h.start < want.start || h.end > want.end));
+        if unwanted {
+            jobs.running.remove(&(op, side));
+        }
+    }
+}
+
+/// Start a job on each side that has frames to do (that the tracker is
+/// asked to track) and no job. True if some work is waiting (for a free
+/// slot, or for new dirt to be planned first).
 fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
     let Some((plan, done)) = world.resource::<TrackJobs>().basis.get(&op).filter(|b| !b.failed).map(|b| (b.plan.clone(), b.done.clone())) else {
         return false;
@@ -523,12 +558,14 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
     let Some(out) = world.get::<Output>(op).map(|o| o.0) else { return false };
     // Where the tracker itself was: the output minus the re-centring shift.
     let offset = world.get::<TrackBook>(op).map_or([0.0; 2], |b| b.offset);
+    let run = run_of(world, op);
     for side in [Side::Forward, Side::Backward] {
         if world.resource::<TrackJobs>().running.contains_key(&(op, side)) {
             continue;
         }
         let range = plan.side(side);
-        let todo = difference(&RangeSet::from_range(range.clone()), &done);
+        let want = plan.wanted(side, run);
+        let todo = difference(&RangeSet::from_range(want.clone()), &done);
         let Some(hull) = todo.hull() else { continue };
         if world.resource::<TrackJobs>().working() >= MAX_JOBS {
             return true;
@@ -544,7 +581,7 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
             (None, Side::Forward) => plan.anchor,
             (None, Side::Backward) => plan.anchor - 1,
         };
-        let to = if side == Side::Forward { range.end - 1 } else { range.start };
+        let to = if side == Side::Forward { want.end - 1 } else { want.start };
         start_job(world, op, side, &plan, from, to, resume, footage);
     }
     false
@@ -839,14 +876,19 @@ pub fn coverage(world: &World, op: Entity) -> Option<Range<FrameIndex>> {
 }
 
 /// Whether a tracker has nothing left to do: no jobs, no dirt, and its
-/// results complete (or a job failed). For tests and scripts.
+/// results complete where it is asked to track (or a job failed; a paused
+/// tracker has nothing to do). For tests and scripts.
 pub fn settled(world: &World, op: Entity) -> bool {
     let jobs = world.resource::<TrackJobs>();
     let running = [Side::Forward, Side::Backward].iter().any(|s| jobs.running.contains_key(&(op, *s)));
     let dirty = world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty());
+    let run = run_of(world, op);
     let complete = jobs.basis.get(&op).is_some_and(|b| {
-        let p = b.plan.produced();
-        b.failed || b.done.intersect(&p).len() == p.end - p.start
+        b.failed
+            || [Side::Forward, Side::Backward].iter().all(|s| {
+                let w = b.plan.wanted(*s, run);
+                b.done.intersect(&w).len() == w.end - w.start
+            })
     });
     !running && !dirty && (complete || world.get::<OpError>(op).is_some())
 }

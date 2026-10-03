@@ -5,9 +5,8 @@
 # (crates/tt_app/src/update.rs). Run it by hand for an existing tag from
 # Actions > Release > Run workflow.
 #
-# The zip holds trackertools.exe, ffmpeg.exe and ffprobe.exe (gyan.dev's
-# release "essentials" build, GPL: its license goes along) and a README for
-# people who didn't build it.
+# The zip holds trackertools.exe alone (the updater installs from it): FFmpeg
+# isn't bundled, the app sets it up on its first start (tt_app::setup).
 name: Release
 
 on:
@@ -42,19 +41,14 @@ jobs:
         shell: pwsh
         run: |
           $env:TT_VERSION = $env:TAG
+          # The C runtime linked in: it runs without the Visual C++ redistributable.
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
           cargo build -p tt_app --release
       - name: Package
         shell: pwsh
         run: |
-          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip ffmpeg
-          $bin = (Get-ChildItem ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
-          $license = Get-ChildItem ffmpeg -Recurse -Filter LICENSE* | Select-Object -First 1
           New-Item -ItemType Directory pkg | Out-Null
           Copy-Item target/release/trackertools.exe pkg/
-          Copy-Item (Join-Path $bin ffmpeg.exe), (Join-Path $bin ffprobe.exe) pkg/
-          Copy-Item $license.FullName pkg/FFMPEG-LICENSE.txt
-          Copy-Item packaging/README.txt pkg/
           Compress-Archive -Path pkg/* -DestinationPath trackertools-windows-x64.zip
           Get-ChildItem pkg, trackertools-windows-x64.zip | Format-Table Name, Length
       - name: Publish

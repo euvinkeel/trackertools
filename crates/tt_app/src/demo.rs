@@ -388,6 +388,10 @@ impl SketchDemo {
                     }
                     return false;
                 }
+                // Then "Both ways", as in the Inspector: new trackers wait to be asked.
+                if let Some(t) = world.resource::<Selection>().primary().filter(|e| tt_track::is_tracker(world, *e)) {
+                    tt_track::set_run(world, t, tt_track::TrackRun::Both);
+                }
                 let busy = world.resource::<tt_track::runner::TrackJobs>().busy() > 0;
                 if now - since > 0.5 && !busy {
                     world.resource_mut::<ActiveTool>().0 = Tool::Sketch;

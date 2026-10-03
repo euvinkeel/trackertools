@@ -65,6 +65,8 @@ fn cotracker_follows_the_sprite_both_ways_through_the_view() {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     let index = Arc::new(VideoIndex::open(&fixture).expect("fixture opens"));
     let w = &mut core.world;
     {
