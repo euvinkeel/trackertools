@@ -14,16 +14,21 @@
 //! English): short sentences, simple present tense, one instruction each,
 //! no contractions. The people reading it skip anything longer.
 //!
-//! Dev: `TT_SETUP_AUTO=<seconds>` presses Install FFmpeg by itself, then
-//! Start that many seconds after FFmpeg works (scripted checks of the setup;
-//! `TT_FFMPEG_URL` points it at a local zip).
+//! At its top, one big button does all of it: JUST DO EVERYTHING FOR ME PLZ
+//! (the label is the user's) installs FFmpeg in the folder shown if it isn't
+//! there, waits for the checks, and starts the app, saying each step in a
+//! box under it (the explanations in STE like the rest).
+//!
+//! Dev: `TT_SETUP_AUTO=<seconds>` presses that button by itself once the
+//! checks are done, its countdown to the start that many seconds (scripted
+//! checks of the setup; `TT_FFMPEG_URL` points it at a local zip).
 
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bevy_ecs::prelude::*;
 use sha2::{Digest, Sha256};
@@ -549,8 +554,23 @@ pub struct Doctor {
     seen_done: bool,
     /// A sentence under the buttons (copied, saved, a folder without FFmpeg): (text, is it a problem).
     note: Option<(String, bool)>,
-    /// Dev (`TT_SETUP_AUTO`): seconds to wait before Start once FFmpeg works, and since when it does.
-    auto: Option<(f64, Option<std::time::Instant>)>,
+    /// JUST DO EVERYTHING FOR ME PLZ was pressed: what it is doing.
+    everything: Option<Everything>,
+    /// Dev (`TT_SETUP_AUTO`): press it by itself once the checks are done; its seconds before the start.
+    auto: Option<f64>,
+}
+
+/// JUST DO EVERYTHING FOR ME PLZ: FFmpeg installed if it isn't there, the
+/// checks, then the app, each step said in the box under the button.
+#[derive(Clone, Copy, Debug)]
+struct Everything {
+    /// FFmpeg already worked when it was pressed: nothing to install.
+    had_ffmpeg: bool,
+    /// It started the install (once a press).
+    installing: bool,
+    /// When everything was ready: the app starts `delay` seconds after.
+    ready_at: Option<Instant>,
+    delay: f64,
 }
 
 impl Default for Doctor {
@@ -565,7 +585,8 @@ impl Default for Doctor {
             install_dir: chosen_dir(),
             seen_done: false,
             note: None,
-            auto: std::env::var("TT_SETUP_AUTO").ok().and_then(|s| s.parse().ok()).map(|s| (s, None)),
+            everything: None,
+            auto: std::env::var("TT_SETUP_AUTO").ok().and_then(|s| s.parse().ok()),
         }
     }
 }
@@ -617,6 +638,12 @@ impl Doctor {
         });
     }
 
+    /// The big button: do every step (see [`Everything`]); the app starts `delay` seconds after they are done.
+    fn do_everything(&mut self, ready: bool, delay: f64) {
+        self.note = None;
+        self.everything = Some(Everything { had_ffmpeg: ready, installing: false, ready_at: None, delay });
+    }
+
     /// The person points at the FFmpeg they have.
     fn use_folder(&mut self, picked: &Path) {
         match ffmpeg_folder(picked) {
@@ -650,12 +677,152 @@ pub fn screen(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_max_width(660.0);
-            ui.add_space(6.0);
+            ui.add_space(8.0);
+            start = everything(ui, doctor);
+            ui.add_space(10.0);
             ui.heading(egui::RichText::new("Set up trackertools").strong());
             ui.add_space(4.0);
-            start = body(ui, doctor, true);
+            start |= body(ui, doctor, true);
         });
     });
+    start
+}
+
+/// Where a step of JUST DO EVERYTHING FOR ME PLZ is.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    Done,
+    Now,
+    Later,
+    Problem,
+}
+
+/// JUST DO EVERYTHING FOR ME PLZ, and once pressed, what it does, step by
+/// step, in a box under it. True: it starts the app.
+fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
+    let checked = doctor.checked();
+    let install = doctor.install_state();
+    let ready = checked.as_ref().is_some_and(|c| c.ready);
+    let can_install = cfg!(all(windows, target_arch = "x86_64"));
+    // A check that fails besides FFmpeg (a read-only data folder): it doesn't start.
+    let failing = checked.as_ref().filter(|c| c.ready).is_some_and(|c| c.checks.iter().any(|k| k.level == Level::Fail));
+    let warnings = checked.as_ref().map_or(0, |c| c.checks.iter().filter(|k| k.level == Level::Warn).count());
+    if checked.is_some()
+        && let Some(delay) = doctor.auto.take()
+    {
+        doctor.do_everything(ready, delay);
+    }
+    let failed = matches!(install, Install::Failed(_)) && doctor.everything.is_some_and(|e| e.installing);
+    let stuck = failed || failing || (doctor.everything.is_some() && !ready && !can_install);
+
+    ui.vertical_centered(|ui| {
+        let text = egui::RichText::new("JUST DO EVERYTHING FOR ME PLZ").size(24.0).strong().color(style::BG);
+        let button = egui::Button::new(text).fill(style::ACCENT).min_size(egui::vec2(ui.available_width().min(600.0), 60.0)).corner_radius(10.0);
+        let free = doctor.everything.is_none() || stuck;
+        if ui
+            .add_enabled(free, button)
+            .on_hover_text("trackertools installs FFmpeg, does the checks and starts. You do not do anything.")
+            .clicked()
+        {
+            doctor.do_everything(ready, 3.0);
+        }
+    });
+
+    let Some(mut e) = doctor.everything else { return false };
+    // What it does next.
+    if checked.is_some() && !ready && !e.installing && can_install && !install.busy() {
+        doctor.start_install();
+        e.installing = true;
+    }
+    let mut start = false;
+    if ready && !failing && checked.is_some() {
+        let at = *e.ready_at.get_or_insert_with(Instant::now);
+        start = at.elapsed().as_secs_f64() >= e.delay;
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+    }
+    doctor.everything = Some(e);
+
+    // What it says.
+    let red = egui::Color32::from_rgb(0xf4, 0x3f, 0x5e);
+    let install_now = doctor.install_state();
+    let mut lines: Vec<(Mark, String)> = vec![(Mark::Done, format!("1. trackertools uses this folder for FFmpeg: {}", doctor.install_dir.display()))];
+    lines.push(if e.had_ffmpeg || (ready && !e.installing) {
+        (Mark::Done, "2. FFmpeg is on this computer. trackertools does not download it.".into())
+    } else if !can_install {
+        (Mark::Problem, "2. trackertools cannot install FFmpeg on this computer. Install FFmpeg with a package manager. Then click Check again.".into())
+    } else {
+        match &install_now {
+            Install::Idle => (Mark::Now, "2. trackertools gets ready to download FFmpeg.".into()),
+            Install::Done(v) => (Mark::Done, format!("2. FFmpeg {v} is installed.")),
+            Install::Failed(p) => (Mark::Problem, format!("2. {} If the problem continues, click Copy report below. Send the report to the person who gave you trackertools.", p.what)),
+            busy => (Mark::Now, format!("2. {}", busy.text())),
+        }
+    });
+    lines.push(match &checked {
+        _ if !(ready || matches!(install_now, Install::Done(_))) => (Mark::Later, "3. trackertools does the checks.".into()),
+        None => (Mark::Now, "3. trackertools does the checks.".into()),
+        Some(_) if failing => (Mark::Problem, "3. A check failed. Read the checks below. Click Copy report. Send the report to the person who gave you trackertools.".into()),
+        Some(_) if warnings == 1 => (Mark::Done, "3. The checks are complete. 1 check has a warning. trackertools can start.".into()),
+        Some(_) if warnings > 1 => (Mark::Done, format!("3. The checks are complete. {warnings} checks have a warning. trackertools can start.")),
+        Some(_) => (Mark::Done, "3. The checks are complete. All checks are good.".into()),
+    });
+    lines.push(match e.ready_at {
+        Some(at) if !failing => {
+            let left = (e.delay - at.elapsed().as_secs_f64()).ceil().max(0.0) as u32;
+            match left {
+                0 => (Mark::Now, "4. trackertools starts now.".into()),
+                1 => (Mark::Now, "4. trackertools starts in 1 second.".into()),
+                n => (Mark::Now, format!("4. trackertools starts in {n} seconds.")),
+            }
+        }
+        _ => (Mark::Later, "4. trackertools starts.".into()),
+    });
+    ui.add_space(8.0);
+    egui::Frame::new()
+        .fill(style::PANEL)
+        .stroke(egui::Stroke::new(1.0, if stuck { red } else { style::ACCENT.gamma_multiply(0.7) }))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("trackertools does these steps for you:").strong());
+            ui.add_space(4.0);
+            for (mark, text) in &lines {
+                ui.horizontal(|ui| {
+                    match mark {
+                        Mark::Done => {
+                            ui.colored_label(style::ACCENT, "\u{2714}");
+                        }
+                        Mark::Now => {
+                            ui.spinner();
+                        }
+                        Mark::Later => {
+                            ui.colored_label(style::MUTED, "\u{2022}");
+                        }
+                        Mark::Problem => {
+                            ui.colored_label(red, "\u{2716}");
+                        }
+                    }
+                    let rich = egui::RichText::new(text);
+                    let rich = match mark {
+                        Mark::Later => rich.color(style::MUTED),
+                        Mark::Problem => rich.color(red),
+                        _ => rich,
+                    };
+                    ui.add(egui::Label::new(rich).wrap());
+                });
+                if text.starts_with("2. trackertools downloads")
+                    && let Install::Download { got, total } = &install_now
+                    && *total > 0
+                {
+                    ui.add(egui::ProgressBar::new(*got as f32 / *total as f32).desired_width(ui.available_width()));
+                }
+            }
+            if stuck {
+                ui.add_space(4.0);
+                ui.label("Click JUST DO EVERYTHING FOR ME PLZ again to try again.");
+            }
+        });
     start
 }
 
@@ -822,18 +989,6 @@ fn body(ui: &mut egui::Ui, doctor: &mut Doctor, first_run: bool) -> bool {
     }
     if doctor.busy() {
         ui.ctx().request_repaint_after(Duration::from_millis(120));
-    }
-    // Dev: TT_SETUP_AUTO (see the module docs).
-    if first_run && let Some((delay, since)) = doctor.auto {
-        if !ready && checked.is_some() && install == Install::Idle {
-            doctor.start_install();
-        }
-        if ready {
-            let since = since.unwrap_or_else(std::time::Instant::now);
-            doctor.auto = Some((delay, Some(since)));
-            start |= since.elapsed().as_secs_f64() >= delay;
-            ui.ctx().request_repaint_after(Duration::from_millis(200));
-        }
     }
     start
 }
