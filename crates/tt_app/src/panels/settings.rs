@@ -14,6 +14,15 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         updates(ui, world);
 
         ui.separator();
+        ui.heading("Doctor");
+        ui.label("The doctor checks FFmpeg, the graphics and the folders. It also makes a report for the person who helps you.");
+        if ui.button("Open the doctor").clicked() {
+            let mut doctor = world.resource_mut::<crate::setup::Doctor>();
+            doctor.open = true;
+            doctor.recheck();
+        }
+
+        ui.separator();
         ui.heading("Sketching");
         ui.label(egui::RichText::new("The next stroke's size, falloff, the wheel and the box are in the Brush tab.").color(style::MUTED).small());
         ui.add_space(6.0);

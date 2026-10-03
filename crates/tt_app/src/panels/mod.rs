@@ -34,6 +34,7 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
         });
     });
     export::ui(ui.ctx(), world);
+    crate::setup::window(ui.ctx(), &mut world.resource_mut::<crate::setup::Doctor>());
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
 }
@@ -70,6 +71,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut history_action = None;
     let mut new_sketch = false;
     let mut track_kind = None;
+    let mut report_problem = false;
     let tracking = tracks::summary(world);
     let kind = world.resource::<tt_track::NewTrackers>().method;
     let cotracker = tt_track::job::cotracker_availability();
@@ -119,6 +121,13 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             }
         }
         update_button(ui, world);
+        if world.resource::<crate::setup::Doctor>().last_run_failed {
+            ui.separator();
+            report_problem = ui
+                .button(egui::RichText::new("\u{26a0} Report a problem").color(egui::Color32::from_rgb(0xfb, 0xbf, 0x24)))
+                .on_hover_text("trackertools stopped because of an error the last time. Click Report a problem. Then click Copy report and send the report to the person who gave you trackertools.")
+                .clicked();
+        }
         if let Some((msg, error)) = &world.resource::<StatusLine>().0 {
             ui.label(egui::RichText::new(msg).color(if *error { egui::Color32::from_rgb(0xf4, 0x3f, 0x5e) } else { style::MUTED }));
         }
@@ -201,6 +210,11 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     });
     if open {
         world.resource_mut::<PendingActions>().push(Action::OpenFile);
+    }
+    if report_problem {
+        let mut doctor = world.resource_mut::<crate::setup::Doctor>();
+        (doctor.open, doctor.last_run_failed) = (true, false);
+        doctor.recheck();
     }
     if let Some(method) = track_kind {
         world.resource_mut::<tt_track::NewTrackers>().method = method;

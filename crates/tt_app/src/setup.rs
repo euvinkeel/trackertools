@@ -1,0 +1,938 @@
+//! First-run setup and the doctor. trackertools reads and writes video with
+//! FFmpeg (`ffmpeg` and `ffprobe`), which doesn't come with it. When they
+//! can't be found, a small setup window comes before the app: it installs
+//! FFmpeg in a folder the person chooses (gyan.dev's Windows "essentials"
+//! build, checked against its SHA-256, unpacked with Windows' own curl and
+//! tar), or takes the folder of one they have; then the app starts.
+//!
+//! The doctor (Settings) shows the same checks, and makes a report to send
+//! to whoever helps: the checks, this computer, and the end of this run's
+//! and the last run's logs (`logs/` in the data folder, written from here).
+//! A panic is logged and, on the next start, the top bar offers the report.
+//!
+//! Every instruction shown follows ASD-STE100 (Simplified Technical
+//! English): short sentences, simple present tense, one instruction each,
+//! no contractions. The people reading it skip anything longer.
+//!
+//! Dev: `TT_SETUP_AUTO=<seconds>` presses Install FFmpeg by itself, then
+//! Start that many seconds after FFmpeg works (scripted checks of the setup;
+//! `TT_FFMPEG_URL` points it at a local zip).
+
+use std::fmt::Write as _;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bevy_ecs::prelude::*;
+use sha2::{Digest, Sha256};
+use tt_core::{AppBuilder, Class, Module};
+
+use crate::style;
+use crate::update::{Problem, quiet, system_tool};
+
+/// FFmpeg for Windows: the latest release's "essentials" build from
+/// gyan.dev (where ffmpeg.org points Windows users), its SHA-256 at the
+/// same address + `.sha256`. `TT_FFMPEG_URL` replaces it (tests).
+pub const FFMPEG_ZIP: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+
+const LOG: &str = "trackertools.log";
+const PREVIOUS_LOG: &str = "trackertools-previous.log";
+/// Starts a panic's line in the log (the next start looks for it).
+const PANIC: &str = "PANIC: ";
+
+const CANNOT_WRITE: &str = "trackertools cannot write to this folder. Select a different folder.";
+const STOPPED: &str = "The download stopped. Make sure that the computer is connected to the internet. Then click Install FFmpeg again.";
+const CANNOT_CHECK: &str = "trackertools cannot check the download. Click Install FFmpeg again.";
+const DOES_NOT_START: &str = "FFmpeg does not start. Click Copy report. Send the report to the person who gave you trackertools.";
+const ASK_FOR_HELP: &str = "If you have a problem, click Copy report. Then paste the report in a message to the person who gave you trackertools.";
+
+// ---------------------------------------------------------------- logging
+
+pub fn logs_dir() -> PathBuf {
+    tt_media::proxy::data_dir().join("logs")
+}
+
+/// Logs to stdout and to `logs/trackertools.log` in the data folder (the
+/// last run's log kept beside it), and logs panics (in a release, a panic
+/// on the main thread also says what to do in a message box).
+pub fn start_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let dir = logs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let log = dir.join(LOG);
+    if log.exists() {
+        let _ = std::fs::rename(&log, dir.join(PREVIOUS_LOG));
+    }
+    let file = std::fs::File::create(&log).ok().map(|f| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(Mutex::new(f)));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=warn".into());
+    tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(file).init();
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("{PANIC}{info}\n{}", std::backtrace::Backtrace::force_capture());
+        if !cfg!(debug_assertions) && std::thread::current().name() == Some("main") {
+            message("trackertools stopped because of an error.\n\nStart trackertools again. Then click Report a problem at the top of the window.");
+        }
+        default(info);
+    }));
+}
+
+/// The last run stopped on an error (a panic in its log).
+pub fn last_run_failed() -> bool {
+    std::fs::read_to_string(logs_dir().join(PREVIOUS_LOG)).is_ok_and(|t| t.contains(PANIC))
+}
+
+/// A message box, when there is no window of ours to say it in.
+fn message(text: &str) {
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("trackertools")
+        .set_description(text)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+/// trackertools couldn't open its window (`why`: from eframe): the report goes
+/// in the data folder, and a message box says where.
+pub fn cannot_start(why: &str) {
+    tracing::error!("cannot start: {why}");
+    let path = tt_media::proxy::data_dir().join("trackertools-report.txt");
+    let saved = std::fs::write(&path, report(&run_checks(None), None)).is_ok();
+    let place = if saved { format!("\n\nThe report is in {}.", path.display()) } else { String::new() };
+    message(&format!(
+        "trackertools cannot start its graphics.\n\nUpdate the graphics driver. Then start trackertools again. If the problem continues, send the report to the person who gave you trackertools.{place}\n\n({why})"
+    ));
+}
+
+// ------------------------------------------------------- where FFmpeg is
+
+/// Where setup puts FFmpeg unless the person chooses another folder.
+pub fn default_dir() -> PathBuf {
+    tt_media::proxy::data_dir().join("ffmpeg")
+}
+
+fn location_file() -> PathBuf {
+    tt_media::proxy::data_dir().join("ffmpeg-location.txt")
+}
+
+/// The FFmpeg folder: the one chosen at setup, else the default one.
+pub fn chosen_dir() -> PathBuf {
+    std::fs::read_to_string(location_file()).ok().map(|s| PathBuf::from(s.trim())).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(default_dir)
+}
+
+/// At start: FFmpeg is looked for in the chosen folder first.
+pub fn apply_location() {
+    let dir = chosen_dir();
+    for name in ["ffmpeg", "ffprobe"] {
+        let _ = std::fs::remove_file(dir.join(exe(name)).with_extension("old"));
+    }
+    tt_media::ffmpeg::set_dir(Some(dir));
+}
+
+/// `dir` is the FFmpeg folder from now on (and at the next start).
+fn remember(dir: &Path) -> std::io::Result<()> {
+    let file = location_file();
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(file, dir.display().to_string())?;
+    tt_media::ffmpeg::set_dir(Some(dir.to_path_buf()));
+    Ok(())
+}
+
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The folder with ffmpeg and ffprobe in `dir`: itself, or its `bin` (an unpacked build).
+pub fn ffmpeg_folder(dir: &Path) -> Option<PathBuf> {
+    [dir.to_path_buf(), dir.join("bin")].into_iter().find(|d| d.join(exe("ffmpeg")).is_file() && d.join(exe("ffprobe")).is_file())
+}
+
+/// The program trackertools runs as `name` (ffmpeg, ffprobe), and its version, if it starts.
+pub fn tool_version(name: &str) -> Result<(PathBuf, String), String> {
+    let path = tt_media::ffmpeg::tool(name, &name.to_uppercase());
+    let out = quiet(path.clone()).args(["-hide_banner", "-version"]).output().map_err(|e| format!("{}: {e}", path.display()))?;
+    let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or_default().to_string();
+    if !out.status.success() || !first.contains("version") {
+        return Err(format!("{}: {first}", path.display()));
+    }
+    Ok((path, version_of(&first)))
+}
+
+/// `ffmpeg version 7.0.1-essentials_build-www.gyan.dev Copyright…` → `7.0.1`
+/// (a build without a release number keeps its name, e.g. `N-117500-g0b3c`).
+pub fn version_of(line: &str) -> String {
+    let Some(v) = line.split_whitespace().skip_while(|w| *w != "version").nth(1) else { return line.trim().to_string() };
+    let number: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    if number.contains('.') { number.trim_end_matches('.').to_string() } else { v.to_string() }
+}
+
+/// FFmpeg and ffprobe are there and start.
+pub fn ready() -> bool {
+    tool_version("ffmpeg").is_ok() && tool_version("ffprobe").is_ok()
+}
+
+fn writable(dir: &Path) -> bool {
+    let probe = dir.join(".trackertools-write-test");
+    let ok = std::fs::create_dir_all(dir).is_ok() && std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(probe);
+    ok
+}
+
+// ------------------------------------------------------------------ checks
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Pass,
+    Info,
+    Warn,
+    Fail,
+}
+
+/// One thing the doctor looked at, said in a sentence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Check {
+    pub level: Level,
+    pub text: String,
+}
+
+impl Check {
+    fn new(level: Level, text: impl Into<String>) -> Self {
+        Self { level, text: text.into() }
+    }
+
+    fn tag(&self) -> &'static str {
+        match self.level {
+            Level::Pass => "OK",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Fail => "FAIL",
+        }
+    }
+}
+
+/// What the doctor found: the checks, and whether FFmpeg and ffprobe work
+/// (the app needs nothing else to start).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Checked {
+    pub checks: Vec<Check>,
+    pub ready: bool,
+}
+
+/// Everything the doctor looks at. `graphics`: the graphics adapter, from the window.
+pub fn run_checks(graphics: Option<&str>) -> Checked {
+    use Level::*;
+    let mut checks = Vec::new();
+    let ffmpeg = tool_version("ffmpeg");
+    let ffprobe = tool_version("ffprobe");
+    for (name, found) in [("FFmpeg", &ffmpeg), ("ffprobe", &ffprobe)] {
+        checks.push(match found {
+            Ok((path, v)) => Check::new(Pass, format!("{name} {v} is installed: {}.", path.display())),
+            Err(_) => Check::new(Fail, format!("{name} is not installed.")),
+        });
+    }
+    if let Ok((path, _)) = &ffmpeg {
+        let list = |what: &str| quiet(path.clone()).args(["-hide_banner", what]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let has = |text: &str, codec: &str| text.lines().any(|l| l.split_whitespace().nth(1) == Some(codec));
+        let encoders = list("-encoders");
+        let cannot: Vec<&str> = [("prores_ks", "ProRes"), ("dnxhd", "DNxHR"), ("libx264", "H.264"), ("aac", "AAC sound"), ("pcm_s16le", "PCM sound")]
+            .into_iter()
+            .filter(|(c, _)| !has(&encoders, c))
+            .map(|(_, n)| n)
+            .collect();
+        checks.push(if cannot.is_empty() {
+            Check::new(Pass, "Export can write ProRes, DNxHR and H.264 video.")
+        } else {
+            Check::new(Warn, format!("Export cannot write {}. Install FFmpeg again.", cannot.join(", ")))
+        });
+        let decoders = list("-decoders");
+        let unread: Vec<&str> = [("h264", "H.264"), ("hevc", "HEVC (H.265)")].into_iter().filter(|(c, _)| !has(&decoders, c)).map(|(_, n)| n).collect();
+        checks.push(if unread.is_empty() {
+            Check::new(Pass, "FFmpeg can read H.264 and HEVC video.")
+        } else {
+            Check::new(Warn, format!("FFmpeg cannot read {} video.", unread.join(", ")))
+        });
+    }
+    checks.push(match graphics {
+        Some(g) if ["Basic Render", "llvmpipe", "SwiftShader", "WARP"].iter().any(|s| g.contains(s)) => {
+            Check::new(Warn, format!("Graphics: {g}. The video can be slow. Update the graphics driver."))
+        }
+        Some(g) => Check::new(Pass, format!("Graphics: {g}.")),
+        None => Check::new(Info, "Graphics: not known."),
+    });
+    let data = tt_media::proxy::data_dir();
+    checks.push(if writable(&data) {
+        Check::new(Pass, format!("trackertools can save its files in {}.", data.display()))
+    } else {
+        Check::new(Fail, format!("trackertools cannot save its files in {}. Make sure that the folder is not read-only.", data.display()))
+    });
+    if cfg!(windows) {
+        let have = |n: &str| system_tool(n).is_file();
+        checks.push(if have("curl") && have("tar") {
+            Check::new(Pass, "Updates can download and install.")
+        } else {
+            Check::new(Warn, "Updates cannot download, because curl or tar is not on this computer.")
+        });
+    }
+    checks.push(match tt_track::job::cotracker_availability() {
+        Ok(()) => Check::new(Pass, "CoTracker is available."),
+        Err(why) => Check::new(Info, format!("CoTracker is not available. {why}")),
+    });
+    Checked { checks, ready: ffmpeg.is_ok() && ffprobe.is_ok() }
+}
+
+// ------------------------------------------------------------------ report
+
+/// The report to send: the checks, this computer, and the end of the logs
+/// (the last run's and this one's).
+pub fn report(checked: &Checked, graphics: Option<&str>) -> String {
+    report_from(checked, graphics, &logs_dir(), now_utc())
+}
+
+fn report_from(checked: &Checked, graphics: Option<&str>, logs: &Path, when: String) -> String {
+    let mut r = String::new();
+    let _ = writeln!(r, "trackertools report, {when}");
+    let _ = writeln!(r, "version: {} ({})", crate::update::version(), if crate::update::installable() { "a release" } else { "built from source" });
+    let _ = writeln!(r, "program: {}", std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default());
+    let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
+    let _ = writeln!(r, "system: {} {}, {cpus} logical processors{}", std::env::consts::OS, std::env::consts::ARCH, os_version().map(|v| format!(", {v}")).unwrap_or_default());
+    let _ = writeln!(r, "graphics: {}", graphics.unwrap_or("not known"));
+    let _ = writeln!(r, "data folder: {}", tt_media::proxy::data_dir().display());
+    let _ = writeln!(r, "FFmpeg folder: {}", chosen_dir().display());
+    let _ = writeln!(r, "\nchecks:");
+    for c in &checked.checks {
+        let _ = writeln!(r, "  [{}] {}", c.tag(), c.text);
+    }
+    for (title, name, keep) in [("the last run's log", PREVIOUS_LOG, 150), ("this run's log", LOG, 250)] {
+        let Ok(text) = std::fs::read_to_string(logs.join(name)) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        let from = lines.len().saturating_sub(keep);
+        let _ = writeln!(r, "\n{title} (its last {} of {} lines):", lines.len() - from, lines.len());
+        for l in &lines[from..] {
+            let _ = writeln!(r, "{l}");
+        }
+    }
+    r
+}
+
+fn os_version() -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let out = quiet(system_tool("cmd")).args(["/c", "ver"]).output().ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+fn now_utc() -> String {
+    utc(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64))
+}
+
+/// Seconds since 1970 as `2026-10-03 22:37 UTC` (days to a date: Howard Hinnant's `civil_from_days`).
+fn utc(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02} UTC", rest / 3600, rest % 3600 / 60)
+}
+
+// ----------------------------------------------------------------- install
+
+/// Where an installation of FFmpeg is.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Install {
+    #[default]
+    Idle,
+    Download { got: u64, total: u64 },
+    Verify,
+    Extract,
+    Test,
+    /// Installed: FFmpeg's version.
+    Done(String),
+    Failed(Problem),
+}
+
+impl Install {
+    pub fn busy(&self) -> bool {
+        matches!(self, Install::Download { .. } | Install::Verify | Install::Extract | Install::Test)
+    }
+
+    /// In a sentence, for the person.
+    pub fn text(&self) -> String {
+        let mb = |b: u64| b as f64 / 1e6;
+        match self {
+            Install::Idle => String::new(),
+            Install::Download { got, total } if *total > 0 => format!("trackertools downloads FFmpeg: {:.0} MB of {:.0} MB.", mb(*got), mb(*total)),
+            Install::Download { got, .. } => format!("trackertools downloads FFmpeg: {:.0} MB.", mb(*got)),
+            Install::Verify => "trackertools checks the download.".into(),
+            Install::Extract => "trackertools extracts the files.".into(),
+            Install::Test => "trackertools tests FFmpeg.".into(),
+            Install::Done(v) => format!("FFmpeg {v} is installed."),
+            Install::Failed(p) => p.what.clone(),
+        }
+    }
+}
+
+/// Install FFmpeg from `url` into `dir` and see that it starts: its version.
+pub fn install(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<String, Problem> {
+    fetch_and_place(url, dir, step)?;
+    step(Install::Test);
+    let out = quiet(dir.join(exe("ffmpeg"))).args(["-hide_banner", "-version"]).output().map_err(|e| Problem::new(DOES_NOT_START, e))?;
+    let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or_default().to_string();
+    if !out.status.success() || !first.contains("version") {
+        return Err(Problem::new(DOES_NOT_START, first));
+    }
+    Ok(version_of(&first))
+}
+
+/// Download the zip at `url`, check it against the SHA-256 at `url` +
+/// `.sha256`, unpack it in a temporary folder, and put its ffmpeg and
+/// ffprobe (and FFmpeg's license) in `dir`.
+fn fetch_and_place(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<(), Problem> {
+    if !writable(dir) {
+        return Err(Problem::new(CANNOT_WRITE, dir.display()));
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let work = std::env::temp_dir().join(format!("trackertools-ffmpeg-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&work).map_err(|e| Problem::new("trackertools cannot write to the temporary folder.", e))?;
+    let done = (|| {
+        let zip = work.join("ffmpeg.zip");
+        // Where the address leads now (the latest release's file): the zip and its checksum both come from there.
+        let (total, url) = head(url);
+        step(Install::Download { got: 0, total });
+        download(&url, &zip, &|got| step(Install::Download { got, total }))?;
+        step(Install::Verify);
+        let expected = fetch_text(&format!("{url}.sha256")).map_err(|e| Problem::new(CANNOT_CHECK, e))?;
+        let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+        let got = sha256(&zip).map_err(|e| Problem::new(CANNOT_CHECK, e))?;
+        if expected.len() != 64 || got != expected {
+            return Err(Problem::new("The download is not correct. Click Install FFmpeg again.", format!("SHA-256 {got}, expected {expected}")));
+        }
+        step(Install::Extract);
+        let files = work.join("files");
+        std::fs::create_dir_all(&files).map_err(|e| Problem::new("trackertools cannot write to the temporary folder.", e))?;
+        let out = quiet(system_tool("tar")).arg("-xf").arg(&zip).arg("-C").arg(&files).output().map_err(|e| Problem::new("trackertools cannot extract the files. Click Install FFmpeg again.", e))?;
+        if !out.status.success() {
+            return Err(Problem::new("trackertools cannot extract the files. Click Install FFmpeg again.", String::from_utf8_lossy(&out.stderr)));
+        }
+        let (Some(ffmpeg), Some(ffprobe)) = (find(&files, &exe("ffmpeg")), find(&files, &exe("ffprobe"))) else {
+            return Err(Problem::new("The download does not contain FFmpeg. Click Install FFmpeg again.", &url));
+        };
+        for (from, name) in [(ffmpeg, exe("ffmpeg")), (ffprobe, exe("ffprobe"))] {
+            replace(&from, &dir.join(name)).map_err(|e| Problem::new(CANNOT_WRITE, e))?;
+        }
+        if let Some(license) = find(&files, "LICENSE").or_else(|| find(&files, "LICENSE.txt")) {
+            let _ = std::fs::copy(license, dir.join("FFMPEG-LICENSE.txt"));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    done
+}
+
+/// The size of what `url` leads to (0: it doesn't say), and where it leads
+/// after redirects (`url` itself if that can't be found out).
+fn head(url: &str) -> (u64, String) {
+    let Ok(out) = quiet(system_tool("curl")).args(["-sIL", "--max-time", "20", "-w", "\n%{url_effective}"]).arg(url).output() else { return (0, url.to_string()) };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let size = text
+        .lines()
+        .filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse().ok()))
+        .next_back()
+        .unwrap_or(0);
+    let last = text.lines().map(str::trim).rfind(|l| !l.is_empty()).filter(|l| l.contains("://")).unwrap_or(url);
+    (size, last.to_string())
+}
+
+fn fetch_text(url: &str) -> Result<String, String> {
+    let out = quiet(system_tool("curl")).args(["-sS", "-L", "--fail", "--max-time", "30"]).arg(url).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("{url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `url` to the file `to` (Windows' curl), telling `progress` the bytes so far.
+fn download(url: &str, to: &Path, progress: &dyn Fn(u64)) -> Result<(), Problem> {
+    let mut child = quiet(system_tool("curl"))
+        .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-setup", "-o"])
+        .arg(to)
+        .arg(url)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Problem::new(STOPPED, e))?;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| Problem::new(STOPPED, e))? {
+            break status;
+        }
+        progress(std::fs::metadata(to).map_or(0, |m| m.len()));
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    progress(std::fs::metadata(to).map_or(0, |m| m.len()));
+    if !status.success() {
+        let mut err = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        return Err(Problem::new(STOPPED, format!("curl: {status}: {}", err.trim())));
+    }
+    Ok(())
+}
+
+fn sha256(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    }))
+}
+
+/// The first file called `name` in `dir` or the folders in it.
+fn find(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    if let Some(f) = entries.iter().find(|p| p.is_file() && p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))) {
+        return Some(f.clone());
+    }
+    entries.iter().filter(|p| p.is_dir()).find_map(|d| find(d, name))
+}
+
+/// Put `from` at `to`. A program in use there (an export running) is
+/// renamed out of the way, as Windows lets a running program be renamed but
+/// not replaced; the next start removes it.
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() && std::fs::remove_file(to).is_err() {
+        let old = to.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(to, &old)?;
+    }
+    std::fs::copy(from, to).map(|_| ())
+}
+
+// ------------------------------------------------------------------ state
+
+/// The setup and the doctor (a resource; the window draws them).
+#[derive(Resource)]
+pub struct Doctor {
+    /// The first-run setup shows instead of the app.
+    pub setup: bool,
+    /// The doctor's window is open (Settings, the top bar after an error).
+    pub open: bool,
+    /// The last run stopped on an error: the top bar offers a report.
+    pub last_run_failed: bool,
+    /// The graphics adapter (name, API, driver), from the window.
+    pub graphics: Option<String>,
+    checked: Arc<Mutex<Option<Checked>>>,
+    install: Arc<Mutex<Install>>,
+    /// Where Install FFmpeg puts it.
+    install_dir: PathBuf,
+    /// The install whose result the checks have seen.
+    seen_done: bool,
+    /// A sentence under the buttons (copied, saved, a folder without FFmpeg): (text, is it a problem).
+    note: Option<(String, bool)>,
+    /// Dev (`TT_SETUP_AUTO`): seconds to wait before Start once FFmpeg works, and since when it does.
+    auto: Option<(f64, Option<std::time::Instant>)>,
+}
+
+impl Default for Doctor {
+    fn default() -> Self {
+        Self {
+            setup: false,
+            open: false,
+            last_run_failed: false,
+            graphics: None,
+            checked: Arc::default(),
+            install: Arc::default(),
+            install_dir: chosen_dir(),
+            seen_done: false,
+            note: None,
+            auto: std::env::var("TT_SETUP_AUTO").ok().and_then(|s| s.parse().ok()).map(|s| (s, None)),
+        }
+    }
+}
+
+impl Doctor {
+    /// Look at everything again (in the background).
+    pub fn recheck(&mut self) {
+        *self.checked.lock().expect("checks") = None;
+        let (checked, graphics) = (self.checked.clone(), self.graphics.clone());
+        std::thread::spawn(move || {
+            let c = run_checks(graphics.as_deref());
+            *checked.lock().expect("checks") = Some(c);
+        });
+    }
+
+    fn checked(&self) -> Option<Checked> {
+        self.checked.lock().expect("checks").clone()
+    }
+
+    fn install_state(&self) -> Install {
+        self.install.lock().expect("install").clone()
+    }
+
+    /// Something is still going on: keep the window repainting.
+    pub fn busy(&self) -> bool {
+        self.checked().is_none() || self.install_state().busy()
+    }
+
+    fn start_install(&mut self) {
+        if self.install_state().busy() {
+            return;
+        }
+        self.seen_done = false;
+        self.note = None;
+        let (state, dir) = (self.install.clone(), self.install_dir.clone());
+        *state.lock().expect("install") = Install::Download { got: 0, total: 0 };
+        std::thread::spawn(move || {
+            let url = std::env::var("TT_FFMPEG_URL").unwrap_or_else(|_| FFMPEG_ZIP.to_string());
+            let step = |s: Install| *state.lock().expect("install") = s;
+            let done = install(&url, &dir, &step).and_then(|v| remember(&dir).map(|()| v).map_err(|e| Problem::new(CANNOT_WRITE, e)));
+            match &done {
+                Ok(v) => tracing::info!("FFmpeg {v} installed in {}", dir.display()),
+                Err(p) => tracing::warn!("FFmpeg setup: {} ({})", p.what, p.details),
+            }
+            step(match done {
+                Ok(v) => Install::Done(v),
+                Err(p) => Install::Failed(p),
+            });
+        });
+    }
+
+    /// The person points at the FFmpeg they have.
+    fn use_folder(&mut self, picked: &Path) {
+        match ffmpeg_folder(picked) {
+            Some(dir) => match remember(&dir) {
+                Ok(()) => {
+                    tracing::info!("FFmpeg folder chosen: {}", dir.display());
+                    self.install_dir = dir;
+                    self.note = None;
+                    self.recheck();
+                }
+                Err(e) => self.note = Some((format!("{CANNOT_WRITE} ({e})"), true)),
+            },
+            None => self.note = Some(("This folder does not contain ffmpeg.exe and ffprobe.exe. Select a different folder.".into(), true)),
+        }
+    }
+}
+
+pub struct SetupModule;
+
+impl Module for SetupModule {
+    fn build(&self, app: &mut AppBuilder) {
+        app.declare::<Doctor>(Class::Derived).init_resource::<Doctor>();
+    }
+}
+
+// --------------------------------------------------------------------- UI
+
+/// The first-run setup, filling the window. True: the person starts the app.
+pub fn screen(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
+    let mut start = false;
+    egui::CentralPanel::default().show(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(660.0);
+            ui.add_space(6.0);
+            ui.heading(egui::RichText::new("Set up trackertools").strong());
+            ui.add_space(4.0);
+            start = body(ui, doctor, true);
+        });
+    });
+    start
+}
+
+/// The doctor's window (from Settings, or the top bar after an error).
+pub fn window(ctx: &egui::Context, doctor: &mut Doctor) {
+    if !doctor.open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Doctor").open(&mut open).default_width(600.0).collapsible(false).show(ctx, |ui| {
+        body(ui, doctor, false);
+    });
+    doctor.open = open;
+}
+
+/// What setup and the doctor show. True: Start trackertools was clicked.
+fn body(ui: &mut egui::Ui, doctor: &mut Doctor, first_run: bool) -> bool {
+    let checked = doctor.checked();
+    let install = doctor.install_state();
+    // A finished install: look again (once).
+    if matches!(install, Install::Done(_)) && !doctor.seen_done {
+        doctor.seen_done = true;
+        doctor.recheck();
+    }
+    let ready = checked.as_ref().is_some_and(|c| c.ready);
+    let mut start = false;
+    let step = |ui: &mut egui::Ui, text: &str| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(text).strong());
+    };
+
+    if first_run {
+        ui.label(if ready {
+            "FFmpeg is installed. Click Start trackertools."
+        } else {
+            "trackertools uses FFmpeg to read and write video files. FFmpeg is not on this computer."
+        });
+    } else {
+        ui.label("The doctor checks FFmpeg, the graphics and the folders. It also makes a report for the person who helps you.");
+    }
+
+    // FFmpeg: where, install, or the one they have.
+    step(ui, if first_run { "1. Select a folder for FFmpeg." } else { "FFmpeg folder" });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!install.busy(), egui::Button::new("Change\u{2026}")).clicked()
+            && let Some(dir) = rfd::FileDialog::new().set_directory(&doctor.install_dir).pick_folder()
+        {
+            doctor.install_dir = dir;
+        }
+        ui.add(egui::Label::new(egui::RichText::new(doctor.install_dir.display().to_string()).monospace()).wrap());
+    });
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        step(ui, if first_run { "2. Click Install FFmpeg. The download is approximately 120 MB." } else { "Install FFmpeg in this folder. The download is approximately 120 MB." });
+        ui.horizontal(|ui| {
+            let label = if ready && !first_run { "Install FFmpeg again" } else { "Install FFmpeg" };
+            if ui.add_enabled(!install.busy(), egui::Button::new(egui::RichText::new(label).strong())).clicked() {
+                doctor.start_install();
+            }
+            if install.busy() {
+                ui.spinner();
+            }
+        });
+        if let Install::Download { got, total } = &install
+            && *total > 0
+        {
+            ui.add(egui::ProgressBar::new(*got as f32 / *total as f32).desired_width(360.0));
+        }
+        match &install {
+            Install::Idle => {}
+            Install::Failed(p) => {
+                ui.colored_label(egui::Color32::from_rgb(0xf4, 0x3f, 0x5e), &p.what);
+            }
+            Install::Done(_) => {
+                ui.colored_label(style::ACCENT, install.text());
+            }
+            _ => {
+                ui.label(install.text());
+            }
+        }
+    } else {
+        step(ui, "2. Install FFmpeg with a package manager, for example: brew install ffmpeg. Then click Check again.");
+    }
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("If you have FFmpeg, click Find FFmpeg. Then select the folder that contains ffmpeg.exe and ffprobe.exe.");
+        if ui.add_enabled(!install.busy(), egui::Button::new("Find FFmpeg\u{2026}")).clicked()
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+        {
+            doctor.use_folder(&dir);
+        }
+    });
+
+    if first_run {
+        step(ui, "3. Click Start trackertools.");
+        let go = ui.add_enabled(ready, egui::Button::new(egui::RichText::new("Start trackertools").strong().size(16.0)));
+        start = go.on_disabled_hover_text("Start trackertools is available after FFmpeg is installed.").clicked();
+    }
+
+    // The checks.
+    ui.add_space(10.0);
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Checks").strong());
+        if ui.add_enabled(checked.is_some(), egui::Button::new("Check again")).clicked() {
+            doctor.recheck();
+        }
+    });
+    match &checked {
+        None => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("trackertools does the checks.");
+            });
+        }
+        Some(c) => {
+            for check in &c.checks {
+                let (mark, color) = match check.level {
+                    Level::Pass => ("\u{2714}", style::ACCENT),
+                    Level::Info => ("\u{2013}", style::MUTED),
+                    Level::Warn => ("\u{26a0}", egui::Color32::from_rgb(0xfb, 0xbf, 0x24)),
+                    Level::Fail => ("\u{2716}", egui::Color32::from_rgb(0xf4, 0x3f, 0x5e)),
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, mark);
+                    ui.add(egui::Label::new(&check.text).wrap());
+                });
+            }
+        }
+    }
+
+    // The report.
+    ui.add_space(10.0);
+    ui.separator();
+    ui.label(ASK_FOR_HELP);
+    ui.horizontal(|ui| {
+        let can = checked.is_some();
+        if ui.add_enabled(can, egui::Button::new("Copy report")).clicked()
+            && let Some(c) = &checked
+        {
+            ui.ctx().copy_text(report(c, doctor.graphics.as_deref()));
+            doctor.note = Some(("The report is on the clipboard.".into(), false));
+        }
+        if ui.add_enabled(can, egui::Button::new("Save report\u{2026}")).clicked()
+            && let Some(c) = &checked
+        {
+            let mut dialog = rfd::FileDialog::new().set_file_name("trackertools-report.txt").add_filter("Text", &["txt"]);
+            if let Some(desktop) = std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Desktop")).filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(desktop);
+            }
+            if let Some(path) = dialog.save_file() {
+                doctor.note = Some(match std::fs::write(&path, report(c, doctor.graphics.as_deref())) {
+                    Ok(()) => (format!("The report is in {}.", path.display()), false),
+                    Err(e) => (format!("trackertools cannot save the report there. Select a different folder. ({e})"), true),
+                });
+            }
+        }
+    });
+    if let Some((text, problem)) = &doctor.note {
+        if *problem {
+            ui.colored_label(egui::Color32::from_rgb(0xf4, 0x3f, 0x5e), text);
+        } else {
+            ui.colored_label(style::ACCENT, text);
+        }
+    }
+    if doctor.busy() {
+        ui.ctx().request_repaint_after(Duration::from_millis(120));
+    }
+    // Dev: TT_SETUP_AUTO (see the module docs).
+    if first_run && let Some((delay, since)) = doctor.auto {
+        if !ready && checked.is_some() && install == Install::Idle {
+            doctor.start_install();
+        }
+        if ready {
+            let since = since.unwrap_or_else(std::time::Instant::now);
+            doctor.auto = Some((delay, Some(since)));
+            start |= since.elapsed().as_secs_f64() >= delay;
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+    }
+    start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_read_from_the_first_line() {
+        assert_eq!(version_of("ffmpeg version 7.0.1-essentials_build-www.gyan.dev Copyright (c) 2000-2024"), "7.0.1");
+        assert_eq!(version_of("ffprobe version 9.0.2-essentials_build-www.gyan.dev"), "9.0.2");
+        assert_eq!(version_of("ffmpeg version N-117500-g0b3c3e6f6e-20241010 Copyright"), "N-117500-g0b3c3e6f6e-20241010");
+        assert_eq!(version_of("ffmpeg version 6.1 Copyright"), "6.1");
+    }
+
+    #[test]
+    fn dates_are_utc() {
+        assert_eq!(utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc(951_782_400 + 3_661), "2000-02-29 01:01 UTC");
+        assert_eq!(utc(1_759_530_000), "2025-10-03 22:20 UTC");
+    }
+
+    /// A zip like gyan.dev's (`<name>/bin/ffmpeg.exe`, …, `<name>/LICENSE`) and its `.sha256`, as a file:// address.
+    fn fake_build(dir: &Path, with_ffmpeg: bool) -> String {
+        let root = dir.join("src").join("ffmpeg-9.9-essentials_build");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        if with_ffmpeg {
+            std::fs::write(bin.join(exe("ffmpeg")), b"ffmpeg").unwrap();
+            std::fs::write(bin.join(exe("ffprobe")), b"ffprobe").unwrap();
+        }
+        std::fs::write(bin.join(exe("ffplay")), b"ffplay").unwrap();
+        std::fs::write(root.join("LICENSE"), b"GPL").unwrap();
+        let zip = dir.join("ffmpeg-test.zip");
+        let made = quiet(system_tool("tar")).arg("-a").arg("-cf").arg(&zip).arg("-C").arg(dir.join("src")).arg(".").status().unwrap();
+        assert!(made.success());
+        std::fs::write(dir.join("ffmpeg-test.zip.sha256"), format!("{}\n", sha256(&zip).unwrap())).unwrap();
+        format!("file:///{}", zip.display().to_string().replace('\\', "/"))
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tt-setup-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_checked_download_puts_ffmpeg_and_ffprobe_in_the_folder() {
+        let d = scratch("ok");
+        let url = fake_build(&d, true);
+        let dest = d.join("chosen folder");
+        let steps = Mutex::new(Vec::new());
+        fetch_and_place(&url, &dest, &|s| steps.lock().unwrap().push(s)).expect("installs");
+        assert_eq!(std::fs::read(dest.join(exe("ffmpeg"))).unwrap(), b"ffmpeg");
+        assert_eq!(std::fs::read(dest.join(exe("ffprobe"))).unwrap(), b"ffprobe");
+        assert!(dest.join("FFMPEG-LICENSE.txt").is_file());
+        assert!(!dest.join(exe("ffplay")).exists(), "only what trackertools runs");
+        let steps = steps.into_inner().unwrap();
+        assert!(steps.iter().any(|s| matches!(s, Install::Download { total, .. } if *total > 0)), "the size is known: {steps:?}");
+        assert!(steps.contains(&Install::Verify) && steps.contains(&Install::Extract));
+        assert_eq!(ffmpeg_folder(&dest), Some(dest.clone()));
+        let unpacked = d.join("src").join("ffmpeg-9.9-essentials_build");
+        assert_eq!(ffmpeg_folder(&unpacked), Some(unpacked.join("bin")), "an unpacked build: its bin");
+        assert_eq!(ffmpeg_folder(&d), None);
+        // Installed again over itself (a program in use is renamed away instead).
+        fetch_and_place(&url, &dest, &|_| {}).expect("again");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_download_that_does_not_match_its_checksum_is_refused() {
+        let d = scratch("bad");
+        let url = fake_build(&d, true);
+        std::fs::write(d.join("ffmpeg-test.zip.sha256"), format!("{}\n", "0".repeat(64))).unwrap();
+        let err = fetch_and_place(&url, &d.join("dest"), &|_| {}).expect_err("refused");
+        assert_eq!(err.what, "The download is not correct. Click Install FFmpeg again.");
+        assert!(!d.join("dest").join(exe("ffmpeg")).exists());
+        // And one without FFmpeg in it.
+        let e = scratch("empty");
+        let url = fake_build(&e, false);
+        assert_eq!(fetch_and_place(&url, &e.join("dest"), &|_| {}).expect_err("refused").what, "The download does not contain FFmpeg. Click Install FFmpeg again.");
+        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(e);
+    }
+
+    #[test]
+    fn the_report_has_the_checks_and_the_ends_of_the_logs() {
+        let d = scratch("report");
+        let lines: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(d.join(LOG), &lines).unwrap();
+        std::fs::write(d.join(PREVIOUS_LOG), format!("start\n{PANIC}panicked at src/main.rs\n")).unwrap();
+        let checked = Checked { checks: vec![Check::new(Level::Fail, "FFmpeg is not installed."), Check::new(Level::Pass, "Graphics: a GPU.")], ready: false };
+        let r = report_from(&checked, Some("a GPU"), &d, "2026-10-03 22:37 UTC".into());
+        assert!(r.starts_with("trackertools report, 2026-10-03 22:37 UTC\n"));
+        assert!(r.contains("  [FAIL] FFmpeg is not installed.\n") && r.contains("  [OK] Graphics: a GPU.\n"));
+        assert!(r.contains("the last run's log (its last 2 of 2 lines):\nstart\nPANIC: panicked"));
+        assert!(r.contains("this run's log (its last 250 of 400 lines):\nline 150\n") && r.ends_with("line 399\n"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

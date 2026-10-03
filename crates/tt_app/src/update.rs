@@ -72,7 +72,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn new(what: &str, details: impl std::fmt::Display) -> Self {
+    pub(crate) fn new(what: &str, details: impl std::fmt::Display) -> Self {
         Self { what: what.to_string(), details: details.to_string() }
     }
 }
@@ -179,7 +179,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 /// A console tool run without a window of its own (the app has no console).
-fn quiet(program: PathBuf) -> Command {
+pub(crate) fn quiet(program: PathBuf) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
@@ -189,7 +189,7 @@ fn quiet(program: PathBuf) -> Command {
     cmd
 }
 
-fn system_tool(name: &str) -> PathBuf {
+pub(crate) fn system_tool(name: &str) -> PathBuf {
     // Windows' own curl and tar (System32): another tar on the PATH (Git's) can't open zips.
     if cfg!(windows) {
         let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
