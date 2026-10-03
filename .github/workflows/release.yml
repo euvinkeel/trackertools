@@ -42,6 +42,8 @@ jobs:
         shell: pwsh
         run: |
           $env:TT_VERSION = $env:TAG
+          # The C runtime linked in: it runs without the Visual C++ redistributable.
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
           cargo build -p tt_app --release
       - name: Package
         shell: pwsh

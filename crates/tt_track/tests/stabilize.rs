@@ -160,6 +160,8 @@ fn tracked_points_hold_the_whole_scene_still(fps: u32, tracked: &[[f64; 2]], smo
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     let index = Arc::new(VideoIndex::open(&clip).expect("clip opens"));
     assert_eq!(index.frame_count(), frames, "the clip has every frame");
     let source = index.clone();
@@ -297,6 +299,8 @@ fn export_a_saved_projects_stabilizer() {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     let index = Arc::new(VideoIndex::open(&video).expect("video opens"));
     {
         let w = &mut core.world;

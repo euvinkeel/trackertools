@@ -1,5 +1,8 @@
 //! trackertools v2 desktop app. See docs/v2/DESIGN.md.
 
+// A release build is a windowed program: no console window beside it.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod demo;
 mod input_probe;
 mod keys;

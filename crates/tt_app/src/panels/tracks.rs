@@ -1,6 +1,6 @@
 //! Trackers in the panels: their points, paths and looks over the video, the
 //! Track tool's preview and hints, their progress in the top bar, and the
-//! inspector (looks and their masks).
+//! inspector (which way to track, looks and their masks).
 
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
@@ -17,7 +17,7 @@ use tt_core::tool::{ActiveTool, Tool};
 use tt_track::look::{Look, looks_of};
 use tt_track::runner::{SideStatus, TrackStatus};
 use tt_track::tool::TrackTool;
-use tt_track::{LOST as LOST_FLAG, guide_of, is_tracker, trackers_of};
+use tt_track::{LOST as LOST_FLAG, Method, NewTrackers, TrackRun, guide_of, is_tracker, run_of, set_run, trackers_of};
 
 use super::viewport::ViewportMapping;
 use crate::style;
@@ -27,6 +27,30 @@ pub const LOST: Color32 = Color32::from_rgb(0xf4, 0x3f, 0x5e);
 /// Frames of path drawn either side of the playhead: selected trackers, others.
 const PATH_FRAMES: FrameIndex = 90;
 const SHORT_PATH: FrameIndex = 12;
+
+/// What a tracker can be asked to do: (run, button, menu item, tip). It
+/// tracks from where you showed it the subject (its first look).
+pub const RUNS: [(TrackRun, &str, &str, &str); 4] = [
+    (TrackRun::Backward, "\u{25c0} Back", "Track backward", "Track backward from its first look, to the start of its sketch"),
+    (TrackRun::Both, "\u{25c0} Both \u{25b6}", "Track both ways", "Track both ways from its first look"),
+    (TrackRun::Forward, "Forward \u{25b6}", "Track forward", "Track forward from its first look, to the end of its sketch"),
+    (TrackRun::Paused, "\u{23f8} Pause", "Pause tracking", "Stop tracking: what it tracked stays, and a direction goes on from there"),
+];
+
+/// Ask `trackers` to track one way, both, or pause (the Inspector's buttons, the menu).
+pub fn ask(world: &mut World, trackers: &[Entity], run: TrackRun) {
+    for t in trackers {
+        set_run(world, *t, run);
+    }
+}
+
+/// What the Track tool makes: "template tracker" or "CoTracker".
+pub fn kind_name(method: Method) -> &'static str {
+    match method {
+        Method::Template => "template tracker",
+        Method::CoTracker => "CoTracker",
+    }
+}
 
 /// Live trackers with their output signals.
 pub fn list(world: &mut World) -> Vec<(Entity, SignalId)> {
@@ -176,10 +200,14 @@ pub fn draw_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, wo
     let world_ref: &World = world;
     let selected = world_ref.resource::<Selection>().primary().filter(|e| is_tracker(world_ref, *e));
     let name = selected.and_then(|e| world_ref.get::<Name>(e)).map_or("the tracker".to_string(), |n| n.to_string());
+    let kind = kind_name(world_ref.resource::<NewTrackers>().method).to_uppercase();
     let text = match (selected, tool.reseed) {
         (Some(t), Some(r)) if t == r => format!("TRACK · drag around the subject on this frame: {name} starts again from it · T/Esc exits"),
+        (Some(t), _) if run_of(world_ref, t) == TrackRun::Paused => {
+            format!("TRACK · {name} waits: Back, Both or Forward in the Inspector tracks it · drag where it missed: a new look · Shift+drag: a new tracker · T/Esc exits")
+        }
         (Some(_), _) => format!("TRACK · drag around the subject where {name} missed it: a new look, pinned here · Shift+drag: a new tracker · T/Esc exits"),
-        _ => "TRACK · drag around what to follow (its pattern) · click: a point, the dashed box's size (Ctrl+wheel) · T/Esc exits".to_string(),
+        _ => format!("NEW {kind} · drag around what to follow (its pattern) · click: a point, the dashed box's size (Ctrl+wheel) · T/Esc exits"),
     };
     let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), TRACK);
     let r = Align2::LEFT_TOP.anchor_size(map.panel.left_top() + Vec2::new(15.0, 65.0), galley.size()).expand(5.0);
@@ -223,8 +251,26 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             ui.colored_label(LOST, format!("⚠ {}", err.0));
         }
         let guide = guide_of(world, e).and_then(|g| world.get::<Name>(g)).map(|n| n.to_string());
-        ui.label(egui::RichText::new(format!("searches inside {} · where it misses: Track tool, drag around the subject (a new look, pinned there) · \"Re-seed here\" starts it again from the playhead", guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
+        let method = world.get::<tt_track::Tracker>(e).map_or(Method::Template, |t| t.method);
+        ui.label(egui::RichText::new(format!("A {} searching inside {} · where it misses: Track tool, drag around the subject (a new look, pinned there) · \"Re-seed here\" starts it again from the playhead", kind_name(method), guide.as_deref().unwrap_or("nothing"))).color(style::MUTED));
         let status = world.get::<TrackStatus>(e).cloned().unwrap_or_default();
+        // Which way to track (for every selected tracker): nothing runs until asked.
+        let trackers: Vec<Entity> = world.resource::<Selection>().entities.iter().copied().filter(|t| is_tracker(world, *t)).collect();
+        let run = run_of(world, e);
+        let mut asked = None;
+        ui.horizontal(|ui| {
+            for (r, button, _, tip) in RUNS {
+                if ui.selectable_label(run == r, button).on_hover_text(tip).clicked() {
+                    asked = Some(r);
+                }
+            }
+        });
+        if let Some(r) = asked {
+            ask(world, &trackers, r);
+        }
+        if run == TrackRun::Paused && !status.busy() {
+            ui.label(egui::RichText::new("Paused: Back, Both or Forward tracks it (what it has tracked stays)").color(super::overlay::LIVE));
+        }
         let (covered, lost) = counts(ui, world, e);
         ui.label(format!("{covered} frames tracked · {lost} flagged (lost, or outside the sketch){}", if status.rendition.is_empty() { String::new() } else { format!(" · reads the {}", status.rendition) }));
         // Its looks: select one to paint its mask.
@@ -265,13 +311,21 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if !tt_core::sketch::is_sketch(world, e) {
         return;
     }
-    let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Track)).unwrap_or_default();
     let existing = trackers_of(world, e);
+    let cotracker = tt_track::job::cotracker_availability();
     ui.horizontal(|ui| {
-        if ui.button(format!("⌖ Track tool ({chord})")).on_hover_text("Drag a rectangle around what to follow in this sketch (or click a point). The tracker searches inside this sketch's box, in its view.").clicked() {
-            world.resource_mut::<ActiveTool>().0 = Tool::Track;
+        for (method, text, tip) in [
+            (Method::Template, "⌖ Template tracker", "Drag a rectangle around what to follow in this sketch (or click a point): a tracker matching that pattern on every frame (fast, sub-pixel). It searches inside this sketch's box, in its view."),
+            (Method::CoTracker, "⌖ CoTracker", "Drag a rectangle around what to follow in this sketch (or click a point): Meta's CoTracker3, a learned point tracker, run in Python. It searches inside this sketch's box, in its view."),
+        ] {
+            let usable = method == Method::Template || cotracker.is_ok();
+            let r = ui.add_enabled(usable, egui::Button::new(text)).on_hover_text(tip).on_disabled_hover_text(cotracker.clone().err().unwrap_or_default());
+            if r.clicked() {
+                world.resource_mut::<NewTrackers>().method = method;
+                world.resource_mut::<ActiveTool>().0 = Tool::Track;
+            }
         }
-        if ui.button("Track its centre").on_hover_text("A quick tracker on this sketch's own point at the playhead (a square of its box); re-centred on the sketch when done").clicked() {
+        if ui.button("Track its centre").on_hover_text("A quick tracker on this sketch's own point at the playhead (a square of its box; the kind last chosen); re-centred on the sketch when done").clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }
         if !existing.is_empty() {

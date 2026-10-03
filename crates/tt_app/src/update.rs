@@ -178,6 +178,17 @@ pub fn newer(a: &str, b: &str) -> bool {
     na > nb || (na == nb && plain_a && !plain_b)
 }
 
+/// A console tool run without a window of its own (the app has no console).
+fn quiet(program: PathBuf) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 fn system_tool(name: &str) -> PathBuf {
     // Windows' own curl and tar (System32): another tar on the PATH (Git's) can't open zips.
     if cfg!(windows) {
@@ -192,7 +203,7 @@ fn system_tool(name: &str) -> PathBuf {
 
 /// The latest release, from GitHub's API (or a `file://` feed, for tests).
 pub fn fetch_release(url: &str) -> Result<Release, Problem> {
-    let out = Command::new(system_tool("curl"))
+    let out = quiet(system_tool("curl"))
         .args(["-sS", "-L", "--max-time", "20", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: trackertools-updater", "-w", "\n%{http_code}"])
         .arg(url)
         .output()
@@ -234,7 +245,7 @@ pub fn download(url: &str, size: u64, dir: &Path, progress: impl Fn(u64)) -> Res
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| Problem::new("Couldn't make a folder for the download.", e))?;
     let zip = dir.join("update.zip");
-    let mut child = Command::new(system_tool("curl"))
+    let mut child = quiet(system_tool("curl"))
         .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-updater", "-o"])
         .arg(&zip)
         .arg(url)
@@ -257,7 +268,7 @@ pub fn download(url: &str, size: u64, dir: &Path, progress: impl Fn(u64)) -> Res
     }
     let staged = dir.join("new");
     std::fs::create_dir_all(&staged).map_err(|e| Problem::new("Couldn't unpack the update.", e))?;
-    let out = Command::new(system_tool("tar"))
+    let out = quiet(system_tool("tar"))
         .arg("-xf")
         .arg(&zip)
         .arg("-C")

@@ -18,5 +18,8 @@ Thumbs.db
 # Rust (v2)
 /target/
 
+# Portable builds (scripts/package_windows.ps1)
+/dist/
+
 # Generated test clips (cargo xtask fixtures)
 /fixtures/

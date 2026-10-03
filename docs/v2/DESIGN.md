@@ -206,6 +206,8 @@ A runner system in `Set::Jobs` owns them. It does four things:
 - writes the results as they arrive;
 - reports each changed range as an `output_changed`, so dependents update chunk by chunk.
 
+**Which way is the user's to ask** (`TrackRun`: forward, backward, both, or paused; the tracker's buttons in the Inspector and its right-click menu). New trackers wait until asked *(changed on request: "creating a tracker should probably not automatically start tracking")*. The state only gates which side's jobs may run: switching keeps every result, Pause cancels the running jobs and keeps what they produced, and asking again goes on from the last result. Tracking only backward still produces the anchor's frame (the forward side's first). While a tracker is asked to track, edits re-track it as before; paused, they only mark its results stale. It is saved, but not an undo step (undoing an edit shouldn't stop or start tracking); trackers saved before it existed track both ways.
+
 Dirt only says "look again". The runner compares the new plan with the one the results came from, and re-tracks from the first frame whose inputs differ, on each side of the anchor. So a stroke on a guide re-tracks from the stroke, although a sketch reports its whole extent as changed. A job whose inputs are unchanged keeps running; the others are cancelled and restarted.
 
 Results are document data written outside edits: `History::touch` marks them for saving, with no undo step. An operator that comes back (redo, an undone delete) recomputes itself.
@@ -251,7 +253,7 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 - **Validity is a flag, never a deletion.** Output `[x, y, left, top, right, bottom, score, flags]`. `flags` marks *lost* (score below `min_score`) and *outside* (the point left the guide's box: the rough pass says the subject isn't there). Raw values stay. Consumers (views framed on the tracker, re-centring, export) skip flagged frames; the overlay and timeline draw them red. Changing the rule re-flags, it doesn't re-track.
 - **Unguided trackers** (planned). Without a sketch, the search would be around the last position and velocity, within `search` × the pattern's size. For now the tool asks for a sketch first ("Draw a sketch over the subject first (D)"): it makes the search region and the prediction far better.
 
-**The Track tool** (`T`; `T` or `Esc` leaves it):
+**The Track tool** (`T`; `T` or `Esc` leaves it). The top bar has a button for each kind of tracker it makes: *Template tracker* and *CoTracker* (`NewTrackers::method`; `T` makes the kind chosen last). CoTracker's is greyed out, saying what's missing, where its Python worker, a Python or its weights aren't found (a copy given to someone without the repository's Python setup):
 - **drag** a rectangle on the video: a new tracker with that look on the shown frame;
 - **click**: a point tracker with the brush-sized pattern (a dashed box shows it, 28 pt by default; Ctrl+wheel sizes it, the plain wheel zooms as always);
 - with a **tracker selected**, a drag or click **patches** it: another look, on this frame, where the subject really is (the path is pinned there; a new icon is learned too). `Shift` makes a new tracker instead. *(Changed after hands-on use: "my workflow is to just kinda patch wherever it seems to miss".)*

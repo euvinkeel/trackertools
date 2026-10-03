@@ -69,7 +69,10 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut reopen = None;
     let mut history_action = None;
     let mut new_sketch = false;
+    let mut track_kind = None;
     let tracking = tracks::summary(world);
+    let kind = world.resource::<tt_track::NewTrackers>().method;
+    let cotracker = tt_track::job::cotracker_availability();
     let t = world.resource::<Transport>();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
@@ -149,18 +152,31 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         }
         let tracking_tool = world.resource::<ActiveTool>().0 == Tool::Track;
         let track_chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Track)).unwrap_or_default();
-        if ui
-            .selectable_label(tracking_tool, "⌖ Track")
-            .on_hover_text(format!(
-                "Track tool ({track_chord})
-                 • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
-                 • click: a point, with a pattern the dashed box's size (Ctrl+wheel sizes it; the wheel zooms)
-                 • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
-                 • select a look (Outliner, Inspector) to paint which of its pixels are the subject"
-            ))
-            .clicked()
-        {
-            history_action = Some(Action::Tool(Tool::Track));
+        for (method, text, what) in [
+            (tt_track::Method::Template, "⌖ Template tracker", "matches the pattern you show it on every frame: fast, sub-pixel, built in"),
+            (tt_track::Method::CoTracker, "⌖ CoTracker", "Meta's CoTracker3, a learned point tracker, run in Python (PyTorch and its weights)"),
+        ] {
+            let usable = method == tt_track::Method::Template || cotracker.is_ok();
+            let r = ui
+                .add_enabled_ui(usable, |ui| ui.selectable_label(tracking_tool && kind == method, text))
+                .inner
+                .on_hover_text(format!(
+                    "Track tool ({track_chord}) making a {}: {what}
+                     • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
+                     • click: a point, with a pattern the dashed box's size (Ctrl+wheel sizes it; the wheel zooms)
+                     • a new tracker waits: Back, Both or Forward in the Inspector (or its right-click menu) tracks it; Pause stops it
+                     • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
+                     • select a look (Outliner, Inspector) to paint which of its pixels are the subject",
+                    tracks::kind_name(method)
+                ))
+                .on_disabled_hover_text(cotracker.clone().err().unwrap_or_default());
+            if r.clicked() {
+                track_kind = Some(method);
+                // The other kind while the tool is on: switch kinds, keep the tool.
+                if !tracking_tool || kind == method {
+                    history_action = Some(Action::Tool(Tool::Track));
+                }
+            }
         }
         let sketch_selected = world.resource::<tt_core::selection::Selection>().primary().is_some_and(|e| tt_core::sketch::is_sketch(world, e));
         if ui
@@ -185,6 +201,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     });
     if open {
         world.resource_mut::<PendingActions>().push(Action::OpenFile);
+    }
+    if let Some(method) = track_kind {
+        world.resource_mut::<tt_track::NewTrackers>().method = method;
     }
     if let Some(a) = history_action {
         world.resource_mut::<PendingActions>().push(a);

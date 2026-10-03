@@ -1,7 +1,8 @@
 trackertools
 ============
 
-To start it: double-click trackertools.exe.
+To start it: unzip it first (right-click the zip, "Extract All..."), then
+double-click trackertools.exe in the folder. It needs Windows 10 or 11.
 
 The first time, Windows may say "Windows protected your PC". Click "More info",
 then "Run anyway". (Windows says that about programs that don't come from a big

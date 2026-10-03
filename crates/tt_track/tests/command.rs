@@ -51,6 +51,8 @@ fn tracking_several_sketches_is_one_undo_step_and_reseeds_stay_in_the_guide() {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     core.world.resource_mut::<Transport>().frame_count = 300;
     let a = sketch(&mut core, "A", 50..150);
     let b = sketch(&mut core, "B", 100..200);
@@ -102,6 +104,8 @@ fn deleting_or_restoring_a_look_re_tracks() {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     core.world.resource_mut::<Transport>().frame_count = 300;
     let a = sketch(&mut core, "A", 50..150);
     track_at(&mut core, 120, vec![a]);
@@ -140,6 +144,8 @@ fn the_track_tool_patches_the_selected_tracker_with_auto_masked_looks() {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     core.world.resource_mut::<Transport>().frame_count = 300;
     core.world.insert_resource(LookMasker(Some(masked_everywhere)));
     let a = sketch(&mut core, "A", 50..150);
@@ -182,6 +188,8 @@ fn the_wheel_zooms_in_the_track_tool_and_ctrl_wheel_sizes_the_click() {
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
+    // (New trackers wait for a button in the app; these start at once.)
+    core.world.resource_mut::<tt_track::NewTrackers>().run = tt_track::TrackRun::Both;
     core.world.resource_mut::<ActiveTool>().0 = Tool::Track;
     let brush = |core: &Core| core.world.resource::<TrackTool>().brush;
     let before = brush(&core);
