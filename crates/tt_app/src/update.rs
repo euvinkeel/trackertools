@@ -1,0 +1,497 @@
+//! Updates: the repository's latest release on GitHub, installed in one click
+//! (Settings → Updates, or the top bar's button when a new version is out).
+//!
+//! The repository is the source of truth. Pushing a tag `vX.Y.Z` makes the
+//! release workflow (`.github/workflows/release.yml`) build
+//! `trackertools-windows-x64.zip` and publish it with the changes since the
+//! last tag as its notes. A copy that workflow built knows its version (the
+//! tag, `TT_VERSION` at build time) and can replace itself; a copy built from
+//! source says so and leaves updating to git.
+//!
+//! No libraries for it: downloads go through `curl` and the zip opens with
+//! `tar`, both part of Windows 10/11 and macOS. Installing renames each file it
+//! replaces to `<name>.old` (Windows lets a running program be renamed, not
+//! overwritten) and moves the new one in; the old ones are deleted at the next
+//! start. Then trackertools saves your work, closes, and starts the new version.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bevy_ecs::prelude::*;
+use tt_core::{AppBuilder, Class, Module};
+
+/// Where releases come from: `owner/name` on GitHub. People can only get
+/// updates from it if it's public (a private repository's releases need a
+/// GitHub sign-in).
+pub const REPO: &str = "euvinkeel/trackertools";
+
+/// This copy's version: the tag it was released as, or the crate's version
+/// with "-dev" for a copy built from source.
+pub fn version() -> String {
+    match option_env!("TT_VERSION") {
+        Some(tag) => tag.trim_start_matches('v').to_string(),
+        None => format!("{}-dev", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// Built by the release workflow: it can replace itself.
+pub fn installable() -> bool {
+    option_env!("TT_VERSION").is_some()
+}
+
+/// The release download made for this computer.
+pub fn asset_name() -> Option<&'static str> {
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        Some("trackertools-windows-x64.zip")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("trackertools-macos-arm64.zip")
+    } else {
+        None
+    }
+}
+
+/// A published version.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Release {
+    pub version: String,
+    /// What changed (the release's description).
+    pub notes: String,
+    /// Its page on GitHub.
+    pub page: String,
+    /// The download for this computer and its size in bytes, if there is one.
+    pub download: Option<(String, u64)>,
+}
+
+/// Something went wrong: what to tell a person, and what to tell a developer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Problem {
+    pub what: String,
+    pub details: String,
+}
+
+impl Problem {
+    fn new(what: &str, details: impl std::fmt::Display) -> Self {
+        Self { what: what.to_string(), details: details.to_string() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum State {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Downloading { release: Release, got: u64, total: u64 },
+    /// Downloaded and unpacked into `staged`: installed on the next frame.
+    Ready { release: Release, staged: PathBuf },
+    Restarting,
+    Failed(Problem),
+}
+
+/// The updater (a resource): its state is shared with the thread doing the work.
+#[derive(Resource, Clone)]
+pub struct Updater {
+    state: Arc<Mutex<State>>,
+    /// Look for a new version when trackertools starts (a user setting).
+    pub check_on_start: bool,
+}
+
+impl Default for Updater {
+    fn default() -> Self {
+        Self { state: Arc::new(Mutex::new(State::Idle)), check_on_start: true }
+    }
+}
+
+/// Set when an update is installed: the program to start once this one has saved and closed.
+#[derive(Resource, Default)]
+pub struct RestartWith(pub Option<PathBuf>);
+
+impl Updater {
+    pub fn state(&self) -> State {
+        self.state.lock().expect("updater state").clone()
+    }
+
+    fn set(&self, s: State) {
+        *self.state.lock().expect("updater state") = s;
+    }
+
+    pub fn busy(&self) -> bool {
+        matches!(self.state(), State::Checking | State::Downloading { .. } | State::Ready { .. } | State::Restarting)
+    }
+
+    /// Looks for a new version in the background. `quiet`: the check at start,
+    /// which only speaks up when there is one.
+    pub fn check(&self, quiet: bool) {
+        if self.busy() {
+            return;
+        }
+        self.set(State::Checking);
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let url = std::env::var("TT_UPDATE_FEED").unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest"));
+            me.set(match fetch_release(&url) {
+                Ok(r) if newer(&r.version, &version()) => State::Available(r),
+                Ok(_) if quiet => State::Idle,
+                Ok(_) => State::UpToDate,
+                Err(e) if quiet => {
+                    tracing::info!("update check: {} ({})", e.what, e.details);
+                    State::Idle
+                }
+                Err(e) => State::Failed(e),
+            });
+        });
+    }
+
+    /// Downloads and unpacks `release` in the background; [`drive`] installs it.
+    pub fn update(&self, release: Release) {
+        if self.busy() {
+            return;
+        }
+        let Some((url, size)) = release.download.clone() else { return };
+        self.set(State::Downloading { release: release.clone(), got: 0, total: size });
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let dir = std::env::temp_dir().join(format!("trackertools-update-{}", release.version));
+            let progress = |got| me.set(State::Downloading { release: release.clone(), got, total: size });
+            me.set(match download(&url, size, &dir, progress) {
+                Ok(staged) => State::Ready { release, staged },
+                Err(e) => State::Failed(e),
+            });
+        });
+    }
+}
+
+/// Whether version `a` is newer than `b` ("1.2.10" > "1.2.9"; a "-dev" or
+/// other suffix ranks below the plain version).
+pub fn newer(a: &str, b: &str) -> bool {
+    let parts = |v: &str| -> (Vec<u64>, bool) {
+        let v = v.trim().trim_start_matches('v');
+        let (num, suffix) = v.split_once('-').unwrap_or((v, ""));
+        (num.split('.').map(|p| p.parse().unwrap_or(0)).collect(), suffix.is_empty())
+    };
+    let ((mut na, plain_a), (mut nb, plain_b)) = (parts(a), parts(b));
+    let n = na.len().max(nb.len());
+    na.resize(n, 0);
+    nb.resize(n, 0);
+    na > nb || (na == nb && plain_a && !plain_b)
+}
+
+fn system_tool(name: &str) -> PathBuf {
+    // Windows' own curl and tar (System32): another tar on the PATH (Git's) can't open zips.
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let path = root.join("System32").join(format!("{name}.exe"));
+        if path.is_file() {
+            return path;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// The latest release, from GitHub's API (or a `file://` feed, for tests).
+pub fn fetch_release(url: &str) -> Result<Release, Problem> {
+    let out = Command::new(system_tool("curl"))
+        .args(["-sS", "-L", "--max-time", "20", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: trackertools-updater", "-w", "\n%{http_code}"])
+        .arg(url)
+        .output()
+        .map_err(|e| Problem::new("Couldn't start the download tool (curl), which comes with Windows 10 and later.", e))?;
+    if !out.status.success() {
+        return Err(Problem::new("Couldn't reach GitHub. Check your internet connection and try again.", String::from_utf8_lossy(&out.stderr)));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, ""));
+    match code.trim() {
+        // (000: a file:// feed.)
+        "200" | "000" => parse_release(body),
+        "404" => Err(Problem::new("No published version was found yet.", format!("{url}: 404 (the repository is private, or has no releases)"))),
+        "403" | "429" => Err(Problem::new("GitHub is limiting requests right now. Try again in an hour.", format!("{url}: {code}"))),
+        other => Err(Problem::new("GitHub answered with an error. Try again later.", format!("{url}: {other}\n{body}"))),
+    }
+}
+
+/// A release as GitHub's API describes it.
+pub fn parse_release(json: &str) -> Result<Release, Problem> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| Problem::new("GitHub's answer didn't make sense.", e))?;
+    let tag = v["tag_name"].as_str().ok_or_else(|| Problem::new("GitHub's answer didn't make sense.", "no tag_name"))?;
+    let download = asset_name().and_then(|name| {
+        let a = v["assets"].as_array()?.iter().find(|a| a["name"].as_str() == Some(name))?;
+        Some((a["browser_download_url"].as_str()?.to_string(), a["size"].as_u64().unwrap_or(0)))
+    });
+    Ok(Release {
+        version: tag.trim_start_matches('v').to_string(),
+        notes: v["body"].as_str().unwrap_or_default().trim().to_string(),
+        page: v["html_url"].as_str().unwrap_or_default().to_string(),
+        download,
+    })
+}
+
+/// Downloads `url` (`size` bytes, 0 if unknown) into `dir` and unpacks it;
+/// returns the folder holding the new program. `progress` hears the bytes so far.
+pub fn download(url: &str, size: u64, dir: &Path, progress: impl Fn(u64)) -> Result<PathBuf, Problem> {
+    // Our own folder in the temp directory, left from an earlier try at most.
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| Problem::new("Couldn't make a folder for the download.", e))?;
+    let zip = dir.join("update.zip");
+    let mut child = Command::new(system_tool("curl"))
+        .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-updater", "-o"])
+        .arg(&zip)
+        .arg(url)
+        .spawn()
+        .map_err(|e| Problem::new("Couldn't start the download tool (curl), which comes with Windows 10 and later.", e))?;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| Problem::new("The download stopped.", e))? {
+            break status;
+        }
+        progress(std::fs::metadata(&zip).map_or(0, |m| m.len()));
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    let got = std::fs::metadata(&zip).map_or(0, |m| m.len());
+    progress(got);
+    if !status.success() {
+        return Err(Problem::new("The download didn't finish. Check your internet connection and try again.", format!("curl: {status}")));
+    }
+    if size > 0 && got != size {
+        return Err(Problem::new("The download came out incomplete. Try again.", format!("{got} of {size} bytes")));
+    }
+    let staged = dir.join("new");
+    std::fs::create_dir_all(&staged).map_err(|e| Problem::new("Couldn't unpack the update.", e))?;
+    let out = Command::new(system_tool("tar"))
+        .arg("-xf")
+        .arg(&zip)
+        .arg("-C")
+        .arg(&staged)
+        .output()
+        .map_err(|e| Problem::new("Couldn't unpack the update (tar, which comes with Windows 10 and later, didn't start).", e))?;
+    if !out.status.success() {
+        return Err(Problem::new("Couldn't unpack the update.", String::from_utf8_lossy(&out.stderr)));
+    }
+    // The program sits at the top of the zip, or in one folder there.
+    let exe = program_name();
+    let root = std::iter::once(staged.clone())
+        .chain(std::fs::read_dir(&staged).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()))
+        .find(|d| d.join(&exe).is_file())
+        .ok_or_else(|| Problem::new("The update didn't contain the program.", format!("no {} in {}", exe.to_string_lossy(), staged.display())))?;
+    Ok(root)
+}
+
+/// This program's file name (trackertools.exe).
+fn program_name() -> std::ffi::OsString {
+    std::env::current_exe().ok().and_then(|e| e.file_name().map(|n| n.to_owned())).unwrap_or_else(|| format!("trackertools{}", std::env::consts::EXE_SUFFIX).into())
+}
+
+fn old_name(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".old");
+    path.with_file_name(name)
+}
+
+/// Moves every file of `staged` into `home` (keeping folders), each file it
+/// replaces renamed to `<name>.old` first; on a failure, puts back what it moved.
+pub fn install_into(staged: &Path, home: &Path) -> Result<(), Problem> {
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { files(&p, out) } else { out.push(p) }
+        }
+    }
+    let mut todo = Vec::new();
+    files(staged, &mut todo);
+    let mut done: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let undo = |done: &[(PathBuf, Option<PathBuf>)]| {
+        for (dst, old) in done.iter().rev() {
+            let _ = std::fs::remove_file(dst);
+            if let Some(old) = old {
+                let _ = std::fs::rename(old, dst);
+            }
+        }
+    };
+    for src in todo {
+        let dst = home.join(src.strip_prefix(staged).expect("inside staged"));
+        let step = || -> std::io::Result<Option<PathBuf>> {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let old = if dst.exists() {
+                let old = old_name(&dst);
+                let _ = std::fs::remove_file(&old);
+                std::fs::rename(&dst, &old)?;
+                Some(old)
+            } else {
+                None
+            };
+            // A rename, or a copy when the temp folder is on another drive.
+            if std::fs::rename(&src, &dst).is_err()
+                && let Err(e) = std::fs::copy(&src, &dst)
+            {
+                if let Some(old) = &old {
+                    let _ = std::fs::rename(old, &dst);
+                }
+                return Err(e);
+            }
+            Ok(old)
+        };
+        match step() {
+            Ok(old) => done.push((dst, old)),
+            Err(e) => {
+                undo(&done);
+                return Err(Problem::new(
+                    "Couldn't replace trackertools' files (is its folder read-only?). Move the trackertools folder into your Documents and try again.",
+                    format!("{}: {e}", dst.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deletes what the last update renamed aside (`<name>.old` next to a `<name>`).
+pub fn clean_up_after_update(home: &Path) {
+    fn walk(dir: &Path, depth: usize) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() && depth > 0 {
+                walk(&p, depth - 1);
+            } else if p.extension().is_some_and(|x| x == "old") && p.with_extension("").exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    walk(home, 2);
+}
+
+/// Every frame: keeps the window drawing while there's progress to show, and
+/// installs a finished download: files in place, then save, close, and start
+/// the new version (in `Shell::on_exit`).
+pub fn drive(ctx: &egui::Context, world: &mut World) {
+    let up = world.resource::<Updater>().clone();
+    match up.state() {
+        State::Checking | State::Downloading { .. } => ctx.request_repaint_after(Duration::from_millis(150)),
+        State::Ready { staged, .. } => {
+            let Some(home) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else { return };
+            match install_into(&staged, &home) {
+                Ok(()) => {
+                    world.resource_mut::<RestartWith>().0 = Some(home.join(program_name()));
+                    up.set(State::Restarting);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(e) => up.set(State::Failed(e)),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// After the app saved and is closing: start the new version, if one was installed.
+pub fn restart_if_updated(world: &World) {
+    if let Some(exe) = &world.resource::<RestartWith>().0 {
+        let mut cmd = Command::new(exe);
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+        if let Err(e) = cmd.spawn() {
+            tracing::error!("could not start the updated trackertools ({}): {e}", exe.display());
+        }
+    }
+}
+
+pub struct UpdateModule;
+
+impl Module for UpdateModule {
+    fn build(&self, app: &mut AppBuilder) {
+        app.declare::<Updater>(Class::Session).init_resource::<Updater>().declare::<RestartWith>(Class::Session).init_resource::<RestartWith>();
+    }
+}
+
+/// At start: tidy what the last update left, and (a released copy, if the
+/// setting is on) look for a new version quietly.
+pub fn on_start(world: &World) {
+    // (A copy built from source lives in cargo's target folder: left alone.)
+    if !installable() {
+        return;
+    }
+    if let Some(home) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        clean_up_after_update(&home);
+    }
+    let up = world.resource::<Updater>();
+    if up.check_on_start {
+        up.check(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(newer("0.2.0", "0.1.0"));
+        assert!(newer("0.1.10", "0.1.9"));
+        assert!(newer("v1.0.0", "0.9.9"));
+        assert!(newer("0.2.0", "0.1.0-dev"));
+        assert!(newer("0.1.0", "0.1.0-dev"), "a release beats the build from source it came from");
+        assert!(!newer("0.1.0", "0.1.0"));
+        assert!(!newer("0.1.9", "0.1.10"));
+        assert!(!newer("0.1", "0.1.0"));
+    }
+
+    #[test]
+    fn a_release_reads_with_this_computers_download() {
+        let name = asset_name().unwrap_or("none");
+        let json = format!(
+            r#"{{"tag_name": "v0.3.1", "html_url": "https://github.com/x/y/releases/tag/v0.3.1", "body": "Sketches work as trackers.\n",
+                "assets": [{{"name": "other.zip", "browser_download_url": "https://x/other.zip", "size": 1}},
+                           {{"name": "{name}", "browser_download_url": "https://x/{name}", "size": 1234}}]}}"#
+        );
+        let r = parse_release(&json).expect("reads");
+        assert_eq!((r.version.as_str(), r.notes.as_str()), ("0.3.1", "Sketches work as trackers."));
+        if asset_name().is_some() {
+            assert_eq!(r.download, Some((format!("https://x/{name}"), 1234)));
+        }
+        let none = parse_release(r#"{"tag_name": "v0.3.2", "assets": []}"#).expect("reads");
+        assert_eq!(none.download, None, "no download for this computer");
+    }
+
+    /// The whole path but the restart, offline: a release feed and its zip as
+    /// files, downloaded, unpacked, and installed over an older copy.
+    #[cfg(windows)]
+    #[test]
+    fn an_update_downloads_unpacks_and_replaces_the_files() {
+        let root = std::env::temp_dir().join(format!("tt-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (pkg, home) = (root.join("pkg"), root.join("home"));
+        std::fs::create_dir_all(pkg.join("docs")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let exe = program_name();
+        std::fs::write(pkg.join(&exe), b"new program").unwrap();
+        std::fs::write(pkg.join("ffmpeg.exe"), b"new ffmpeg").unwrap();
+        std::fs::write(pkg.join("docs").join("README.txt"), b"read me").unwrap();
+        std::fs::write(home.join(&exe), b"old program").unwrap();
+        std::fs::write(home.join("keep.txt"), b"mine").unwrap();
+        // The zip, as the release workflow makes it (files at its top).
+        let zip = root.join("trackertools-windows-x64.zip");
+        let made = Command::new(system_tool("tar")).arg("-a").arg("-cf").arg(&zip).arg("-C").arg(&pkg).arg(".").status().unwrap();
+        assert!(made.success());
+        let size = std::fs::metadata(&zip).unwrap().len();
+        let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
+        let feed = root.join("latest.json");
+        std::fs::write(&feed, format!(r#"{{"tag_name": "v9.9.9", "assets": [{{"name": "trackertools-windows-x64.zip", "browser_download_url": "{url}", "size": {size}}}]}}"#)).unwrap();
+
+        let release = fetch_release(&format!("file:///{}", feed.display().to_string().replace('\\', "/"))).expect("the feed reads");
+        assert_eq!(release.version, "9.9.9");
+        let (url, size) = release.download.expect("a download");
+        let seen = std::sync::Mutex::new(0);
+        let staged = download(&url, size, &root.join("dl"), |n| *seen.lock().unwrap() = n).expect("downloads and unpacks");
+        assert_eq!(*seen.lock().unwrap(), size, "progress reaches the whole size");
+        install_into(&staged, &home).expect("installs");
+        assert_eq!(std::fs::read(home.join(&exe)).unwrap(), b"new program");
+        assert_eq!(std::fs::read(home.join("ffmpeg.exe")).unwrap(), b"new ffmpeg");
+        assert_eq!(std::fs::read(home.join("docs").join("README.txt")).unwrap(), b"read me");
+        assert_eq!(std::fs::read(home.join("keep.txt")).unwrap(), b"mine", "files the update doesn't have stay");
+        assert_eq!(std::fs::read(old_name(&home.join(&exe))).unwrap(), b"old program", "the old program is set aside");
+        clean_up_after_update(&home);
+        assert!(!old_name(&home.join(&exe)).exists(), "and deleted at the next start");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -7,6 +7,11 @@
 //! the view's *canvas* (its pixel grid) and the shader samples the source
 //! through the view's per-frame mapping, from the original whenever the proxy
 //! would be magnified. A breadcrumb (`Source ▸ Sketch 1 ▸ …`) walks the chain.
+//!
+//! The in and out points show on the picture: a bracket down its left edge
+//! on the frame an export starts on, down its right edge on the one it ends
+//! on; outside them a note, and the picture dimmed while the export window
+//! is open or a mark is being dragged on the timeline.
 
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
@@ -323,6 +328,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     } else {
         painter.rect_filled(rect, 0.0, style::BG);
     }
+    marks_on_picture(&painter, rect, vr, world, shown_grid);
 
     // HUD
     let state = match &shown {
@@ -413,8 +419,9 @@ fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Ent
     let selected = world.resource::<tt_core::selection::Selection>().primary().and_then(|e| tt_core::sketch::sketch_of(world, e));
     let name = |w: &World, e: Entity| sketch_framed(w, e).and_then(|s| w.get::<Name>(s)).map_or("view".to_string(), |n| n.to_string());
     let mut go: Option<Option<Entity>> = None;
-    // Its own foreground layer: a click here is the breadcrumb's, never a press on the video.
-    egui::Area::new(egui::Id::new("viewport-breadcrumb")).order(egui::Order::Foreground).fixed_pos(at).interactable(true).show(ui.ctx(), |ui| {
+    // Its own layer above the video: a click here is the breadcrumb's, never a
+    // press on the video. (Not in front of windows, like the export window.)
+    egui::Area::new(egui::Id::new("viewport-breadcrumb")).order(egui::Order::Middle).fixed_pos(at).interactable(true).show(ui.ctx(), |ui| {
         egui::Frame::new().fill(Color32::from_black_alpha(170)).corner_radius(3.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -533,6 +540,44 @@ impl Default for SpeedFlash {
     fn default() -> Self {
         Self { rate: None, changed_at: f64::NEG_INFINITY }
     }
+}
+
+/// The in and out points on the picture (see the module docs).
+fn marks_on_picture(painter: &egui::Painter, rect: Rect, picture: Rect, world: &World, frame: tt_core::time::FrameIndex) {
+    let m = tt_core::marks::marks(world);
+    if !m.is_set() {
+        return;
+    }
+    let r = m.frames(world.resource::<Transport>().frame_count);
+    let exporting = super::export::is_open(world) || super::timeline::dragging_mark(world);
+    let top = rect.center_top() + Vec2::new(0.0, 8.0);
+    if !r.contains(&frame) {
+        if exporting {
+            painter.rect_filled(picture.intersect(rect), 0.0, Color32::from_black_alpha(160));
+        }
+        hud(painter, top, Align2::CENTER_TOP, &format!("outside in/out ({}\u{2013}{}): not exported", r.start, r.end - 1), style::MUTED);
+        return;
+    }
+    let (first, last) = (frame == r.start && m.mark_in.is_some(), frame == r.end - 1 && m.mark_out.is_some());
+    // Along the edges of the picture as far as it is in view, outlined to stand out on light footage.
+    let seen = picture.intersect(rect).shrink(5.0);
+    let tab = (seen.width() * 0.06).clamp(16.0, 64.0);
+    for (on, x, dir) in [(first, seen.min.x, 1.0), (last, seen.max.x, -1.0)] {
+        if on {
+            let path = vec![Pos2::new(x + dir * tab, seen.min.y), Pos2::new(x, seen.min.y), Pos2::new(x, seen.max.y), Pos2::new(x + dir * tab, seen.max.y)];
+            painter.add(egui::Shape::line(path.clone(), egui::Stroke::new(8.0, Color32::from_black_alpha(140))));
+            painter.add(egui::Shape::line(path, egui::Stroke::new(4.0, style::RANGE)));
+        }
+    }
+    let n = r.end - r.start;
+    let label = match (first, last) {
+        (true, true) => "IN \u{b7} OUT: the export is this one frame".to_string(),
+        (true, false) => format!("IN: the export starts on this frame ({n} frames)"),
+        (false, true) => format!("OUT: the export ends on this frame ({n} frames)"),
+        _ if exporting => format!("export frame {} of {n}", frame - r.start + 1),
+        _ => return,
+    };
+    hud(painter, top, Align2::CENTER_TOP, &label, style::RANGE);
 }
 
 fn hud(painter: &egui::Painter, pos: Pos2, align: Align2, text: &str, color: Color32) {

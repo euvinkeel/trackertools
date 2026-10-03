@@ -15,12 +15,20 @@
 //!   (past the top or bottom it scrolls the lanes; Esc drops it), a
 //!   double-click enters that sketch's view, a right-click opens the menu.
 //! - A stroke that starts scrolls its lane into view.
+//! - In and out points (I / O; Alt+X clears; `tt_core::marks`): what an
+//!   export covers, shaded outside it on the ruler and the lanes. Drag a
+//!   mark's bracket on the ruler to move it (one undo step, snapping like the
+//!   playhead); the playhead goes with it, so the viewport shows the frame
+//!   the export starts or ends on.
 //! - Wheel on the ruler or Ctrl+wheel zooms time; Shift+wheel pans time; the
 //!   wheel on the lanes scrolls them; a middle-drag pans both.
+
+use std::ops::Range;
 
 use bevy_ecs::prelude::*;
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use tt_core::input::{Action, Keymap, PendingActions};
+use tt_core::marks::{Marks, marks, set_marks};
 use tt_core::time::{FrameIndex, Rational, timecode};
 use tt_core::transport::{RATES, Transport};
 use tt_core::{AppBuilder, Class, Module};
@@ -85,11 +93,12 @@ impl Scale {
 pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let t = world.resource::<Transport>().clone();
     let keymap = world.resource::<Keymap>();
+    let marked = marks(world);
     let mut actions = Vec::new();
     let mut fit = false;
 
     ui.horizontal(|ui| {
-        let mut button = |ui: &mut egui::Ui, text: &str, action: Action, what: &str| {
+        let button = |ui: &mut egui::Ui, actions: &mut Vec<Action>, text: &str, action: Action, what: &str| {
             let tip = match keymap.chord_for(action) {
                 Some(chord) => format!("{what} ({chord})"),
                 None => what.to_string(),
@@ -98,13 +107,13 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                 actions.push(action);
             }
         };
-        button(ui, "⏮", Action::GoToStart, "Go to start");
-        button(ui, "◀", Action::StepBackward, "Previous frame");
-        button(ui, "◀", Action::ShuttleBackward, "Play backward; again: faster");
-        button(ui, if t.playing { "⏸" } else { "▶" }, Action::TogglePlay, "Play / pause (also K)");
-        button(ui, "▶▶", Action::ShuttleForward, "Play forward; again: faster");
-        button(ui, "▶|", Action::StepForward, "Next frame");
-        button(ui, "⏭", Action::GoToEnd, "Go to end");
+        button(ui, &mut actions, "⏮", Action::GoToStart, "Go to start");
+        button(ui, &mut actions, "◀", Action::StepBackward, "Previous frame");
+        button(ui, &mut actions, "◀", Action::ShuttleBackward, "Play backward; again: faster");
+        button(ui, &mut actions, if t.playing { "⏸" } else { "▶" }, Action::TogglePlay, "Play / pause (also K)");
+        button(ui, &mut actions, "▶▶", Action::ShuttleForward, "Play forward; again: faster");
+        button(ui, &mut actions, "▶|", Action::StepForward, "Next frame");
+        button(ui, &mut actions, "⏭", Action::GoToEnd, "Go to end");
         ui.separator();
 
         let speed_tip = format!(
@@ -134,6 +143,22 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             .clicked()
         {
             actions.push(Action::ToggleSnap);
+        }
+        ui.separator();
+        button(ui, &mut actions, "In", Action::MarkIn, "Mark the in point here: the first frame an export renders");
+        button(ui, &mut actions, "Out", Action::MarkOut, "Mark the out point here: the last frame an export renders");
+        if marked.is_set() {
+            let r = marked.frames(t.frame_count);
+            let n = r.end - r.start;
+            ui.label(egui::RichText::new(format!("{}\u{2013}{} \u{b7} {n} fr", r.start, r.end - 1)).monospace().color(style::RANGE)).on_hover_text(format!(
+                "What an export covers: frames {} to {}, both included ({n} frames, {:.2} s). Drag the brackets on the ruler to move them; {} and {} go to them.",
+                r.start,
+                r.end - 1,
+                n as f64 / t.fps.as_f64(),
+                keymap.chord_for(Action::GoToIn).unwrap_or_default(),
+                keymap.chord_for(Action::GoToOut).unwrap_or_default()
+            ));
+            button(ui, &mut actions, "Clear", Action::ClearMarks, "Clear the in and out points: exports render the whole video");
         }
         ui.separator();
         ui.monospace(format!("{} / {}", t.frame(), t.last_frame()));
@@ -359,6 +384,73 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
     response.context_menu(|ui| menu::entity_menu(ui, world));
 
+    // Snapping (N, Ctrl inverts) pulls the playhead, and the in and out
+    // points, to the edges of timeline objects within 8 points.
+    let snapping = world.resource::<tt_core::commands::TimeSnap>().enabled != ui.input(|i| i.modifiers.ctrl);
+    let mut points = if snapping { tt_core::commands::snap_points(world) } else { Vec::new() };
+    let reach = ((8.0 / scale.px_per_frame().max(1e-6)).round() as FrameIndex).max(1);
+
+    // In and out points: a bracket on the ruler for each one marked, to drag
+    // (one undo step); the playhead goes with it, so the viewport shows the
+    // frame the export starts or ends on.
+    let handles = mark_handles(&scale, marked, t.frame_count);
+    let handle_at = |p: Pos2| {
+        handles
+            .iter()
+            .filter(|(_, x)| p.y < lanes_area.min.y && (p.x - x).abs() <= EDGE_GRAB + 1.0)
+            .min_by(|a, b| (p.x - a.1).abs().total_cmp(&(p.x - b.1).abs()))
+            .map(|(end, _)| *end)
+    };
+    let mut tl = std::mem::take(&mut *world.resource_mut::<TimelineUi>());
+    tl.hover_mark = response.hover_pos().and_then(handle_at);
+    if tl.mark.is_none()
+        && response.drag_started_by(egui::PointerButton::Primary)
+        && let Some(end) = origin.and_then(handle_at)
+    {
+        tl.mark = Some(end);
+        tt_core::marks::begin_drag(world, end.name());
+    }
+    if let Some(end) = tl.mark {
+        if ui.input(|i| i.pointer.primary_down())
+            && let Some(p) = pointer
+        {
+            let range = marked.frames(t.frame_count);
+            let under = scale.frame_at(p.x).round() as FrameIndex;
+            let f = if end == MarkEnd::In { under } else { under - 1 };
+            let f = tt_core::commands::snap(&points, f, reach).unwrap_or(f);
+            let (f, moved) = match end {
+                MarkEnd::In => {
+                    let f = f.clamp(0, range.end - 1);
+                    (f, Marks { mark_in: Some(f), ..marked })
+                }
+                MarkEnd::Out => {
+                    let f = f.clamp(range.start, t.last_frame());
+                    (f, Marks { mark_out: Some(f), ..marked })
+                }
+            };
+            set_marks(world, moved, &format!("Move {} point", end.name()));
+            if f != t.frame() {
+                actions.push(Action::Seek(f));
+            }
+            let r = moved.frames(t.frame_count);
+            response.clone().on_hover_text_at_pointer(format!("{} point: frame {f}  ·  {}  ·  {} frames from in to out", end.title(), timecode(f, t.fps), r.end - r.start));
+        } else {
+            tt_core::marks::end_drag(world);
+            tl.mark = None;
+        }
+    }
+    let dragging_mark = tl.mark.is_some();
+    let hot = tl.mark.or(tl.hover_mark);
+    if hot.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    *world.resource_mut::<TimelineUi>() = tl;
+    // Drawn as they are now (a drag may just have moved one).
+    let marked = marks(world);
+    if marked.is_set() {
+        draw_marks(&painter, &scale, rect, band, marked.frames(t.frame_count), &mark_handles(&scale, marked, t.frame_count), hot);
+    }
+
     // Playhead: a frame-wide band when frames are wide enough to see, else a line.
     let shown = t.frame() as f64;
     let (x0, x1) = (scale.x(shown), scale.x(shown + 1.0));
@@ -367,10 +459,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
     painter.line_segment([Pos2::new(x0, rect.min.y), Pos2::new(x0, rect.max.y)], Stroke::new(1.5, style::ACCENT));
 
-    // Scrub with the primary button, from the ruler; snapping (N, Ctrl inverts)
-    // pulls the playhead to the edges of timeline objects within 8 points.
-    let snapping = world.resource::<tt_core::commands::TimeSnap>().enabled != ui.input(|i| i.modifiers.ctrl);
-    let points = if snapping { tt_core::commands::snap_points(world) } else { Vec::new() };
+    // Scrub with the primary button, from the ruler.
     if snapping {
         for p in &points {
             let x = scale.x(*p as f64 + 0.5);
@@ -379,18 +468,35 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                 painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 3.0, y - 5.0), Pos2::new(x + 3.0, y - 5.0), Pos2::new(x, y)], style::ACCENT.gamma_multiply(0.6), Stroke::NONE));
             }
         }
+        // The playhead snaps to the in and out points too.
+        if marked.is_set() {
+            let r = marked.frames(t.frame_count);
+            points.extend([r.start, r.end - 1]);
+            points.sort_unstable();
+            points.dedup();
+        }
     }
-    let reach = ((8.0 / scale.px_per_frame().max(1e-6)).round() as FrameIndex).max(1);
     let to_frame = |x: f32| {
         let f = (scale.frame_at(x).floor() as FrameIndex).clamp(0, t.last_frame());
         tt_core::commands::snap(&points, f, reach).unwrap_or(f)
     };
-    if let Some(pos) = response.hover_pos().filter(|p| p.y < lanes_area.min.y) {
-        let f = to_frame(pos.x);
-        response.clone().on_hover_text_at_pointer(format!("{f}  ·  {}", timecode(f, t.fps)));
+    if let Some(pos) = response.hover_pos().filter(|p| p.y < lanes_area.min.y && !dragging_mark) {
+        let tip = match hot {
+            Some(end) => {
+                let r = marked.frames(t.frame_count);
+                let f = if end == MarkEnd::In { r.start } else { r.end - 1 };
+                format!("{} point: frame {f}  ·  {}  ·  drag to move it", end.title(), timecode(f, t.fps))
+            }
+            None => {
+                let f = to_frame(pos.x);
+                format!("{f}  ·  {}", timecode(f, t.fps))
+            }
+        };
+        response.clone().on_hover_text_at_pointer(tip);
     }
     let from_ruler = origin.is_some_and(|o| o.y < lanes_area.min.y);
     if from_ruler
+        && !dragging_mark
         && (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
         && let Some(pos) = response.interact_pointer_pos()
     {
@@ -722,7 +828,7 @@ fn lanes(
 }
 
 /// Timeline pointer state (a box being dragged over the lanes, an end of a
-/// lifetime being dragged) and what the lanes cache.
+/// lifetime or a mark being dragged) and what the lanes cache.
 #[derive(Resource, Debug, Default)]
 pub struct TimelineUi {
     /// The box's anchor, in content coordinates (screen y + lane scroll).
@@ -730,12 +836,69 @@ pub struct TimelineUi {
     /// The end of a lifetime being dragged, and the one under the pointer.
     edge: Option<(Entity, Edge)>,
     hover_edge: Option<(Entity, Edge)>,
+    /// The in or out point being dragged, and the one under the pointer.
+    mark: Option<MarkEnd>,
+    hover_mark: Option<MarkEnd>,
     /// Tracker lanes' per-column summaries.
     columns: std::collections::HashMap<Entity, (u64, Columns)>,
     /// A stroke was in progress last frame.
     live: bool,
     /// Where the lanes were drawn (the demo aims at it).
     pub lanes_area: Option<Rect>,
+}
+
+/// An in or out point (`tt_core::marks`), as a handle on the ruler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkEnd {
+    In,
+    Out,
+}
+
+impl MarkEnd {
+    fn name(self) -> &'static str {
+        if self == MarkEnd::In { "in" } else { "out" }
+    }
+
+    fn title(self) -> &'static str {
+        if self == MarkEnd::In { "In" } else { "Out" }
+    }
+}
+
+/// An in or out point is being dragged on the ruler (the viewport shows what an export leaves out meanwhile).
+pub fn dragging_mark(world: &World) -> bool {
+    world.get_resource::<TimelineUi>().is_some_and(|t| t.mark.is_some())
+}
+
+/// The brackets of the marks set: the in point's at the start of its frame, the out point's at the end of its.
+fn mark_handles(scale: &Scale, marked: Marks, count: FrameIndex) -> Vec<(MarkEnd, f32)> {
+    let r = marked.frames(count);
+    [marked.mark_in.map(|_| (MarkEnd::In, scale.x(r.start as f64))), marked.mark_out.map(|_| (MarkEnd::Out, scale.x(r.end as f64)))].into_iter().flatten().collect()
+}
+
+/// The in and out points: outside them shaded, between them a bar along the
+/// ruler's foot, and a bracket on each one marked (`hot`: under the pointer
+/// or being dragged), with a thin line down through the lanes.
+fn draw_marks(painter: &egui::Painter, scale: &Scale, rect: Rect, band: Rect, range: Range<FrameIndex>, handles: &[(MarkEnd, f32)], hot: Option<MarkEnd>) {
+    let (x0, x1) = (scale.x(range.start as f64).max(rect.min.x), scale.x(range.end as f64).min(rect.max.x));
+    let veil = egui::Color32::from_black_alpha(110);
+    if x0 > rect.min.x {
+        painter.rect_filled(Rect::from_x_y_ranges(rect.min.x..=x0.min(rect.max.x), rect.y_range()), 0.0, veil);
+    }
+    if x1 < rect.max.x {
+        painter.rect_filled(Rect::from_x_y_ranges(x1.max(rect.min.x)..=rect.max.x, rect.y_range()), 0.0, veil);
+    }
+    if x1 > x0 {
+        painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, band.max.y - 4.0..=band.max.y), 0.0, style::RANGE.gamma_multiply(0.8));
+    }
+    for (end, x) in handles {
+        let stroke = Stroke::new(if hot == Some(*end) { 3.0 } else { 2.0 }, style::RANGE);
+        let tab = if *end == MarkEnd::In { 6.0 } else { -6.0 };
+        let (top, foot) = (band.min.y + 1.5, band.max.y - 1.0);
+        painter.line_segment([Pos2::new(*x, top), Pos2::new(*x, foot)], stroke);
+        painter.line_segment([Pos2::new(*x, top), Pos2::new(x + tab, top)], stroke);
+        painter.line_segment([Pos2::new(*x, foot), Pos2::new(x + tab, foot)], stroke);
+        painter.line_segment([Pos2::new(*x, band.max.y), Pos2::new(*x, rect.max.y)], Stroke::new(1.0, style::RANGE.gamma_multiply(0.45)));
+    }
 }
 
 /// `0.25×`, `1×`, `1.5×`: at most two decimals (auto speed sets rates

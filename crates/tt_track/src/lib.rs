@@ -412,6 +412,8 @@ impl Module for TrackModule {
             .init_resource::<look::LookDefaults>()
             .declare::<look::LookMasker>(Class::Session)
             .init_resource::<look::LookMasker>()
+            .declare::<export::StabilizerDefaults>(Class::Session)
+            .init_resource::<export::StabilizerDefaults>()
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .register_type::<Matching>()

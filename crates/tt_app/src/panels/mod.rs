@@ -2,6 +2,7 @@
 //! queue actions/intents; they never own state or mutate the document directly.
 
 mod brush;
+pub mod export;
 mod inspector;
 pub mod look_editor;
 mod menu;
@@ -24,6 +25,7 @@ use crate::session::Session;
 use crate::style;
 
 pub fn draw(ui: &mut egui::Ui, world: &mut World) {
+    crate::update::drive(ui.ctx(), world);
     egui::Panel::top("top_bar").show(ui, |ui| top_bar(ui, world));
     egui::CentralPanel::no_frame().show(ui, |ui| {
         world.resource_scope(|world, mut layout: Mut<Layout>| {
@@ -31,8 +33,35 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
             layout.tree.ui(&mut behavior, ui);
         });
     });
+    export::ui(ui.ctx(), world);
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
+}
+
+/// A new version, in one click from anywhere (Settings \u{2192} Updates has the details).
+fn update_button(ui: &mut egui::Ui, world: &World) {
+    use crate::update::{State, Updater, installable};
+    let up = world.resource::<Updater>();
+    match up.state() {
+        State::Available(release) if installable() && release.download.is_some() => {
+            ui.separator();
+            let button = egui::Button::new(egui::RichText::new(format!("\u{2B06} Update to {}", release.version)).color(style::ACCENT));
+            let tip = "A new version of trackertools is out. Click to download it, save your work, and restart with it (Settings \u{2192} Updates says what's new).";
+            if ui.add(button).on_hover_text(tip).clicked() {
+                up.update(release);
+            }
+        }
+        State::Downloading { got, total, .. } => {
+            ui.separator();
+            let pct = (100 * got).checked_div(total).unwrap_or(0);
+            ui.label(egui::RichText::new(format!("Updating\u{2026} {pct}%")).color(style::ACCENT));
+        }
+        State::Ready { .. } | State::Restarting => {
+            ui.separator();
+            ui.label(egui::RichText::new("Restarting with the new version\u{2026}").color(style::ACCENT));
+        }
+        _ => {}
+    }
 }
 
 fn top_bar(ui: &mut egui::Ui, world: &mut World) {
@@ -86,6 +115,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 ui.label(egui::RichText::new("no media (demo clock)").color(style::MUTED));
             }
         }
+        update_button(ui, world);
         if let Some((msg, error)) = &world.resource::<StatusLine>().0 {
             ui.label(egui::RichText::new(msg).color(if *error { egui::Color32::from_rgb(0xf4, 0x3f, 0x5e) } else { style::MUTED }));
         }

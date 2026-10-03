@@ -155,6 +155,24 @@ fn rows(world: &mut World, st: &OutlinerState) -> Vec<Row> {
         &tree[i..end]
     };
     let mut out = Vec::new();
+    // Subjects first, each with its members under it (they're also in the tree below).
+    let subjects = {
+        let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
+        let mut v: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "subject").map(|(e, _)| e).collect();
+        creation_order(world, &mut v);
+        v
+    };
+    for s in subjects {
+        let members = tt_core::subject::members_of(world, s);
+        if !filter.is_empty() && !matches(world, s) && !members.iter().any(|m| matches(world, *m)) {
+            continue;
+        }
+        let open = !filter.is_empty() || !st.folded.contains(&s);
+        out.push(Row::Entity { e: s, depth: 0, fold: (!members.is_empty()).then_some(open) });
+        if open {
+            out.extend(members.into_iter().map(|m| Row::Entity { e: m, depth: 1, fold: None }));
+        }
+    }
     let mut hidden_below: Option<usize> = None;
     for (i, &(s, depth)) in tree.iter().enumerate() {
         if let Some(d) = hidden_below {
@@ -483,7 +501,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 /// sketches, strokes or views.
 fn other_entities(world: &mut World) -> Vec<Entity> {
     let mut q = world.query_filtered::<(Entity, Option<&Operator>), (With<Created>, Without<Capture>, Without<tt_track::look::Look>, Without<Disabled>)>();
-    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame" || o.kind == "track")).map(|(e, _)| e).collect();
+    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame" || o.kind == "track" || o.kind == "subject")).map(|(e, _)| e).collect();
     creation_order(world, &mut out);
     out
 }
