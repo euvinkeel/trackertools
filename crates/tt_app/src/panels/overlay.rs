@@ -21,6 +21,8 @@ use super::viewport::ViewportMapping;
 use crate::style;
 
 pub const LIVE: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+/// Subjects (tt_core::subject).
+pub const SUBJECT: Color32 = Color32::from_rgb(0xc0, 0x84, 0xfc);
 /// Frames of path drawn either side of the playhead for the selected sketch.
 const PATH_FRAMES: FrameIndex = 90;
 
@@ -34,6 +36,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     let selected = picked.last().and_then(|e| sketch_of(world, *e));
     let mut q = world.query::<(Entity, &Operator, &Output)>();
     let sketches: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "sketch").map(|(e, _, o)| (e, o.0)).collect();
+    let subject_list: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "subject").map(|(e, _, o)| (e, o.0)).collect();
     let trackers = super::tracks::list(world);
     let world: &World = world;
     // The shown space's framing around the playhead, looked up once per frame drawn.
@@ -68,6 +71,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     }
 
     super::tracks::draw(painter, map, world, &trackers, frame, &space);
+    subjects(painter, map, world, &subject_list, &picked, frame, &space);
 
     if let Some(live) = live {
         if live.target.is_none() {
@@ -132,6 +136,52 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let r = Align2::LEFT_TOP.anchor_size(map.panel.left_top() + Vec2::new(15.0, 65.0), galley.size()).expand(5.0);
         painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
         painter.galley(r.min + Vec2::splat(5.0), galley, color);
+    }
+}
+
+/// Subjects (tt_core::subject): a diamond turned with each one's angle, a tick
+/// the way it faces, and its name. The selected one also shows its path, its
+/// members joined to it, and (when an offset moves it from there) where its
+/// members' motion alone puts it, dashed.
+#[allow(clippy::too_many_arguments)]
+fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(Entity, tt_core::signal::SignalId)], picked: &[Entity], frame: FrameIndex, space: &dyn Fn(FrameIndex) -> SpaceMap) {
+    let store = world.resource::<SignalStore>();
+    // A source point on frame f, in the shown space's pixels.
+    let shown = |f: FrameIndex, x: f32, y: f32| {
+        let (x, y) = (x as f64, y as f64);
+        let b = space(f).box_from_source([x, y, x, y, x, y]);
+        [b[0], b[1]]
+    };
+    for (e, sig) in list {
+        let Some(sig) = store.get(*sig) else { continue };
+        let value = |f: FrameIndex| sig.get(f).filter(|v| v.len() >= tt_core::subject::SUBJECT_CHANNELS);
+        let selected = picked.contains(e);
+        let color = if selected { SUBJECT } else { SUBJECT.gamma_multiply(0.6) };
+        if selected {
+            path(painter, map, frame, |f| value(f).map(|v| shown(f, v[0], v[1])), color);
+        }
+        let Some(v) = value(frame) else { continue };
+        let p = map.to_screen(shown(frame, v[0], v[1]));
+        if selected {
+            for m in tt_core::subject::members_of(world, *e) {
+                if let Some(q) = world.get::<Output>(m).and_then(|o| store.get(o.0)).and_then(|s| s.get(frame)).filter(|q| q.len() >= 2) {
+                    painter.add(Shape::dashed_line(&[p, map.to_screen(shown(frame, q[0], q[1]))], Stroke::new(1.0, color.gamma_multiply(0.45)), 3.0, 3.0));
+                }
+            }
+            let pushed = map.to_screen(shown(frame, v[8], v[9]));
+            if (pushed - p).length() > 2.0 {
+                painter.add(Shape::dashed_line(&[pushed, p], Stroke::new(1.0, color.gamma_multiply(0.7)), 2.0, 3.0));
+                painter.circle_stroke(pushed, 3.0, Stroke::new(1.0, color.gamma_multiply(0.7)));
+            }
+        }
+        let (s, c) = v[6].sin_cos();
+        let r = if selected { 9.0 } else { 7.0 };
+        let turned = |x: f32, y: f32| p + Vec2::new(c * x - s * y, s * x + c * y);
+        painter.add(Shape::closed_line(vec![turned(r, 0.0), turned(0.0, r), turned(-r, 0.0), turned(0.0, -r)], Stroke::new(if selected { 2.0 } else { 1.5 }, color)));
+        painter.line_segment([turned(r, 0.0), turned(r + 7.0, 0.0)], Stroke::new(1.5, color));
+        if let Some(name) = world.get::<Name>(*e) {
+            painter.text(p + Vec2::new(r + 4.0, -r - 2.0), Align2::LEFT_BOTTOM, name.as_str(), FontId::proportional(12.0), color);
+        }
     }
 }
 

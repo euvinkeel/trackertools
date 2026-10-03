@@ -20,8 +20,10 @@
 //! Trackers are *job* operators: evaluation leaves their dirty frames to
 //! [`runner`], which runs them in background threads forward and backward
 //! from the anchor, keeps old results on screen as stale until new ones
-//! arrive, and can hold them to the playhead (catch-up mode).
+//! arrive, and can hold them to the playhead (catch-up mode). Which way
+//! they track is the user's to ask ([`TrackRun`]): new trackers wait.
 
+pub mod export;
 pub mod image;
 pub mod job;
 pub mod look;
@@ -77,6 +79,61 @@ pub enum Method {
     /// CoTracker3 (Meta's learned point tracker, CC-BY-NC weights): seeded at
     /// the looks' points, run by a Python worker on the job's frames.
     CoTracker,
+}
+
+/// What a tracker is asked to do (its buttons): track forward from its
+/// anchor, backward, both ways, or nothing for now. Not a setting: switching
+/// keeps every result and only says which side's jobs may run (and keep
+/// re-tracking after edits). New trackers start paused ([`NewTrackers`]);
+/// a tracker saved before this existed tracks both ways, as it always did.
+#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[reflect(Component)]
+pub enum TrackRun {
+    #[default]
+    Paused,
+    Forward,
+    Backward,
+    Both,
+}
+
+impl TrackRun {
+    pub fn forward(self) -> bool {
+        matches!(self, TrackRun::Forward | TrackRun::Both)
+    }
+
+    pub fn backward(self) -> bool {
+        matches!(self, TrackRun::Backward | TrackRun::Both)
+    }
+}
+
+/// A tracker's run state (one without any, from before: both ways).
+pub fn run_of(world: &World, tracker: Entity) -> TrackRun {
+    world.get::<TrackRun>(tracker).copied().unwrap_or(TrackRun::Both)
+}
+
+/// Ask `tracker` to track one way, both, or pause. Like its results, not an
+/// undo step (undoing an edit shouldn't stop tracking), but saved.
+pub fn set_run(world: &mut World, tracker: Entity, run: TrackRun) {
+    if !is_tracker(world, tracker) || run_of(world, tracker) == run {
+        return;
+    }
+    world.entity_mut(tracker).insert(run);
+    world.resource_mut::<History>().touch();
+}
+
+/// What new trackers start with.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct NewTrackers {
+    /// Templates or CoTracker (the Track tool's two buttons).
+    pub method: Method,
+    /// Paused: each starts when asked (scripted runs and tests start them at once).
+    pub run: TrackRun,
+}
+
+impl Default for NewTrackers {
+    fn default() -> Self {
+        Self { method: Method::Template, run: TrackRun::Paused }
+    }
 }
 
 /// Which copy of the video a tracker reads.
@@ -230,8 +287,9 @@ fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Entity, look: Look, space
     let mut inputs = vec![("guide".to_string(), guide)];
     inputs.extend(space.map(|v| ("space".to_string(), v)));
     inputs.push(("look".to_string(), look));
-    let tracker = Tracker { center_on_guide: !placed, ..Tracker::at(anchor) };
-    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), tracker, runner::TrackBook::default()))
+    let new = tx.world().get_resource::<NewTrackers>().copied().unwrap_or_default();
+    let tracker = Tracker { center_on_guide: !placed, method: new.method, ..Tracker::at(anchor) };
+    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), tracker, runner::TrackBook::default(), new.run))
 }
 
 /// A look around the guide's point on `frame`: a square of `feature` × its
@@ -405,12 +463,17 @@ impl Module for TrackModule {
             .operator_params::<Tracker>()
             .component::<runner::TrackBook>(Class::Document)
             .component::<Look>(Class::Document)
+            .component::<TrackRun>(Class::Document)
+            .declare::<NewTrackers>(Class::Session)
+            .init_resource::<NewTrackers>()
             .declare::<tool::TrackTool>(Class::Session)
             .init_resource::<tool::TrackTool>()
             .declare::<look::LookDefaults>(Class::Session)
             .init_resource::<look::LookDefaults>()
             .declare::<look::LookMasker>(Class::Session)
             .init_resource::<look::LookMasker>()
+            .declare::<export::StabilizerDefaults>(Class::Session)
+            .init_resource::<export::StabilizerDefaults>()
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .register_type::<Matching>()

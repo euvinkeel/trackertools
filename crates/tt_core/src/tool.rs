@@ -95,7 +95,8 @@ fn apply_tool_actions(mut actions: ResMut<PendingActions>, mut active: ResMut<Ac
     }
 }
 
-/// A click (in any tool) selects the sketch whose region is under it, or clears the selection.
+/// A click (in any tool) selects the subject whose point is under it, else
+/// the sketch whose region is, or clears the selection.
 fn select_on_click(world: &mut World) {
     let Some(pos) = world.resource::<PointerFrame>().click else { return };
     // In the Track tool a click places a tracker.
@@ -105,7 +106,9 @@ fn select_on_click(world: &mut World) {
     let frame = world.resource::<crate::transport::Transport>().frame();
     // The pointer is in the shown space's pixels; sketches live in source pixels.
     let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);
-    let picked = crate::sketch::pick_sketch(world, frame, pos);
+    let scale = world.resource::<PointerFrame>().scale;
+    let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
+    let picked = crate::subject::pick_subject(world, frame, pos, grab).or_else(|| crate::sketch::pick_sketch(world, frame, pos));
     let mut sel = world.resource_mut::<crate::selection::Selection>();
     match picked {
         Some(e) => sel.select_only(e),

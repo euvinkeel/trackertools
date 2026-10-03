@@ -36,6 +36,9 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.heading(crate::panels::outliner::label(world, e));
     super::tracks::inspector(ui, world, e);
+    if tt_core::subject::is_subject(world, e) {
+        subject_section(ui, world, e);
+    }
     if world.get::<SketchParams>(e).is_some() {
         sketch_presets(ui, world, e);
     }
@@ -109,6 +112,99 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     }
     if r.drag_stopped {
         world.resource_mut::<History>().end();
+    }
+}
+
+/// A subject (tt_core::subject): its members, its own offset on the shown
+/// frame (editing keys it there; a drag is one undo step), its anchor, and
+/// its keys (click one to go to its frame).
+fn subject_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    use tt_core::input::{Action, PendingActions};
+    use tt_core::subject::{OffsetKey, Subject, members_of, offset_at, remove_offset_key, set_offset_key};
+    let Some(subject) = world.get::<Subject>(e).cloned() else { return };
+    let here = world.resource::<Transport>().frame();
+    let members = members_of(world, e);
+    let name = crate::panels::outliner::label(world, e);
+    ui.label(
+        egui::RichText::new(
+            "It moves with its members' motion (one coming, going or getting lost never makes it jump), plus its own offset. \
+             Drag it on the video (Select tool) to put it where you want it on this frame: that keys the offset.",
+        )
+        .weak()
+        .small(),
+    );
+    let mut select: Option<Entity> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("{} member{}:", members.len(), if members.len() == 1 { "" } else { "s" }));
+        for m in &members {
+            if ui.small_button(crate::panels::outliner::label(world, *m)).on_hover_text("Select it").clicked() {
+                select = Some(*m);
+            }
+        }
+    });
+    let keyed = subject.offsets.iter().any(|k| k.frame == here);
+    let [x, y, a] = offset_at(&subject.offsets, here);
+    let (mut x, mut y, mut a) = (x as f32, y as f32, a.to_degrees() as f32);
+    let (mut changed, mut started, mut stopped) = (false, false, false);
+    ui.horizontal(|ui| {
+        ui.label(if keyed { format!("Its key on frame {here}:") } else { format!("Its offset on frame {here}:") }).on_hover_text(
+            "Where on the moving thing it sits (px, in its starting frame's directions, so it turns with the thing) and how much more it is turned. \
+             Linear between keys, held beyond them. Changing it here keys it on this frame.",
+        );
+        for (v, suffix, speed) in [(&mut x, " x", 0.5), (&mut y, " y", 0.5), (&mut a, "\u{b0}", 0.2)] {
+            let r = ui.add(egui::DragValue::new(v).speed(speed).max_decimals(2).suffix(suffix));
+            changed |= r.changed();
+            started |= r.drag_started();
+            stopped |= r.drag_stopped();
+        }
+    });
+    let (mut unkey, mut anchor) = (false, false);
+    ui.horizontal(|ui| {
+        if keyed && ui.button("Remove this key").clicked() {
+            unkey = true;
+        }
+        if subject.anchor != here
+            && ui
+                .button(format!("Start it here (frame {here})"))
+                .on_hover_text(format!("Its anchor is frame {}: there it starts in the middle of its members, and their motion carries it both ways from there.", subject.anchor))
+                .clicked()
+        {
+            anchor = true;
+        }
+    });
+    let mut go: Option<tt_core::time::FrameIndex> = None;
+    if !subject.offsets.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Keys:");
+            for k in &subject.offsets {
+                let tip = format!("Go to frame {}: {:+.1}, {:+.1} px, {:+.1}\u{b0}", k.frame, k.x, k.y, k.angle);
+                if ui.small_button(k.frame.to_string()).on_hover_text(tip).clicked() {
+                    go = Some(k.frame);
+                }
+            }
+        });
+    }
+    ui.separator();
+    if started {
+        world.resource_mut::<History>().begin(format!("Key {name}"));
+    }
+    if changed {
+        set_offset_key(world, e, OffsetKey { frame: here, x, y, angle: a });
+    }
+    if stopped {
+        world.resource_mut::<History>().end();
+    }
+    if unkey {
+        remove_offset_key(world, e, here);
+    }
+    if anchor {
+        edit(world, &format!("Start {name} on frame {here}"), |tx| tx.modify::<Subject>(e, |s| s.anchor = here));
+    }
+    if let Some(f) = go {
+        world.resource_mut::<PendingActions>().push(Action::Seek(f));
+    }
+    if let Some(m) = select {
+        world.resource_mut::<Selection>().select_only(m);
     }
 }
 

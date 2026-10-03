@@ -30,15 +30,32 @@ impl Default for DecodeOptions {
     }
 }
 
+/// The folder FFmpeg was installed into (the app's setup) or chosen from:
+/// where [`tool`] looks first, after the environment variable.
+static DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Set (or forget) the folder [`tool`] looks in first.
+pub fn set_dir(dir: Option<PathBuf>) {
+    *DIR.write().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
 /// An ffmpeg executable (`ffmpeg`, `ffprobe`): the environment variable `var`
-/// if set, else `name` on PATH. On macOS, when PATH doesn't have it, also
-/// Homebrew's folders: an app opened from Finder or the Dock gets a minimal
-/// PATH without them.
+/// if set, else the folder given to [`set_dir`], next to this program, or
+/// `name` on PATH. On macOS, when PATH doesn't have it, also Homebrew's
+/// folders: an app opened from Finder or the Dock gets a minimal PATH
+/// without them.
 pub fn tool(name: &str, var: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(var).filter(|v| !v.is_empty()) {
         return PathBuf::from(path);
     }
     let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    if let Some(chosen) = DIR.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|d| d.join(&exe)).filter(|p| p.is_file()) {
+        return chosen;
+    }
+    // A copy next to the program: a build that ships its own.
+    if let Some(beside) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(&exe))).filter(|p| p.is_file()) {
+        return beside;
+    }
     let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()));
     if !on_path && cfg!(target_os = "macos") {
         let brew = ["/opt/homebrew/bin", "/usr/local/bin"].iter().map(|d| Path::new(d).join(name)).find(|p| p.is_file());
@@ -47,6 +64,28 @@ pub fn tool(name: &str, var: &str) -> PathBuf {
         }
     }
     PathBuf::from(name)
+}
+
+/// ffmpeg's options before and after `-i` that start decoding exactly at
+/// presented frame `first` (an index into `index.frames`).
+pub(crate) fn seek_args(index: &VideoIndex, first: usize) -> (Vec<String>, Vec<String>) {
+    if first == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    // Seek a quarter frame before the target: the previous frame is dropped,
+    // the target kept, with no floating-point tie at the boundary.
+    let quarter = 0.25 / index.fps.as_f64();
+    match index.leading_frame_start(first) {
+        // Normal case: ffmpeg seeks to the right keyframe and trims to the target.
+        None => (vec!["-ss".into(), format!("{:.6}", index.seconds(first) - quarter)], Vec::new()),
+        // Open-GOP leading frame: position at an earlier keyframe, then trim
+        // on the output side (still inside ffmpeg: skipped frames never
+        // cross the pipe). Output timestamps start at 0 at the input seek.
+        Some(start) => (
+            vec!["-ss".into(), format!("{:.6}", (index.seconds(start) - quarter).max(0.0))],
+            vec!["-ss".into(), format!("{:.6}", index.seconds(first) - index.seconds(start))],
+        ),
+    }
 }
 
 pub struct FrameStream {
@@ -70,31 +109,8 @@ impl FrameStream {
         if let Some(hw) = &opts.hwaccel {
             cmd.args(["-hwaccel", hw]);
         }
-        // Seek a quarter frame before the target: the previous frame is dropped,
-        // the target kept, with no floating-point tie at the boundary.
-        let quarter = 0.25 / index.fps.as_f64();
-        let mut output_seek = None;
-        if first > 0 {
-            match index.leading_frame_start(first) {
-                // Normal case: ffmpeg seeks to the right keyframe and trims to the target.
-                None => {
-                    let t = index.seconds(first) - quarter;
-                    cmd.args(["-ss", &format!("{t:.6}")]);
-                }
-                // Open-GOP leading frame: position at an earlier keyframe, then trim
-                // on the output side (still inside ffmpeg: skipped frames never
-                // cross the pipe). Output timestamps start at 0 at the input seek.
-                Some(start) => {
-                    let t = index.seconds(start) - quarter;
-                    cmd.args(["-ss", &format!("{:.6}", t.max(0.0))]);
-                    output_seek = Some(index.seconds(first) - index.seconds(start));
-                }
-            }
-        }
-        cmd.arg("-i").arg(&index.path);
-        if let Some(t) = output_seek {
-            cmd.args(["-ss", &format!("{t:.6}")]);
-        }
+        let (before, after) = seek_args(index, first);
+        cmd.args(before).arg("-i").arg(&index.path).args(after);
         cmd.args(["-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough", "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1"]);
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]

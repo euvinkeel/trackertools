@@ -2,6 +2,7 @@
 //! queue actions/intents; they never own state or mutate the document directly.
 
 mod brush;
+pub mod export;
 mod inspector;
 pub mod look_editor;
 mod menu;
@@ -24,6 +25,7 @@ use crate::session::Session;
 use crate::style;
 
 pub fn draw(ui: &mut egui::Ui, world: &mut World) {
+    crate::update::drive(ui.ctx(), world);
     egui::Panel::top("top_bar").show(ui, |ui| top_bar(ui, world));
     egui::CentralPanel::no_frame().show(ui, |ui| {
         world.resource_scope(|world, mut layout: Mut<Layout>| {
@@ -31,8 +33,36 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
             layout.tree.ui(&mut behavior, ui);
         });
     });
+    export::ui(ui.ctx(), world);
+    crate::setup::window(ui.ctx(), &mut world.resource_mut::<crate::setup::Doctor>());
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
+}
+
+/// A new version, in one click from anywhere (Settings \u{2192} Updates has the details).
+fn update_button(ui: &mut egui::Ui, world: &World) {
+    use crate::update::{State, Updater, installable};
+    let up = world.resource::<Updater>();
+    match up.state() {
+        State::Available(release) if installable() && release.download.is_some() => {
+            ui.separator();
+            let button = egui::Button::new(egui::RichText::new(format!("\u{2B06} Update to {}", release.version)).color(style::ACCENT));
+            let tip = "A new version of trackertools is out. Click to download it, save your work, and restart with it (Settings \u{2192} Updates says what's new).";
+            if ui.add(button).on_hover_text(tip).clicked() {
+                up.update(release);
+            }
+        }
+        State::Downloading { got, total, .. } => {
+            ui.separator();
+            let pct = (100 * got).checked_div(total).unwrap_or(0);
+            ui.label(egui::RichText::new(format!("Updating\u{2026} {pct}%")).color(style::ACCENT));
+        }
+        State::Ready { .. } | State::Restarting => {
+            ui.separator();
+            ui.label(egui::RichText::new("Restarting with the new version\u{2026}").color(style::ACCENT));
+        }
+        _ => {}
+    }
 }
 
 fn top_bar(ui: &mut egui::Ui, world: &mut World) {
@@ -40,7 +70,11 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut reopen = None;
     let mut history_action = None;
     let mut new_sketch = false;
+    let mut track_kind = None;
+    let mut report_problem = false;
     let tracking = tracks::summary(world);
+    let kind = world.resource::<tt_track::NewTrackers>().method;
+    let cotracker = tt_track::job::cotracker_availability();
     let t = world.resource::<Transport>();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
@@ -86,6 +120,14 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 ui.label(egui::RichText::new("no media (demo clock)").color(style::MUTED));
             }
         }
+        update_button(ui, world);
+        if world.resource::<crate::setup::Doctor>().last_run_failed {
+            ui.separator();
+            report_problem = ui
+                .button(egui::RichText::new("\u{26a0} Report a problem").color(egui::Color32::from_rgb(0xfb, 0xbf, 0x24)))
+                .on_hover_text("trackertools stopped because of an error the last time. Click Report a problem. Then click Copy report and send the report to the person who gave you trackertools.")
+                .clicked();
+        }
         if let Some((msg, error)) = &world.resource::<StatusLine>().0 {
             ui.label(egui::RichText::new(msg).color(if *error { egui::Color32::from_rgb(0xf4, 0x3f, 0x5e) } else { style::MUTED }));
         }
@@ -119,18 +161,31 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         }
         let tracking_tool = world.resource::<ActiveTool>().0 == Tool::Track;
         let track_chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Track)).unwrap_or_default();
-        if ui
-            .selectable_label(tracking_tool, "⌖ Track")
-            .on_hover_text(format!(
-                "Track tool ({track_chord})
-                 • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
-                 • click: a point, with a pattern the dashed box's size (Ctrl+wheel sizes it; the wheel zooms)
-                 • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
-                 • select a look (Outliner, Inspector) to paint which of its pixels are the subject"
-            ))
-            .clicked()
-        {
-            history_action = Some(Action::Tool(Tool::Track));
+        for (method, text, what) in [
+            (tt_track::Method::Template, "⌖ Template tracker", "matches the pattern you show it on every frame: fast, sub-pixel, built in"),
+            (tt_track::Method::CoTracker, "⌖ CoTracker", "Meta's CoTracker3, a learned point tracker, run in Python (PyTorch and its weights)"),
+        ] {
+            let usable = method == tt_track::Method::Template || cotracker.is_ok();
+            let r = ui
+                .add_enabled_ui(usable, |ui| ui.selectable_label(tracking_tool && kind == method, text))
+                .inner
+                .on_hover_text(format!(
+                    "Track tool ({track_chord}) making a {}: {what}
+                     • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
+                     • click: a point, with a pattern the dashed box's size (Ctrl+wheel sizes it; the wheel zooms)
+                     • a new tracker waits: Back, Both or Forward in the Inspector (or its right-click menu) tracks it; Pause stops it
+                     • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
+                     • select a look (Outliner, Inspector) to paint which of its pixels are the subject",
+                    tracks::kind_name(method)
+                ))
+                .on_disabled_hover_text(cotracker.clone().err().unwrap_or_default());
+            if r.clicked() {
+                track_kind = Some(method);
+                // The other kind while the tool is on: switch kinds, keep the tool.
+                if !tracking_tool || kind == method {
+                    history_action = Some(Action::Tool(Tool::Track));
+                }
+            }
         }
         let sketch_selected = world.resource::<tt_core::selection::Selection>().primary().is_some_and(|e| tt_core::sketch::is_sketch(world, e));
         if ui
@@ -155,6 +210,14 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     });
     if open {
         world.resource_mut::<PendingActions>().push(Action::OpenFile);
+    }
+    if report_problem {
+        let mut doctor = world.resource_mut::<crate::setup::Doctor>();
+        (doctor.open, doctor.last_run_failed) = (true, false);
+        doctor.recheck();
+    }
+    if let Some(method) = track_kind {
+        world.resource_mut::<tt_track::NewTrackers>().method = method;
     }
     if let Some(a) = history_action {
         world.resource_mut::<PendingActions>().push(a);

@@ -51,6 +51,51 @@ pub fn worker_command() -> (PathBuf, PathBuf) {
     (python, script)
 }
 
+/// Whether CoTracker can run on this computer: the worker script, a Python
+/// and the weights where the worker looks for them. Err: what's missing, in
+/// words for the button. (Whether that Python has PyTorch shows when a job
+/// starts.) Checked once.
+pub fn availability() -> Result<(), String> {
+    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECKED
+        .get_or_init(|| {
+            let (python, script) = worker_command();
+            if !script.is_file() {
+                return Err("CoTracker needs its Python worker (editor/cotracker_worker.py in the trackertools repository), which this copy doesn't have.".into());
+            }
+            let bare = python.components().count() == 1;
+            if !(python.is_file() || bare && on_path(&python)) {
+                return Err("CoTracker needs Python with PyTorch (TT_PYTHON says which).".into());
+            }
+            if !weights().is_some_and(|w| w.is_file()) {
+                return Err("CoTracker needs Meta's CoTracker3 weights, scaled_online.pth (TT_COTRACKER_WEIGHTS says where).".into());
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+fn on_path(program: &std::path::Path) -> bool {
+    let exe = if cfg!(windows) { program.with_extension("exe") } else { program.to_path_buf() };
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()))
+}
+
+/// Where the worker finds the weights: `TT_COTRACKER_WEIGHTS`, else torch
+/// hub's cache (`torch.hub.get_dir()`, as v1 downloaded them).
+fn weights() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("TT_COTRACKER_WEIGHTS") {
+        return Some(PathBuf::from(p));
+    }
+    let hub = match std::env::var_os("TORCH_HOME") {
+        Some(t) => PathBuf::from(t).join("hub"),
+        None => {
+            let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".cache"));
+            std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or(home)?.join("torch").join("hub")
+        }
+    };
+    Some(hub.join("checkpoints").join("scaled_online.pth"))
+}
+
 /// A worker's message.
 enum Reply {
     Ready,
@@ -71,13 +116,14 @@ struct Process {
 impl Process {
     fn start() -> Result<Self> {
         let (python, script) = worker_command();
-        let mut child = Command::new(&python)
-            .arg(&script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("starting the CoTracker worker ({} {})", python.display(), script.display()))?;
+        let mut cmd = Command::new(&python);
+        cmd.arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: the app has no console
+        }
+        let mut child = cmd.spawn().with_context(|| format!("starting the CoTracker worker ({} {})", python.display(), script.display()))?;
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let (tx, replies) = channel();

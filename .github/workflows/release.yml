@@ -1,0 +1,64 @@
+# Builds the Windows app and publishes it as a GitHub release when a version
+# tag is pushed (git tag v0.2.0 && git push origin v0.2.0). The tag is the
+# version: the app is built with TT_VERSION set to it, and Settings > Updates
+# in every released copy finds the new release and installs it in one click
+# (crates/tt_app/src/update.rs). Run it by hand for an existing tag from
+# Actions > Release > Run workflow.
+#
+# The zip holds trackertools.exe alone (the updater installs from it): FFmpeg
+# isn't bundled, the app sets it up on its first start (tt_app::setup).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to release (it must exist), e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Rust 1.95
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:TT_VERSION = $env:TAG
+          # The C runtime linked in: it runs without the Visual C++ redistributable.
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          cargo build -p tt_app --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item target/release/trackertools.exe pkg/
+          Compress-Archive -Path pkg/* -DestinationPath trackertools-windows-x64.zip
+          Get-ChildItem pkg, trackertools-windows-x64.zip | Format-Table Name, Length
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG trackertools-windows-x64.zip --clobber
+          } else {
+            gh release create $env:TAG trackertools-windows-x64.zip --title "trackertools $env:TAG" --generate-notes
+          }
