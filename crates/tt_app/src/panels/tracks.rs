@@ -319,8 +319,10 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             (Method::CoTracker, "⌖ CoTracker", "Drag a rectangle around what to follow in this sketch (or click a point): Meta's CoTracker3, a learned point tracker, run in Python. It searches inside this sketch's box, in its view."),
         ] {
             let usable = method == Method::Template || cotracker.is_ok();
-            let r = ui.add_enabled(usable, egui::Button::new(text)).on_hover_text(tip).on_disabled_hover_text(cotracker.clone().err().unwrap_or_default());
-            if r.clicked() {
+            let r = ui.button(text).on_hover_text(if usable { tip } else { "CoTracker is not set up on this computer. Click CoTracker. The doctor shows what CoTracker needs and sets it up." });
+            if r.clicked() && !usable {
+                world.resource_mut::<crate::setup::Doctor>().show();
+            } else if r.clicked() {
                 world.resource_mut::<NewTrackers>().method = method;
                 world.resource_mut::<ActiveTool>().0 = Tool::Track;
             }

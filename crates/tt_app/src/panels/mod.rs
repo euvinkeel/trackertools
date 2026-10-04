@@ -72,6 +72,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut new_sketch = false;
     let mut track_kind = None;
     let mut report_problem = false;
+    let mut open_doctor = false;
     let tracking = tracks::summary(world);
     let kind = world.resource::<tt_track::NewTrackers>().method;
     let cotracker = tt_track::job::cotracker_availability();
@@ -128,6 +129,22 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 .on_hover_text("trackertools stopped because of an error the last time. Click Report a problem. Then click Copy report and send the report to the person who gave you trackertools.")
                 .clicked();
         }
+        {
+            use crate::cotracker::Step;
+            let co = world.resource::<crate::setup::Doctor>().cotracker();
+            let (step, finished) = (co.step(), co.finished());
+            let shown = match &step {
+                s if s.busy() => Some((format!("\u{23f3} CoTracker setup: {}", s.short()), style::ACCENT)),
+                Step::Failed(_) => Some(("\u{26a0} CoTracker setup stopped".to_string(), egui::Color32::from_rgb(0xfb, 0xbf, 0x24))),
+                Step::Done(_) if finished.is_some_and(|s| s < 60) => Some(("\u{2714} CoTracker is ready".to_string(), style::ACCENT)),
+                _ => None,
+            };
+            if let Some((text, color)) = shown {
+                ui.separator();
+                open_doctor |= ui.button(egui::RichText::new(text).color(color)).on_hover_text(format!("{} Click to open the doctor.", step.text())).clicked();
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
         if let Some((msg, error)) = &world.resource::<StatusLine>().0 {
             ui.label(egui::RichText::new(msg).color(if *error { egui::Color32::from_rgb(0xf4, 0x3f, 0x5e) } else { style::MUTED }));
         }
@@ -166,9 +183,12 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             (tt_track::Method::CoTracker, "⌖ CoTracker", "Meta's CoTracker3, a learned point tracker, run in Python (PyTorch and its weights)"),
         ] {
             let usable = method == tt_track::Method::Template || cotracker.is_ok();
-            let r = ui
-                .add_enabled_ui(usable, |ui| ui.selectable_label(tracking_tool && kind == method, text))
-                .inner
+            let r = ui.selectable_label(tracking_tool && kind == method, text);
+            if !usable {
+                open_doctor |= r.on_hover_text("CoTracker is not set up on this computer. Click CoTracker. The doctor shows what CoTracker needs and sets it up.").clicked();
+                continue;
+            }
+            let r = r
                 .on_hover_text(format!(
                     "Track tool ({track_chord}) making a {}: {what}
                      • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
@@ -177,8 +197,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                      • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
                      • select a look (Outliner, Inspector) to paint which of its pixels are the subject",
                     tracks::kind_name(method)
-                ))
-                .on_disabled_hover_text(cotracker.clone().err().unwrap_or_default());
+                ));
             if r.clicked() {
                 track_kind = Some(method);
                 // The other kind while the tool is on: switch kinds, keep the tool.
@@ -215,6 +234,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         let mut doctor = world.resource_mut::<crate::setup::Doctor>();
         (doctor.open, doctor.last_run_failed) = (true, false);
         doctor.recheck();
+    }
+    if open_doctor {
+        world.resource_mut::<crate::setup::Doctor>().show();
     }
     if let Some(method) = track_kind {
         world.resource_mut::<tt_track::NewTrackers>().method = method;
