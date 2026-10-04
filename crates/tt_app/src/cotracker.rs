@@ -1,0 +1,577 @@
+//! Setting CoTracker up on a computer that only has the program (the
+//! doctor, `crate::setup`). CoTracker3 runs in a Python worker
+//! (tt_track::job::learned) with PyTorch on an NVIDIA graphics card. All of
+//! it goes into `cotracker\` in the data folder (`tt_track::job::cotracker_dir`):
+//!
+//! - `uv\`: uv, Astral's single-file Python manager, from its GitHub release
+//!   (checked against its SHA-256). It needs no admin rights and changes
+//!   nothing else on the computer.
+//! - `python\`, `env\`: a Python 3.12 of uv's own, and an environment with
+//!   PyTorch 2.14.0 built for the card: CUDA 13.0 for Blackwell (the RTX 50
+//!   cards; the CUDA 12.6 build has no code for them), else CUDA 12.6, what
+//!   the worker was developed with; and the worker's other packages (NumPy,
+//!   PyAV, OpenCV), at the versions it was developed with. pip installs
+//!   them (from the Python itself, `ensurepip`), not uv: uv unpacks into its
+//!   cache and then renames the folder, which Windows refused ("Access is
+//!   denied") for PyTorch's thousands of new DLLs while Defender scanned
+//!   them; pip unpacks in place. Its temporary folder (the download's
+//!   progress) and uv's cache go afterwards.
+//! - `code\`: the worker's code, packed into the program (build.rs).
+//! - `scaled_online.pth`: Meta's CoTracker3 model from Hugging Face, checked
+//!   against its SHA-256. CC BY-NC 4.0, non-commercial use only: the doctor
+//!   says so before.
+//!
+//! Then the worker starts once, to see that it loads the model on the card.
+//! Every step says what it does in a sentence (ASD-STE100, as all of setup).
+//! `TT_COTRACKER_CUDA=cu126|cu130` picks the PyTorch build (tests).
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::setup::{download, fetch_text, find, sha256};
+use crate::update::{Problem, quiet, system_tool};
+
+mod code {
+    include!(concat!(env!("OUT_DIR"), "/cotracker_code.rs"));
+}
+
+pub const UV_ZIP: &str = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip";
+pub const MODEL: &str = "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth";
+/// The model's SHA-256, as Hugging Face publishes it (and v1's copy has it).
+pub const MODEL_SHA256: &str = "205d34789f19699d64b22cf93f9b697f15f28d4025240e31532e504109837218";
+pub const MODEL_BYTES: u64 = 101_695_610;
+const PYTHON: &str = "3.12";
+const TORCH: &str = "torch==2.14.0";
+const PACKAGES: [&str; 3] = ["numpy==2.5.2", "av==18.1.0", "opencv-python-headless==5.0.0.93"];
+
+const AGAIN: &str = "Then click Set up CoTracker again.";
+const ASK: &str = "Click Copy report. Send the report to the person who gave you trackertools.";
+
+/// The NVIDIA graphics card, as its driver's `nvidia-smi` tells.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gpu {
+    pub name: String,
+    /// CUDA compute capability (Blackwell's RTX 50 cards: 12.0).
+    pub compute: (u32, u32),
+    pub driver: String,
+}
+
+/// The computer's NVIDIA graphics card, if it has one with a driver.
+pub fn nvidia_gpu() -> Option<Gpu> {
+    let smi = [system_tool("nvidia-smi"), PathBuf::from(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe")]
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("nvidia-smi"));
+    let out = quiet(smi).args(["--query-gpu=name,compute_cap,driver_version", "--format=csv,noheader"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_gpu(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The first card of `nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader`.
+fn parse_gpu(text: &str) -> Option<Gpu> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+    let (major, minor) = parts.get(1)?.split_once('.')?;
+    Some(Gpu { name: parts.first()?.to_string(), compute: (major.parse().ok()?, minor.parse().ok()?), driver: parts.get(2)?.to_string() })
+}
+
+/// The PyTorch build a card needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plan {
+    /// PyTorch's index for it (`cu130`).
+    pub index: &'static str,
+    /// Its CUDA version, for people.
+    pub cuda: &'static str,
+    /// The oldest NVIDIA driver that runs it.
+    pub min_driver: u32,
+}
+
+const CUDA_13: Plan = Plan { index: "cu130", cuda: "13.0", min_driver: 580 };
+const CUDA_12: Plan = Plan { index: "cu126", cuda: "12.6", min_driver: 528 };
+
+/// The PyTorch build for `gpu`, or why it can't run CoTracker (a sentence for the person).
+pub fn plan(gpu: &Gpu) -> Result<Plan, String> {
+    let plan = match std::env::var("TT_COTRACKER_CUDA").as_deref() {
+        Ok("cu130") => CUDA_13,
+        Ok("cu126") => CUDA_12,
+        _ => match gpu.compute.0 {
+            10.. => CUDA_13,
+            5..=9 => CUDA_12,
+            _ => return Err(format!("The {} is too old for CoTracker.", gpu.name)),
+        },
+    };
+    let driver: u32 = gpu.driver.split('.').next().and_then(|d| d.parse().ok()).unwrap_or(0);
+    if driver < plan.min_driver {
+        return Err(format!(
+            "CoTracker needs NVIDIA driver {} or later. This computer has driver {}. Update the NVIDIA driver. {AGAIN}",
+            plan.min_driver, gpu.driver
+        ));
+    }
+    Ok(plan)
+}
+
+/// Where a CoTracker setup is.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Step {
+    #[default]
+    Idle,
+    Uv,
+    Python,
+    /// PyTorch for CUDA `cuda`: bytes of it on the disk so far.
+    Torch { cuda: &'static str, bytes: u64 },
+    Packages,
+    Code,
+    Model { got: u64, total: u64 },
+    Test,
+    /// Ready on this card.
+    Done(String),
+    Failed(Problem),
+}
+
+impl Step {
+    pub fn busy(&self) -> bool {
+        !matches!(self, Step::Idle | Step::Done(_) | Step::Failed(_))
+    }
+
+    /// In a sentence, for the person.
+    pub fn text(&self) -> String {
+        let gb = |b: u64| b as f64 / 1e9;
+        match self {
+            Step::Idle => String::new(),
+            Step::Uv => "trackertools downloads uv, a Python installer (18 MB).".into(),
+            Step::Python => "trackertools installs Python 3.12 for CoTracker.".into(),
+            Step::Torch { cuda, bytes } => format!("trackertools downloads and installs PyTorch for CUDA {cuda} (approximately 2 GB): {:.1} GB on the disk now.", gb(*bytes)),
+            Step::Packages => "trackertools installs NumPy, PyAV and OpenCV.".into(),
+            Step::Code => "trackertools copies the CoTracker code.".into(),
+            Step::Model { got, total } => format!("trackertools downloads the CoTracker model: {:.0} MB of {:.0} MB.", *got as f64 / 1e6, *total as f64 / 1e6),
+            Step::Test => "trackertools starts CoTracker on the graphics card. This can take 1 minute.".into(),
+            Step::Done(gpu) => format!("CoTracker is ready on the {gpu}."),
+            Step::Failed(p) => p.what.clone(),
+        }
+    }
+
+    /// A few words, for the top bar.
+    pub fn short(&self) -> String {
+        match self {
+            Step::Uv | Step::Python => "Python".into(),
+            Step::Torch { bytes, .. } => format!("PyTorch, {:.1} GB", *bytes as f64 / 1e9),
+            Step::Packages => "packages".into(),
+            Step::Code => "code".into(),
+            Step::Model { got, total } => format!("model, {}%", (100 * got).checked_div(*total).unwrap_or(0)),
+            Step::Test => "test".into(),
+            other => other.text(),
+        }
+    }
+}
+
+/// A CoTracker setup running in the background, shared with the doctor.
+#[derive(Clone, Default)]
+pub struct Setup {
+    step: Arc<Mutex<Step>>,
+    started: Arc<Mutex<Option<Instant>>>,
+    finished: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Setup {
+    pub fn step(&self) -> Step {
+        self.step.lock().expect("step").clone()
+    }
+
+    /// Seconds since it started (while it runs).
+    pub fn elapsed(&self) -> Option<u64> {
+        self.started.lock().expect("started").map(|t| t.elapsed().as_secs())
+    }
+
+    /// Seconds since it finished, if it did.
+    pub fn finished(&self) -> Option<u64> {
+        self.finished.lock().expect("finished").map(|t| t.elapsed().as_secs())
+    }
+
+    /// Set CoTracker up for `gpu` in the data folder.
+    pub fn start(&self, gpu: Gpu) {
+        if self.step().busy() {
+            return;
+        }
+        *self.step.lock().expect("step") = Step::Uv;
+        *self.started.lock().expect("started") = Some(Instant::now());
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let dir = tt_track::job::cotracker_dir();
+            tracing::info!("CoTracker setup for the {} (CUDA capability {}.{}, driver {}) in {}", gpu.name, gpu.compute.0, gpu.compute.1, gpu.driver, dir.display());
+            let step = |s: Step| *me.step.lock().expect("step") = s;
+            let done = install(&dir, &gpu, &step);
+            tt_track::job::forget_cotracker_availability();
+            match &done {
+                Ok(device) => tracing::info!("CoTracker is set up: the worker loaded on {device}"),
+                Err(p) => tracing::warn!("CoTracker setup: {} ({})", p.what, p.details),
+            }
+            step(match done {
+                Ok(_) => Step::Done(gpu.name.trim_start_matches("NVIDIA ").to_string()),
+                Err(p) => Step::Failed(p),
+            });
+            *me.started.lock().expect("started") = None;
+            *me.finished.lock().expect("finished") = Some(Instant::now());
+        });
+    }
+}
+
+/// Set CoTracker up for `gpu` in `dir`, telling `step` each step. The
+/// device the worker loaded the model on.
+pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Problem> {
+    let plan = plan(gpu).map_err(|why| Problem::new(&why, &gpu.name))?;
+    let cannot_write = |e: std::io::Error| Problem::new("trackertools cannot write to its folder. Make sure that the disk has approximately 6 GB free. Then click Set up CoTracker again.", e);
+    std::fs::create_dir_all(dir).map_err(cannot_write)?;
+
+    step(Step::Uv);
+    let uv = get_uv(dir)?;
+
+    step(Step::Python);
+    let env = dir.join("env");
+    let python = env.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+    let no_python = |d: String| Problem::new(&format!("trackertools cannot install Python. Make sure that the computer is connected to the internet. {AGAIN}"), d);
+    if !python.is_file() {
+        let py = format!("--python={PYTHON}");
+        run(uv_command(&uv, dir).args(["venv".as_ref(), env.as_os_str(), py.as_ref()]), None).map_err(no_python)?;
+    }
+    // pip comes with Python (no download).
+    if !pip(&python, dir).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        run(python_command(&python, dir).args(["-m", "ensurepip", "--upgrade"]), None).map_err(no_python)?;
+    }
+
+    // pip downloads into its temporary folder (here), so its size is the download's progress.
+    let tmp = dir.join("tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(cannot_write)?;
+    let index = format!("https://download.pytorch.org/whl/{}", plan.index);
+    step(Step::Torch { cuda: plan.cuda, bytes: 0 });
+    run(pip(&python, dir).args(["install", "--no-cache-dir", TORCH, "--index-url", &index]), Some((&tmp, &|bytes| step(Step::Torch { cuda: plan.cuda, bytes }))))
+        .map_err(|d| Problem::new(&format!("trackertools cannot install PyTorch. Make sure that the computer is connected to the internet and that the disk has approximately 6 GB free. {AGAIN}"), d))?;
+
+    step(Step::Packages);
+    run(pip(&python, dir).args(["install", "--no-cache-dir"]).args(PACKAGES), None)
+        .map_err(|d| Problem::new(&format!("trackertools cannot install NumPy, PyAV and OpenCV. Make sure that the computer is connected to the internet. {AGAIN}"), d))?;
+
+    step(Step::Code);
+    let code = dir.join("code");
+    write_code(&code).map_err(cannot_write)?;
+
+    let model = dir.join("scaled_online.pth");
+    if !sha256(&model).is_ok_and(|h| h == MODEL_SHA256) {
+        step(Step::Model { got: 0, total: MODEL_BYTES });
+        let part = dir.join("scaled_online.pth.part");
+        download(MODEL, &part, &|got| step(Step::Model { got, total: MODEL_BYTES }))
+            .map_err(|p| Problem::new(&format!("The download of the CoTracker model stopped. Make sure that the computer is connected to the internet. {AGAIN}"), p.details))?;
+        let got = sha256(&part).map_err(cannot_write)?;
+        if got != MODEL_SHA256 {
+            let _ = std::fs::remove_file(&part);
+            return Err(Problem::new(&format!("The CoTracker model download is not correct. {AGAIN}"), format!("SHA-256 {got}, expected {MODEL_SHA256}")));
+        }
+        let _ = std::fs::remove_file(&model);
+        std::fs::rename(&part, &model).map_err(cannot_write)?;
+    }
+
+    step(Step::Test);
+    let device = test_worker(&python, &code.join("editor").join("cotracker_worker.py"), &model)?;
+    if device != "cuda" {
+        return Err(Problem::new(&format!("CoTracker starts, but it cannot use the graphics card. Update the NVIDIA driver. {AGAIN}"), format!("the worker loaded on {device}")));
+    }
+    // pip's temporary folder and uv's cache (Python's download): the environment has everything it needs.
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(dir.join("cache"));
+    Ok(device)
+}
+
+/// uv in `dir\uv` (downloaded and checked the first time).
+fn get_uv(dir: &Path) -> Result<PathBuf, Problem> {
+    let home = dir.join("uv");
+    let uv = home.join(format!("uv{}", std::env::consts::EXE_SUFFIX));
+    if quiet(uv.clone()).arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return Ok(uv);
+    }
+    let stopped = |d: String| Problem::new(&format!("The download of uv stopped. Make sure that the computer is connected to the internet. {AGAIN}"), d);
+    std::fs::create_dir_all(&home).map_err(|e| stopped(e.to_string()))?;
+    let zip = home.join("uv.zip");
+    download(UV_ZIP, &zip, &|_| {}).map_err(|p| stopped(p.details))?;
+    let expected = fetch_text(&format!("{UV_ZIP}.sha256")).map_err(stopped)?;
+    let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+    let got = sha256(&zip).map_err(|e| stopped(e.to_string()))?;
+    if expected.len() != 64 || got != expected {
+        return Err(Problem::new(&format!("The download of uv is not correct. {AGAIN}"), format!("SHA-256 {got}, expected {expected}")));
+    }
+    let out = quiet(system_tool("tar")).arg("-xf").arg(&zip).arg("-C").arg(&home).output().map_err(|e| stopped(e.to_string()))?;
+    let _ = std::fs::remove_file(&zip);
+    if !out.status.success() {
+        return Err(stopped(String::from_utf8_lossy(&out.stderr).into_owned()));
+    }
+    // (The program may sit in a folder inside the zip.)
+    if !uv.is_file()
+        && let Some(found) = find(&home, &format!("uv{}", std::env::consts::EXE_SUFFIX))
+    {
+        let _ = std::fs::copy(found, &uv);
+    }
+    Ok(uv)
+}
+
+/// uv, with its own Python and cache in `dir`, and none of the person's own uv or Python settings.
+fn uv_command(uv: &Path, dir: &Path) -> Command {
+    let mut cmd: Command = quiet(uv.to_path_buf());
+    cmd.env("UV_PYTHON_INSTALL_DIR", dir.join("python"))
+        .env("UV_CACHE_DIR", dir.join("cache"))
+        .env("UV_PYTHON_PREFERENCE", "only-managed")
+        .env("UV_NO_CONFIG", "1")
+        .env("UV_NO_PROGRESS", "1");
+    for v in ["VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH", "UV_INDEX_URL", "UV_EXTRA_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX"] {
+        cmd.env_remove(v);
+    }
+    cmd
+}
+
+/// The environment's Python, with none of the person's own Python or pip
+/// settings, its temporary folder in `dir`.
+fn python_command(python: &Path, dir: &Path) -> Command {
+    let mut cmd: Command = quiet(python.to_path_buf());
+    let tmp = dir.join("tmp");
+    cmd.env("TMP", &tmp)
+        .env("TEMP", &tmp)
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PIP_CONFIG_FILE", if cfg!(windows) { "nul" } else { "/dev/null" })
+        .env("PIP_NO_INPUT", "1")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .env("PIP_NO_CACHE_DIR", "1")
+        .env("PIP_PROGRESS_BAR", "off");
+    for v in ["PYTHONHOME", "PYTHONPATH", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_REQUIRE_VIRTUALENV", "PIP_USER", "PIP_TARGET", "PIP_PREFIX"] {
+        cmd.env_remove(v);
+    }
+    cmd
+}
+
+/// `python -m pip`, as [`python_command`].
+fn pip(python: &Path, dir: &Path) -> Command {
+    let mut cmd = python_command(python, dir);
+    cmd.args(["-m", "pip"]);
+    cmd
+}
+
+/// Run `cmd`, logging what it says. While it runs, `watch` is told how big
+/// a folder is (a download's progress). Err: its last words.
+fn run(cmd: &mut Command, watch: Option<(&Path, &dyn Fn(u64))>) -> Result<(), String> {
+    let what = format!("{} {}", cmd.get_program().to_string_lossy(), cmd.get_args().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
+    tracing::info!("CoTracker setup: {what}");
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("{what}: {e}"))?;
+    let said = Arc::new(Mutex::new(Vec::<String>::new()));
+    let readers: Vec<_> = [child.stdout.take().map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|e| Box::new(e) as Box<dyn std::io::Read + Send>)]
+        .into_iter()
+        .flatten()
+        .map(|pipe| {
+            let said = said.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    tracing::info!("  {line}");
+                    let mut s = said.lock().expect("lines");
+                    s.push(line);
+                    if s.len() > 40 {
+                        s.remove(0);
+                    }
+                }
+            })
+        })
+        .collect();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if let Some((folder, tell)) = watch {
+            tell(folder_size(folder));
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+    };
+    for r in readers {
+        let _ = r.join();
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{what}: {status}\n{}", said.lock().expect("lines").join("\n")))
+    }
+}
+
+/// The bytes in a folder and the folders in it. (Each file's own size: the
+/// folder's listing doesn't update a file still being written, on Windows.)
+fn folder_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => folder_size(&e.path()),
+            _ => std::fs::metadata(e.path()).map_or(0, |m| m.len()),
+        })
+        .sum()
+}
+
+/// Write the worker's code (packed into the program) into `dir`, replacing what was there.
+pub fn write_code(dir: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_dir_all(dir);
+    for (path, bytes) in code::FILES {
+        let to = dir.join(path);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(to, bytes)?;
+    }
+    Ok(())
+}
+
+/// Start the worker and wait (up to 5 minutes) for it to load the model:
+/// the device it loaded on (`cuda`, `cpu`, `mps`).
+pub fn test_worker(python: &Path, worker: &Path, model: &Path) -> Result<String, Problem> {
+    let failed = |d: String| Problem::new(&format!("CoTracker does not start. {ASK}"), d);
+    let mut child = quiet(python.to_path_buf())
+        .arg(worker)
+        .arg("--weights")
+        .arg(model)
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| failed(format!("{}: {e}", python.display())))?;
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let errors = errors.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                tracing::info!("CoTracker worker: {line}");
+                let mut e = errors.lock().expect("lines");
+                e.push(line);
+                if e.len() > 30 {
+                    e.remove(0);
+                }
+            }
+        });
+    }
+    let (tx, rx) = channel();
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let said = |e: &Arc<Mutex<Vec<String>>>| e.lock().expect("lines").join("\n");
+    let result = loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                if let Some(ready) = v.get("ready") {
+                    break Ok(ready.get("device").and_then(|d| d.as_str()).unwrap_or("unknown").to_string());
+                }
+                if let Some(e) = v.get("error") {
+                    break Err(failed(format!("{e}\n{}", said(&errors))));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break Err(failed(format!("the worker stopped\n{}", said(&errors)))),
+            Err(RecvTimeoutError::Timeout) if Instant::now() > deadline => break Err(failed("no answer in 5 minutes".into())),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu(name: &str, compute: (u32, u32), driver: &str) -> Gpu {
+        Gpu { name: name.into(), compute, driver: driver.into() }
+    }
+
+    #[test]
+    fn the_card_is_read_from_nvidia_smi() {
+        assert_eq!(parse_gpu("NVIDIA GeForce RTX 5080, 12.0, 581.57\n"), Some(gpu("NVIDIA GeForce RTX 5080", (12, 0), "581.57")));
+        assert_eq!(parse_gpu("\nNVIDIA GeForce RTX 4090, 8.9, 591.86\nNVIDIA GeForce GTX 1060, 6.1, 591.86\n"), Some(gpu("NVIDIA GeForce RTX 4090", (8, 9), "591.86")), "the first card");
+        assert_eq!(parse_gpu("No devices were found"), None);
+    }
+
+    #[test]
+    fn blackwell_gets_cuda_13_and_the_rest_cuda_12() {
+        assert_eq!(plan(&gpu("NVIDIA GeForce RTX 5080", (12, 0), "581.57")), Ok(CUDA_13));
+        assert_eq!(plan(&gpu("NVIDIA GeForce RTX 4090", (8, 9), "591.86")), Ok(CUDA_12));
+        assert_eq!(plan(&gpu("NVIDIA GeForce GTX 1060", (6, 1), "560.94")), Ok(CUDA_12));
+        let old_driver = plan(&gpu("NVIDIA GeForce RTX 5080", (12, 0), "572.16")).unwrap_err();
+        assert!(old_driver.starts_with("CoTracker needs NVIDIA driver 580 or later. This computer has driver 572.16. Update the NVIDIA driver."), "{old_driver}");
+        assert_eq!(plan(&gpu("NVIDIA GeForce GTX 780", (3, 5), "474.30")), Err("The NVIDIA GeForce GTX 780 is too old for CoTracker.".into()));
+    }
+
+    #[test]
+    fn the_code_is_written_out_as_the_worker_expects_it() {
+        let dir = std::env::temp_dir().join(format!("tt-cotracker-code-{}", std::process::id()));
+        write_code(&dir).expect("written");
+        for f in ["editor/cotracker_worker.py", "editor/engine.py", "editor/frames.py", "cotracker/models/build_cotracker.py", "cotracker/models/core/cotracker/cotracker3_online.py", "LICENSE.md"] {
+            assert!(dir.join(f).is_file(), "{f}");
+        }
+        assert!(code::FILES.len() >= 30, "{} files", code::FILES.len());
+        assert!(!code::FILES.iter().any(|(p, _)| p.contains("__pycache__")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole setup for real, into `TT_COTRACKER_SETUP_TEST` (a scratch
+    /// folder): uv, Python, PyTorch, the packages, the code, the model, and
+    /// the worker loading on this computer's NVIDIA card. Downloads about
+    /// 2.5 GB, so only when asked: `cargo test -p tt_app full_setup -- --ignored`
+    /// (`TT_COTRACKER_CUDA=cu130` installs what an RTX 50 card gets).
+    #[test]
+    #[ignore]
+    fn full_setup_for_real() {
+        let dir = PathBuf::from(std::env::var("TT_COTRACKER_SETUP_TEST").expect("TT_COTRACKER_SETUP_TEST: a scratch folder"));
+        let gpu = nvidia_gpu().expect("an NVIDIA card");
+        let t0 = Instant::now();
+        let last = Mutex::new(String::new());
+        let step = |s: Step| {
+            let text = s.text();
+            let mut l = last.lock().unwrap();
+            // (The download's progress: every step, and PyTorch at most every 10 seconds.)
+            let key = text.split(':').next().unwrap_or_default().to_string();
+            if *l != key || t0.elapsed().as_secs().is_multiple_of(10) {
+                eprintln!("[{:>4} s] {text}", t0.elapsed().as_secs());
+                *l = key;
+            }
+        };
+        let device = install(&dir, &gpu, &step).unwrap_or_else(|p| panic!("{}
+{}", p.what, p.details));
+        eprintln!("[{:>4} s] done: CoTracker loads on {device}", t0.elapsed().as_secs());
+        assert_eq!(device, "cuda");
+        assert!(dir.join("env").is_dir() && dir.join("scaled_online.pth").is_file() && !dir.join("cache").exists(), "installed, cache gone");
+    }
+
+    /// The worker's code as written out, run by this computer's CoTracker
+    /// Python (the repository's .venv) on its model: it loads. Skipped
+    /// without them.
+    #[test]
+    fn the_written_code_loads_the_model() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let python = repo.join(".venv").join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+        let model = tt_track::job::cotracker_model().filter(|m| m.is_file());
+        let (true, Some(model)) = (python.is_file(), model) else {
+            eprintln!("skipped: no CoTracker Python or model here");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("tt-cotracker-run-{}", std::process::id()));
+        write_code(&dir).expect("written");
+        let device = test_worker(&python, &dir.join("editor").join("cotracker_worker.py"), &model).expect("the worker loads the model");
+        eprintln!("CoTracker loaded on {device}");
+        assert!(["cuda", "cpu", "mps"].contains(&device.as_str()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

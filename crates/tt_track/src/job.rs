@@ -33,7 +33,10 @@ use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
 
 mod learned;
 
-pub use learned::availability as cotracker_availability;
+pub use learned::{
+    availability as cotracker_availability, forget_availability as forget_cotracker_availability, installed_dir as cotracker_dir, installed_python as cotracker_python,
+    installed_weights as cotracker_weights, installed_worker as cotracker_worker, weights as cotracker_model,
+};
 
 pub use learned::worker_command;
 

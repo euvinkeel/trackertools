@@ -3,6 +3,7 @@
 // A release build is a windowed program: no console window beside it.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod cotracker;
 mod demo;
 mod input_probe;
 mod keys;
@@ -27,7 +28,7 @@ fn main() -> eframe::Result {
     if !ready {
         tracing::info!("FFmpeg not found: setup first");
     }
-    let (title, size, min) = if ready { ("trackertools", [1600.0, 950.0], [900.0, 560.0]) } else { ("trackertools setup", [780.0, 760.0], [560.0, 480.0]) };
+    let (title, size, min) = if ready { ("trackertools", [1600.0, 950.0], [900.0, 560.0]) } else { ("trackertools setup", [800.0, 900.0], [560.0, 480.0]) };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size(min),
         ..Default::default()

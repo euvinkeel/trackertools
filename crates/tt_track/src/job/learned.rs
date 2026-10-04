@@ -36,43 +36,70 @@ use crate::image::{Grid, Luma, chroma_planes, resample_xy, with_colour};
 pub const CROP_W: usize = 512;
 pub const CROP_H: usize = 384;
 
+/// Where the app's doctor sets CoTracker up on a computer without the
+/// repository (tt_app::cotracker): `cotracker\` in the data folder.
+pub fn installed_dir() -> PathBuf {
+    tt_media::proxy::data_dir().join("cotracker")
+}
+
+/// The Python of the environment the doctor made.
+pub fn installed_python() -> PathBuf {
+    installed_dir().join("env").join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" })
+}
+
+/// The worker, as the doctor wrote it out (the code is packed into the app).
+pub fn installed_worker() -> PathBuf {
+    installed_dir().join("code").join("editor").join("cotracker_worker.py")
+}
+
+/// The model the doctor downloaded.
+pub fn installed_weights() -> PathBuf {
+    installed_dir().join("scaled_online.pth")
+}
+
 /// The Python interpreter and worker script to run: `TT_PYTHON` and
-/// `TT_COTRACKER_WORKER`, else the repository's `.venv` (as v1 set it up)
-/// or `python3` / `python`, and `editor/cotracker_worker.py` next to this crate.
+/// `TT_COTRACKER_WORKER`, else what the doctor set up, else the repository's
+/// `.venv` (as v1 set it up) or `python3` / `python`, and
+/// `editor/cotracker_worker.py` next to this crate.
 pub fn worker_command() -> (PathBuf, PathBuf) {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let python = std::env::var_os("TT_PYTHON").map(PathBuf::from).unwrap_or_else(|| {
-        [repo.join(".venv/Scripts/python.exe"), repo.join(".venv/bin/python")]
+        [installed_python(), repo.join(".venv/Scripts/python.exe"), repo.join(".venv/bin/python")]
             .into_iter()
             .find(|p| p.exists())
             .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "python" } else { "python3" }))
     });
-    let script = std::env::var_os("TT_COTRACKER_WORKER").map(PathBuf::from).unwrap_or_else(|| repo.join("editor/cotracker_worker.py"));
+    let script = std::env::var_os("TT_COTRACKER_WORKER").map(PathBuf::from).unwrap_or_else(|| {
+        let installed = installed_worker();
+        if installed.is_file() { installed } else { repo.join("editor/cotracker_worker.py") }
+    });
     (python, script)
 }
 
+static CHECKED: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
+
 /// Whether CoTracker can run on this computer: the worker script, a Python
 /// and the weights where the worker looks for them. Err: what's missing, in
-/// words for the button. (Whether that Python has PyTorch shows when a job
-/// starts.) Checked once.
+/// words for the person (ASD-STE100, like the doctor). (Whether that Python
+/// has PyTorch shows when a job starts.) Checked once, until
+/// [`forget_availability`].
 pub fn availability() -> Result<(), String> {
-    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    CHECKED
-        .get_or_init(|| {
+    let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    checked
+        .get_or_insert_with(|| {
             let (python, script) = worker_command();
-            if !script.is_file() {
-                return Err("CoTracker needs its Python worker (editor/cotracker_worker.py in the trackertools repository), which this copy doesn't have.".into());
-            }
             let bare = python.components().count() == 1;
-            if !(python.is_file() || bare && on_path(&python)) {
-                return Err("CoTracker needs Python with PyTorch (TT_PYTHON says which).".into());
-            }
-            if !weights().is_some_and(|w| w.is_file()) {
-                return Err("CoTracker needs Meta's CoTracker3 weights, scaled_online.pth (TT_COTRACKER_WEIGHTS says where).".into());
+            if !script.is_file() || !(python.is_file() || bare && on_path(&python)) || !weights().is_some_and(|w| w.is_file()) {
+                return Err("CoTracker is not set up on this computer.".into());
             }
             Ok(())
         })
         .clone()
+}
+
+/// Something was installed: [`availability`] looks again.
+pub fn forget_availability() {
+    *CHECKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn on_path(program: &std::path::Path) -> bool {
@@ -80,11 +107,16 @@ fn on_path(program: &std::path::Path) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()))
 }
 
-/// Where the worker finds the weights: `TT_COTRACKER_WEIGHTS`, else torch
-/// hub's cache (`torch.hub.get_dir()`, as v1 downloaded them).
-fn weights() -> Option<PathBuf> {
+/// Where the weights are: `TT_COTRACKER_WEIGHTS`, else the doctor's
+/// download, else torch hub's cache (`torch.hub.get_dir()`, as v1
+/// downloaded them). The worker is told (`--weights`).
+pub fn weights() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("TT_COTRACKER_WEIGHTS") {
         return Some(PathBuf::from(p));
+    }
+    let installed = installed_weights();
+    if installed.is_file() {
+        return Some(installed);
     }
     let hub = match std::env::var_os("TORCH_HOME") {
         Some(t) => PathBuf::from(t).join("hub"),
@@ -118,6 +150,9 @@ impl Process {
         let (python, script) = worker_command();
         let mut cmd = Command::new(&python);
         cmd.arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(w) = weights().filter(|w| w.is_file()) {
+            cmd.arg("--weights").arg(w);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
