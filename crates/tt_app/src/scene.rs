@@ -19,7 +19,8 @@ use tt_track::{Method, NewTrackers, TrackRun};
 
 /// The scene being built. `TT_SCENE_DEMO=settings` then shows the Settings
 /// tab (a click egui sees, at `tab`), `=export` opens the stabilized export
-/// window on the subject once it has frames.
+/// window on the subject once it has frames (`=export-framed`: zoomed in and
+/// moved).
 pub struct Scene {
     sketch: Option<Entity>,
     subject: Option<Entity>,
@@ -44,12 +45,17 @@ impl Scene {
     pub fn drive(&mut self, world: &mut World) -> bool {
         if let Some(n) = self.after.as_mut() {
             // The export waits for the subject's frames (its members tracking).
-            if self.mode == "export"
+            if self.mode.starts_with("export")
                 && let Some(s) = self.subject
             {
                 if tt_track::export::subject_path(world, s).len() < 100 && *n < 3000 {
                     *n += 1;
                     return false;
+                }
+                // `=export-framed`: zoomed in and moved, for the preview.
+                if self.mode == "export-framed" {
+                    let mut d = world.resource_mut::<tt_track::export::StabilizerDefaults>();
+                    (d.fill, d.zoom, d.offset) = (false, 1.6, [0.08, -0.05]);
                 }
                 crate::panels::export::open(world, crate::panels::export::Kind::Stabilized, crate::panels::export::Source::Subject(s));
                 self.subject = None;

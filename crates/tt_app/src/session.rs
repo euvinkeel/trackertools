@@ -75,6 +75,11 @@ struct SettingsFile {
     /// Stabilizers undo the rotation too; they hold what they follow in the middle of the picture.
     stabilize_rotation: bool,
     stabilize_centre: bool,
+    /// Rendered stabilized videos: zoom just enough to hide the black edges, else
+    /// by the zoom; where the picture is moved (a part of its width and height).
+    stabilize_fill: bool,
+    stabilize_zoom: f32,
+    stabilize_offset: [f32; 2],
     /// Look for a new version at start.
     check_for_updates: bool,
 }
@@ -101,6 +106,9 @@ impl Default for SettingsFile {
             stabilize_smooth_rotation: st.smooth_rotation,
             stabilize_rotation: st.rotation,
             stabilize_centre: st.centre,
+            stabilize_fill: st.fill,
+            stabilize_zoom: st.zoom,
+            stabilize_offset: st.offset,
             check_for_updates: Updater::default().check_on_start,
         }
     }
@@ -126,6 +134,9 @@ impl SettingsFile {
             stabilize_smooth_rotation: st.smooth_rotation,
             stabilize_rotation: st.rotation,
             stabilize_centre: st.centre,
+            stabilize_fill: st.fill,
+            stabilize_zoom: st.zoom,
+            stabilize_offset: st.offset,
             check_for_updates: u.check_on_start,
         }
     }
@@ -166,6 +177,9 @@ impl SettingsFile {
             st.smooth_rotation = self.stabilize_smooth_rotation.clamp(0.0, 2.0);
             st.rotation = self.stabilize_rotation;
             st.centre = self.stabilize_centre;
+            st.fill = self.stabilize_fill;
+            st.zoom = if self.stabilize_zoom.is_finite() { self.stabilize_zoom.clamp(1.0, 4.0) } else { 1.0 };
+            st.offset = self.stabilize_offset.map(|v| if v.is_finite() { v.clamp(-0.5, 0.5) } else { 0.0 });
         }
     }
 }
@@ -344,7 +358,7 @@ mod tests {
 
     #[test]
     fn the_stabilizers_smoothing_is_remembered() {
-        let chosen = StabilizerDefaults { smooth_position: 0.2, smooth_rotation: 0.4, rotation: false, centre: false };
+        let chosen = StabilizerDefaults { smooth_position: 0.2, smooth_rotation: 0.4, rotation: false, centre: false, fill: true, zoom: 1.75, offset: [0.125, -0.25] };
         let text = serde_json::to_string(&SettingsFile::of(
             &SketchDefaults::default(),
             &ViewDefaults::default(),
@@ -366,6 +380,13 @@ mod tests {
         // A session file from before it reads with the defaults.
         let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
         assert_eq!((old.stabilize_smooth_position, old.stabilize_smooth_rotation, old.stabilize_rotation, old.stabilize_centre), (0.0, 0.05, true, true));
+        // From before the zoom and position: the whole picture, where it is.
+        assert_eq!((old.stabilize_fill, old.stabilize_zoom, old.stabilize_offset), (false, 1.0, [0.0, 0.0]));
+        // Values out of range (a hand edit) are brought back in.
+        let wild: SettingsFile = serde_json::from_str(r#"{"stabilize_zoom": 40.0, "stabilize_offset": [3.0, -0.1]}"#).unwrap();
+        wild.apply(&mut world);
+        let st = world.resource::<StabilizerDefaults>();
+        assert_eq!((st.zoom, st.offset), (4.0, [0.5, -0.1]));
     }
 
     #[test]
