@@ -108,10 +108,15 @@ impl History {
         self.open = Some(Transaction { label: label.into(), steps: Vec::new() });
     }
 
-    /// Finish the open gesture (a no-op gesture leaves no undo step).
-    pub fn end(&mut self) {
-        if let Some(t) = self.open.take() {
-            self.push(t);
+    /// Finish the open gesture (a no-op gesture leaves no undo step). True
+    /// if it left one.
+    pub fn end(&mut self) -> bool {
+        match self.open.take() {
+            Some(t) if !t.steps.is_empty() => {
+                self.push(t);
+                true
+            }
+            _ => false,
         }
     }
 

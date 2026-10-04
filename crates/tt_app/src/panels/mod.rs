@@ -47,7 +47,7 @@ fn update_button(ui: &mut egui::Ui, world: &World) {
         State::Available(release) if installable() && release.download.is_some() => {
             ui.separator();
             let button = egui::Button::new(egui::RichText::new(format!("\u{2B06} Update to {}", release.version)).color(style::ACCENT));
-            let tip = "A new version of trackertools is out. Click to download it, save your work, and restart with it (Settings \u{2192} Updates says what's new).";
+            let tip = "A new version of trackertools is out. Click to download it, save your work, and restart with it (Settings, Updates says what's new).";
             if ui.add(button).on_hover_text(tip).clicked() {
                 up.update(release);
             }
@@ -79,7 +79,6 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let t = world.resource::<Transport>();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
-        ui.label(egui::RichText::new("v2 · M3").weak());
         ui.separator();
         open = ui.button("Open…").on_hover_text("Open a video (Ctrl+O), or drop a file on the window").clicked();
         let recent = world.resource::<Session>().recent();
@@ -97,17 +96,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             Some(m) => {
                 let i = m.index();
                 ui.label(egui::RichText::new(&m.name).strong());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}×{} · {} · {} frames @ {:.3} fps",
-                        i.width,
-                        i.height,
-                        i.codec,
-                        i.frame_count(),
-                        i.fps.as_f64()
-                    ))
-                    .color(style::MUTED),
-                );
+                // (Short: the top bar holds the tools too. The codec and the exact rate on hover.)
+                ui.label(egui::RichText::new(format!("{}×{} \u{b7} {:.2} fps", i.width, i.height, i.fps.as_f64())).color(style::MUTED))
+                    .on_hover_text(format!("{} \u{b7} {} frames @ {:.3} fps", i.codec, i.frame_count(), i.fps.as_f64()));
                 if let Some(status) = proxy_status(m) {
                     ui.separator();
                     ui.label(egui::RichText::new(status).color(style::MUTED));
@@ -144,9 +135,6 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 open_doctor |= ui.button(egui::RichText::new(text).color(color)).on_hover_text(format!("{} Click to open the doctor.", step.text())).clicked();
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
-        }
-        if let Some((msg, error)) = &world.resource::<StatusLine>().0 {
-            ui.label(egui::RichText::new(msg).color(if *error { egui::Color32::from_rgb(0xf4, 0x3f, 0x5e) } else { style::MUTED }));
         }
         let history = world.resource::<tt_core::history::History>();
         ui.separator();
@@ -190,12 +178,13 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             }
             let r = r
                 .on_hover_text(format!(
-                    "Track tool ({track_chord}) making a {}: {what}
-                     • drag a rectangle around what to follow: a tracker with that pattern (a look), searching inside the sketch under it
-                     • click: a point, with a pattern the dashed box's size (Ctrl+wheel sizes it; the wheel zooms)
-                     • a new tracker waits: Back, Both or Forward in the Inspector (or its right-click menu) tracks it; Pause stops it
-                     • Shift+drag with a tracker selected: another look for it (a cursor that changes icon)
-                     • select a look (Outliner, Inspector) to paint which of its pixels are the subject",
+                    "Track tool ({track_chord}) making a {}: {what}\n\
+                     \u{2022} template tracker: drag a rectangle around what to follow (its pattern, a look), or click a point (the dashed box's size; Ctrl+wheel sizes it)\n\
+                     \u{2022} CoTracker: click the pixel to follow (a reset point)\n\
+                     \u{2022} inside a sketch's box it searches there; elsewhere, the whole frame\n\
+                     \u{2022} a new tracker waits: Back, Both or Forward in the Inspector (or its right-click menu) tracks it; Pause stops it\n\
+                     \u{2022} with a tracker selected: where it missed, another look (a CoTracker: a reset point); Shift: a new tracker\n\
+                     \u{2022} select a look (Outliner, Inspector) to paint which of its pixels are the subject",
                     tracks::kind_name(method)
                 ));
             if r.clicked() {
@@ -205,6 +194,21 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                     history_action = Some(Action::Tool(Tool::Track));
                 }
             }
+        }
+        let drawing = world.resource::<ActiveTool>().0 == Tool::Draw;
+        let draw_chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::Tool(Tool::Draw)).unwrap_or_default();
+        if ui
+            .selectable_label(drawing, egui::RichText::new("Draw by hand").color(if drawing { style::HAND } else { style::TEXT }))
+            .on_hover_text(format!(
+                "Draw tool ({draw_chord}): a tracker's point by hand, frame by frame\n\
+                 \u{2022} with a tracker selected: hold on the video, and on every frame shown its point is where you hold (paused: this frame; Space plays). \
+                 What you draw is its output there, over its automatic results (orange on the video and the timeline)\n\
+                 \u{2022} with nothing selected (or Shift+hold): a manual dot, a tracker that is only what you draw\n\
+                 \u{2022} Alt+hold: erase what was drawn (its own results show again) \u{b7} Esc: cancel the hold"
+            ))
+            .clicked()
+        {
+            history_action = Some(Action::Tool(Tool::Draw));
         }
         let sketch_selected = world.resource::<tt_core::selection::Selection>().primary().is_some_and(|e| tt_core::sketch::is_sketch(world, e));
         if ui
@@ -225,6 +229,12 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             }
             ui.separator();
             ui.monospace(timecode(t.frame(), t.fps));
+            // The last message, in the room left (cut short; all of it on hover).
+            if let Some((msg, error)) = &world.resource::<StatusLine>().0 {
+                ui.separator();
+                let color = if *error { style::LOST } else { style::MUTED };
+                ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).truncate()).on_hover_text(msg);
+            }
         });
     });
     if open {

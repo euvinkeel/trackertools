@@ -39,6 +39,8 @@ pub struct Shell {
     /// Dev/benchmark: `TT_SKETCH_DEMO=<sprite_truth.json>` sketches the sprite
     /// fixture with a scripted hand, logs the error, and quits (demo.rs).
     sketch_demo: Option<crate::demo::SketchDemo>,
+    /// Dev: `TT_SCENE_DEMO=1` builds a scene with one of everything (scene.rs).
+    scene: Option<crate::scene::Scene>,
 }
 
 /// Seek to a few far-apart frames, then step backward and forward, timing each
@@ -144,7 +146,7 @@ impl Shell {
             tracing::error!("{} not found: nothing to run on (cargo xtask fixtures makes the test clips)", std::path::Path::new(&path).display());
             std::process::exit(2);
         }
-        Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), was_typing: false, autoplay, bench, sketch_demo }
+        Self { core, epoch, pointer, pointer_read: 0.0, taken_keys: Vec::new(), was_typing: false, autoplay, bench, sketch_demo, scene: crate::scene::Scene::start() }
     }
 
     /// Setup is done: the window becomes the app's.
@@ -279,6 +281,14 @@ impl eframe::App for Shell {
         }
 
         self.core.run_pre_ui();
+        if let Some(scene) = &mut self.scene
+            && self.core.world.get_resource::<tt_track::runner::Footage>().is_some()
+        {
+            ctx.request_repaint();
+            if scene.drive(&mut self.core.world) {
+                self.scene = None;
+            }
+        }
 
         // Trackers: results arrive from background threads, and a re-plan may
         // be waiting (inputs settling, a drag just ended). Keep frames coming.
@@ -293,9 +303,12 @@ impl eframe::App for Shell {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         keys::take_tab(ctx, raw_input, &mut self.taken_keys);
-        // The sketch demo's scripted UI input.
+        // The sketch demo's (and the scene demo's) scripted UI input.
         if let Some(demo) = &mut self.sketch_demo {
             raw_input.events.append(&mut demo.inject);
+        }
+        if let Some(scene) = &mut self.scene {
+            raw_input.events.append(&mut scene.inject);
         }
     }
 

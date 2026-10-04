@@ -87,6 +87,12 @@ pub fn auto_masked(world: &World, mut look: Look) -> Look {
     look
 }
 
+/// The tracker a look belongs to.
+pub fn owner_of(world: &World, look: Entity) -> Option<Entity> {
+    let mut q = world.try_query::<(Entity, &Inputs)>()?;
+    q.iter(world).find(|(_, i)| i.0.iter().any(|(s, p)| s == "look" && *p == look)).map(|(e, _)| e)
+}
+
 /// A tracker's looks, in order (the first is the seed): live ones (not
 /// deleted, nor references a reopened project couldn't resolve).
 pub fn looks_of(world: &World, tracker: Entity) -> Vec<Entity> {

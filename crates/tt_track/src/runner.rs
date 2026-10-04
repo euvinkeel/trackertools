@@ -31,6 +31,11 @@
 //!   two over the frames it saw the subject. The tracker gives the motion's
 //!   shape; the rough pass, on average, where the subject is (instead of
 //!   wherever the guide happened to be at the anchor).
+//! - Results go into the tracker's automatic layer (`human::AutoOutput`); its
+//!   output is that with its human layer over it (`human::compose`, run
+//!   right after). A manual dot has no algorithm: nothing is planned for it.
+//! - A tracker with no guide searches the whole frame: its plan's guide is
+//!   the frame itself on every frame of the video.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -45,16 +50,17 @@ use bevy_reflect::Reflect;
 use tt_core::history::History;
 use tt_core::op::{Dirty, Inputs, Invalidations, OpError, Operator, Output, extent};
 use tt_core::ranges::RangeSet;
-use tt_core::signal::{FrameState, SignalStore};
+use tt_core::signal::{FrameState, SignalId, SignalStore};
 use tt_core::time::FrameIndex;
 use tt_core::transport::Transport;
 use tt_core::view::{SpaceMap, home_of, map_at};
 use tt_media::{DecodeOptions, VideoIndex};
 
-use crate::job::{JobSpec, LookSpec, Msg, Shared, Side, spawn};
+use crate::human::{AutoOutput, ensure_auto, is_manual};
+use crate::job::{JobSpec, LookSpec, Msg, Phase, Shared, Side, spawn};
 use crate::look::Look;
 use crate::template::{LOOK_PX, Settings, TEMPLATE_R};
-use crate::{Direction, Rendition, TRACK_CHANNELS, TrackRun, Tracker, guide_of, run_of};
+use crate::{Direction, Method, Rendition, TRACK_CHANNELS, TrackRun, Tracker, guide_of, run_of};
 
 /// Part of every stamp: bump it when a change to the tracking makes saved
 /// results out of date (they re-track when their project is opened).
@@ -87,6 +93,9 @@ pub struct TrackStatus {
     pub rendition: String,
     /// The frame it tracks from (its anchor, moved into the guide's frames).
     pub anchor: FrameIndex,
+    /// Asked to track, with frames left, but no job yet: waiting for a free
+    /// slot (at most [`MAX_JOBS`] at once) or for its inputs to settle.
+    pub queued: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,11 +108,27 @@ pub struct SideStatus {
     pub fps: f64,
     /// Holding at the playhead (catch-up mode).
     pub waiting: bool,
+    /// Starting, loading its model (CoTracker's Python worker), or tracking.
+    pub phase: Phase,
 }
 
 impl TrackStatus {
     pub fn busy(&self) -> bool {
         self.forward.is_some() || self.backward.is_some()
+    }
+
+    /// A job starts up: decoding its first frames, or CoTracker's worker
+    /// loading its model (`Some(true)`: the model).
+    pub fn starting(&self) -> Option<bool> {
+        let sides = [self.forward, self.backward];
+        let mut s = sides.iter().flatten();
+        if s.clone().any(|s| s.phase == Phase::Loading) {
+            Some(true)
+        } else if s.any(|s| s.phase == Phase::Starting) {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -198,6 +223,8 @@ struct Plan {
     /// The looks (in the tracked range), and the seed: the look on the anchor frame's centre, source px.
     looks: Arc<Vec<LookSpec>>,
     seed: Option<[f64; 2]>,
+    /// No guide: `guide` is the whole frame, and the search follows the tracker.
+    root: bool,
 }
 
 impl Plan {
@@ -264,6 +291,7 @@ impl Plan {
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && p.matching == q.matching
             && p.method == q.method
+            && self.root == old.root
             && self.looks == old.looks
             && self.seed == old.seed;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
@@ -340,6 +368,24 @@ pub fn run_trackers(world: &mut World) {
     let mut live: Vec<Entity> = live.into_iter().collect();
     tt_core::meta::creation_order(world, &mut live);
     for op in live {
+        // (A tracker saved before the human layer: its output was its results.)
+        ensure_auto(world, op);
+        if is_manual(world, op) {
+            // No algorithm: nothing to plan or run, and nothing to wait for.
+            let mut jobs = world.resource_mut::<TrackJobs>();
+            jobs.running.retain(|(o, _), _| *o != op);
+            jobs.basis.remove(&op);
+            if world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty()) {
+                world.get_mut::<Dirty>(op).expect("checked").0 = RangeSet::new();
+            }
+            if world.get::<OpError>(op).is_some() {
+                world.entity_mut(op).remove::<OpError>();
+            }
+            if world.get::<TrackStatus>(op).is_some() {
+                world.entity_mut(op).remove::<TrackStatus>();
+            }
+            continue;
+        }
         drain(world, op);
         replan(world, op, &footage);
         stop_unwanted(world, op);
@@ -351,7 +397,8 @@ pub fn run_trackers(world: &mut World) {
     }
 }
 
-/// Write finished frames into the tracker's output.
+/// Write finished frames into the tracker's automatic layer (its output
+/// follows when it is composed).
 fn drain(world: &mut World, op: Entity) {
     let mut msgs: Vec<(Side, Msg)> = Vec::new();
     {
@@ -365,12 +412,11 @@ fn drain(world: &mut World, op: Entity) {
     if msgs.is_empty() {
         return;
     }
-    let Some(out) = world.get::<Output>(op).map(|o| o.0) else { return };
+    let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0) else { return };
     let [ox, oy] = world.get::<TrackBook>(op).map_or([0.0; 2], |b| b.offset);
     // Frames whose inputs changed since the job started (the new plan waits
     // for a drag to end): their new values are already out of date.
     let outdated = world.get::<Dirty>(op).map(|d| d.0.clone()).unwrap_or_default();
-    let mut changed = RangeSet::default();
     for (side, msg) in msgs {
         match msg {
             Msg::Frames(frames) => {
@@ -397,9 +443,6 @@ fn drain(world: &mut World, op: Entity) {
                     }
                     basis.unsettled = true;
                 }
-                for (f, _) in &frames {
-                    changed.insert(*f..*f + 1);
-                }
             }
             Msg::Finished => {
                 world.resource_mut::<TrackJobs>().running.remove(&(op, side));
@@ -414,10 +457,6 @@ fn drain(world: &mut World, op: Entity) {
                 world.entity_mut(op).insert(OpError(e));
             }
         }
-    }
-    let mut inv = world.resource_mut::<Invalidations>();
-    for r in changed.ranges() {
-        inv.output_changed(op, r.clone());
     }
 }
 
@@ -437,16 +476,18 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
         return;
     }
     world.get_mut::<Dirty>(op).expect("checked").0 = RangeSet::new();
-    // An output from before the flags channel: start it afresh.
-    if let Some(out) = world.get::<Output>(op).map(|o| o.0)
-        && world.resource::<SignalStore>().get(out).is_some_and(|s| s.channels() != TRACK_CHANNELS)
-    {
-        world.resource_mut::<SignalStore>().insert(out, tt_core::signal::Signal::new(TRACK_CHANNELS));
+    // Results from before the flags channel: start them afresh (the output too: it is composed from them).
+    let signals: Vec<SignalId> = [world.get::<Output>(op).map(|o| o.0), world.get::<AutoOutput>(op).map(|o| o.0)].into_iter().flatten().collect();
+    if signals.iter().any(|id| world.resource::<SignalStore>().get(*id).is_some_and(|s| s.channels() != TRACK_CHANNELS)) {
+        for id in signals {
+            world.resource_mut::<SignalStore>().insert(id, tt_core::signal::Signal::new(TRACK_CHANNELS));
+        }
         world.resource_mut::<TrackJobs>().basis.remove(&op);
+        world.entity_mut(op).remove::<crate::human::Composed>();
         let book = world.get::<TrackBook>(op).copied().unwrap_or_default();
         set_book(world, op, TrackBook { stamp: 0, ..book });
     }
-    let Some(out) = world.get::<Output>(op).map(|o| o.0) else { return };
+    let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0) else { return };
     let extent = extent(world);
     let old = world.resource_mut::<TrackJobs>().basis.remove(&op);
     let plan = match plan(world, op, footage, old.as_ref().map(|b| b.plan.as_ref())) {
@@ -504,24 +545,18 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
         }
     }
 
-    // The output: what holds is valid, the rest stale until replaced, and
+    // The results: what holds is valid, the rest stale until replaced, and
     // nothing outside the frames the tracker can reach (its span only hides).
-    let mut cleared = Vec::new();
     if let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out) {
         for r in [extent.start..reachable.start, reachable.end..extent.end] {
             if !r.is_empty() && !sig.runs(r.clone()).is_empty() {
-                sig.clear(r.clone());
-                cleared.push(r);
+                sig.clear(r);
             }
         }
         sig.mark_stale(reachable.clone());
         for r in done.ranges() {
             sig.mark_valid(r.clone());
         }
-    }
-    let mut inv = world.resource_mut::<Invalidations>();
-    for r in cleared {
-        inv.output_changed(op, r);
     }
     let reach = tt_core::span::Reach(reachable.start, reachable.end - 1);
     if world.get::<tt_core::span::Reach>(op) != Some(&reach) {
@@ -555,8 +590,9 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
     if world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty()) {
         return true; // the plan is about to change
     }
-    let Some(out) = world.get::<Output>(op).map(|o| o.0) else { return false };
-    // Where the tracker itself was: the output minus the re-centring shift.
+    let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0) else { return false };
+    // Where the tracker itself was: its results minus the re-centring shift
+    // (not what a person drew: drawing never changes what it tracks).
     let offset = world.get::<TrackBook>(op).map_or([0.0; 2], |b| b.offset);
     let run = run_of(world, op);
     for side in [Side::Forward, Side::Backward] {
@@ -610,6 +646,7 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         seed: plan.seed,
         fuse: p.fuse,
         method: p.method,
+        root: plan.root,
     };
     let shared = Arc::new(Shared::new(catch_up_limit(world, op, side), from));
     let (tx, rx) = channel();
@@ -674,7 +711,7 @@ fn recenter(world: &mut World, op: Entity) {
     let Some(params) = world.get::<Tracker>(op).cloned() else { return };
     let book = world.get::<TrackBook>(op).copied().unwrap_or_default();
     let guide = guide_of(world, op).filter(|g| world.get::<Disabled>(*g).is_none());
-    let (Some(out), Some(guide)) = (world.get::<Output>(op).map(|o| o.0), guide.and_then(|g| world.get::<Output>(g)).map(|o| o.0)) else { return };
+    let (Some(out), Some(guide)) = (world.get::<AutoOutput>(op).map(|o| o.0), guide.and_then(|g| world.get::<Output>(g)).map(|o| o.0)) else { return };
     let new = if params.center_on_guide {
         let store = world.resource::<SignalStore>();
         let (Some(sig), Some(g)) = (store.get(out), store.get(guide)) else { return };
@@ -711,13 +748,13 @@ fn recenter(world: &mut World, op: Entity) {
             sig.mark_stale(f..f + 1);
         }
     }
-    world.resource_mut::<Invalidations>().output_changed(op, lo..hi + 1);
     set_book(world, op, TrackBook { offset: new, ..book });
 }
 
 /// Move the catch-up limits and refresh the status.
 fn update_status(world: &mut World, op: Entity) {
     let limits = [Side::Forward, Side::Backward].map(|s| catch_up_limit(world, op, s));
+    let run = run_of(world, op);
     let jobs = world.resource::<TrackJobs>();
     let mut status = match jobs.basis.get(&op) {
         Some(b) => {
@@ -736,12 +773,20 @@ fn update_status(world: &mut World, op: Entity) {
                 to: job.to,
                 fps: if secs > 0.2 { job.produced as f64 / secs } else { 0.0 },
                 waiting: job.shared.waiting.load(Ordering::Relaxed),
+                phase: job.shared.phase(),
             }
         });
         match side {
             Side::Forward => status.forward = s,
             Side::Backward => status.backward = s,
         }
+    }
+    // Frames left on a side it is asked to track, and no job there yet.
+    if let Some(b) = jobs.basis.get(&op).filter(|b| !b.failed) {
+        status.queued = [Side::Forward, Side::Backward].into_iter().any(|s| {
+            let w = b.plan.wanted(s, run);
+            !jobs.running.contains_key(&(op, s)) && b.done.intersect(&w).len() < w.end - w.start
+        });
     }
     world.entity_mut(op).insert(status);
 }
@@ -750,18 +795,35 @@ fn update_status(world: &mut World, op: Entity) {
 /// from. Err = why it can't run.
 fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Result<Plan, String> {
     let params = world.get::<Tracker>(op).cloned().ok_or("no tracker settings")?;
-    let guide = guide_of(world, op).filter(|g| world.get::<Disabled>(*g).is_none()).ok_or("the guide was deleted")?;
-    // (Through the guide's span: a trimmed sketch guides only where it lives.)
-    let sig = tt_core::span::output(world, guide).ok_or("the guide has no output")?;
-    if sig.channels() < 6 {
-        return Err("the guide is not a box".into());
+    if params.method == Method::Manual {
+        return Err("a manual dot has nothing to track".into());
     }
-    let (lo, hi) = sig.present_hull().ok_or("the guide has no frames yet")?;
-
-    // The guide's boxes over its whole span, gaps interpolated.
-    let mut boxes: Vec<Option<[f64; 6]>> = (lo..=hi).map(|f| sig.get(f).map(|v| std::array::from_fn(|c| v[c] as f64))).collect();
-    fill_gaps(&mut boxes);
-    let guide_boxes: Vec<[f64; 6]> = boxes.into_iter().map(|b| b.expect("filled")).collect();
+    let (lo, hi, guide_boxes) = match guide_of(world, op) {
+        Some(guide) => {
+            if world.get::<Disabled>(guide).is_some() {
+                return Err("the guide was deleted".into());
+            }
+            // (Through the guide's span: a trimmed sketch guides only where it lives.)
+            let sig = tt_core::span::output(world, guide).ok_or("the guide has no output")?;
+            if sig.channels() < 6 {
+                return Err("the guide is not a box".into());
+            }
+            let (lo, hi) = sig.present_hull().ok_or("the guide has no frames yet")?;
+            // The guide's boxes over its whole span, gaps interpolated.
+            let mut boxes: Vec<Option<[f64; 6]>> = (lo..=hi).map(|f| sig.get(f).map(|v| std::array::from_fn(|c| v[c] as f64))).collect();
+            fill_gaps(&mut boxes);
+            (lo, hi, boxes.into_iter().map(|b| b.expect("filled")).collect::<Vec<[f64; 6]>>())
+        }
+        // No guide: the whole frame is the search region, on every frame of the video.
+        None => {
+            let n = footage.original.frame_count();
+            if n == 0 {
+                return Err("the video has no frames".into());
+            }
+            let (w, h) = (footage.original.width as f64, footage.original.height as f64);
+            (0, n - 1, vec![[w / 2.0, h / 2.0, 0.0, 0.0, w, h]; n as usize])
+        }
+    };
     let space = home_of(world, op);
     let maps: Vec<SpaceMap> = (lo..=hi).map(|f| map_at(world, space, f)).collect();
 
@@ -844,11 +906,16 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         [l.frame as f64, l.center[0], l.center[1], l.half[0], l.half[1]].iter().for_each(|x| put(*x));
         l.mask.iter().flatten().for_each(|c| put(*c as f64));
     }
+    // (Only when there is no guide, so a guided tracker's stamp stays what it was.)
+    let root = guide_of(world, op).is_none();
+    if root {
+        put(-1.0);
+    }
     h.update(original.path.to_string_lossy().as_bytes());
     let stamp = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"));
 
     let span = tt_core::span::span_of(world, op).range();
-    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed })
+    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed, root })
 }
 
 /// Fill gaps by linear interpolation; ends hold the nearest value.
@@ -879,6 +946,10 @@ pub fn coverage(world: &World, op: Entity) -> Option<Range<FrameIndex>> {
 /// results complete where it is asked to track (or a job failed; a paused
 /// tracker has nothing to do). For tests and scripts.
 pub fn settled(world: &World, op: Entity) -> bool {
+    // (A manual dot never runs anything.)
+    if is_manual(world, op) {
+        return true;
+    }
     let jobs = world.resource::<TrackJobs>();
     let running = [Side::Forward, Side::Backward].iter().any(|s| jobs.running.contains_key(&(op, *s)));
     let dirty = world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty());

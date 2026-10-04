@@ -284,9 +284,9 @@ fn two_tracked_points_hold_the_whole_scene_still_30fps() {
 
 #[test]
 fn four_tracked_points_hold_the_whole_scene_still_50fps() {
-    // Spread over the frame, through the app's default spring.
+    // Spread over the frame, through the app's default spring (held where they are, to measure against).
     let spread = [[520.0, 430.0], [880.0, 560.0], [430.0, 600.0], [960.0, 380.0]];
-    tracked_points_hold_the_whole_scene_still(50, &spread, StabilizerDefaults::default().into());
+    tracked_points_hold_the_whole_scene_still(50, &spread, Smoothing { centred: false, ..StabilizerDefaults::default().into() });
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn export_a_saved_projects_stabilizer() {
     let smoothing: Smoothing = match std::env::var("TT_REAL_SMOOTH") {
         Ok(v) => {
             let s: Vec<f64> = v.split(',').map(|x| x.trim().parse().expect("TT_REAL_SMOOTH: <position>,<rotation> seconds")).collect();
-            Smoothing { position: s[0], rotation: s[1] }
+            Smoothing { position: s[0], rotation: s[1], ..Smoothing::default() }
         }
         Err(_) => StabilizerDefaults::default().into(),
     };

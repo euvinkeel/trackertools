@@ -22,6 +22,9 @@ pub enum Tool {
     Sketch,
     /// Show a tracker what to follow: drag a pattern, click a point (tt_track).
     Track,
+    /// Draw a tracker's point by hand, frame by frame: over a tracker's
+    /// automatic results, or a manual dot of its own (tt_track::human).
+    Draw,
 }
 
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,26 @@ pub struct PointerFrame {
     pub click: Option<[f64; 2]>,
     /// Set by a tool that used the wheel this frame (the viewport then doesn't zoom).
     pub wheel_taken: bool,
+}
+
+/// The pointer's last second over the viewport (`[t, x, y]`, the shown
+/// space's pixels, oldest first): what a tool's preview reads (the Sketch
+/// tool sizes its dashed box by the hand's jiggle before a press).
+#[derive(Resource, Debug, Default, Clone)]
+pub struct PointerTrail(pub std::collections::VecDeque<[f64; 3]>);
+
+/// How long [`PointerTrail`] keeps samples (seconds).
+const TRAIL: f64 = 1.0;
+
+fn keep_trail(pointer: Res<PointerFrame>, mut trail: ResMut<PointerTrail>, clock: Res<crate::time::WallClock>) {
+    if pointer.hover.is_none() {
+        trail.0.clear();
+        return;
+    }
+    trail.0.extend(pointer.samples.iter().copied());
+    while trail.0.front().is_some_and(|s| s[0] < clock.now - TRAIL) && trail.0.len() > 1 {
+        trail.0.pop_front();
+    }
 }
 
 /// A press shorter than this (seconds) that moved less than [`CLICK_MOVE`] is a click.
@@ -95,12 +118,30 @@ fn apply_tool_actions(mut actions: ResMut<PendingActions>, mut active: ResMut<Ac
     }
 }
 
+/// The tracker (a `track` operator) whose point on `frame` is nearest `pos`
+/// (source px), within `radius`.
+pub fn pick_tracker(world: &mut World, frame: crate::time::FrameIndex, pos: [f64; 2], radius: f64) -> Option<Entity> {
+    let mut q = world.query_filtered::<(Entity, &crate::op::Operator), Without<bevy_ecs::entity_disabling::Disabled>>();
+    let trackers: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "track").map(|(e, _)| e).collect();
+    trackers
+        .into_iter()
+        .filter_map(|e| {
+            let sig = crate::span::output(world, e)?;
+            let v = sig.get(frame)?;
+            let d = (v[0] as f64 - pos[0]).hypot(v[1] as f64 - pos[1]);
+            (d <= radius).then_some((e, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(e, _)| e)
+}
+
 /// A click (in any tool) selects the subject whose point is under it, else
-/// the sketch whose region is, or clears the selection.
+/// the tracker whose point is, else the sketch whose region is, or clears
+/// the selection.
 fn select_on_click(world: &mut World) {
     let Some(pos) = world.resource::<PointerFrame>().click else { return };
-    // In the Track tool a click places a tracker.
-    if world.resource::<ActiveTool>().0 == Tool::Track {
+    // In the Track tool a click places a tracker; in the Draw tool it draws.
+    if matches!(world.resource::<ActiveTool>().0, Tool::Track | Tool::Draw) {
         return;
     }
     let frame = world.resource::<crate::transport::Transport>().frame();
@@ -108,7 +149,9 @@ fn select_on_click(world: &mut World) {
     let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);
     let scale = world.resource::<PointerFrame>().scale;
     let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
-    let picked = crate::subject::pick_subject(world, frame, pos, grab).or_else(|| crate::sketch::pick_sketch(world, frame, pos));
+    let picked = crate::subject::pick_subject(world, frame, pos, grab)
+        .or_else(|| pick_tracker(world, frame, pos, grab))
+        .or_else(|| crate::sketch::pick_sketch(world, frame, pos));
     let mut sel = world.resource_mut::<crate::selection::Selection>();
     match picked {
         Some(e) => sel.select_only(e),
@@ -123,10 +166,12 @@ impl Module for ToolModule {
         app.declare::<ActiveTool>(Class::Session)
             .declare::<PointerFrame>(Class::Derived)
             .declare::<ClickTracker>(Class::Derived)
+            .declare::<PointerTrail>(Class::Derived)
             .init_resource::<ActiveTool>()
             .init_resource::<PointerFrame>()
             .init_resource::<ClickTracker>()
-            .add_systems(detect_clicks.in_set(Set::Input))
+            .init_resource::<PointerTrail>()
+            .add_systems((detect_clicks, keep_trail).in_set(Set::Input))
             .add_systems((apply_tool_actions, crate::capture::sketch_tool, select_on_click).chain().in_set(Set::Tools));
     }
 }

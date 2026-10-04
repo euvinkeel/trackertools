@@ -109,11 +109,25 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     let trackers: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e)).collect();
     if let Some(first) = trackers.first() {
         let now = tt_track::run_of(world, *first);
-        for (run, _, item, tip) in super::tracks::RUNS {
-            if ui.add_enabled(now != run || trackers.len() > 1, egui::Button::new(item)).on_hover_text(tip).clicked() {
-                super::tracks::ask(world, &trackers, run);
-                ui.close();
+        let automatic: Vec<Entity> = trackers.iter().copied().filter(|t| !tt_track::human::is_manual(world, *t)).collect();
+        if !automatic.is_empty() {
+            for (run, _, item, tip) in super::tracks::RUNS {
+                if ui.add_enabled(now != run || automatic.len() > 1, egui::Button::new(item)).on_hover_text(tip).clicked() {
+                    super::tracks::ask(world, &automatic, run);
+                    ui.close();
+                }
             }
+        }
+        // What was drawn by hand on them, on this frame.
+        let here = world.resource::<tt_core::transport::Transport>().frame();
+        let drawn: Vec<Entity> = trackers.iter().copied().filter(|t| tt_track::human::drawn_at(world, *t, here).is_some()).collect();
+        if !drawn.is_empty()
+            && ui.button(format!("Erase what was drawn on frame {here}")).on_hover_text("Its automatic result shows here again (a manual dot has nothing here then)").clicked()
+        {
+            for t in drawn {
+                tt_track::human::erase_drawn(world, t, Some(here..here + 1));
+            }
+            ui.close();
         }
         ui.separator();
     }
@@ -257,6 +271,10 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             ui.label("Smooth position");
             ui.add(egui::DragValue::new(&mut d.smooth_position).range(0.0..=2.0).speed(0.005).max_decimals(2).suffix(" s")).on_hover_text(spring);
         });
+        ui.checkbox(&mut d.rotation, "Undo rotation too")
+            .on_hover_text("With two or more points, or a subject's angle. Off: position only (the picture moves, but never turns; a follower doesn't turn).");
+        ui.checkbox(&mut d.centre, "Stabilizers: keep it in the middle of the picture")
+            .on_hover_text("On every frame, what it follows is in the middle of the picture. Off: it holds where it is on this frame (the classic stabilizer).");
         if d != *world.resource::<tt_track::export::StabilizerDefaults>() {
             *world.resource_mut::<tt_track::export::StabilizerDefaults>() = d;
         }
@@ -318,7 +336,10 @@ fn copy_stabilizer(ctx: &egui::Context, world: &World, points: &[Entity], subjec
     let file = dir.join(format!("{} {what}.setting", if follower { "follow" } else { "stabilize" }).replace(['/', '\\', ':'], "_"));
     let saved = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, &text)).map_or_else(|e| format!(" (not saved: {e})"), |()| format!("; saved {}", file.display()));
     let (lo, hi) = (st.keys.first().map_or(0, |k| k.frame), st.keys.last().map_or(0, |k| k.frame));
-    let rotation = if subject.is_some() {
+    let options = *world.resource::<StabilizerDefaults>();
+    let rotation = if !options.rotation {
+        "; position only (rotation off)".to_string()
+    } else if subject.is_some() {
         "; its final position and angle".to_string()
     } else if st.used < 2 {
         "; position only (a second point adds rotation)".to_string()
@@ -340,11 +361,11 @@ fn copy_stabilizer(ctx: &egui::Context, world: &World, points: &[Entity], subjec
             )
         } else {
             format!(
-                "Copied a Fusion stabilizer from {} point{}: {} keys, frames {lo}–{hi}, held as on frame {}{rotation}{saved}",
+                "Copied a Fusion stabilizer from {} point{}: {} keys, frames {lo}–{hi}, {}{rotation}{saved}",
                 st.used,
                 if st.used == 1 { "" } else { "s" },
                 st.keys.len(),
-                st.reference
+                if options.centre { "kept in the middle of the picture".to_string() } else { format!("held as on frame {}", st.reference) }
             )
         },
         false,
