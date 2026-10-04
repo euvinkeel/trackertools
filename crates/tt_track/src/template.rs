@@ -143,6 +143,13 @@ impl TemplateTracker {
         self.own = Some((pos, [0.0, 0.0]));
     }
 
+    /// Where it expects the point on the next frame (view px): where it was
+    /// going on its own (its last position plus half its last step), else
+    /// the guide's point `guide` plus its offset.
+    pub fn expected(&self, guide: [f64; 2]) -> [f64; 2] {
+        self.own.map_or([guide[0] + self.offset[0], guide[1] + self.offset[1]], |(p, v)| [p[0] + 0.5 * v[0], p[1] + 0.5 * v[1]])
+    }
+
     /// A frame where the user showed the subject at `pos` (a look's frame):
     /// the position is theirs, and tracking goes on from it.
     pub fn pin(&mut self, pos: [f64; 2], guide: [f64; 2]) {

@@ -11,12 +11,17 @@
 //!   learned too). `Shift` makes a new tracker instead.
 //! - After *Re-seed here* on a frame without a look, the next drag is the
 //!   look the tracker starts again from.
+//! - **CoTracker** follows one pixel, not a pattern: a press makes a point
+//!   where it is let go (a new CoTracker, or with one selected its *reset
+//!   point* on this frame: the pixel it follows from here on, moved if it
+//!   already has one here).
 //!
-//! New looks get their mask painted automatically ([`crate::look::LookDefaults`]).
+//! New template looks get their mask painted automatically ([`crate::look::LookDefaults`]).
 //!
 //! The guide (search region and motion prior) is the selected sketch (or
 //! the selected tracker's guide), else the smallest sketch whose box holds
-//! the pattern on this frame.
+//! the pattern on this frame; with none there, the tracker has no guide and
+//! searches the whole frame.
 
 use bevy_ecs::prelude::*;
 use tt_core::input::KeysHeld;
@@ -28,7 +33,7 @@ use tt_core::transport::Transport;
 use tt_core::view::{ActiveView, map_at};
 
 use crate::look::{Look, auto_masked};
-use crate::{add_look, add_tracker_with_look, guide_of, is_tracker, reseed_with_look};
+use crate::{Method, NewTrackers, Tracker, add_look, add_tracker_with_look, add_unguided_tracker, guide_of, is_tracker, reseed_with_look, set_reset_point};
 
 #[derive(Resource, Debug, Clone)]
 pub struct TrackTool {
@@ -94,32 +99,58 @@ pub fn track_tool(world: &mut World) {
     let ended = p.released.is_some() || !p.down;
     if ended && let Some((start, f, shift)) = tool.drag.take() {
         let end = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover).unwrap_or(start);
-        let (c, h) = tool.pattern(start, end, p.scale);
+        // CoTracker follows a pixel: the point where the press is let go.
+        let point = method_for(world, shift) == Method::CoTracker;
+        let (c, h) = if point { (end, [tool.brush as f64 / p.scale.max(1e-9); 2]) } else { tool.pattern(start, end, p.scale) };
         // The pointer is in the shown space's pixels; looks live in source pixels.
         let map = map_at(world, world.resource::<ActiveView>().0, f);
-        let look = auto_masked(world, Look::new(f, map.to_source(c), [h[0] * map.a, h[1] * map.a]));
+        let look = Look::new(f, map.to_source(c), [h[0] * map.a, h[1] * map.a]);
         tool.refused = place(world, look, shift, tool.reseed.take()).err();
     }
     *world.resource_mut::<TrackTool>() = tool;
 }
 
-/// Patch the selected tracker with `look`, re-seed it (`reseed`), or make a
-/// new tracker with it (`new`, or nothing selected). Err = why not.
+/// What a press makes: the selected tracker's kind (unless `new`), else the kind chosen for new ones.
+pub fn method_for(world: &World, new: bool) -> Method {
+    let selected = world.resource::<Selection>().primary().filter(|e| is_tracker(world, *e)).filter(|_| !new);
+    match selected.and_then(|t| world.get::<Tracker>(t)) {
+        Some(t) => t.method,
+        None => world.get_resource::<NewTrackers>().map_or(Method::Template, |n| n.method),
+    }
+}
+
+/// Patch the selected tracker with `look` (a CoTracker: its reset point on
+/// that frame), re-seed it (`reseed`), or make a new tracker with it
+/// (`new`, or nothing selected). Err = why not.
 fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Result<(), String> {
     let primary = world.resource::<Selection>().primary();
     let tracker = primary.filter(|e| is_tracker(world, *e));
     if let (Some(t), false) = (tracker, new) {
-        if reseed == Some(t) {
-            reseed_with_look(world, t, look);
-        } else {
-            add_look(world, t, look);
+        match world.get::<Tracker>(t).map_or(Method::Template, |p| p.method) {
+            Method::Manual => return Err("A manual dot has no automatic tracking: draw it with the Draw tool (M), or Shift+drag for a new tracker".into()),
+            Method::CoTracker if reseed == Some(t) => {
+                reseed_with_look(world, t, look);
+            }
+            Method::CoTracker => {
+                set_reset_point(world, t, look);
+            }
+            Method::Template if reseed == Some(t) => {
+                reseed_with_look(world, t, auto_masked(world, look));
+            }
+            Method::Template => {
+                add_look(world, t, auto_masked(world, look));
+            }
         }
         return Ok(());
     }
+    let look = if method_for(world, true) == Method::Template { auto_masked(world, look) } else { look };
     let guide = match primary.and_then(|e| sketch_of(world, e).or_else(|| guide_of(world, e))) {
         Some(s) => Some(s),
         None => pick_sketch(world, look.frame, look.center()),
     };
-    let guide = guide.ok_or("Draw a sketch over the subject first (D): the tracker searches inside it")?;
-    add_tracker_with_look(world, guide, look).map(|_| ()).ok_or_else(|| "That sketch has no frames to track in".to_string())
+    match guide {
+        Some(g) => add_tracker_with_look(world, g, look).map(|_| ()).ok_or_else(|| "That sketch has no frames to track in".to_string()),
+        // No sketch here: the tracker searches the whole frame.
+        None => add_unguided_tracker(world, look).map(|_| ()).ok_or_else(|| "There is no video to track in".to_string()),
+    }
 }

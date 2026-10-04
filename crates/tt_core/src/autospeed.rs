@@ -10,6 +10,16 @@
 //!   in the next `look_ahead` seconds, placed in that range, picks a rate in
 //!   your range: calm plays at `fastest`, busy at `slowest`, in between on a
 //!   log scale. So playback slows *before* a busy stretch arrives.
+//! - **Sensitivity that adapts** *(added on request: "if it slightly moves
+//!   some pixels, that must be prepared for some seconds in advance")*: what
+//!   is ahead is also compared with the last `memory` seconds of the same
+//!   sketch. Its motion (the point's speed over a few frames) and its box
+//!   size, each against how calm they were lately (their 20th percentile
+//!   there): up to 1.5× is ordinary, `sensitivity`× or more is busy, log
+//!   in between; motion slower than `still` px/s counts as none. So after a
+//!   still stretch even a few pixels' move ahead slows playback, while a
+//!   steady motion the hand already follows doesn't. The busier of the two
+//!   readings sets the rate.
 //! - **Q / E** while it drives set a multiplier on what it picks (×1.5 per
 //!   press), kept until changed: "a bit faster everywhere".
 //! - **Your hand** (optional, off by default): the older reactive limits, the
@@ -62,6 +72,12 @@ pub struct AutoSpeed {
     pub fastest: f32,
     /// How far ahead (seconds of video) it looks: it slows this long before a busy stretch.
     pub look_ahead: f32,
+    /// How far back (seconds of video) it looks to know how calm the subject has been lately.
+    pub memory: f32,
+    /// How many times busier than lately counts as fully busy (1.5× or less is ordinary).
+    pub sensitivity: f32,
+    /// Motion slower than this (source px per second) counts as standing still.
+    pub still: f32,
     /// (Advanced) Which sketch it reads ahead in.
     pub foresight: Foresight,
     /// (Advanced) Also slow down when your hand moves fast or starts to jiggle.
@@ -78,7 +94,21 @@ pub struct AutoSpeed {
 
 impl Default for AutoSpeed {
     fn default() -> Self {
-        Self { enabled: true, slowest: 0.1, fastest: 2.0, look_ahead: 1.0, foresight: Foresight::Parent, react_to_hand: false, comfort: 300.0, jiggle: 1.0, slow_down: 0.1, speed_up: 1.0 }
+        Self {
+            enabled: true,
+            slowest: 0.1,
+            fastest: 2.0,
+            look_ahead: 1.0,
+            memory: 3.0,
+            sensitivity: 3.0,
+            still: 6.0,
+            foresight: Foresight::Parent,
+            react_to_hand: false,
+            comfort: 300.0,
+            jiggle: 1.0,
+            slow_down: 0.1,
+            speed_up: 1.0,
+        }
     }
 }
 
@@ -179,6 +209,17 @@ pub fn busyness(x: f64, calm: f64, busy: f64) -> f64 {
     ((x - calm) / spread).clamp(0.0, 1.0)
 }
 
+/// What is ahead, `ahead`, against how it has been lately, `lately`: up to
+/// [`ORDINARY`]× is 0 (calm), `sensitivity`× or more is 1 (busy), log in between.
+pub fn change(ahead: f64, lately: f64, sensitivity: f64) -> f64 {
+    let ratio = ahead.max(1e-9) / lately.max(1e-9);
+    let (lo, hi) = (ORDINARY.ln(), sensitivity.max(ORDINARY + 0.01).ln());
+    ((ratio.ln() - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+/// Up to this many times what it was lately is ordinary variation.
+pub const ORDINARY: f64 = 1.5;
+
 /// Busyness 0 … 1 → a rate from `fastest` down to `slowest`, even on a log scale.
 pub fn busy_rate(u: f64, slowest: f64, fastest: f64) -> f64 {
     (fastest.ln() + u.clamp(0.0, 1.0) * (slowest.ln() - fastest.ln())).exp()
@@ -202,11 +243,25 @@ fn foresight_sources(world: &World, live: &Live, foresight: Foresight) -> Vec<En
     out
 }
 
+/// The 20th percentile ("calm"), None for nothing.
+fn calm_of(mut v: Vec<f64>) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[(v.len() - 1) / 5])
+}
+
 /// How busy the next `look_ahead` seconds are in the foresight sketches
-/// (0 calm … 1 busy; the busier of them), each against its own normal.
+/// (0 calm … 1 busy; the busier of them), each against its own normal and
+/// against how it has been lately (module docs).
 fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<Entity, (u64, f64, f64)>) -> Option<f64> {
     let t = world.resource::<Transport>();
-    let (f0, n) = (t.frame(), (knobs.look_ahead.max(0.0) as f64 * t.fps.as_f64()).ceil() as FrameIndex);
+    let fps = t.fps.as_f64();
+    let (f0, n) = (t.frame(), (knobs.look_ahead.max(0.0) as f64 * fps).ceil() as FrameIndex);
+    let back = (knobs.memory.max(0.1) as f64 * fps).ceil() as FrameIndex;
+    // (Ahead is behind while playing backward, and lately after.)
+    let dir: FrameIndex = if t.reverse { -1 } else { 1 };
     let store = world.resource::<SignalStore>();
     let mut out: Option<f64> = None;
     for source in foresight_sources(world, live, knobs.foresight) {
@@ -228,13 +283,25 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
                 (c, b)
             }
         };
-        // (Ahead is behind while playing backward.)
-        let ahead = if t.reverse { f0 - n..=f0 } else { f0..=f0 + n };
-        let ahead = ahead.filter_map(|f| sig.get(f)).map(side).fold(None, |m: Option<f64>, s| Some(m.map_or(s, |m| m.max(s))));
-        if let Some(a) = ahead {
-            let u = busyness(a, calm, busy);
-            out = Some(out.map_or(u, |o| o.max(u)));
+        let soon: Vec<FrameIndex> = (0..=n).map(|k| f0 + dir * k).collect();
+        let lately: Vec<FrameIndex> = (1..=back).map(|k| f0 - dir * k).collect();
+        let max = |m: Option<f64>, s: f64| Some(m.map_or(s, |m: f64| m.max(s)));
+        let ahead = soon.iter().filter_map(|f| sig.get(*f)).map(side).fold(None, max);
+        let Some(a) = ahead else { continue };
+        let mut u = busyness(a, calm, busy);
+        // Against lately: the point's speed over a few frames (px per second) and the box's size.
+        let speed = |f: FrameIndex| -> Option<f64> {
+            let (p, q) = (sig.get(f - 2)?, sig.get(f + 2)?);
+            Some(((q[0] - p[0]) as f64).hypot((q[1] - p[1]) as f64) / 4.0 * fps)
+        };
+        let (sens, still) = (knobs.sensitivity.max(1.6) as f64, knobs.still.max(0.1) as f64);
+        if let (Some(s), Some(l)) = (soon.iter().filter_map(|f| speed(*f)).fold(None, max), calm_of(lately.iter().filter_map(|f| speed(*f)).collect())) {
+            u = u.max(change(s + still, l + still, sens));
         }
+        if let Some(l) = calm_of(lately.iter().filter_map(|f| sig.get(*f)).map(side).collect()) {
+            u = u.max(change(a, l, sens));
+        }
+        out = Some(out.map_or(u, |o| o.max(u)));
     }
     out
 }
@@ -431,6 +498,16 @@ mod tests {
         // The same size everywhere: a step of half the calm size reads as busy.
         assert_eq!(busyness(60.0, 40.0, 40.0), 1.0);
         assert_eq!(busyness(50.0, 40.0, 40.0), 0.5);
+    }
+
+    #[test]
+    fn a_change_from_lately_is_ordinary_up_to_one_and_a_half_times_and_busy_at_the_sensitivity() {
+        assert_eq!(change(15.0, 10.0, 3.0), 0.0);
+        assert_eq!(change(30.0, 10.0, 3.0), 1.0);
+        assert!((change(10.0 * 4.5f64.sqrt(), 10.0, 3.0) - 0.5).abs() < 1e-9, "the middle is the geometric mean");
+        assert_eq!(change(5.0, 10.0, 3.0), 0.0, "calmer than lately is calm");
+        // A still subject (0 px/s, `still` 6) moving 18 px/s ahead: busy.
+        assert_eq!(change(18.0 + 6.0, 0.0 + 6.0, 3.0), 1.0);
     }
 
     #[test]

@@ -5,6 +5,8 @@
 
 mod cotracker;
 mod demo;
+mod files;
+mod icons;
 mod input_probe;
 mod keys;
 mod layout;
@@ -14,6 +16,7 @@ mod pointer;
 mod project;
 mod session;
 mod reflect_ui;
+mod scene;
 mod setup;
 mod shell;
 mod style;

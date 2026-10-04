@@ -14,9 +14,15 @@
 //! - Both stop at a *limit* the runner moves (catch-up-to-playhead mode) and
 //!   stop at once when cancelled (an input changed; the runner restarts them).
 //!   Held at the limit for a while, a job lets go of its decoder (*parked*).
+//! - A tracker with no guide (its guide is the whole frame) searches a patch
+//!   around where it was going instead of around the guide's boxes. Going
+//!   backward, that is only known while tracking, so a segment keeps its
+//!   decoded frames (up to [`ROOT_SEGMENT_BYTES`]) instead of its patches.
+//! - Each job says what it is doing ([`Phase`]): starting, loading its model
+//!   (CoTracker's Python worker), or tracking.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -85,6 +91,9 @@ const CONVERGED: usize = 12;
 /// Results are sent every this many frames or this often.
 const FLUSH_FRAMES: usize = 8;
 const FLUSH_EVERY: Duration = Duration::from_millis(40);
+/// Decoded frames a backward job without a guide keeps at once (it cuts
+/// each frame's patch only while tracking it).
+pub const ROOT_SEGMENT_BYTES: usize = 256 << 20;
 
 /// Everything a job needs, copied out of the world when it starts.
 pub struct JobSpec {
@@ -123,6 +132,21 @@ pub struct JobSpec {
     pub fuse: bool,
     /// Templates, or a learned point tracker ([`learned`]).
     pub method: Method,
+    /// No guide: `guide` is the whole frame, and the search goes around where
+    /// the tracker was going (its patch follows it).
+    pub root: bool,
+}
+
+/// What a job is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Phase {
+    /// Decoding its first frames, cutting its looks.
+    #[default]
+    Starting,
+    /// CoTracker's Python worker starting up and loading its model onto the card.
+    Loading,
+    /// Tracking frames.
+    Tracking,
 }
 
 /// State shared between a job and the runner.
@@ -137,6 +161,8 @@ pub struct Shared {
     pub waiting: AtomicBool,
     /// Waiting long enough to have let go of its decoder: not using a job slot.
     pub parked: AtomicBool,
+    /// Its [`Phase`].
+    phase: AtomicU8,
 }
 
 impl Shared {
@@ -147,7 +173,20 @@ impl Shared {
             at: AtomicI64::new(at),
             waiting: AtomicBool::new(false),
             parked: AtomicBool::new(false),
+            phase: AtomicU8::new(Phase::Starting as u8),
         }
+    }
+
+    pub fn phase(&self) -> Phase {
+        match self.phase.load(Ordering::Relaxed) {
+            1 => Phase::Loading,
+            2 => Phase::Tracking,
+            _ => Phase::Starting,
+        }
+    }
+
+    pub fn set_phase(&self, phase: Phase) {
+        self.phase.store(phase as u8, Ordering::Relaxed);
     }
 }
 
@@ -186,10 +225,13 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                 offsets: Vec::new(),
                 stretch: Vec::new(),
                 stretch_bytes: Some(0),
+                near: None,
             };
             let result = match worker.spec.method {
                 Method::Template => worker.run(),
                 Method::CoTracker => worker.run_learned(),
+                // (A manual dot is never planned: nothing to track.)
+                Method::Manual => Ok(()),
             };
             worker.flush();
             let _ = tx.send(match result {
@@ -216,6 +258,9 @@ struct Worker {
     /// their patches, and None = over [`MAX_STRETCH_BYTES`] (not kept).
     stretch: Vec<(FrameIndex, Grid, Patch, Estimate)>,
     stretch_bytes: Option<usize>,
+    /// With no guide: where the next patch is centred (view px), where the
+    /// tracker was going.
+    near: Option<[f64; 2]>,
 }
 
 impl Worker {
@@ -337,21 +382,26 @@ impl Worker {
     /// the guide's box of some frame near `f`, not always of `f` itself.
     fn patch(&self, frame: &[u8], f: FrameIndex) -> (Grid, Patch) {
         let (map, s) = (self.map(f), &self.spec);
-        let last = s.lo + s.guide.len() as FrameIndex - 1;
-        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-        for g in (f - NEIGHBOURS).max(s.lo)..=(f + NEIGHBOURS).min(last) {
-            let b = map.box_from_source(self.guide(g));
-            let (hw, hh) = ((b[0] - b[2]).max(b[4] - b[0]) * s.search, (b[1] - b[3]).max(b[5] - b[1]) * s.search);
-            lo = [lo[0].min(b[0] - hw), lo[1].min(b[1] - hh)];
-            hi = [hi[0].max(b[0] + hw), hi[1].max(b[1] + hh)];
-        }
         let margin = self.margin;
-        let half = |h: f64| (h * s.scale + margin).clamp(margin + 16.0, MAX_HALF + margin);
-        let (hw, hh) = (half((hi[0] - lo[0]) / 2.0), half((hi[1] - lo[1]) / 2.0));
-        // Centred on the neighbours' boxes; where that is too big, on this frame's point.
-        let b = map.box_from_source(self.guide(f));
-        let centre = |i: usize, h: f64| if h < MAX_HALF + margin { (lo[i] + hi[i]) / 2.0 } else { b[i] };
-        let c = [centre(0, hw), centre(1, hh)];
+        let (c, hw, hh) = if s.root {
+            // No guide: as big a patch as any, around where the tracker was going.
+            (self.near.unwrap_or_else(|| self.guide_point(f)), MAX_HALF + margin, MAX_HALF + margin)
+        } else {
+            let last = s.lo + s.guide.len() as FrameIndex - 1;
+            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            for g in (f - NEIGHBOURS).max(s.lo)..=(f + NEIGHBOURS).min(last) {
+                let b = map.box_from_source(self.guide(g));
+                let (hw, hh) = ((b[0] - b[2]).max(b[4] - b[0]) * s.search, (b[1] - b[3]).max(b[5] - b[1]) * s.search);
+                lo = [lo[0].min(b[0] - hw), lo[1].min(b[1] - hh)];
+                hi = [hi[0].max(b[0] + hw), hi[1].max(b[1] + hh)];
+            }
+            let half = |h: f64| (h * s.scale + margin).clamp(margin + 16.0, MAX_HALF + margin);
+            let (hw, hh) = (half((hi[0] - lo[0]) / 2.0), half((hi[1] - lo[1]) / 2.0));
+            // Centred on the neighbours' boxes; where that is too big, on this frame's point.
+            let b = map.box_from_source(self.guide(f));
+            let centre = |i: usize, h: f64| if h < MAX_HALF + margin { (lo[i] + hi[i]) / 2.0 } else { b[i] };
+            ([centre(0, hw), centre(1, hh)], hw, hh)
+        };
         let (w, h) = ((2.0 * hw).ceil() as usize, (2.0 * hh).ceil() as usize);
         let grid = Grid { origin: [c[0] - w as f64 / 2.0 / s.scale, c[1] - h as f64 / 2.0 / s.scale], scale: s.scale };
         let (vw, vh) = (s.video.width as usize, s.video.height as usize);
@@ -521,6 +571,7 @@ impl Worker {
             if self.cancelled() {
                 return Ok(());
             }
+            self.near = Some(seed);
             let (grid, patch) = self.patch(&frame, anchor);
             TemplateTracker::seed(&patch, grid, seed, settings).context("the guide's point at the anchor frame has no detail to follow (flat)")?
         } else {
@@ -541,8 +592,9 @@ impl Worker {
                 if self.cancelled() {
                     return Ok(());
                 }
-                let (grid, patch) = self.patch(&frame, f);
                 let pos = self.map(f).from_source(src);
+                self.near = Some(pos);
+                let (grid, patch) = self.patch(&frame, f);
                 tracker.resume(&patch, grid, pos, self.guide_point(f), score);
                 self.spec.from
             }
@@ -560,9 +612,17 @@ impl Worker {
         if self.cancelled() {
             return Ok(());
         }
+        self.shared.set_phase(Phase::Tracking);
         match self.spec.side {
             Side::Forward => self.forward(&mut tracker, start),
             Side::Backward => self.backward(&mut tracker, start),
+        }
+    }
+
+    /// With no guide, the patch for frame `f` goes around where `tracker` was going.
+    fn follow(&mut self, tracker: &TemplateTracker, f: FrameIndex) {
+        if self.spec.root {
+            self.near = Some(tracker.expected(self.guide_point(f)));
         }
     }
 
@@ -580,6 +640,7 @@ impl Worker {
                 stream = Some(FrameStream::start(&self.spec.video, self.presented(f), &self.spec.decode)?);
             }
             self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
+            self.follow(tracker, f);
             let (grid, patch) = self.patch(&buf, f);
             self.track(tracker, f, grid, &patch);
         }
@@ -588,30 +649,47 @@ impl Worker {
 
     fn backward(&mut self, tracker: &mut TemplateTracker, start: FrameIndex) -> Result<()> {
         let to = self.spec.to;
+        // Frames kept at once: their patches, or with no guide the decoded
+        // frames themselves (the patch goes where the tracker is going, known
+        // only while tracking), as many as fit in ROOT_SEGMENT_BYTES.
+        let frame_bytes = (self.spec.video.width as usize * self.spec.video.height as usize * 3 / 2).max(1);
+        let keep = if self.spec.root { (ROOT_SEGMENT_BYTES / frame_bytes).clamp(4, MAX_PATCHES as usize) as FrameIndex } else { MAX_PATCHES };
         let mut hi = start;
         while hi >= to {
             // A segment of at least SEGMENT frames that starts on a keyframe,
-            // or the last MAX_PATCHES frames before `hi` (ffmpeg skips to them).
-            let want = (hi - SEGMENT + 1).max(to);
+            // or the last `keep` frames before `hi` (ffmpeg skips to them).
+            let want = (hi - SEGMENT.min(keep) + 1).max(to);
             let key = self.spec.video.group_start(self.presented(want));
-            let lo = self.spec.grid.grid_of.get(key).copied().unwrap_or(want).clamp(to, want).max(hi + 1 - MAX_PATCHES);
+            let lo = self.spec.grid.grid_of.get(key).copied().unwrap_or(want).clamp(to, want).max(hi + 1 - keep);
             let mut stream = FrameStream::start(&self.spec.video, self.presented(lo), &self.spec.decode)?;
             let (mut held, mut buf) = (None, Vec::new());
             let mut patches = Vec::with_capacity((hi - lo + 1) as usize);
+            let mut frames: Vec<Vec<u8>> = Vec::new();
             for f in lo..=hi {
                 if self.cancelled() {
                     return Ok(());
                 }
                 self.read_to(&mut stream, &mut held, &mut buf, f)?;
-                patches.push(self.patch(&buf, f));
+                if self.spec.root {
+                    frames.push(buf.clone());
+                } else {
+                    patches.push(self.patch(&buf, f));
+                }
             }
             drop(stream);
             for f in (lo..=hi).rev() {
                 if !self.wait_for(f, || {}) {
                     return Ok(());
                 }
-                let (grid, patch) = &patches[(f - lo) as usize];
-                self.track(tracker, f, *grid, patch);
+                let i = (f - lo) as usize;
+                if self.spec.root {
+                    self.follow(tracker, f);
+                    let (grid, patch) = self.patch(&frames[i], f);
+                    self.track(tracker, f, grid, &patch);
+                } else {
+                    let (grid, patch) = &patches[i];
+                    self.track(tracker, f, *grid, patch);
+                }
             }
             hi = lo - 1;
         }

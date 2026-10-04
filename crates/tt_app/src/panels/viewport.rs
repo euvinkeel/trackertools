@@ -438,7 +438,7 @@ fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Ent
                     go = Some(None);
                 }
                 for (i, v) in chain.iter().enumerate() {
-                    ui.label(egui::RichText::new("▸").monospace().size(12.0).color(style::MUTED));
+                    ui.label(egui::RichText::new("\u{203a}").monospace().size(12.0).color(style::MUTED));
                     if crumb(ui, name(world, *v), i + 1 == chain.len()) {
                         go = Some(Some(*v));
                     }

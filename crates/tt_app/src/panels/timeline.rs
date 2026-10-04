@@ -22,6 +22,14 @@
 //!   the export starts or ends on.
 //! - Wheel on the ruler or Ctrl+wheel zooms time; Shift+wheel pans time; the
 //!   wheel on the lanes scrolls them; a middle-drag pans both.
+//! - A column on the left names each lane: what it is (an icon in the visual
+//!   language's colours, `crate::icons`) and, for a tracker, what it is doing
+//!   (a spinner while it starts or tracks). Rows alternate in shade and the
+//!   one under the pointer lights up. A tracker's lane shows its two layers:
+//!   what was drawn by hand (orange, along the top) over its automatic
+//!   results (cyan), its looks or reset points (white), its score and flagged
+//!   frames. With the Sketch tool armed, the selected sketch's lane shows how
+//!   far a stroke at the playhead would pull its neighbours (its falloff).
 
 use std::ops::Range;
 
@@ -182,9 +190,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         world.resource_mut::<TimelineUi>().marquee = None;
         return;
     }
-    let band = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 22.0));
-    let strip = Rect::from_min_size(Pos2::new(rect.min.x, band.max.y + 1.0), Vec2::new(rect.width(), 3.0));
-    let lanes_area = Rect::from_min_max(Pos2::new(rect.min.x, strip.max.y + 4.0), rect.max);
+    // A column of lane names on the left; time runs to the right of it.
+    let gutter_w = GUTTER.min(rect.width() * 0.35).max(60.0);
+    let track = Rect::from_min_max(Pos2::new(rect.min.x + gutter_w, rect.min.y), rect.max);
+    let band = Rect::from_min_size(track.min, Vec2::new(track.width(), 22.0));
+    let strip = Rect::from_min_size(Pos2::new(track.min.x, band.max.y + 1.0), Vec2::new(track.width(), 3.0));
+    let lanes_area = Rect::from_min_max(Pos2::new(track.min.x, strip.max.y + 4.0), track.max);
+    // The lanes' rows, names included: what clicks and boxes hit.
+    let rows = Rect::from_min_max(Pos2::new(rect.min.x, lanes_area.min.y), rect.max);
 
     // Visible range and lane scroll (session state), with zoom/pan/follow applied:
     // wheel over the ruler or Ctrl+wheel zooms time; Shift+wheel (or a
@@ -197,7 +210,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
     // At most 40 px per frame, unless the clip is shorter than that.
     let max_span = count * 1.05;
-    let min_span = (rect.width() as f64 / 40.0).max(4.0).min(max_span);
+    let min_span = (track.width() as f64 / 40.0).max(4.0).min(max_span);
     let mut span = view.span.unwrap_or(count).clamp(min_span, max_span);
     let mut start = if view.span.is_none() { 0.0 } else { view.start };
     let mut lane_scroll = view.lane_scroll;
@@ -211,16 +224,16 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             lane_scroll -= delta.y;
         }
         if (factor - 1.0).abs() > 1e-9 {
-            let under = Scale { rect, start, span }.frame_at(pos.x);
+            let under = Scale { rect: track, start, span }.frame_at(pos.x.max(track.min.x));
             let new_span = (span / factor).clamp(min_span, max_span);
             start = under - (under - start) * new_span / span;
             span = new_span;
         }
-        start -= delta.x as f64 * span / rect.width() as f64;
+        start -= delta.x as f64 * span / track.width() as f64;
     }
     if response.dragged_by(egui::PointerButton::Middle) {
         let d = response.drag_delta();
-        start -= d.x as f64 * span / rect.width() as f64;
+        start -= d.x as f64 * span / track.width() as f64;
         lane_scroll -= d.y;
     }
     // A box dragged past the top or bottom of the lanes scrolls them.
@@ -240,10 +253,13 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         start = if t.reverse { head - span * 0.95 } else { head - span * 0.05 };
     }
     start = start.clamp(-span * 0.02, (count - span * 0.98).max(-span * 0.02));
-    let scale = Scale { rect, start, span };
+    let scale = Scale { rect: track, start, span };
 
-    // Ruler.
+    // Ruler, and in the corner above the names the playhead's frame.
     painter.rect_filled(band, 0.0, style::RULER);
+    let corner = Rect::from_min_max(rect.min, Pos2::new(track.min.x, band.max.y));
+    painter.rect_filled(corner, 0.0, style::RULER.gamma_multiply(0.8));
+    painter.text(corner.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, format!("frame {}", t.frame()), FontId::monospace(11.0), style::TEXT);
     let step = tick_step(scale.px_per_frame(), t.fps);
     let mut f = (start / step as f64).ceil() as FrameIndex * step;
     while (f as f64) < start + span && f < t.frame_count {
@@ -254,8 +270,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
     // Clip end.
     let end_x = scale.x(count);
-    if end_x < rect.max.x {
-        painter.rect_filled(Rect::from_x_y_ranges(end_x..=rect.max.x, rect.y_range()), 0.0, style::BG);
+    if end_x < track.max.x {
+        painter.rect_filled(Rect::from_x_y_ranges(end_x.max(track.min.x)..=track.max.x, track.y_range()), 0.0, style::BG);
     }
 
     // Decode cache coverage (active rendition).
@@ -283,13 +299,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let stroke_started = live && !ui_state.live;
     ui_state.live = live;
     let hot = ui_state.edge.or(ui_state.hover_edge);
-    let hits = lanes(&painter, world, &scale, lanes_area, &mut lane_scroll, ui_state.marquee.zip(pointer), stroke_started, hot, &mut ui_state.columns);
+    let hover = response.hover_pos().filter(|p| rows.contains(*p));
+    let hits = lanes(&painter, world, &scale, lanes_area, rows, &mut lane_scroll, ui_state.marquee.zip(pointer), stroke_started, hot, &mut ui_state.columns, hover, ui.input(|i| i.time));
+    if hits.moving {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+    }
     let fitted = span >= count * 0.999 && start.abs() < 1.0;
     *world.resource_mut::<TimelineView>() =
         if fitted { TimelineView { lane_scroll, ..TimelineView::default() } } else { TimelineView { start, span: Some(span), lane_scroll } };
 
     ui_state.lanes_area = Some(lanes_area);
-    let in_lanes = origin.is_some_and(|o| lanes_area.contains(o));
+    let in_lanes = origin.is_some_and(|o| rows.contains(o));
     ui_state.hover_edge = response.hover_pos().filter(|p| lanes_area.contains(*p)).and_then(|p| hits.edge_at(p));
     if ui_state.hover_edge.is_some() || ui_state.edge.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -333,7 +353,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             ui_state.edge = None;
         }
     } else if let Some(m) = hits.marquee {
-        painter.with_clip_rect(lanes_area).rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
+        painter.with_clip_rect(rows).rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
         let down = ui.input(|i| i.pointer.primary_down());
         if response.drag_stopped() || !down {
             // Stopped with the button still down (Esc): no selection.
@@ -378,7 +398,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     *world.resource_mut::<TimelineUi>() = ui_state;
     // Right-click: select what's under it, then the entity menu.
     if response.secondary_clicked()
-        && let Some(e) = response.interact_pointer_pos().filter(|p| lanes_area.contains(*p)).and_then(|p| hits.at(p))
+        && let Some(e) = response.interact_pointer_pos().filter(|p| rows.contains(*p)).and_then(|p| hits.at(p))
     {
         menu::right_clicked(world, e);
     }
@@ -397,7 +417,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let handle_at = |p: Pos2| {
         handles
             .iter()
-            .filter(|(_, x)| p.y < lanes_area.min.y && (p.x - x).abs() <= EDGE_GRAB + 1.0)
+            .filter(|(_, x)| p.y < lanes_area.min.y && p.x >= track.min.x && (p.x - x).abs() <= EDGE_GRAB + 1.0)
             .min_by(|a, b| (p.x - a.1).abs().total_cmp(&(p.x - b.1).abs()))
             .map(|(end, _)| *end)
     };
@@ -448,22 +468,31 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     // Drawn as they are now (a drag may just have moved one).
     let marked = marks(world);
     if marked.is_set() {
-        draw_marks(&painter, &scale, rect, band, marked.frames(t.frame_count), &mark_handles(&scale, marked, t.frame_count), hot);
+        draw_marks(&painter.with_clip_rect(track), &scale, track, band, marked.frames(t.frame_count), &mark_handles(&scale, marked, t.frame_count), hot);
     }
 
-    // Playhead: a frame-wide band when frames are wide enough to see, else a line.
+    // Playhead: a frame-wide band when frames are wide enough to see, else a
+    // line; a head on the ruler with the frame's number.
     let shown = t.frame() as f64;
     let (x0, x1) = (scale.x(shown), scale.x(shown + 1.0));
-    if x1 - x0 >= 3.0 {
-        painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, rect.y_range()), 0.0, style::ACCENT.gamma_multiply(0.25));
+    if track.x_range().contains(x0) {
+        if x1 - x0 >= 3.0 {
+            painter.rect_filled(Rect::from_x_y_ranges(x0..=x1.min(track.max.x), track.y_range()), 0.0, style::ACCENT.gamma_multiply(0.25));
+        }
+        painter.line_segment([Pos2::new(x0, band.max.y), Pos2::new(x0, track.max.y)], Stroke::new(1.5, style::ACCENT));
+        let label = painter.layout_no_wrap(t.frame().to_string(), FontId::monospace(10.0), style::BG);
+        let w = label.size().x + 8.0;
+        let head = Rect::from_min_size(Pos2::new((x0 - w / 2.0).clamp(track.min.x, track.max.x - w), band.min.y + 2.0), Vec2::new(w, 13.0));
+        painter.rect_filled(head, 3.0, style::ACCENT);
+        painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x0 - 4.0, head.max.y), Pos2::new(x0 + 4.0, head.max.y), Pos2::new(x0, band.max.y)], style::ACCENT, Stroke::NONE));
+        painter.galley(head.min + Vec2::new(4.0, 1.0), label, style::BG);
     }
-    painter.line_segment([Pos2::new(x0, rect.min.y), Pos2::new(x0, rect.max.y)], Stroke::new(1.5, style::ACCENT));
 
     // Scrub with the primary button, from the ruler.
     if snapping {
         for p in &points {
             let x = scale.x(*p as f64 + 0.5);
-            if rect.x_range().contains(x) {
+            if track.x_range().contains(x) {
                 let y = lanes_area.min.y;
                 painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 3.0, y - 5.0), Pos2::new(x + 3.0, y - 5.0), Pos2::new(x, y)], style::ACCENT.gamma_multiply(0.6), Stroke::NONE));
             }
@@ -480,7 +509,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         let f = (scale.frame_at(x).floor() as FrameIndex).clamp(0, t.last_frame());
         tt_core::commands::snap(&points, f, reach).unwrap_or(f)
     };
-    if let Some(pos) = response.hover_pos().filter(|p| p.y < lanes_area.min.y && !dragging_mark) {
+    if let Some(pos) = response.hover_pos().filter(|p| p.y < lanes_area.min.y && p.x >= track.min.x && !dragging_mark) {
         let tip = match hot {
             Some(end) => {
                 let r = marked.frames(t.frame_count);
@@ -494,7 +523,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         };
         response.clone().on_hover_text_at_pointer(tip);
     }
-    let from_ruler = origin.is_some_and(|o| o.y < lanes_area.min.y);
+    let from_ruler = origin.is_some_and(|o| o.y < lanes_area.min.y && o.x >= track.min.x);
     if from_ruler
         && !dragging_mark
         && (response.dragged_by(egui::PointerButton::Primary) || response.clicked())
@@ -510,23 +539,33 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 }
 
 const LANE_H: f32 = 18.0;
+/// The column of lane names (points; less on a narrow timeline).
+const GUTTER: f32 = 176.0;
 /// A lane's end can be grabbed this close (points).
 const EDGE_GRAB: f32 = 5.0;
 
 /// What a lane shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneKind {
+    Subject,
     Sketch,
     View,
     Tracker,
 }
 
-/// The lanes, top to bottom: each sketch in the outliner's tree order, then
-/// its view and its trackers (indented), then the sketches nested in its
-/// view; trackers following something else come last.
+/// The lanes, top to bottom: subjects, then each sketch in the outliner's
+/// tree order, then its view and its trackers (indented), then the sketches
+/// nested in its view; trackers with no sketch (or following something
+/// else) come last.
 pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
     let tree = super::outliner::sketch_tree(world);
     let mut out = Vec::new();
+    let mut subjects: Vec<Entity> = {
+        let mut q = world.query_filtered::<(Entity, &tt_core::op::Operator), bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
+        q.iter(world).filter(|(_, o)| o.kind == "subject").map(|(e, _)| e).collect()
+    };
+    tt_core::meta::creation_order(world, &mut subjects);
+    out.extend(subjects.into_iter().map(|s| (s, 0, LaneKind::Subject)));
     for (s, depth) in tree {
         out.push((s, depth, LaneKind::Sketch));
         if let Some(v) = tt_core::view::view_of(world, s).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
@@ -553,6 +592,8 @@ struct Hits {
     edges: Vec<(Entity, Edge, f32, Rect)>,
     /// The box being dragged, as drawn this frame.
     marquee: Option<Rect>,
+    /// A spinner turns: keep repainting.
+    moving: bool,
 }
 
 impl Hits {
@@ -602,38 +643,52 @@ fn tracker_columns(cache: &mut std::collections::HashMap<Entity, (u64, Columns)>
     for (r, _) in sig.runs(first..last) {
         for f in r {
             let Some(v) = sig.get(f) else { continue };
-            let i = ((scale.x(f as f64 + 0.5) - scale.rect.min.x) as usize).min(width - 1);
+            // Every column the frame covers (a frame wider than a pixel covers several: the line doesn't break).
+            let col = |x: f32| ((x - scale.rect.min.x).max(0.0) as usize).min(width - 1);
+            let (a, b) = (col(scale.x(f as f64)), col(scale.x(f as f64 + 1.0) - 0.01));
             let (score, flagged) = (v.get(6).copied().unwrap_or(1.0), tt_track::flags(v) != 0);
-            cols[i] = Some(cols[i].map_or((score, flagged), |(s, fl)| (s.min(score), fl || flagged)));
+            for c in &mut cols[a..=b.max(a)] {
+                *c = Some(c.map_or((score, flagged), |(s, fl)| (s.min(score), fl || flagged)));
+            }
         }
     }
     cache.insert(e, (key, cols.clone()));
     cols
 }
 
-/// The lanes ([`lane_list`]): each object's frames (valid solid, stale
-/// dim, outside its lifetime faint) with its lifetime's ends to drag; under a
-/// selected sketch, a tick per stroke; on a tracker's, its score (a line
-/// along the bottom, low is down), its flagged frames (red) and its jobs
-/// (what is left to track, and where they are). A stroke in progress shows
-/// on the lane of the sketch it edits (visited frames solid, frames its
-/// falloff moves dim), or on a lane of its own for a new sketch. The lanes
+/// The lanes ([`lane_list`]), in rows across the timeline: on the left
+/// (`rows` minus `area`) each one's name, its icon and (a tracker) its
+/// spinner; on the right (`area`) its frames (valid solid, stale dim, outside
+/// its lifetime faint) with its lifetime's ends to drag. Under a selected
+/// sketch, a tick per stroke. A tracker's lane: what was drawn by hand along
+/// the top (orange), its automatic results (cyan), its looks or reset points
+/// (white), its score (a line along the bottom, low is down), its flagged
+/// frames (red) and its jobs (what is left to track, and where they are). A
+/// subject's lane: its frames and its offset keys (purple). A stroke in
+/// progress shows on the lane of the sketch it edits (visited frames solid,
+/// frames its falloff moves dim), or on a lane of its own for a new sketch;
+/// before one, with the Sketch tool armed, the selected sketch's lane shows
+/// how far its falloff would reach from the playhead (dashed). The lanes
 /// scroll vertically under the fixed ruler; `scroll` is clamped here, and
 /// brought to the live stroke's lane when `stroke_started`. `marquee`: a
 /// box's anchor (in content coordinates) and the pointer. `hot`: the end
-/// being dragged or under the pointer.
+/// being dragged or under the pointer. `hover`: the pointer over the rows.
 #[allow(clippy::too_many_arguments)]
 fn lanes(
     painter: &egui::Painter,
     world: &mut World,
     scale: &Scale,
     area: Rect,
+    rows: Rect,
     scroll: &mut f32,
     marquee: Option<(Pos2, Pos2)>,
     stroke_started: bool,
     hot: Option<(Entity, Edge)>,
     cache: &mut std::collections::HashMap<Entity, (u64, Columns)>,
+    hover: Option<Pos2>,
+    time: f64,
 ) -> Hits {
+    use crate::icons::{self, Activity, Glyph};
     let tree = lane_list(world);
     let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
@@ -643,11 +698,13 @@ fn lanes(
     if stroke_started && let Some(l) = live {
         let i = l.target.and_then(|t| tree.iter().position(|(e, _, _)| *e == t)).unwrap_or(tree.len());
         let y = i as f32 * LANE_H;
-        *scroll = scroll.max(y + LANE_H - area.height()).min(y);
+        *scroll = scroll.max(y + LANE_H - rows.height()).min(y);
     }
-    *scroll = scroll.clamp(0.0, (content_h - area.height()).max(0.0));
-    let marquee = marquee.map(|(a, b)| Rect::from_two_pos(Pos2::new(a.x, a.y - *scroll), b.clamp(area.min, area.max)));
-    let painter = painter.with_clip_rect(area);
+    *scroll = scroll.clamp(0.0, (content_h - rows.height()).max(0.0));
+    let marquee = marquee.map(|(a, b)| Rect::from_two_pos(Pos2::new(a.x, a.y - *scroll), b.clamp(rows.min, rows.max)));
+    let painter = painter.with_clip_rect(rows);
+    let gutter = Rect::from_min_max(rows.min, Pos2::new(area.min.x, rows.max.y));
+    painter.rect_filled(gutter, 0.0, style::BG.gamma_multiply(0.6));
     let visible = (scale.start.floor() as FrameIndex).max(0)..(scale.start + scale.span).ceil() as FrameIndex;
     let mut hits = Hits { marquee, ..Hits::default() };
     let bar = |y0: f32, y1: f32, a: FrameIndex, b: FrameIndex| -> Option<Rect> {
@@ -687,88 +744,154 @@ fn lanes(
             }
         }
     };
-    for (i, (e, depth, kind)) in tree.iter().copied().enumerate() {
-        let y = area.min.y + i as f32 * LANE_H - *scroll;
-        let lane = Rect::from_min_size(Pos2::new(area.min.x, y), Vec2::new(area.width(), LANE_H));
-        // Off screen, a lane only matters to a box that swept it before the lanes scrolled.
-        if (lane.max.y < area.min.y || lane.min.y > area.max.y) && marquee.is_none() {
-            continue;
-        }
-        let name = world.get::<Name>(e).map_or("item".into(), |n| n.to_string());
-        let name = match kind {
-            LaneKind::Sketch => name,
-            LaneKind::View => format!("▭ {name}"),
-            LaneKind::Tracker => format!("⌖ {name}"),
-        };
-        let label_pos = Pos2::new(lane.min.x + 6.0 + depth as f32 * 10.0, y + 7.0);
-        let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
-        let label = Rect::from_min_size(label_pos - Vec2::new(0.0, galley.size().y / 2.0), galley.size()).expand(2.0);
-        let span = span_of(world, e);
-        let alive = span.range();
-        let (y0, y1) = if kind == LaneKind::View { (y + 4.0, y + 9.0) } else { (y + 2.0, y + 11.0) };
-        // (bar, state, inside its lifetime)
-        let mut bars: Vec<(Rect, FrameState, bool)> = Vec::new();
-        if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
-            for (r, state) in sig.runs(visible.clone()) {
-                let inside = r.start.max(alive.start)..r.end.min(alive.end);
-                for (part, alive) in [(r.start..inside.start.min(r.end), false), (inside.clone(), true), (inside.end.max(r.start)..r.end, false)] {
-                    if !part.is_empty()
-                        && let Some(b) = bar(y0, y1, part.start, part.end)
-                    {
-                        bars.push((b, state, alive));
-                    }
+    // Bars of a signal's runs over the visible frames, split at a lifetime's edges: (bar, state, inside it).
+    let bars_of = |sig: &tt_core::signal::Signal, y0: f32, y1: f32, alive: &std::ops::Range<FrameIndex>| -> Vec<(Rect, FrameState, bool)> {
+        let mut out = Vec::new();
+        for (r, state) in sig.runs(visible.clone()) {
+            let inside = r.start.max(alive.start)..r.end.min(alive.end);
+            for (part, alive) in [(r.start..inside.start.min(r.end), false), (inside.clone(), true), (inside.end.max(r.start)..r.end, false)] {
+                if !part.is_empty()
+                    && let Some(b) = bar(y0, y1, part.start, part.end)
+                {
+                    out.push((b, state, alive));
                 }
             }
         }
-        let strokes = if kind == LaneKind::Sketch { tt_core::commands::strokes_of(world, e) } else { Vec::new() };
+        out
+    };
+    let alpha = |alive: bool, state: FrameState| match (alive, state == FrameState::Valid) {
+        (false, _) => 0.10,
+        (true, true) => 0.75,
+        (true, false) => 0.28,
+    };
+    // Before a stroke: how far its falloff would reach from the playhead, on the sketch it would edit.
+    let falloff_on = {
+        let armed = world.resource::<tt_core::tool::ActiveTool>().0 == tt_core::tool::Tool::Sketch && live.is_none();
+        let target = selection.primary().filter(|e| tt_core::sketch::is_sketch(world, *e));
+        let fo = world.resource::<tt_core::capture::SketchDefaults>().stroke.falloff as f64;
+        let t = world.resource::<Transport>();
+        target.filter(|_| armed).map(|s| (s, t.frame(), (fo * t.fps.as_f64()).round() as FrameIndex))
+    };
+    for (i, (e, depth, kind)) in tree.iter().copied().enumerate() {
+        let y = rows.min.y + i as f32 * LANE_H - *scroll;
+        let lane = Rect::from_min_size(Pos2::new(rows.min.x, y), Vec2::new(rows.width(), LANE_H));
+        // Off screen, a lane only matters to a box that swept it before the lanes scrolled.
+        if (lane.max.y < rows.min.y || lane.min.y > rows.max.y) && marquee.is_none() {
+            continue;
+        }
         let selected = selection.is_selected(e);
+        // Rows alternate in shade; the one under the pointer lights up.
+        if i % 2 == 1 {
+            painter.rect_filled(lane, 0.0, egui::Color32::from_white_alpha(5));
+        }
+        if hover.is_some_and(|p| lane.contains(p)) {
+            painter.rect_filled(lane, 0.0, egui::Color32::from_white_alpha(9));
+        }
+        let glyph = Glyph::of(world, e);
+        let method = world.get::<tt_track::Tracker>(e).map(|t| t.method);
+        let manual = method == Some(tt_track::Method::Manual);
+        // The name column: indent, (a tracker's) spinner, icon, name.
+        let mut x = gutter.min.x + 6.0 + depth as f32 * 10.0;
+        if kind == LaneKind::Tracker && !manual {
+            let a = Activity::of(world, e);
+            hits.moving |= a.moving();
+            icons::activity(&painter, Pos2::new(x + 5.0, y + LANE_H / 2.0), 4.5, a, time);
+            x += 13.0;
+        }
+        icons::paint(&painter, Rect::from_center_size(Pos2::new(x + 6.0, y + LANE_H / 2.0), Vec2::splat(12.0)), glyph, selected);
+        x += 16.0;
+        let name = world.get::<Name>(e).map_or("item".into(), |n| n.to_string());
+        let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
+        let label = Rect::from_min_max(Pos2::new(x - 1.0, y + 1.0), Pos2::new((x + galley.size().x + 2.0).min(gutter.max.x - 2.0), y + LANE_H - 1.0));
+        let span = span_of(world, e);
+        let alive = span.range();
+        // (bar, state, inside its lifetime), in this lane's colour.
+        let mut bars: Vec<(Rect, FrameState, bool)> = Vec::new();
+        let color = if selected { glyph.color() } else { glyph.color().gamma_multiply(0.6) };
+        match kind {
+            LaneKind::Sketch | LaneKind::Subject => {
+                if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
+                    bars = bars_of(sig, y + 2.0, y + 11.0, &alive);
+                }
+            }
+            LaneKind::View => {
+                if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
+                    bars = bars_of(sig, y + 5.0, y + 9.0, &alive);
+                }
+            }
+            LaneKind::Tracker => {
+                // Its automatic results (a manual dot has none) …
+                if !manual && let Some(sig) = tt_track::human::auto_signal(world, e) {
+                    bars = bars_of(sig, y + 6.0, y + 12.0, &alive);
+                }
+            }
+        }
         let previewed = marquee.is_some_and(|m| label.intersects(m) || bars.iter().any(|(b, _, _)| b.intersects(m)));
         if selected || previewed {
             painter.rect_filled(lane, 0.0, style::ACCENT.gamma_multiply(if selected { 0.10 } else { 0.05 }));
         }
-        let base = if kind == LaneKind::Tracker { tracks::TRACK } else { style::ACCENT };
-        let color = if selected || previewed { base } else if kind == LaneKind::Tracker { tracks::TRACK.gamma_multiply(0.6) } else { style::MUTED };
+        let mut hit_bars: Vec<Rect> = bars.iter().map(|(b, _, _)| *b).collect();
         for (b, state, alive) in &bars {
-            let alpha = match (alive, *state == FrameState::Valid) {
-                (false, _) => 0.10,
-                (true, true) => 0.7,
-                (true, false) => 0.25,
-            };
-            painter.rect_filled(*b, 1.5, color.gamma_multiply(alpha));
+            painter.rect_filled(*b, 1.5, color.gamma_multiply(alpha(*alive, *state)));
         }
-        if kind == LaneKind::Tracker
-            && let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0))
-        {
-            // Flagged frames red, and the score along the bottom (1 at the top of the band).
-            let cols = tracker_columns(cache, e, sig, alive.clone(), scale);
-            let x0 = scale.rect.min.x;
-            let mut line: Vec<Pos2> = Vec::new();
-            let flush = |line: &mut Vec<Pos2>| {
-                if line.len() > 1 {
-                    painter.add(egui::Shape::line(std::mem::take(line), Stroke::new(1.0, style::TEXT.gamma_multiply(0.55))));
-                }
-                line.clear();
-            };
-            for (i, c) in cols.iter().enumerate() {
-                let x = x0 + i as f32 + 0.5;
-                match c {
-                    Some((score, flagged)) => {
-                        if *flagged {
-                            painter.rect_filled(Rect::from_x_y_ranges(x - 0.5..=x + 0.5, y0..=y1), 0.0, tracks::LOST.gamma_multiply(0.85));
-                        }
-                        line.push(Pos2::new(x, y + 16.5 - 4.5 * score.clamp(0.0, 1.0)));
-                    }
-                    None => flush(&mut line),
+        if kind == LaneKind::Tracker {
+            // … what was drawn by hand, a layer over them (a manual dot: all of it).
+            if let Some(h) = tt_track::human::human_signal(world, e) {
+                let (y0, y1) = if manual { (y + 2.0, y + 12.0) } else { (y + 1.5, y + 5.0) };
+                let hand = if selected { style::HAND } else { style::HAND.gamma_multiply(0.7) };
+                for (b, state, alive) in bars_of(h, y0, y1, &alive) {
+                    painter.rect_filled(b, 1.0, hand.gamma_multiply(alpha(alive, state).max(0.1) / 0.75));
+                    hit_bars.push(b);
                 }
             }
-            flush(&mut line);
+            if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)).filter(|_| !manual) {
+                // Flagged frames red, and the score along the bottom (1 at the top of the band).
+                let cols = tracker_columns(cache, e, sig, alive.clone(), scale);
+                let x0 = scale.rect.min.x;
+                let mut line: Vec<Pos2> = Vec::new();
+                let flush = |line: &mut Vec<Pos2>| {
+                    if line.len() > 1 {
+                        painter.add(egui::Shape::line(std::mem::take(line), Stroke::new(1.0, style::TEXT.gamma_multiply(0.5))));
+                    }
+                    line.clear();
+                };
+                for (i, c) in cols.iter().enumerate() {
+                    let x = x0 + i as f32 + 0.5;
+                    match c {
+                        Some((score, flagged)) => {
+                            if *flagged {
+                                painter.rect_filled(Rect::from_x_y_ranges(x - 0.5..=x + 0.5, y + 6.0..=y + 12.0), 0.0, tracks::LOST.gamma_multiply(0.85));
+                            }
+                            line.push(Pos2::new(x, y + 17.0 - 4.5 * score.clamp(0.0, 1.0)));
+                        }
+                        None => flush(&mut line),
+                    }
+                }
+                flush(&mut line);
+            }
+            // Its looks (white squares) or a CoTracker's reset points (white diamonds), on their frames.
+            for l in tt_track::look::looks_of(world, e) {
+                let Some(look) = world.get::<tt_track::look::Look>(l) else { continue };
+                if !visible.contains(&look.frame) {
+                    continue;
+                }
+                let c = Pos2::new(scale.x(look.frame as f64 + 0.5), y + 9.0);
+                let lit = selection.is_selected(l);
+                let pin = style::PIN.gamma_multiply(if lit || selected { 1.0 } else { 0.6 });
+                if method == Some(tt_track::Method::CoTracker) {
+                    icons::diamond(&painter, c, if lit { 5.0 } else { 4.0 }, Stroke::new(1.0, egui::Color32::from_black_alpha(160)), Some(pin));
+                } else {
+                    painter.rect_filled(Rect::from_center_size(c, Vec2::splat(if lit { 7.0 } else { 6.0 })), 1.0, pin);
+                    painter.rect_stroke(Rect::from_center_size(c, Vec2::splat(if lit { 7.0 } else { 6.0 })), 1.0, Stroke::new(1.0, egui::Color32::from_black_alpha(160)), egui::StrokeKind::Outside);
+                }
+            }
             // Its jobs: what is left to track (outlined) and where each is.
             if let Some(st) = world.get::<TrackStatus>(e) {
                 for s in [st.forward, st.backward].into_iter().flatten() {
                     let (a, b) = if s.to >= s.at { (s.at + 1, s.to + 1) } else { (s.to, s.at) };
-                    let c = if s.waiting { style::MUTED } else { tracks::TRACK };
+                    let c = if s.waiting { style::MUTED } else if s.phase == tt_track::job::Phase::Loading { style::LIVE } else { tracks::TRACK };
                     if b > a
-                        && let Some(r) = bar(y0, y1, a, b)
+                        && let Some(r) = bar(y + 6.0, y + 12.0, a, b)
                     {
                         painter.rect_stroke(r, 1.5, Stroke::new(1.0, c.gamma_multiply(0.6)), egui::StrokeKind::Inside);
                     }
@@ -777,7 +900,16 @@ fn lanes(
                 }
             }
         }
+        // A subject's own offset keys.
+        if kind == LaneKind::Subject
+            && let Some(sub) = world.get::<tt_core::subject::Subject>(e)
+        {
+            for k in sub.offsets.iter().filter(|k| visible.contains(&k.frame)) {
+                icons::diamond(&painter, Pos2::new(scale.x(k.frame as f64 + 0.5), y + 6.5), 3.5, Stroke::new(1.0, egui::Color32::from_black_alpha(160)), Some(style::SUBJECT));
+            }
+        }
         // A tick per stroke under a selected sketch (or one whose stroke is selected).
+        let strokes = if kind == LaneKind::Sketch { tt_core::commands::strokes_of(world, e) } else { Vec::new() };
         if selected || strokes.iter().any(|c| selection.is_selected(*c)) {
             for c in &strokes {
                 if let Some((a, b)) = world.get::<ClockMap>(*c).and_then(|m| m.frame_hull())
@@ -792,12 +924,21 @@ fn lanes(
         if let Some(l) = live.filter(|l| l.target == Some(e)) {
             live_bars(y, l);
         }
+        // How far a stroke at the playhead would pull this sketch's neighbouring frames.
+        if let Some((_, at, reach)) = falloff_on.filter(|(s, _, _)| *s == e)
+            && let Some(r) = bar(y + 1.0, y + LANE_H - 1.0, at - reach, at + reach + 1)
+        {
+            let c = style::HAND.gamma_multiply(0.7);
+            for (a, b) in [(r.left_top(), r.right_top()), (r.right_top(), r.right_bottom()), (r.right_bottom(), r.left_bottom()), (r.left_bottom(), r.left_top())] {
+                painter.add(egui::Shape::dashed_line(&[a, b], Stroke::new(1.0, c), 3.0, 3.0));
+            }
+        }
         // Its lifetime's ends: brackets where trimmed, grabbable either way.
         if let Some((a, b)) = extent_of(world, e).and_then(|x| span.trim(x)) {
             for (edge, f, trimmed) in [(Edge::First, a, span.first.is_some()), (Edge::Last, b + 1, span.last.is_some())] {
                 let x = scale.x(f as f64);
                 let lit = hot == Some((e, edge));
-                if trimmed || lit {
+                if (trimmed || lit) && x >= area.min.x {
                     let c = if lit { style::TEXT } else { color };
                     let dx = if edge == Edge::First { 3.0 } else { -3.0 };
                     let s = Stroke::new(if lit { 2.0 } else { 1.5 }, c);
@@ -805,24 +946,34 @@ fn lanes(
                     painter.line_segment([Pos2::new(x, y + 1.0), Pos2::new(x + dx, y + 1.0)], s);
                     painter.line_segment([Pos2::new(x, y + LANE_H - 1.0), Pos2::new(x + dx, y + LANE_H - 1.0)], s);
                 }
-                hits.edges.push((e, edge, x, lane.intersect(area)));
+                hits.edges.push((e, edge, x, lane.intersect(rows)));
             }
         }
-        painter.galley(label.min + Vec2::splat(2.0), galley, if selected { style::TEXT } else { style::MUTED });
-        hits.lanes.push((e, lane.intersect(area), label, bars.into_iter().map(|(b, _, _)| b).collect()));
+        // The name over the column's shade, clipped to it.
+        painter.with_clip_rect(gutter.intersect(lane).shrink2(Vec2::new(2.0, 0.0))).galley(Pos2::new(x, y + (LANE_H - galley.size().y) / 2.0), galley, if selected { style::TEXT } else { style::MUTED });
+        hits.lanes.push((e, lane.intersect(rows), label, hit_bars));
     }
-    let y = area.min.y + tree.len() as f32 * LANE_H - *scroll;
+    // The column's edge.
+    painter.line_segment([Pos2::new(gutter.max.x, rows.min.y), Pos2::new(gutter.max.x, rows.max.y)], Stroke::new(1.0, style::RULER));
+    let y = rows.min.y + tree.len() as f32 * LANE_H - *scroll;
     if let Some(l) = live.filter(|l| l.target.is_none()) {
         live_bars(y, l);
-        painter.text(Pos2::new(area.min.x + 6.0, y + 7.0), Align2::LEFT_CENTER, "⏺ new sketch", FontId::proportional(11.0), style::TEXT);
+        icons::paint(&painter, Rect::from_center_size(Pos2::new(gutter.min.x + 12.0, y + LANE_H / 2.0), Vec2::splat(12.0)), Glyph::Sketch, true);
+        painter.text(Pos2::new(gutter.min.x + 24.0, y + LANE_H / 2.0), Align2::LEFT_CENTER, "new sketch (recording)", FontId::proportional(11.0), overlay::LIVE);
     } else if tree.is_empty() {
-        painter.text(Pos2::new(area.min.x + 8.0, y + 4.0), Align2::LEFT_TOP, "no sketches yet · D arms the Sketch tool, then press and hold on the video", FontId::proportional(11.0), style::MUTED);
+        painter.text(
+            Pos2::new(area.min.x + 8.0, y + 4.0),
+            Align2::LEFT_TOP,
+            "nothing yet \u{b7} D arms the Sketch tool (press and hold on the video), T the Track tool, M the Draw tool",
+            FontId::proportional(11.0),
+            style::MUTED,
+        );
     }
     // A scrollbar when the lanes don't fit.
-    if content_h > area.height() {
-        let h = area.height() * area.height() / content_h;
-        let top = area.min.y + (area.height() - h) * (*scroll / (content_h - area.height()));
-        painter.rect_filled(Rect::from_min_size(Pos2::new(area.max.x - 5.0, top), Vec2::new(4.0, h)), 2.0, style::TEXT.gamma_multiply(0.35));
+    if content_h > rows.height() {
+        let h = rows.height() * rows.height() / content_h;
+        let top = rows.min.y + (rows.height() - h) * (*scroll / (content_h - rows.height()));
+        painter.rect_filled(Rect::from_min_size(Pos2::new(rows.max.x - 5.0, top), Vec2::new(4.0, h)), 2.0, style::TEXT.gamma_multiply(0.35));
     }
     hits
 }

@@ -266,6 +266,49 @@ fn a_sketch_recorded_under_auto_speed_is_still_accurate() {
     assert!(q(0.95) < 4.0, "p95 {:.2} px", q(0.95));
 }
 
+/// After a still stretch, a few pixels' move ahead slows playback before it
+/// arrives (the sensitivity adapts to how calm the subject was lately), though
+/// the parent's box never changes size (the whole sketch's reading sees nothing).
+#[test]
+fn a_few_pixels_move_after_a_still_stretch_slows_playback_before_it() {
+    use tt_core::op::Output;
+    use tt_core::signal::SignalStore;
+    use tt_core::sketch::BOX_CHANNELS;
+    use tt_core::view::{ActiveView, ensure_view};
+    let mut d = auto_driver(1.0);
+    // The parent: a subject standing still in a 40 px box, which moves 3 px over frames 400–410 and stands still again.
+    let w = &mut d.core.world;
+    let sig = w.resource_mut::<SignalStore>().create(BOX_CHANNELS);
+    {
+        let mut store = w.resource_mut::<SignalStore>();
+        let s = store.get_mut(sig).expect("created");
+        for f in 0..1000 {
+            let x = 500.0 + 0.3 * (f as f32 - 400.0).clamp(0.0, 10.0);
+            s.set(f, &[x, 400.0, x - 20.0, 380.0, x + 20.0, 420.0]);
+        }
+    }
+    let parent = w.spawn(Output(sig)).id();
+    let view = ensure_view(w, parent);
+    w.resource_mut::<ActiveView>().0 = Some(view);
+    d.frames(3, still(300.0, 200.0), UP);
+    type Log = Vec<(f64, f64, &'static str)>;
+    let mut log: Log = Vec::new();
+    let hand = still(300.0, 200.0);
+    start(&mut d, hand, 250, true);
+    while d.transport().playhead < 405.0 && d.now < 60.0 {
+        d.frame(hand, HOLD);
+        log.push((d.transport().playhead, rate(&d), d.core.world.resource::<AutoSpeedState>().reason));
+    }
+    d.frame(hand, UP);
+    let at = |f: f64| log.iter().find(|(p, _, _)| *p >= f).copied().expect("reached");
+    let calm = log.iter().filter(|(p, _, _)| (280.0..330.0).contains(p)).map(|(_, r, _)| *r).fold(0.0, f64::max);
+    let (_, r395, why) = at(395.0);
+    println!("still: ×{calm:.2}; five frames before a 3 px move: ×{r395:.2} ({why})");
+    assert!(calm > 1.5, "standing still plays fast: ×{calm:.2}");
+    assert!(r395 < 0.5, "slowed before the move: ×{r395:.2}");
+    assert_eq!(why, "busy ahead");
+}
+
 #[test]
 fn drawing_inside_a_view_slows_before_the_parents_erratic_stretch() {
     use tt_core::op::Output;

@@ -5,6 +5,8 @@
 //!   the hard part: it says roughly where the subject is on every frame, so
 //!   the tracker only searches the guide's box and predicts from the guide's
 //!   motion. Where the tracker loses the subject, it follows the guide.
+//!   Without one, its guide is the whole frame (the root): it searches
+//!   around where it was going.
 //! - input `space` (optional): the view it tracks in (stabilized, magnified;
 //!   by default the guide's own view). Its patches are resampled through
 //!   that view and its results lifted back to source pixels, so a tracker in
@@ -16,6 +18,8 @@
 //!   the first six channels are a box, so anything that takes a sketch (a
 //!   view's framing, overlays) takes a tracker too. `flags` marks frames not
 //!   to trust ([`LOST`], [`OUTSIDE`]); their values stay (non-destructive).
+//!   It is the tracker's automatic results with its human layer over them
+//!   ([`human`]): where a person drew the point, that is the output.
 //!
 //! Trackers are *job* operators: evaluation leaves their dirty frames to
 //! [`runner`], which runs them in background threads forward and backward
@@ -24,6 +28,7 @@
 //! they track is the user's to ask ([`TrackRun`]): new trackers wait.
 
 pub mod export;
+pub mod human;
 pub mod image;
 pub mod job;
 pub mod look;
@@ -76,9 +81,24 @@ pub enum Method {
     /// Its looks as templates, matched on every frame (built in).
     #[default]
     Template,
-    /// CoTracker3 (Meta's learned point tracker, CC-BY-NC weights): seeded at
-    /// the looks' points, run by a Python worker on the job's frames.
+    /// CoTracker3 (Meta's learned point tracker, CC-BY-NC weights): one
+    /// pixel followed at a time, from its reset points (its looks, each a
+    /// point exactly where it was put), run by a Python worker on the job's frames.
     CoTracker,
+    /// No algorithm: only what a person draws (a manual dot, [`human`]).
+    Manual,
+}
+
+impl Method {
+    /// What its looks are called: a template tracker's are patterns it
+    /// matches ("look"), CoTracker's the pixel it follows from there on
+    /// ("reset point").
+    pub fn look_word(self) -> &'static str {
+        match self {
+            Method::CoTracker => "reset point",
+            _ => "look",
+        }
+    }
 }
 
 /// What a tracker is asked to do (its buttons): track forward from its
@@ -267,8 +287,13 @@ pub fn trackers_of(world: &mut World, guide: Entity) -> Vec<Entity> {
 }
 
 /// Where a tracker following `guide` seeded at `frame` starts: `frame` moved
-/// into the guide's frames. None if the guide isn't a box with frames.
-fn anchor_in(world: &World, guide: Entity, frame: FrameIndex) -> Option<FrameIndex> {
+/// into the guide's frames (with no guide, the video's). None if the guide
+/// isn't a box with frames.
+fn anchor_in(world: &World, guide: Option<Entity>, frame: FrameIndex) -> Option<FrameIndex> {
+    let Some(guide) = guide else {
+        let n = world.resource::<Transport>().frame_count;
+        return (n > 0).then(|| frame.clamp(0, n - 1));
+    };
     let sig = world.resource::<SignalStore>().get(world.get::<Output>(guide)?.0)?;
     if sig.channels() < 6 {
         return None;
@@ -277,19 +302,27 @@ fn anchor_in(world: &World, guide: Entity, frame: FrameIndex) -> Option<FrameInd
     Some(frame.clamp(lo, hi))
 }
 
-/// A tracker entity following `guide` from `look` (its seed) in `space`, as part of an edit.
-/// `placed`: the user put the look there (else it came from the guide's
-/// point, so the finished path is re-centred on the guide).
-fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Entity, look: Look, space: Option<Entity>, placed: bool) -> Entity {
+/// Its `n`th look's name: "Look 2", or a CoTracker's "Reset point 2".
+fn look_name(method: Method, n: usize) -> String {
+    let word = method.look_word();
+    format!("{}{} {n}", word[..1].to_uppercase(), &word[1..])
+}
+
+/// A tracker entity following `guide` (None: the whole frame) from `look`
+/// (its seed) in `space`, as part of an edit. `placed`: the user put the
+/// look there (else it came from the guide's point, so the finished path is
+/// re-centred on the guide).
+fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Option<Entity>, look: Look, space: Option<Entity>, placed: bool) -> Entity {
     let out = tx.create_signal(TRACK_CHANNELS);
+    let auto = tx.create_signal(TRACK_CHANNELS);
     let anchor = look.frame;
-    let look = tx.spawn((Name::new("Look 1"), look));
-    let mut inputs = vec![("guide".to_string(), guide)];
+    let new = tx.world().get_resource::<NewTrackers>().copied().unwrap_or_default();
+    let look = tx.spawn((Name::new(look_name(new.method, 1)), look));
+    let mut inputs: Vec<(String, Entity)> = guide.map(|g| ("guide".to_string(), g)).into_iter().collect();
     inputs.extend(space.map(|v| ("space".to_string(), v)));
     inputs.push(("look".to_string(), look));
-    let new = tx.world().get_resource::<NewTrackers>().copied().unwrap_or_default();
-    let tracker = Tracker { center_on_guide: !placed, method: new.method, ..Tracker::at(anchor) };
-    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), tracker, runner::TrackBook::default(), new.run))
+    let tracker = Tracker { center_on_guide: !placed && guide.is_some(), method: new.method, ..Tracker::at(anchor) };
+    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), human::AutoOutput(auto), tracker, runner::TrackBook::default(), new.run))
 }
 
 /// A look around the guide's point on `frame`: a square of `feature` × its
@@ -310,13 +343,24 @@ fn tracking_view(world: &mut World, guide: Entity) -> Option<Entity> {
 /// must be one of the guide's), tracking in the guide's view. One undo step;
 /// the tracker is selected.
 pub fn add_tracker_with_look(world: &mut World, guide: Entity, look: Look) -> Option<Entity> {
+    add_tracker_in(world, Some(guide), look)
+}
+
+/// Add a tracker with no guide (the whole frame is its search region)
+/// whose first look is `look`, tracking in the source. One undo step; the
+/// tracker is selected.
+pub fn add_unguided_tracker(world: &mut World, look: Look) -> Option<Entity> {
+    add_tracker_in(world, None, look)
+}
+
+fn add_tracker_in(world: &mut World, guide: Option<Entity>, look: Look) -> Option<Entity> {
     if anchor_in(world, guide, look.frame)? != look.frame {
         return None;
     }
-    let guide_name = world.get::<Name>(guide).map_or("box".to_string(), |n| n.to_string());
+    let guide_name = guide.map_or("the whole frame".to_string(), |g| world.get::<Name>(g).map_or("box".to_string(), |n| n.to_string()));
     let name = format!("Tracker {}", tracker_count(world) + 1);
     world.resource_mut::<History>().begin(format!("Track {guide_name}"));
-    let space = tracking_view(world, guide);
+    let space = guide.and_then(|g| tracking_view(world, g));
     let mut made = None;
     edit(world, "Track", |tx| made = Some(spawn_tracker(tx, name, guide, look, space, true)));
     world.resource_mut::<History>().end();
@@ -325,14 +369,19 @@ pub fn add_tracker_with_look(world: &mut World, guide: Entity, look: Look) -> Op
     Some(tracker)
 }
 
+fn method_of(world: &World, tracker: Entity) -> Method {
+    world.get::<Tracker>(tracker).map_or(Method::Template, |t| t.method)
+}
+
 /// Start `tracker` again from `look` (one undo step): the look goes first
 /// (it seeds) and its frame becomes the anchor.
 pub fn reseed_with_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity> {
     let n = look::looks_of(world, tracker).len() + 1;
+    let name = look_name(method_of(world, tracker), n);
     let frame = look.frame;
     let mut made = None;
     edit(world, "Re-seed tracker", |tx| {
-        let e = tx.spawn((Name::new(format!("Look {n}")), look));
+        let e = tx.spawn((Name::new(name), look));
         tx.modify::<Inputs>(tracker, |i| {
             let at = i.0.iter().position(|(s, _)| s == "look").unwrap_or(i.0.len());
             i.0.insert(at, ("look".to_string(), e));
@@ -347,13 +396,33 @@ pub fn reseed_with_look(world: &mut World, tracker: Entity, look: Look) -> Optio
 /// them, pinned on the look's frame.
 pub fn add_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity> {
     let n = look::looks_of(world, tracker).len() + 1;
+    let method = method_of(world, tracker);
+    let name = look_name(method, n);
     let mut made = None;
-    edit(world, "Add look", |tx| {
-        let e = tx.spawn((Name::new(format!("Look {n}")), look));
+    edit(world, &format!("Add {}", method.look_word()), |tx| {
+        let e = tx.spawn((Name::new(name), look));
         tx.modify::<Inputs>(tracker, |i| i.0.push(("look".to_string(), e)));
         made = Some(e);
     });
     made
+}
+
+/// A CoTracker's reset point on `look`'s frame (one undo step): it follows
+/// one pixel at a time, so a reset point already on that frame moves there;
+/// else a new one. Returns it.
+pub fn set_reset_point(world: &mut World, tracker: Entity, look: Look) -> Option<Entity> {
+    let here = look::looks_of(world, tracker).into_iter().find(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == look.frame));
+    match here {
+        Some(l) => {
+            edit(world, "Move reset point", |tx| {
+                tx.modify::<Look>(l, |old| {
+                    (old.x, old.y) = (look.x, look.y);
+                })
+            });
+            Some(l)
+        }
+        None => add_look(world, tracker, look),
+    }
 }
 
 fn tracker_count(world: &mut World) -> usize {
@@ -366,12 +435,12 @@ fn tracker_count(world: &mut World) -> usize {
 /// square of the guide's box there, tracking in `space` (a view; None = the
 /// source). One undo step; the tracker is selected.
 pub fn add_tracker(world: &mut World, guide: Entity, frame: FrameIndex, space: Option<Entity>) -> Option<Entity> {
-    let anchor = anchor_in(world, guide, frame)?;
+    let anchor = anchor_in(world, Some(guide), frame)?;
     let look = look_from_guide(world, guide, anchor)?;
     let guide_name = world.get::<Name>(guide).map_or("box".to_string(), |n| n.to_string());
     let name = format!("Tracker {}", tracker_count(world) + 1);
     let mut made = None;
-    edit(world, &format!("Track {guide_name}"), |tx| made = Some(spawn_tracker(tx, name, guide, look, space, false)));
+    edit(world, &format!("Track {guide_name}"), |tx| made = Some(spawn_tracker(tx, name, Some(guide), look, space, false)));
     let tracker = made?;
     world.resource_mut::<Selection>().select_only(tracker);
     Some(tracker)
@@ -397,7 +466,11 @@ fn apply_track_actions(world: &mut World) {
     let mut guides: Vec<(Entity, Look)> = Vec::new();
     for e in selected {
         if is_tracker(world, e) {
-            let Some(a) = guide_of(world, e).and_then(|g| anchor_in(world, g, frame)) else { continue };
+            // (A manual dot has nothing to re-seed: it is only what was drawn.)
+            if method_of(world, e) == Method::Manual {
+                continue;
+            }
+            let Some(a) = anchor_in(world, guide_of(world, e), frame) else { continue };
             let here: Vec<Entity> = look::looks_of(world, e).into_iter().filter(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == a)).collect();
             match here.iter().find(|l| world.get::<Look>(**l).is_some_and(|l| l.painted().is_some())).or(here.first()) {
                 // Already its anchor and first look: nothing to do.
@@ -407,7 +480,7 @@ fn apply_track_actions(world: &mut World) {
             }
         } else if let Some(s) = tt_core::sketch::sketch_of(world, e)
             && !guides.iter().any(|(g, _)| *g == s)
-            && let Some(look) = anchor_in(world, s, frame).and_then(|a| look_from_guide(world, s, a))
+            && let Some(look) = anchor_in(world, Some(s), frame).and_then(|a| look_from_guide(world, s, a))
         {
             guides.push((s, look));
         }
@@ -440,7 +513,7 @@ fn apply_track_actions(world: &mut World) {
             });
         }
         for (i, (g, look)) in guides.into_iter().enumerate() {
-            made.push(spawn_tracker(tx, format!("Tracker {}", first + i), g, look, space, false));
+            made.push(spawn_tracker(tx, format!("Tracker {}", first + i), Some(g), look, space, false));
         }
     });
     if !made.is_empty() {
@@ -464,6 +537,11 @@ impl Module for TrackModule {
             .component::<runner::TrackBook>(Class::Document)
             .component::<Look>(Class::Document)
             .component::<TrackRun>(Class::Document)
+            .component::<human::AutoOutput>(Class::Document)
+            .component::<human::HumanLayer>(Class::Document)
+            .declare::<human::Composed>(Class::Derived)
+            .declare::<human::DrawTool>(Class::Derived)
+            .init_resource::<human::DrawTool>()
             .declare::<NewTrackers>(Class::Session)
             .init_resource::<NewTrackers>()
             .declare::<tool::TrackTool>(Class::Session)
@@ -483,7 +561,7 @@ impl Module for TrackModule {
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
             .add_systems((apply_track_actions, look_changed).in_set(Set::Intents))
-            .add_systems(tool::track_tool.in_set(Set::Tools))
-            .add_systems(runner::run_trackers.in_set(Set::Jobs));
+            .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
+            .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
     }
 }

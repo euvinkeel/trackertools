@@ -60,22 +60,28 @@ use std::f64::consts::TAU;
 use std::fmt::Write;
 use tt_core::time::FrameIndex;
 
-/// How much the stabilizer smooths the motion it measured before undoing it:
-/// seconds of [`spring`] (0 holds the trackers exactly still). A user setting;
-/// the app remembers it.
+/// How the stabilizer treats the motion it measured: seconds of [`spring`]
+/// smoothing before undoing it (0 holds the trackers exactly still), whether
+/// it undoes the rotation too, and where it holds what it follows. User
+/// settings; the app remembers them.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct StabilizerDefaults {
     pub smooth_position: f32,
     pub smooth_rotation: f32,
+    /// Undo the rotation too (with two or more points, or a subject's angle); else position only.
+    pub rotation: bool,
+    /// Hold what it follows in the middle of the picture; else where it is on the reference frame.
+    pub centre: bool,
 }
 
 impl Default for StabilizerDefaults {
     /// Position held exactly; rotation through a light spring, which takes
     /// most of the jitter out of trackers close together and barely touches
     /// trackers far apart (on real footage with two points 90 px apart, 0.05 s
-    /// cut the stabilized picture's frame-to-frame turn from 0.35° to 0.11°, p95).
+    /// cut the stabilized picture's frame-to-frame turn from 0.35° to 0.11°,
+    /// p95). Rotation undone, and the subject in the middle of the picture.
     fn default() -> Self {
-        Self { smooth_position: 0.0, smooth_rotation: 0.05 }
+        Self { smooth_position: 0.0, smooth_rotation: 0.05, rotation: true, centre: true }
     }
 }
 
@@ -104,16 +110,25 @@ pub struct Steady {
     pub angle: f64,
 }
 
-/// Seconds of spring on the measured motion's position and rotation ([`stabilize`]).
+/// How the measured motion is used ([`stabilize`]): seconds of spring on its
+/// position and rotation, whether the rotation is left out, and (the
+/// stabilizer) whether what it follows is held in the middle of the picture.
+/// The default is the classic stabilizer: everything as measured, held where
+/// it is on the reference frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Smoothing {
     pub position: f64,
     pub rotation: f64,
+    /// Position only: the angle stays 0 (the rotation isn't undone, or followed).
+    pub position_only: bool,
+    /// The stabilizer holds the points' anchor (their centre on the reference
+    /// frame; a subject's point) in the middle of the picture on every frame.
+    pub centred: bool,
 }
 
 impl From<StabilizerDefaults> for Smoothing {
     fn from(d: StabilizerDefaults) -> Self {
-        Self { position: d.smooth_position.max(0.0) as f64, rotation: d.smooth_rotation.max(0.0) as f64 }
+        Self { position: d.smooth_position.max(0.0) as f64, rotation: d.smooth_rotation.max(0.0) as f64, position_only: !d.rotation, centred: d.centre }
     }
 }
 
@@ -144,13 +159,17 @@ struct Motion {
 }
 
 /// The least-squares rotation and shift taking each pair's first point to its
-/// second (at least two pairs; px, y up), as the angle and where `anchor` goes.
-fn rigid(pairs: &[([f64; 2], [f64; 2])], anchor: [f64; 2]) -> Motion {
+/// second (at least two pairs; px, y up), as the angle and where `anchor`
+/// goes. Without `turn`, the shift alone (the angle stays 0).
+fn rigid(pairs: &[([f64; 2], [f64; 2])], anchor: [f64; 2], turn: bool) -> Motion {
     let n = pairs.len() as f64;
     let (mut from, mut to) = ([0.0; 2], [0.0; 2]);
     for (a, b) in pairs {
         from = [from[0] + a[0] / n, from[1] + a[1] / n];
         to = [to[0] + b[0] / n, to[1] + b[1] / n];
+    }
+    if !turn {
+        return Motion { angle: 0.0, at: [anchor[0] - from[0] + to[0], anchor[1] - from[1] + to[1]] };
     }
     let (mut sin, mut cos) = (0.0, 0.0);
     for (a, b) in pairs {
@@ -194,8 +213,10 @@ pub fn follow_path(path: &[(FrameIndex, [f64; 2], f64)], size: [f64; 2], referen
 fn undone(m: &Measured, size: [f64; 2]) -> Stabilization {
     let [w, h] = size;
     // Undo the (smoothed) motion: turn by −angle about the image's centre, and
-    // put the centre where that brings the anchor back to its reference place.
+    // put the centre where that brings the anchor back to its reference place
+    // (or, centred, to the middle of the picture).
     let c = [w / 2.0, h / 2.0];
+    let hold = if m.centred { c } else { m.anchor };
     let keys = m
         .frames
         .iter()
@@ -204,7 +225,7 @@ fn undone(m: &Measured, size: [f64; 2]) -> Stabilization {
             let phi = -m.angle[i];
             let (s, co) = phi.sin_cos();
             let d = [c[0] - m.at[i][0], c[1] - m.at[i][1]];
-            let centre = [co * d[0] - s * d[1] + m.anchor[0], s * d[0] + co * d[1] + m.anchor[1]];
+            let centre = [co * d[0] - s * d[1] + hold[0], s * d[0] + co * d[1] + hold[1]];
             Steady { frame: f, center: [centre[0] / w, centre[1] / h], angle: phi.to_degrees() }
         })
         .collect();
@@ -262,6 +283,9 @@ fn measure_path(path: &[(FrameIndex, [f64; 2], f64)], size: [f64; 2], reference:
     if relative {
         angle.iter_mut().for_each(|a| *a -= at_ref[0]);
     }
+    if smoothing.position_only {
+        angle.iter_mut().for_each(|a| *a = 0.0);
+    }
     let jitter = {
         let mut d2: Vec<f64> = (1..n.saturating_sub(1)).map(|i| (angle[i - 1] - 2.0 * angle[i] + angle[i + 1]).abs()).collect();
         d2.sort_by(f64::total_cmp);
@@ -270,7 +294,7 @@ fn measure_path(path: &[(FrameIndex, [f64; 2], f64)], size: [f64; 2], reference:
     let (angle, ax, ay) = (spring(&angle, smoothing.rotation * fps), spring(&channel(1), smoothing.position * fps), spring(&channel(2), smoothing.position * fps));
     let at: Vec<[f64; 2]> = ax.into_iter().zip(ay).map(|(x, y)| [x, y]).collect();
     let anchor = at[(reference - lo) as usize];
-    Some(Measured { frames: path.iter().map(|p| p.0).collect(), first: lo, angle, at, anchor, reference, used: 1, spread: 0.0, jitter })
+    Some(Measured { frames: path.iter().map(|p| p.0).collect(), first: lo, angle, at, anchor, reference, used: 1, spread: 0.0, jitter, centred: smoothing.centred })
 }
 
 /// The points' motion, smoothed, on every frame from the first fitted to the
@@ -286,6 +310,8 @@ struct Measured {
     used: usize,
     spread: f64,
     jitter: f64,
+    /// The stabilizer holds the anchor in the middle of the picture.
+    centred: bool,
 }
 
 fn measure(tracks: &[Vec<(FrameIndex, [f64; 2])>], size: [f64; 2], reference: FrameIndex, smoothing: Smoothing, fps: f64) -> Option<Measured> {
@@ -308,7 +334,7 @@ fn measure(tracks: &[Vec<(FrameIndex, [f64; 2])>], size: [f64; 2], reference: Fr
             .iter()
             .filter_map(|&f| {
                 let pairs: Vec<([f64; 2], [f64; 2])> = refs.iter().zip(&pts).filter_map(|(r, m)| Some(((*r)?, *m.get(&f)?))).collect();
-                (pairs.len() >= need.max(1)).then(|| (f, rigid(&pairs, anchor)))
+                (pairs.len() >= need.max(1)).then(|| (f, rigid(&pairs, anchor, !smoothing.position_only)))
             })
             .collect()
     };
@@ -366,7 +392,7 @@ fn measure(tracks: &[Vec<(FrameIndex, [f64; 2])>], size: [f64; 2], reference: Fr
     let jitter = d2.get(d2.len() / 2).map_or(0.0, |m| (m * 1.4826 / 6f64.sqrt()).to_degrees());
     let (angle, ax, ay) = (spring(&angle, smoothing.rotation * fps), spring(&ax, smoothing.position * fps), spring(&ay, smoothing.position * fps));
     let at = ax.into_iter().zip(ay).map(|(x, y)| [x, y]).collect();
-    Some(Measured { frames: motion.keys().copied().collect(), first: lo, angle, at, anchor, reference, used, spread, jitter })
+    Some(Measured { frames: motion.keys().copied().collect(), first: lo, angle, at, anchor, reference, used, spread, jitter, centred: smoothing.centred })
 }
 
 /// A key's values on frame `f`: linear between keys, held beyond them (as
@@ -718,7 +744,7 @@ mod tests {
         let far = tracks(&[[-600.0, -300.0], [600.0, -300.0], [-600.0, 300.0], [600.0, 300.0]]);
         let none = Smoothing::default();
         let (c, f) = (stabilize(&close, size, 100, none, 50.0).unwrap(), stabilize(&far, size, 100, none, 50.0).unwrap());
-        let sprung = stabilize(&close, size, 100, Smoothing { position: 0.0, rotation: 0.05 }, 50.0).unwrap();
+        let sprung = stabilize(&close, size, 100, Smoothing { position: 0.0, rotation: 0.05, ..Smoothing::default() }, 50.0).unwrap();
         let (wc, wf, ws) = (wobble(&c), wobble(&f), wobble(&sprung));
         eprintln!("rotation wobble: two points 90 px apart {wc:.4}°, four far apart {wf:.4}°, the close two through a 0.05 s spring {ws:.4}°");
         assert!(wf < wc / 10.0, "farther apart, steadier: {wf} vs {wc}");
@@ -730,6 +756,45 @@ mod tests {
         let mean = left.iter().sum::<f64>() / left.len() as f64;
         let rms = (left.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / left.len() as f64).sqrt();
         assert!(rms < 0.06, "the roll is still taken out: {rms}° left (rms)");
+    }
+
+    #[test]
+    fn position_only_leaves_the_turn_and_centred_holds_the_subject_in_the_middle() {
+        let size = [1920.0, 1080.0];
+        // Two points turning about a wandering spot, off to one side of the picture.
+        let at = |f: i64, s: [f64; 2]| {
+            let t = f as f64;
+            let (turn, cx, cy) = (0.01 * t, 500.0 + 4.0 * t, 300.0 + 2.0 * t);
+            [cx + s[0] * turn.cos() - s[1] * turn.sin(), cy + s[0] * turn.sin() + s[1] * turn.cos()]
+        };
+        let tracks: Vec<Vec<(i64, [f64; 2])>> = [[-60.0, 0.0], [60.0, 0.0]].iter().map(|s| (0..80).map(|f| (f, at(f, *s))).collect()).collect();
+        let up = |p: [f64; 2]| [p[0], size[1] - p[1]];
+        // Position only: no key turns, and the points' centre is held still (as on frame 20).
+        let flat = stabilize(&tracks, size, 20, Smoothing { position_only: true, ..Smoothing::default() }, 50.0).expect("a stabilizer");
+        assert!(flat.keys.iter().all(|k| k.angle == 0.0));
+        let held = up(at(20, [0.0, 0.0]));
+        for k in &flat.keys {
+            let got = apply(k, up(at(k.frame, [0.0, 0.0])), size);
+            assert!((got[0] - held[0]).hypot(got[1] - held[1]) < 1e-6, "frame {}", k.frame);
+        }
+        // Centred: the points' centre is in the middle of the picture on every frame, still turned as on frame 20.
+        let mid = stabilize(&tracks, size, 20, Smoothing { centred: true, ..Smoothing::default() }, 50.0).expect("a stabilizer");
+        let (ra, rb) = (up(at(20, [-60.0, 0.0])), up(at(20, [60.0, 0.0])));
+        let heading = (rb[1] - ra[1]).atan2(rb[0] - ra[0]);
+        for k in &mid.keys {
+            let got = apply(k, up(at(k.frame, [0.0, 0.0])), size);
+            assert!((got[0] - 960.0).hypot(got[1] - 540.0) < 1e-6, "frame {}: {got:?}", k.frame);
+            let (a, b) = (apply(k, up(at(k.frame, [-60.0, 0.0])), size), apply(k, up(at(k.frame, [60.0, 0.0])), size));
+            assert!(((b[1] - a[1]).atan2(b[0] - a[0]) - heading).abs() < 1e-9, "turned as on frame 20: frame {}", k.frame);
+        }
+        // A subject's path the same way.
+        let path: Vec<(i64, [f64; 2], f64)> = (0..50).map(|f| (f, [300.0 + 3.0 * f as f64, 200.0], (f as f64).to_radians())).collect();
+        let s = stabilize_path(&path, size, 10, Smoothing { centred: true, position_only: true, ..Smoothing::default() }, 50.0).expect("a stabilizer");
+        for (k, (_, p, _)) in s.keys.iter().zip(&path) {
+            assert_eq!(k.angle, 0.0);
+            let got = apply(k, up(*p), size);
+            assert!((got[0] - 960.0).hypot(got[1] - 540.0) < 1e-6);
+        }
     }
 
     #[test]
@@ -798,7 +863,7 @@ mod tests {
                 // The source pixel the render takes for q, through Fusion's Transform, lands on q.
                 let p = [m[0] * q[0] + m[1] * q[1] + m[2], m[3] * q[0] + m[4] * q[1] + m[5]];
                 let back = apply(&k, up(p), size);
-                assert!((back[0] - q[0]).abs() < 1e-6 && (back[1] - (size[1] - q[1])).abs() < 1e-6, "frame {f}: {q:?} → {p:?} → {back:?}");
+                assert!((back[0] - q[0]).abs() < 1e-6 && (back[1] - (size[1] - q[1])).abs() < 1e-6, "frame {f}: {q:?} -> {p:?} -> {back:?}");
             }
         }
         assert_eq!(key_at(&keys, 5).expect("a key").angle, -0.5, "linear between keys");

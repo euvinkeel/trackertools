@@ -34,7 +34,7 @@ impl InputProbe {
         }
         self.summary = summarize(&pointer.recent(2.0), &self.egui_frames);
         if let Some(d) = mapping {
-            self.summary.push_str(&format!(" · raw→window offset ({:+.1}, {:+.1}) pt", d.x, d.y));
+            self.summary.push_str(&format!(" · raw-to-window offset ({:+.1}, {:+.1}) pt", d.x, d.y));
         }
         if now - self.last_log > 5.0 {
             self.last_log = now;

@@ -53,32 +53,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
 
         ui.separator();
-        ui.heading("Views");
-        ui.label("New views (Tab into a sketch)");
-        let (pan, lock) = {
-            let p = &world.resource::<ViewDefaults>().params;
-            (p.pan_only, p.lock_zoom)
-        };
-        let mut mode = if pan { 0 } else if lock { 1 } else { 2 };
-        ui.radio_value(&mut mode, 0, "only pan: follow the subject; the zoom is yours (the wheel)");
-        ui.radio_value(&mut mode, 1, "steady zoom: the widest the sketch needs");
-        ui.radio_value(&mut mode, 2, "zoom with the sketch's size (smoothed)");
-        if mode != if pan { 0 } else if lock { 1 } else { 2 } {
-            let mut d = world.resource_mut::<ViewDefaults>();
-            (d.params.pan_only, d.params.lock_zoom) = (mode == 0, mode != 2);
-        }
-        ui.label(egui::RichText::new("Each view has its own \"pan only\" and \"lock zoom\" in the Inspector.").color(style::MUTED).small());
-        let views: Vec<Entity> = {
-            let mut q = world.query_filtered::<(Entity, &tt_core::view::FrameParams), bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
-            q.iter(world).filter(|(_, p)| !p.pan_only).map(|(e, _)| e).collect()
-        };
-        if ui.add_enabled(!views.is_empty(), egui::Button::new(format!("Make the {} zooming view(s) in this project only pan", views.len()))).clicked() {
-            tt_core::history::edit(world, "Views only pan", |tx| {
-                for v in views {
-                    tx.modify::<tt_core::view::FrameParams>(v, |p| p.pan_only = true);
-                }
-            });
-        }
+        views(ui, world);
+        ui.label(egui::RichText::new("Each view has all of these in the Inspector (select the sketch: its View).").color(style::MUTED).small());
 
         ui.separator();
         ui.heading("Keys");
@@ -103,11 +79,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         ui.label(egui::RichText::new("Projects (autosaved per video), proxies and the session live here.").weak().small());
         if ui.button("Open the folder").clicked() {
             let _ = std::fs::create_dir_all(&dir);
-            // Explorer, Finder, or the desktop's file manager.
-            let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-            if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
-                tracing::warn!("could not open {}: {e}", dir.display());
-            }
+            crate::files::open_folder(&dir);
         }
     });
 }
@@ -180,6 +152,139 @@ fn updates(ui: &mut egui::Ui, world: &mut World) {
     });
 }
 
+/// How a view follows its sketch (Tab into a sketch; tt_core::view's
+/// FrameParams), for new views: the zoom, and how steadily it pans: a dead
+/// zone (small moves of the box don't move the view) and smoothing. The
+/// sketch's box wobbles a little with the hand, and a view that follows it
+/// exactly makes a still picture shake inside it; a preview shows both
+/// sides of that, and a button gives the project's views the same.
+fn views(ui: &mut egui::Ui, world: &mut World) {
+    ui.heading("Views");
+    ui.label(
+        "A view follows its sketch's box (Tab into a sketch). The box wobbles a little with your hand, and a view that follows it exactly makes the picture inside shake, \
+         even where the video is still. A dead zone lets small moves of the box go, and smoothing calms the rest.",
+    );
+    let mut p = world.resource::<ViewDefaults>().params.clone();
+    let before = p.clone();
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Follow:");
+        for (name, damping, dead) in [("closely", 0.1, 0.0), ("steadily", 0.3, 0.08), ("very steadily", 0.6, 0.18)] {
+            let on = (p.pan_damping - damping).abs() < 1e-3 && (p.dead_zone - dead).abs() < 1e-3;
+            if ui.selectable_label(on, name).clicked() {
+                (p.pan_damping, p.dead_zone) = (damping, dead);
+            }
+        }
+    });
+    egui::Grid::new("view-follow").num_columns(2).show(ui, |ui| {
+        ui.label("dead zone").on_hover_text("How far (a fraction of the view, from its middle) the box may wander before the view moves at all. 0: it always follows.");
+        ui.add(egui::Slider::new(&mut p.dead_zone, 0.0..=0.4).max_decimals(2).custom_formatter(|v, _| format!("{:.0}% of the view", v * 100.0)));
+        ui.end_row();
+        ui.label("smoothing").on_hover_text("How calmly the view pans (seconds of video; no lag: it looks both ways).");
+        ui.add(egui::Slider::new(&mut p.pan_damping, 0.0..=2.0).max_decimals(2).suffix(" s"));
+        ui.end_row();
+        ui.label("zoom");
+        let mut mode = if p.pan_only { 0 } else if p.lock_zoom { 1 } else { 2 };
+        ui.vertical(|ui| {
+            ui.radio_value(&mut mode, 0, "only pan: the zoom is yours (the wheel)");
+            ui.radio_value(&mut mode, 1, "steady zoom: the widest the sketch needs");
+            ui.radio_value(&mut mode, 2, "zoom with the sketch's size (smoothed)");
+        });
+        (p.pan_only, p.lock_zoom) = (mode == 0, mode != 2);
+        ui.end_row();
+    });
+    egui::CollapsingHeader::new("Preview").id_salt("view-follow-preview").default_open(true).show(ui, |ui| {
+        view_preview(ui, &p);
+    });
+    if p != before {
+        world.resource_mut::<ViewDefaults>().params = p.clone();
+    }
+    let views: Vec<Entity> = {
+        let mut q = world.query_filtered::<(Entity, &tt_core::view::FrameParams), bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
+        q.iter(world).filter(|(_, v)| (v.pan_damping, v.dead_zone, v.pan_only, v.lock_zoom) != (p.pan_damping, p.dead_zone, p.pan_only, p.lock_zoom)).map(|(e, _)| e).collect()
+    };
+    if ui
+        .add_enabled(!views.is_empty(), egui::Button::new(format!("Use these for the {} other view(s) in this project", views.len())))
+        .on_hover_text("These settings are for new views; this gives them to the views you already have (one undo step).")
+        .clicked()
+    {
+        tt_core::history::edit(world, "Views follow the same way", |tx| {
+            for v in views {
+                tx.modify::<tt_core::view::FrameParams>(v, |q| {
+                    (q.pan_damping, q.dead_zone, q.pan_only, q.lock_zoom) = (p.pan_damping, p.dead_zone, p.pan_only, p.lock_zoom);
+                });
+            }
+        });
+    }
+}
+
+/// A box drawn by hand around a subject that stands still, moves across,
+/// and stands still again (source px, a 320 × 180 source): it wobbles a few
+/// pixels all along, as a hand does.
+fn wobbly_box(f: i64) -> [f32; 6] {
+    let t = f as f64 / 60.0;
+    let s = ((t - 2.5) / 1.2).clamp(0.0, 1.0);
+    let x = 110.0 + 100.0 * s * s * (3.0 - 2.0 * s) + 2.6 * (11.0 * t).sin() + 1.8 * (17.3 * t + 1.0).cos();
+    let y = 92.0 + 2.2 * (13.1 * t).sin() + 1.2 * (7.7 * t).cos();
+    let h = 17.0 + 2.0 * (6.3 * t).sin();
+    [x, y, x - h, y - h, x + h, y + h].map(|v| v as f32)
+}
+
+/// The preview: on the left the source, with the hand-drawn box (orange) and
+/// the view following it (blue); on the right what the view shows, a still
+/// scene (the dots) and the subject: where the dots shake, the view moved.
+fn view_preview(ui: &mut egui::Ui, p: &tt_core::view::FrameParams) {
+    use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+    const N: i64 = 6 * 60;
+    let size = tt_core::view::SourceSize { width: 320.0, height: 180.0 };
+    let mut sig = tt_core::signal::Signal::new(tt_core::sketch::BOX_CHANNELS);
+    for f in 0..N {
+        sig.set(f, &wobbly_box(f));
+    }
+    let Some((first, frames)) = tt_core::view::frame_views(&sig, None, p, 60.0, &size) else { return };
+    let f = ((ui.input(|i| i.time) * 60.0) as i64).rem_euclid(N);
+    let Some(mut v) = frames.get((f - first) as usize).copied() else { return };
+    // Only panning, the zoom is the wheel's: shown as you would look, 3× closer.
+    if p.pan_only {
+        (v[2], v[3]) = (v[2] / 3.0, v[3] / 3.0);
+    }
+    let w = ((ui.available_width() - 12.0) / 2.0).clamp(120.0, 240.0);
+    let h = w * 9.0 / 16.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(2.0 * w + 12.0, h + 16.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let left = Rect::from_min_size(rect.min, Vec2::new(w, h));
+    let right = Rect::from_min_size(rect.min + Vec2::new(w + 12.0, 0.0), Vec2::new(w, h));
+    for r in [left, right] {
+        painter.rect_filled(r, 3.0, style::BG);
+        painter.rect_stroke(r, 3.0, Stroke::new(1.0, style::RULER), egui::StrokeKind::Inside);
+    }
+    // The still scene: a grid of dots, fixed in the source.
+    let dots: Vec<[f64; 2]> = (0..9).flat_map(|i| (0..5).map(move |j| [20.0 + 35.0 * i as f64, 18.0 + 36.0 * j as f64])).collect();
+    let in_left = |q: [f64; 2]| left.min + Vec2::new((q[0] / size.width) as f32 * w, (q[1] / size.height) as f32 * h);
+    for d in &dots {
+        painter.circle_filled(in_left(*d), 1.5, style::MUTED);
+    }
+    let b = wobbly_box(f);
+    let boxed = |to: &dyn Fn([f64; 2]) -> Pos2| Rect::from_two_pos(to([b[2] as f64, b[3] as f64]), to([b[4] as f64, b[5] as f64]));
+    painter.rect_stroke(boxed(&in_left), 0.0, Stroke::new(1.5, style::HAND), egui::StrokeKind::Middle);
+    // The view: [cx, cy, crop_w, crop_h, ..] in source px.
+    let crop = Rect::from_center_size(in_left([v[0], v[1]]), Vec2::new((v[2] / size.width) as f32 * w, (v[3] / size.height) as f32 * h));
+    painter.rect_stroke(crop, 0.0, Stroke::new(1.5, style::VIEW), egui::StrokeKind::Middle);
+    // What the view shows: the source through it.
+    let in_right = |q: [f64; 2]| right.center() + Vec2::new(((q[0] - v[0]) / v[2]) as f32 * w, ((q[1] - v[1]) / v[3]) as f32 * h);
+    let clip = painter.with_clip_rect(right.shrink(1.0));
+    for d in &dots {
+        clip.circle_filled(in_right(*d), 2.0, Color32::from_gray(150));
+    }
+    clip.rect_stroke(boxed(&in_right), 0.0, Stroke::new(1.5, style::HAND), egui::StrokeKind::Middle);
+    let text = |at: Pos2, s: &str| {
+        painter.text(at, egui::Align2::LEFT_TOP, s, egui::FontId::proportional(10.0), style::MUTED);
+    };
+    text(left.left_bottom() + Vec2::new(0.0, 2.0), "the source: your box, the view");
+    text(right.left_bottom() + Vec2::new(0.0, 2.0), "in the view: a still scene should hold still");
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+}
+
 /// Anticipatory speed (tt_core::autospeed): the switch, the speed range and
 /// how far ahead it reads; the rest under Advanced.
 fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
@@ -190,20 +295,45 @@ fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
     };
     ui.heading("Anticipatory speed");
     ui.checkbox(&mut a.enabled, "Set the playback speed for me while I hold a stroke").on_hover_text(
-        "While you hold a stroke with the video playing, it reads ahead in the parent sketch (the one whose view you're drawing in):          where its box is bigger than usual for it, the subject was hard to follow, so playback slows before that arrives;          where it is as small as usual, it plays fast. It measures what \"usual\" is on the sketch itself (the 20th to 80th percentile of its box sizes).          Q/E during a stroke multiply its speed.",
+        "While you hold a stroke with the video playing, it reads ahead in the parent sketch (the one whose view you're drawing in). \
+         It slows down before what is ahead is busier than usual: its box bigger than usual for the whole sketch (the subject was hard to follow there), \
+         or its motion or box busier than they were over the last few seconds (so after a still stretch, even a few pixels' move ahead slows it). \
+         Where it is as calm as usual, it plays fast. Q/E during a stroke multiply its speed.",
     );
     ui.add_enabled_ui(a.enabled, |ui| {
         egui::Grid::new("auto-speed").num_columns(2).show(ui, |ui| {
-            ui.label("busy stretches at").on_hover_text("The speed where the sketch ahead was at its busiest (its box at or above its 80th percentile).");
-            ui.add(egui::Slider::new(&mut a.slowest, 0.02..=1.0).logarithmic(true).max_decimals(2).prefix("×"));
+            ui.label("busy stretches at").on_hover_text("The speed where the sketch ahead is at its busiest.");
+            ui.add(egui::Slider::new(&mut a.slowest, 0.02..=1.0).logarithmic(true).max_decimals(2).prefix("\u{d7}"));
             ui.end_row();
-            ui.label("calm stretches at").on_hover_text("The speed where the sketch ahead was as calm as it gets (its box at or below its 20th percentile). In between, the speed goes smoothly from one to the other.");
-            ui.add(egui::Slider::new(&mut a.fastest, 0.25..=4.0).logarithmic(true).max_decimals(2).prefix("×"));
+            ui.label("calm stretches at").on_hover_text("The speed where the sketch ahead is as calm as it gets. In between, the speed goes smoothly from one to the other.");
+            ui.add(egui::Slider::new(&mut a.fastest, 0.25..=4.0).logarithmic(true).max_decimals(2).prefix("\u{d7}"));
             ui.end_row();
             ui.label("look ahead").on_hover_text("How far ahead it reads (seconds of video): the busiest moment in this window sets the speed, so it slows this long before a busy stretch.");
             ui.add(egui::Slider::new(&mut a.look_ahead, 0.0..=5.0).max_decimals(2).suffix(" s"));
             ui.end_row();
+            ui.label("sensitivity").on_hover_text(
+                "How much busier than the last few seconds counts as fully busy. Up to 1.5\u{d7} is ordinary. Lower: a smaller change slows it (a slight move after standing still).",
+            );
+            ui.add(egui::Slider::new(&mut a.sensitivity, 1.6..=10.0).logarithmic(true).max_decimals(1).suffix("\u{d7} busier"));
+            ui.end_row();
+            ui.label("remembers").on_hover_text("How far back it looks (seconds of video) to know how calm the subject has been lately.");
+            ui.add(egui::Slider::new(&mut a.memory, 0.5..=10.0).max_decimals(1).suffix(" s"));
+            ui.end_row();
         });
+        // What it reads right now, while it drives.
+        let (acting, busy, reason) = {
+            let s = world.resource::<AutoSpeedState>();
+            (s.acting(), s.busy, s.reason)
+        };
+        if acting {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("now: {reason}")).small());
+                if let Some(u) = busy {
+                    ui.add(egui::ProgressBar::new(u as f32).desired_width(140.0).text(format!("{:.0}% busy", 100.0 * u)));
+                }
+            });
+            ui.ctx().request_repaint();
+        }
         a.fastest = a.fastest.max(a.slowest);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("Q/E while it drives: your multiplier ×{bias:.2}")).color(style::MUTED).small());
@@ -246,6 +376,9 @@ fn auto_speed(ui: &mut egui::Ui, world: &mut World) {
             });
             ui.add_space(4.0);
             egui::Grid::new("auto-speed-smooth").num_columns(2).show(ui, |ui| {
+                ui.label("standing still below").on_hover_text("Motion slower than this (source pixels per second) counts as none: the sketch's own wobble isn't a move.");
+                ui.add(egui::DragValue::new(&mut a.still).range(0.1..=100.0).speed(0.2).suffix(" px/s"));
+                ui.end_row();
                 ui.label("slow down within").on_hover_text("How quickly it slows down (real seconds): short, so it brakes in time.");
                 ui.add(egui::DragValue::new(&mut a.slow_down).range(0.01..=2.0).speed(0.005).suffix(" s"));
                 ui.end_row();
@@ -286,6 +419,7 @@ fn describe(action: Action) -> &'static str {
         Undo => "Undo",
         Redo => "Redo",
         Tool(tt_core::tool::Tool::Track) => "Track tool on/off: drag a pattern or click a point on the video",
+        Tool(tt_core::tool::Tool::Draw) => "Draw tool on/off: a tracker's point by hand, or a manual dot",
         Tool(_) => "Sketch tool on/off",
         Cancel => "Cancel the stroke, or leave the tool",
         DeselectAll => "Deselect all",

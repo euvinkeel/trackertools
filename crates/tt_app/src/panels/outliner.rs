@@ -222,6 +222,24 @@ fn rows(world: &mut World, st: &OutlinerState) -> Vec<Row> {
         }
         // (Nested sketches follow in tree order at depth + 1.)
     }
+    // Trackers with no sketch (their guide is the whole frame), and manual dots.
+    let mut loose: Vec<Entity> = {
+        let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
+        q.iter(world).filter(|(_, o)| o.kind == "track").map(|(e, _)| e).collect()
+    };
+    loose.retain(|t| tt_track::guide_of(world, *t).is_none());
+    creation_order(world, &mut loose);
+    for tr in loose {
+        let looks = tt_track::look::looks_of(world, tr);
+        if !(filter.is_empty() || matches(world, tr) || looks.iter().any(|l| matches(world, *l))) {
+            continue;
+        }
+        let tr_open = !filter.is_empty() || !st.folded.contains(&tr);
+        out.push(Row::Entity { e: tr, depth: 0, fold: (!looks.is_empty()).then_some(tr_open) });
+        if tr_open {
+            out.extend(looks.into_iter().map(|l| Row::Entity { e: l, depth: 1, fold: None }));
+        }
+    }
     // Everything else in the document.
     for e in other_entities(world) {
         if matches(world, e) {
@@ -249,8 +267,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     }
 
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("🔍 Filter by name").desired_width(ui.available_width() - 28.0));
-        if ui.add_enabled(!st.filter.is_empty(), egui::Button::new("✖").small()).on_hover_text("Clear the filter").clicked() {
+        ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("Filter by name").desired_width(ui.available_width() - 28.0));
+        if !st.filter.is_empty() && crate::icons::cross_button(ui, "Clear the filter").clicked() {
             st.filter.clear();
         }
     });
@@ -312,14 +330,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                     let preview = ui.painter().add(egui::Shape::Noop);
                     let r = ui.horizontal(|ui| {
                         ui.add_space(depth as f32 * 14.0);
+                        let h = ui.text_style_height(&egui::TextStyle::Body).max(12.0);
                         match fold {
                             Some(open) => {
-                                if ui.add(egui::Button::new(if open { "⏷" } else { "⏵" }).frame(false).small()).clicked() {
+                                if crate::icons::fold_button(ui, open).clicked() {
                                     toggle_fold = Some(e);
                                 }
                             }
-                            None => ui.add_space(18.0),
+                            None => ui.add_space(h),
                         }
+                        // What it is, in the visual language's colours.
+                        crate::icons::icon(ui, crate::icons::Glyph::of(world, e), selection.is_selected(e));
                         if let Some((re, text, focused)) = st.renaming.as_mut().filter(|(re, _, _)| *re == e) {
                             let te = ui.add(egui::TextEdit::singleline(text).desired_width(150.0));
                             if !*focused {
@@ -374,8 +395,10 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                 Row::Strokes { sketch, n, depth, open } => {
                     ui.horizontal(|ui| {
                         ui.add_space(depth as f32 * 14.0);
-                        let text = format!("{} {n} stroke{}", if open { "⏷" } else { "⏵" }, if n == 1 { "" } else { "s" });
-                        if ui.add(egui::Button::new(egui::RichText::new(text).color(style::MUTED)).frame(false).small()).clicked() {
+                        let fold = crate::icons::fold_button(ui, open);
+                        let text = format!("{n} stroke{}", if n == 1 { "" } else { "s" });
+                        let words = ui.add(egui::Label::new(egui::RichText::new(text).color(style::MUTED)).sense(Sense::click()));
+                        if fold.clicked() || words.clicked() {
                             toggle_strokes = Some(sketch);
                         }
                     });

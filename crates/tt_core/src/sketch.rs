@@ -617,6 +617,43 @@ pub fn stroke_frames(samples: &[[f64; 3]], clock: &ClockMap, p: &SketchParams, l
     Some((first, out))
 }
 
+/// The box a hold would get now (the Sketch tool's preview before a press):
+/// where the hand sits (the median of its last `SETTLE` s) and its jiggle's
+/// size around it over the last `jiggle_window`, as a paused frame's retake
+/// takes them ([`stroke_frames`]). `samples`: `[t, x, y]`, oldest first, in
+/// the pixels of the space drawn in; the pointer only reports motion, so the
+/// last position holds until `now`. None without samples.
+pub fn hold_box(samples: &[[f64; 3]], now: f64, p: &SketchParams) -> Option<[f64; 6]> {
+    if samples.is_empty() {
+        return None;
+    }
+    let window = (p.jiggle_window as f64).max(SETTLE);
+    // The pointer on a uniform grid over the window, each position held until the next report.
+    let n = (window * GRID_HZ).ceil() as usize + 1;
+    let mut j = 0;
+    let grid: Vec<[f64; 2]> = (0..n)
+        .map(|i| {
+            let t = now - window + i as f64 / GRID_HZ;
+            while j + 1 < samples.len() && samples[j + 1][0] <= t {
+                j += 1;
+            }
+            let s = if samples[j][0] <= t { samples[j] } else { samples[0] };
+            [s[1], s[2]]
+        })
+        .collect();
+    let settle = ((SETTLE * GRID_HZ).ceil() as usize).min(grid.len());
+    let median = |k: usize| {
+        let mut v: Vec<f64> = grid[grid.len() - settle..].iter().map(|q| q[k]).collect();
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let c = [median(0), median(1)];
+    let spread = |k: usize| (grid.iter().map(|q| (q[k] - c[k]).powi(2)).sum::<f64>() / grid.len() as f64).sqrt();
+    let h = |s: f64| p.gain as f64 * 2.2 * s + p.pad as f64;
+    let (hx, hy) = (h(spread(0)).max(p.min_half as f64), h(spread(1)).max(p.min_half_y as f64));
+    Some([c[0], c[1], c[0] - hx, c[1] - hy, c[0] + hx, c[1] + hy])
+}
+
 /// A `Through` value `[a, bx, by]` as a mapping.
 pub fn through_map(m: &[f32]) -> crate::view::SpaceMap {
     crate::view::SpaceMap { a: m[0] as f64, b: [m[1] as f64, m[2] as f64], canvas: [0.0, 0.0] }

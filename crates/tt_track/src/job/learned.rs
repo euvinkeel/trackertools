@@ -10,11 +10,16 @@
 //!   job, centred on the guide's point on every frame: the rough pass
 //!   stabilizes what the model sees, and its box (× `search`, the largest on
 //!   the job's frames) fits inside.
-//! - **Seeds:** the tracked point where the job starts (the anchor's look,
-//!   or where the tracker was when resuming), and every look on the job's
-//!   frames, each queried on its own frame at its aligned point. On each
-//!   frame the latest seed behind it answers (a fresher seed has drifted
-//!   less); a look's own frame is pinned where the user put it.
+//! - **Seeds:** the tracked point where the job starts (the anchor's reset
+//!   point, or where the tracker was when resuming), and every reset point
+//!   (its looks) on the job's frames, each queried on its own frame exactly
+//!   where the user put it: it follows one pixel at a time, and a reset
+//!   point says which, from there on (no template alignment, as the
+//!   template method's looks get). On each frame the latest seed behind it
+//!   answers (a fresher seed has drifted less); a reset point's own frame is
+//!   pinned there.
+//! - The job says when the worker is loading its model ([`super::Phase`]):
+//!   starting Python and loading PyTorch and the model take seconds.
 //! - **Score** is the model's visibility × confidence; below `min_score` the
 //!   frame is flagged lost (its position stays the model's estimate).
 //! - Catch-up mode works, but the model finalizes frames a half window (8)
@@ -238,12 +243,15 @@ impl Worker {
     fn crop_scale(&self, frames: impl Iterator<Item = FrameIndex>) -> f64 {
         let s = &self.spec;
         let (mut hw, mut hh) = (8.0f64, 8.0f64);
+        // With no guide the "box" is the whole frame: it fits exactly (the
+        // model sees the whole picture, as CoTracker is usually run).
+        let (search, k) = if s.root { (1.0, 2.0) } else { (s.search, 2.5) };
         for f in frames {
             let b = self.map(f).box_from_source(self.guide(f));
-            hw = hw.max((b[0] - b[2]).max(b[4] - b[0]) * s.search);
-            hh = hh.max((b[1] - b[3]).max(b[5] - b[1]) * s.search);
+            hw = hw.max((b[0] - b[2]).max(b[4] - b[0]) * search);
+            hh = hh.max((b[1] - b[3]).max(b[5] - b[1]) * search);
         }
-        let w = (2.5 * hw).max(2.5 * hh * CROP_W as f64 / CROP_H as f64);
+        let w = (k * hw).max(k * hh * CROP_W as f64 / CROP_H as f64);
         CROP_W as f64 / w
     }
 
@@ -272,18 +280,11 @@ impl Worker {
         let s = &self.spec;
         let dir: FrameIndex = if s.side == Side::Forward { 1 } else { -1 };
         let anchor = s.anchor;
-        // The looks, aligned on one point (as the template method does).
-        if !s.looks.is_empty() {
-            let looks = self.look_templates()?;
-            if self.cancelled() {
-                return Ok(());
-            }
-            // (The output box: the first look's size, as the template method's.)
-            if let Some(l) = looks.first() {
-                self.half = l.r.map(|v| v as f64);
-            }
+        // (The output box: the first reset point's size, in patch px as the template method's.)
+        if let Some(l) = s.looks.first() {
+            let a = self.map(l.frame).a;
+            self.half = l.half.map(|h| (h / a * s.scale).max(2.0));
         }
-        let s = &self.spec;
         let seed = s.seed.map_or_else(|| self.guide_point(anchor), |p| self.map(anchor).from_source(p));
         // Where the stream starts: the frame before `from` when resuming, else the anchor.
         let (start, first_seed) = match s.resume {
@@ -295,12 +296,14 @@ impl Worker {
         let scale = self.crop_scale((0..n).map(|i| start + dir * i as FrameIndex));
         let mut stream = Stream { start, dir, grids: Vec::with_capacity(n) };
 
+        self.shared.set_phase(super::Phase::Loading);
         let mut worker = Process::start()?;
         match worker.replies.recv() {
             Ok(Reply::Ready) => {}
             Ok(Reply::Error(e)) => bail!("CoTracker: {e}"),
             _ => bail!("the CoTracker worker didn't start: {}", worker.log_tail()),
         }
+        self.shared.set_phase(super::Phase::Tracking);
         // Seeds, in crop pixels on their frames: the start, and each look's aligned point further on.
         let crop_point = |f: FrameIndex, p: [f64; 2]| {
             let g = self.guide_point(f);

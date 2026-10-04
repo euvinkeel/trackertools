@@ -155,6 +155,8 @@ impl Default for Keymap {
                 (b(Key::Letter('a'), Mods::NONE, false), SelectAll),
                 (b(Key::F2, Mods::NONE, false), Rename),
                 (b(Key::Letter('t'), Mods::NONE, false), Tool(crate::tool::Tool::Track)),
+                // M: draw a tracker's point by hand (a manual dot, or over a tracker's results).
+                (b(Key::Letter('m'), Mods::NONE, false), Tool(crate::tool::Tool::Draw)),
                 (b(Key::Letter('n'), Mods::NONE, false), ToggleSnap),
                 // In and out points, as in DaVinci Resolve.
                 (b(Key::Letter('i'), Mods::NONE, false), MarkIn),
@@ -199,10 +201,11 @@ impl Binding {
         }
         s.push_str(&match b.key {
             Key::Space => "Space".into(),
-            Key::ArrowLeft => "←".into(),
-            Key::ArrowRight => "→".into(),
-            Key::ArrowUp => "↑".into(),
-            Key::ArrowDown => "↓".into(),
+            // (In words: the app's text font has no arrows, which showed as empty boxes.)
+            Key::ArrowLeft => "Left".into(),
+            Key::ArrowRight => "Right".into(),
+            Key::ArrowUp => "Up".into(),
+            Key::ArrowDown => "Down".into(),
             Key::Home => "Home".into(),
             Key::End => "End".into(),
             Key::Escape => "Esc".into(),

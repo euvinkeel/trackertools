@@ -3874,6 +3874,7 @@ dependencies = [
  "tt_core",
  "tt_media",
  "tt_track",
+ "ttf-parser",
  "windows-sys 0.61.2",
 ]
 

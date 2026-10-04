@@ -59,6 +59,9 @@ struct SettingsFile {
     /// New views keep a steady zoom (`FrameParams::lock_zoom`), or only pan (`pan_only`).
     view_lock_zoom: bool,
     view_pan_only: bool,
+    /// How steadily new views pan: smoothing (s) and dead zone (a fraction of the view).
+    view_pan_damping: f32,
+    view_dead_zone: f32,
     /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
     hide_pointer: bool,
     clear_radius: f32,
@@ -69,6 +72,9 @@ struct SettingsFile {
     /// The Resolve stabilizer's spring smoothing, seconds.
     stabilize_smooth_position: f32,
     stabilize_smooth_rotation: f32,
+    /// Stabilizers undo the rotation too; they hold what they follow in the middle of the picture.
+    stabilize_rotation: bool,
+    stabilize_centre: bool,
     /// Look for a new version at start.
     check_for_updates: bool,
 }
@@ -85,12 +91,16 @@ impl Default for SettingsFile {
             new_sketches: SketchParams::default(),
             view_lock_zoom: v.params.lock_zoom,
             view_pan_only: v.params.pan_only,
+            view_pan_damping: v.params.pan_damping,
+            view_dead_zone: v.params.dead_zone,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
             auto_speed: AutoSpeed::default(),
             auto_mask_looks: LookDefaults::default().auto_mask,
             stabilize_smooth_position: st.smooth_position,
             stabilize_smooth_rotation: st.smooth_rotation,
+            stabilize_rotation: st.rotation,
+            stabilize_centre: st.centre,
             check_for_updates: Updater::default().check_on_start,
         }
     }
@@ -106,12 +116,16 @@ impl SettingsFile {
             new_sketches: d.params.clone(),
             view_lock_zoom: v.params.lock_zoom,
             view_pan_only: v.params.pan_only,
+            view_pan_damping: v.params.pan_damping,
+            view_dead_zone: v.params.dead_zone,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
             auto_speed: a.clone(),
             auto_mask_looks: l.auto_mask,
             stabilize_smooth_position: st.smooth_position,
             stabilize_smooth_rotation: st.smooth_rotation,
+            stabilize_rotation: st.rotation,
+            stabilize_centre: st.centre,
             check_for_updates: u.check_on_start,
         }
     }
@@ -135,6 +149,8 @@ impl SettingsFile {
             let mut v = world.resource_mut::<ViewDefaults>();
             v.params.lock_zoom = self.view_lock_zoom;
             v.params.pan_only = self.view_pan_only;
+            v.params.pan_damping = self.view_pan_damping.clamp(0.0, 5.0);
+            v.params.dead_zone = self.view_dead_zone.clamp(0.0, 0.5);
         }
         *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
         // Version 3 turned anticipatory speed on by default.
@@ -148,6 +164,8 @@ impl SettingsFile {
         if let Some(mut st) = world.get_resource_mut::<StabilizerDefaults>() {
             st.smooth_position = self.stabilize_smooth_position.clamp(0.0, 2.0);
             st.smooth_rotation = self.stabilize_smooth_rotation.clamp(0.0, 2.0);
+            st.rotation = self.stabilize_rotation;
+            st.centre = self.stabilize_centre;
         }
     }
 }
@@ -155,7 +173,7 @@ impl SettingsFile {
 /// Scripted runs (the sketch demo, the step benchmark) start from the
 /// built-in settings and leave the user's alone.
 fn scripted() -> bool {
-    ["TT_SKETCH_DEMO", "TT_BENCH_STEPS"].iter().any(|v| std::env::var_os(v).is_some())
+    ["TT_SKETCH_DEMO", "TT_BENCH_STEPS", "TT_SCENE_DEMO"].iter().any(|v| std::env::var_os(v).is_some())
 }
 
 #[derive(Resource)]
@@ -326,7 +344,7 @@ mod tests {
 
     #[test]
     fn the_stabilizers_smoothing_is_remembered() {
-        let chosen = StabilizerDefaults { smooth_position: 0.2, smooth_rotation: 0.4 };
+        let chosen = StabilizerDefaults { smooth_position: 0.2, smooth_rotation: 0.4, rotation: false, centre: false };
         let text = serde_json::to_string(&SettingsFile::of(
             &SketchDefaults::default(),
             &ViewDefaults::default(),
@@ -347,7 +365,7 @@ mod tests {
         assert_eq!(*world.resource::<StabilizerDefaults>(), chosen);
         // A session file from before it reads with the defaults.
         let old: SettingsFile = serde_json::from_str(r#"{"wheel": "Size", "stroke_scale": 1.0}"#).unwrap();
-        assert_eq!((old.stabilize_smooth_position, old.stabilize_smooth_rotation), (0.0, 0.05));
+        assert_eq!((old.stabilize_smooth_position, old.stabilize_smooth_rotation, old.stabilize_rotation, old.stabilize_centre), (0.0, 0.05, true, true));
     }
 
     #[test]

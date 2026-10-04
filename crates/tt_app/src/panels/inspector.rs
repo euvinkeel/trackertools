@@ -53,6 +53,7 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
 /// Every reflected document/session component of `e`, editable.
 fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     // Editable copies of each reflected document/session component on the entity.
+    let manual = tt_track::human::is_manual(world, e);
     let mut components: Vec<(String, String, Box<dyn PartialReflect>, Class)> = {
         let registry = world.resource::<AppTypeRegistry>().read();
         let metas = world.resource::<ComponentMetas>();
@@ -61,13 +62,16 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             .iter()
             .filter_map(|r| {
                 let class = metas.get(r.type_id())?.class;
-                // Derived state isn't edited; the name is the heading; creation order and a tracker's stamp are bookkeeping.
+                // Derived state isn't edited; the name is the heading; creation order, a tracker's stamp
+                // and its layers' signals are bookkeeping (a manual dot has no tracking settings).
                 let hidden = [
                     std::any::TypeId::of::<bevy_ecs::name::Name>(),
                     std::any::TypeId::of::<tt_core::meta::Created>(),
                     std::any::TypeId::of::<tt_track::runner::TrackBook>(),
+                    std::any::TypeId::of::<tt_track::human::AutoOutput>(),
+                    std::any::TypeId::of::<tt_track::human::HumanLayer>(),
                 ];
-                if class == Class::Derived || hidden.contains(&r.type_id()) {
+                if class == Class::Derived || hidden.contains(&r.type_id()) || (manual && r.type_id() == std::any::TypeId::of::<tt_track::Tracker>()) {
                     return None;
                 }
                 let rc = r.data::<ReflectComponent>()?;

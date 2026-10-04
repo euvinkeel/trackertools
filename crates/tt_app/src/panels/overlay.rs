@@ -3,6 +3,11 @@
 //! faint), the stroke in progress laid over the sketch it edits, and the
 //! Sketch tool's cursor and hints. (A click on a region selects its sketch:
 //! tt_core's tool.rs.)
+//!
+//! In the visual language (`style`), sketches are drawn by hand: orange. The
+//! Sketch tool shows, before a press, the box a hold would get, dashed and
+//! light, sized by the hand's jiggle right now (as a held frame is); once
+//! pressed, the box being recorded is solid and thick (amber: live).
 
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
@@ -20,9 +25,9 @@ use tt_core::view::{SpaceMap, map_at};
 use super::viewport::ViewportMapping;
 use crate::style;
 
-pub const LIVE: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+pub const LIVE: Color32 = style::LIVE;
 /// Subjects (tt_core::subject).
-pub const SUBJECT: Color32 = Color32::from_rgb(0xc0, 0x84, 0xfc);
+pub const SUBJECT: Color32 = style::SUBJECT;
 /// Frames of path drawn either side of the playhead for the selected sketch.
 const PATH_FRAMES: FrameIndex = 90;
 
@@ -58,16 +63,16 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let color = if editing == Some(*e) {
             LIVE
         } else if lit.contains(e) && live.is_none() {
-            style::ACCENT
+            style::HAND
         } else {
-            Color32::from_white_alpha(70)
+            style::HAND.gamma_multiply(0.35)
         };
         if editing == Some(*e) || (lit.contains(e) && live.is_none()) {
             path(painter, map, frame, |f| value(f).map(|v| to_canvas(f, v)).map(|v| [v[0], v[1]]), color);
         }
         let Some(v) = value(frame) else { continue };
         let stale = editing != Some(*e) && sig.state(frame) == FrameState::Stale;
-        region(painter, map, to_canvas(frame, v), color, stale);
+        region(painter, map, to_canvas(frame, v), color, stale, editing == Some(*e) && live.is_some_and(|l| l.preview_at(frame).is_some()));
     }
 
     super::tracks::draw(painter, map, world, &trackers, frame, &space);
@@ -77,14 +82,14 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         if live.target.is_none() {
             path(painter, map, frame, |f| live.preview_at(f).map(|b| to_canvas(f, b)).map(|b| [b[0], b[1]]), LIVE);
             if let Some(b) = live.preview_at(frame) {
-                region(painter, map, to_canvas(frame, b), LIVE, false);
+                region(painter, map, to_canvas(frame, b), LIVE, false, true);
             }
         }
         // Playing, the hand is `lag` behind the shown frame: its newest box, dimmed.
         if live.preview_at(frame).is_none()
             && let Some((g, b)) = (frame - 120..frame).rev().find_map(|g| live.visits(g).then(|| live.preview_at(g)).flatten().map(|b| (g, b)))
         {
-            region(painter, map, to_canvas(g, b), LIVE, true);
+            region(painter, map, to_canvas(g, b), LIVE, true, false);
         }
         // The raw hand over the last half second (in the pixels it was drawn in).
         if live.drawn_in == view {
@@ -185,25 +190,43 @@ fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
     }
 }
 
-/// Before a stroke: the box a still hand would get here (padding and the
-/// smallest box, times the stroke's size), dashed, so the brush's size is
-/// something you see.
+/// Before a stroke: the box a hold here would get now, dashed and light:
+/// sized by the hand's jiggle over the last moments (as a held frame is;
+/// `tt_core::sketch::hold_box`), times the stroke's size, so moving or
+/// steadying the hand shows what it does before you press. With the size
+/// and falloff the next stroke starts with.
 fn brush_outline(painter: &Painter, map: &ViewportMapping, world: &World, target: Option<Entity>, pos: Pos2) {
     let defaults = world.resource::<tt_core::capture::SketchDefaults>();
     let params = target.and_then(|e| world.get::<tt_core::sketch::SketchParams>(e)).unwrap_or(&defaults.params);
     let sized = defaults.stroke.sized(params);
-    let half = |m: f32| (sized.pad.max(m) as f64 * map.points_per_canvas()) as f32;
-    let r = Rect::from_center_size(pos, Vec2::new(2.0 * half(sized.min_half), 2.0 * half(sized.min_half_y)));
-    let stroke = Stroke::new(1.0, Color32::from_white_alpha(90));
+    let trail: Vec<[f64; 3]> = world.resource::<tt_core::tool::PointerTrail>().0.iter().copied().collect();
+    let now = world.resource::<tt_core::time::WallClock>().now;
+    let ppc = map.points_per_canvas() as f32;
+    // (Its size from the jiggle; centred on the pointer itself, which the preview follows exactly.)
+    let half = match tt_core::sketch::hold_box(&trail, now, &sized) {
+        Some(b) => Vec2::new(((b[4] - b[2]) / 2.0) as f32, ((b[5] - b[3]) / 2.0) as f32) * ppc,
+        None => Vec2::new(sized.pad.max(sized.min_half), sized.pad.max(sized.min_half_y)) * ppc,
+    };
+    let r = Rect::from_center_size(pos, 2.0 * half);
+    let c = style::HAND.gamma_multiply(0.6);
+    let stroke = Stroke::new(1.0, c);
     for (a, b) in [(r.left_top(), r.right_top()), (r.right_top(), r.right_bottom()), (r.right_bottom(), r.left_bottom()), (r.left_bottom(), r.left_top())] {
         painter.add(Shape::dashed_line(&[a, b], stroke, 4.0, 4.0));
     }
+    let s = &defaults.stroke;
+    let fps = world.resource::<Transport>().fps.as_f64();
+    let falloff = if s.falloff > 0.0 { format!("falloff {:.2} s ({:.0} frames)", s.falloff, s.falloff as f64 * fps) } else { "no falloff".to_string() };
+    painter.text(r.left_bottom() + Vec2::new(0.0, 3.0), Align2::LEFT_TOP, format!("size \u{d7}{:.2} \u{b7} {falloff}", s.scale), FontId::proportional(10.0), c);
+    // Keep it moving with the hand's jiggle as it settles.
+    painter.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }
 
-/// `[x, y, left, top, right, bottom]`: the region's outline and the point.
-fn region(painter: &Painter, map: &ViewportMapping, b: [f64; 6], color: Color32, stale: bool) {
+/// `[x, y, left, top, right, bottom]`: the region's outline and the point;
+/// `thick` while it is being recorded.
+fn region(painter: &Painter, map: &ViewportMapping, b: [f64; 6], color: Color32, stale: bool, thick: bool) {
     let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
-    let stroke = Stroke::new(if stale { 1.0 } else { 1.5 }, color.gamma_multiply(if stale { 0.5 } else { 1.0 }));
+    let width = if thick { 3.0 } else if stale { 1.0 } else { 1.5 };
+    let stroke = Stroke::new(width, color.gamma_multiply(if stale { 0.5 } else { 1.0 }));
     painter.rect_stroke(r, 0.0, stroke, StrokeKind::Middle);
     let p = map.to_screen([b[0], b[1]]);
     painter.line_segment([p - Vec2::new(5.0, 0.0), p + Vec2::new(5.0, 0.0)], stroke);

@@ -27,6 +27,10 @@ rfd = "0.17"
 sha2 = "0.10"
 png = "0.18"
 
+[dev-dependencies]
+# (Already in the tree through egui: reads the fonts' character maps for the glyph test.)
+ttf-parser = "0.25"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

@@ -43,11 +43,16 @@ pub struct ExportWindow {
 
 struct Request {
     kind: Kind,
-    /// What it follows, as the window says it.
+    /// What it follows, as the window says it, and the thing itself.
     name: String,
+    follows: Source,
     video: String,
+    /// The frame held as it is (asked for, and as made: the first with the points if not that one).
+    here: FrameIndex,
     reference: FrameIndex,
     keys: Vec<Steady>,
+    /// How the motion is used (smoothing, rotation, placement), as the keys were made.
+    options: StabilizerDefaults,
     /// The source video (the default name is made from it).
     source: PathBuf,
     codec: Codec,
@@ -100,6 +105,22 @@ fn length(frames: FrameIndex, fps: f64) -> String {
     if secs < 60.0 { format!("{frames} frames, {secs:.2} s") } else { format!("{frames} frames, {}:{:05.2}", (secs / 60.0).floor(), secs % 60.0) }
 }
 
+/// The keys for `kind` following `source`, held as on frame `here`, with `options`.
+fn make(world: &World, kind: Kind, source: &Source, here: FrameIndex, options: StabilizerDefaults) -> Option<tt_track::export::Stabilization> {
+    let index = &world.get_resource::<Media>()?.original.index;
+    let size = [index.width as f64, index.height as f64];
+    let fps = world.resource::<tt_core::transport::Transport>().fps.as_f64();
+    let smoothing = options.into();
+    match (source, kind) {
+        (Source::Subject(s), Kind::Stabilized) => stabilize_path(&subject_path(world, *s), size, here, smoothing, fps),
+        (Source::Subject(s), Kind::Target) => follow_path(&subject_path(world, *s), size, here, smoothing, fps),
+        (Source::Points(p), k) => {
+            let tracks: Vec<_> = p.iter().map(|e| good_points(world, *e)).collect();
+            if k == Kind::Stabilized { stabilize(&tracks, size, here, smoothing, fps) } else { follow(&tracks, size, here, smoothing, fps) }
+        }
+    }
+}
+
 /// Open the window for `kind`, following `source` as it is now (the
 /// stabilizer holds it as on the playhead's frame, or the in point's when
 /// the playhead is outside the in and out points).
@@ -110,19 +131,11 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
     };
     let index = media.original.index.clone();
     let video = media.name.clone();
-    let size = [index.width as f64, index.height as f64];
     let transport = world.resource::<tt_core::transport::Transport>();
     let marked = tt_core::marks::marks(world).frames(index.frame_count());
-    let (here, fps) = (transport.frame().clamp(marked.start, (marked.end - 1).max(marked.start)), transport.fps.as_f64());
-    let smoothing = (*world.resource::<StabilizerDefaults>()).into();
-    let made = match (&source, kind) {
-        (Source::Subject(s), Kind::Stabilized) => stabilize_path(&subject_path(world, *s), size, here, smoothing, fps),
-        (Source::Subject(s), Kind::Target) => follow_path(&subject_path(world, *s), size, here, smoothing, fps),
-        (Source::Points(p), k) => {
-            let tracks: Vec<_> = p.iter().map(|e| good_points(world, *e)).collect();
-            if k == Kind::Stabilized { stabilize(&tracks, size, here, smoothing, fps) } else { follow(&tracks, size, here, smoothing, fps) }
-        }
-    };
+    let here = transport.frame().clamp(marked.start, (marked.end - 1).max(marked.start));
+    let options = *world.resource::<StabilizerDefaults>();
+    let made = make(world, kind, &source, here, options);
     let Some(made) = made else {
         world.resource_mut::<StatusLine>().0 = Some(("Nothing to export: no frame has the points it needs".into(), true));
         return;
@@ -136,8 +149,24 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
     let path = default_path(&index.path, kind, &name, codec);
     let w = &mut *world.resource_mut::<ExportWindow>();
     w.done = None;
-    let source = index.path.clone();
-    w.request = Some(Request { kind, name, video, reference: made.reference, keys: made.keys, source, codec, whole: false, fill: false, zoom: None, path, default_path: true });
+    let video_path = index.path.clone();
+    w.request = Some(Request {
+        kind,
+        name,
+        follows: source,
+        video,
+        here,
+        reference: made.reference,
+        keys: made.keys,
+        options,
+        source: video_path,
+        codec,
+        whole: false,
+        fill: false,
+        zoom: None,
+        path,
+        default_path: true,
+    });
 }
 
 /// Next to the source: "<video> - stabilized (<what>).mov"; never an existing file.
@@ -203,6 +232,7 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
     let zoom = state.request.as_mut().map_or(1.0, |r| r.zoom(size, &frames));
     let mut open = true;
     let mut go = false;
+    let mut options_changed: Option<StabilizerDefaults> = None;
     let title = match state.request.as_ref().map(|r| r.kind) {
         Some(Kind::Stabilized) => "Export stabilized video",
         _ => "Export tracking target video",
@@ -211,11 +241,15 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
         let busy = state.job.is_some();
         if let Some(r) = state.request.as_mut() {
             let about = match r.kind {
-                Kind::Stabilized => format!(
-                    "A new video file, the same size and frame rate as {}, every frame moved and turned so that {} holds still as it is on frame {}. \
-                     The sound comes along. Use it in any editor like any other clip: there is nothing to set up or keep working there.",
-                    r.video, r.name, r.reference
-                ),
+                Kind::Stabilized => {
+                    let how = if r.options.rotation { "moved and turned" } else { "moved (never turned)" };
+                    let place = if r.options.centre { format!("{} stays in the middle of the picture", r.name) } else { format!("{} holds still as it is on frame {}", r.name, r.reference) };
+                    format!(
+                        "A new video file, the same size and frame rate as {}, every frame {how} so that {place}. \
+                         The sound comes along. Use it in any editor like any other clip: there is nothing to set up or keep working there.",
+                        r.video
+                    )
+                }
                 Kind::Target => format!(
                     "A video the size of {}, as long as the frames you export: on black, a marker that moves (and turns) with {}. \
                      In your editor, put it on a track above the footage, lined up with those frames, and point the editor's own tracker at the marker's middle, where its squares cross \
@@ -252,14 +286,32 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                         r.path = if r.default_path { default_path(&r.source, r.kind, &r.name, r.codec) } else { r.path.with_extension(r.codec.extension()) };
                     }
                     ui.end_row();
+                    // How the motion is used (remembered; the right-click menu's Fusion copies use it too).
+                    let mut o = r.options;
+                    ui.label("Rotation");
+                    let turns = if r.kind == Kind::Stabilized { "Undo its turning too" } else { "The marker turns with it" };
+                    ui.checkbox(&mut o.rotation, turns)
+                        .on_hover_text("With two or more points, or a subject's angle. Off: position only: the picture moves, but never turns.");
+                    ui.end_row();
                     if r.kind == Kind::Stabilized {
+                        ui.label("Placement");
+                        ui.vertical(|ui| {
+                            ui.radio_value(&mut o.centre, true, format!("Keep {} in the middle of the picture", r.name))
+                                .on_hover_text("On every frame, what it follows is in the middle (the centre of the points, or the subject's point).");
+                            ui.radio_value(&mut o.centre, false, format!("Hold it where it is on frame {}", r.here))
+                                .on_hover_text("The classic stabilizer: the picture keeps its framing on that frame.");
+                        });
+                        ui.end_row();
                         ui.label("Edges");
                         ui.vertical(|ui| {
                             ui.radio_value(&mut r.fill, false, "Keep the whole picture (black shows where it moved away)");
                             ui.radio_value(&mut r.fill, true, format!("Zoom in just enough to hide the black edges (\u{d7}{zoom:.2})"))
-                                .on_hover_text("The least zoom that covers the frame on every frame exported; the same all through.");
+                                .on_hover_text("The least zoom that covers the frame on every frame exported; the same all through. Centred, it is worked out with the subject in the middle.");
                         });
                         ui.end_row();
+                    }
+                    if o != r.options {
+                        options_changed = Some(o);
                     }
                     ui.label("Save as");
                     ui.horizontal(|ui| {
@@ -318,6 +370,16 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
             }
         }
     });
+    // Another way to use the motion: the keys again (and the zoom that hides the edges), remembered.
+    if let Some(o) = options_changed
+        && let Some(r) = state.request.as_mut()
+    {
+        if let Some(made) = make(world, r.kind, &r.follows, r.here, o) {
+            (r.keys, r.reference) = (made.keys, made.reference);
+        }
+        (r.options, r.zoom) = (o, None);
+        *world.resource_mut::<StabilizerDefaults>() = o;
+    }
     if go && let Some(r) = state.request.as_ref() {
         state.done = None;
         state.job = start(world, r, frames, if r.fill { zoom } else { 1.0 });
@@ -332,14 +394,5 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
 }
 
 fn show_in_folder(path: &Path) {
-    let spawned = if cfg!(windows) {
-        std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg("-R").arg(path).spawn()
-    } else {
-        std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()
-    };
-    if let Err(e) = spawned {
-        tracing::warn!("could not show {}: {e}", path.display());
-    }
+    crate::files::reveal(path);
 }
