@@ -227,6 +227,8 @@ pub struct Checked {
     pub ready: bool,
     /// The NVIDIA graphics card (CoTracker's), if there is one.
     pub gpu: Option<crate::cotracker::Gpu>,
+    /// Windows' Visual C++ runtime, for CoTracker's PyTorch (looked at with an NVIDIA card, on Windows).
+    pub runtime: Option<crate::cotracker::Runtime>,
 }
 
 /// Everything the doctor looks at. `graphics`: the graphics adapter, from the window.
@@ -289,11 +291,20 @@ pub fn run_checks(graphics: Option<&str>) -> Checked {
         Some(g) => Check::new(Pass, format!("NVIDIA graphics card: {} (CUDA capability {}.{}, driver {}).", g.name, g.compute.0, g.compute.1, g.driver)),
         None => Check::new(Info, "There is no NVIDIA graphics card. CoTracker cannot run on this computer."),
     });
+    let runtime = gpu.as_ref().map(|_| crate::cotracker::vc_runtime());
+    if let Some(r) = &runtime {
+        use crate::cotracker::Runtime;
+        checks.push(match r {
+            Runtime::Ready(v) => Check::new(Pass, format!("Microsoft Visual C++ runtime {v} is installed.")),
+            Runtime::Old(v) => Check::new(Info, format!("Microsoft Visual C++ runtime {v} is too old for CoTracker. The CoTracker setup installs a newer one.")),
+            Runtime::Missing => Check::new(Info, "The Microsoft Visual C++ runtime is not installed. The CoTracker setup installs it."),
+        });
+    }
     checks.push(match tt_track::job::cotracker_availability() {
         Ok(()) => Check::new(Pass, "CoTracker is ready."),
         Err(why) => Check::new(Info, why),
     });
-    Checked { checks, ready: ffmpeg.is_ok() && ffprobe.is_ok(), gpu }
+    Checked { checks, ready: ffmpeg.is_ok() && ffprobe.is_ok(), gpu, runtime }
 }
 
 // ------------------------------------------------------------------ report
@@ -772,10 +783,12 @@ fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
         doctor.co.start(g.clone());
         e.cotracker = true;
     }
+    // Not while Windows asks for permission for the Visual C++ runtime: step 5 says here what to click.
+    let asking = doctor.co.step() == crate::cotracker::Step::Runtime;
     let mut start = false;
     if ready && !failing && checked.is_some() {
         let at = *e.ready_at.get_or_insert_with(Instant::now);
-        start = at.elapsed().as_secs_f64() >= e.delay;
+        start = at.elapsed().as_secs_f64() >= e.delay && !asking;
         ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
     doctor.everything = Some(e);
@@ -805,6 +818,7 @@ fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
         Some(_) => (Mark::Done, "3. The checks are complete. All checks are good.".into()),
     });
     lines.push(match e.ready_at {
+        Some(_) if !failing && asking => (Mark::Later, "4. trackertools starts when the Microsoft Visual C++ runtime is installed (step 5).".into()),
         Some(at) if !failing => {
             let left = (e.delay - at.elapsed().as_secs_f64()).ceil().max(0.0) as u32;
             match left {
@@ -825,6 +839,7 @@ fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
             Ok(_) => match &co {
                 crate::cotracker::Step::Failed(p) => (Mark::Problem, format!("5. {} The Doctor in Settings has the CoTracker steps.", p.what)),
                 crate::cotracker::Step::Done(_) => (Mark::Done, format!("5. {}", co.text())),
+                crate::cotracker::Step::Runtime => (Mark::Now, format!("5. {}", co.text())),
                 s if s.busy() => (Mark::Now, format!("5. {} This continues after trackertools starts.", s.text())),
                 _ => (Mark::Later, format!("5. trackertools sets up CoTracker for the {}. This continues after trackertools starts.", g.name)),
             },
@@ -937,6 +952,9 @@ fn cotracker_part(ui: &mut egui::Ui, doctor: &mut Doctor, checked: Option<&Check
                 plan.cuda
             ));
             ui.label("Make sure that the disk has approximately 6 GB free. The setup can take 5 to 30 minutes.");
+            if c.runtime.as_ref().is_some_and(|r| !matches!(r, crate::cotracker::Runtime::Ready(_))) {
+                ui.label("trackertools also installs the Microsoft Visual C++ runtime from Microsoft. Windows asks for permission. Click Yes.");
+            }
             ui.label("The CoTracker model is for non-commercial use only (license: CC BY-NC 4.0).");
             if cfg!(all(windows, target_arch = "x86_64")) {
                 let label = if matches!(step, Step::Failed(_)) { "Set up CoTracker again" } else { "Set up CoTracker" };
@@ -1216,7 +1234,7 @@ mod tests {
         let lines: String = (0..400).map(|i| format!("line {i}\n")).collect();
         std::fs::write(d.join(LOG), &lines).unwrap();
         std::fs::write(d.join(PREVIOUS_LOG), format!("start\n{PANIC}panicked at src/main.rs\n")).unwrap();
-        let checked = Checked { checks: vec![Check::new(Level::Fail, "FFmpeg is not installed."), Check::new(Level::Pass, "Graphics: a GPU.")], ready: false, gpu: None };
+        let checked = Checked { checks: vec![Check::new(Level::Fail, "FFmpeg is not installed."), Check::new(Level::Pass, "Graphics: a GPU.")], ready: false, gpu: None, runtime: None };
         let r = report_from(&checked, Some("a GPU"), &d, "2026-10-03 22:37 UTC".into());
         assert!(r.starts_with("trackertools report, 2026-10-03 22:37 UTC\n"));
         assert!(r.contains("  [FAIL] FFmpeg is not installed.\n") && r.contains("  [OK] Graphics: a GPU.\n"));

@@ -21,9 +21,16 @@
 //!   against its SHA-256. CC BY-NC 4.0, non-commercial use only: the doctor
 //!   says so before.
 //!
+//! Before all of it, Windows' Visual C++ runtime, if it is missing or older
+//! than what PyTorch was built with: PyTorch's DLLs load it from Windows
+//! (`msvcp140.dll`, `msvcp140_atomic_wait.dll`), and uv's Python doesn't
+//! bring it. Microsoft's installer (checked: signed by Microsoft) puts it
+//! there, after Windows asks the person for permission.
+//!
 //! Then the worker starts once, to see that it loads the model on the card.
 //! Every step says what it does in a sentence (ASD-STE100, as all of setup).
-//! `TT_COTRACKER_CUDA=cu126|cu130` picks the PyTorch build (tests).
+//! `TT_COTRACKER_CUDA=cu126|cu130` picks the PyTorch build, and
+//! `TT_VC_RUNTIME=<version>|none` pretends a Visual C++ runtime (tests).
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -47,6 +54,13 @@ pub const MODEL_BYTES: u64 = 101_695_610;
 const PYTHON: &str = "3.12";
 const TORCH: &str = "torch==2.14.0";
 const PACKAGES: [&str; 3] = ["numpy==2.5.2", "av==18.1.0", "opencv-python-headless==5.0.0.93"];
+/// Microsoft's installer for the newest Visual C++ runtime (its permanent link).
+pub const VC_RUNTIME: &str = "https://aka.ms/vc14/vc_redist.x64.exe";
+/// PyTorch 2.14.0's DLLs are linked with MSVC 14.42, and a program needs a
+/// Visual C++ runtime at least as new as what built it.
+const VC_RUNTIME_MIN: (u32, u32) = (14, 42);
+/// What PyTorch's DLLs load from it, in System32.
+const VC_RUNTIME_DLLS: [&str; 4] = ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll"];
 
 const AGAIN: &str = "Then click Set up CoTracker again.";
 const ASK: &str = "Click Copy report. Send the report to the person who gave you trackertools.";
@@ -116,11 +130,121 @@ pub fn plan(gpu: &Gpu) -> Result<Plan, String> {
     Ok(plan)
 }
 
+/// Windows' Visual C++ runtime, as PyTorch needs it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Runtime {
+    /// New enough (its version).
+    Ready(String),
+    /// Too old (its version): the setup installs the newest.
+    Old(String),
+    /// Not there: the setup installs it.
+    Missing,
+}
+
+/// The Visual C++ runtime Windows has: the version its installer wrote in
+/// the registry, if its DLLs are in System32.
+pub fn vc_runtime() -> Runtime {
+    let version = match std::env::var("TT_VC_RUNTIME") {
+        Ok(v) => Some(v).filter(|v| v != "none"),
+        Err(_) => quiet(system_tool("reg"))
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64", "/reg:64"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_vc_runtime(&String::from_utf8_lossy(&o.stdout)))
+            .filter(|_| VC_RUNTIME_DLLS.iter().all(|d| system32().join(d).is_file())),
+    };
+    match version {
+        Some(v) if new_enough(&v) => Runtime::Ready(v),
+        Some(v) => Runtime::Old(v),
+        None => Runtime::Missing,
+    }
+}
+
+/// The version in `reg query` of the runtime's key (`v14.51.36247.00`), if it says it's installed.
+fn parse_vc_runtime(text: &str) -> Option<String> {
+    let value = |name: &str| text.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        (words.next() == Some(name)).then(|| words.nth(1)).flatten()
+    });
+    (value("Installed") == Some("0x1")).then_some(())?;
+    Some(value("Version")?.trim_start_matches('v').to_string())
+}
+
+fn new_enough(version: &str) -> bool {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) >= VC_RUNTIME_MIN
+}
+
+fn system32() -> PathBuf {
+    std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join("System32")
+}
+
+/// Download Microsoft's installer for the Visual C++ runtime into `dir`,
+/// check that Microsoft signed it, and run it: Windows asks the person for
+/// permission. True: Windows uses the new runtime after a restart.
+fn install_runtime(dir: &Path) -> Result<bool, Problem> {
+    let stopped = |d: String| Problem::new(&format!("The download of the Microsoft Visual C++ runtime stopped. Make sure that the computer is connected to the internet. {AGAIN}"), d);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).map_err(|e| stopped(e.to_string()))?;
+    let exe = tmp.join("vc_redist.x64.exe");
+    download(VC_RUNTIME, &exe, &|_| {}).map_err(|p| stopped(p.details))?;
+    let ran = signed_by_microsoft(&exe)
+        .map_err(|why| Problem::new(&format!("The download of the Microsoft Visual C++ runtime is not correct. {AGAIN}"), why))
+        .and_then(|()| {
+            tracing::info!("CoTracker setup: {} /install /passive /norestart", exe.display());
+            quiet(exe.clone())
+                .args(["/install", "/passive", "/norestart"])
+                .status()
+                .map_err(|e| Problem::new(&format!("trackertools cannot start the installation of the Microsoft Visual C++ runtime. {ASK}"), e))
+        });
+    let _ = std::fs::remove_file(&exe);
+    let code = ran?.code().unwrap_or(-1);
+    tracing::info!("CoTracker setup: the Visual C++ runtime's installer stopped with {code}");
+    runtime_installed(code)
+}
+
+/// What the runtime installer's exit `code` means. True: Windows uses the new runtime after a restart.
+fn runtime_installed(code: i32) -> Result<bool, Problem> {
+    let what = format!("vc_redist.x64.exe exit code {code}");
+    match code {
+        // Installed; or a newer one is there already.
+        0 | 1638 => Ok(false),
+        3010 | 1641 => Ok(true),
+        // Cancelled: the person said no when Windows asked for permission (ERROR_CANCELLED as itself and as an HRESULT).
+        1602 | 1223 | -2_147_023_673 => Err(Problem::new(
+            "Windows asked for permission to install the Microsoft Visual C++ runtime, and the permission was not given. CoTracker needs it. Click Set up CoTracker again. Then click Yes.",
+            what,
+        )),
+        1618 => Err(Problem::new(&format!("Another installation is in progress on this computer. Wait until it is complete. {AGAIN}"), what)),
+        _ => Err(Problem::new(&format!("trackertools cannot install the Microsoft Visual C++ runtime. {ASK}"), what)),
+    }
+}
+
+/// Ok if Windows finds a good signature on `file`, and Microsoft's.
+fn signed_by_microsoft(file: &Path) -> Result<(), String> {
+    // (Started from PowerShell 7, the program has its module path, where Windows PowerShell can't load the command.)
+    let out = quiet(system32().join(r"WindowsPowerShell\v1.0\powershell.exe"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", "$s = Get-AuthenticodeSignature -LiteralPath $env:TT_SIGNED; $s.Status.ToString() + '|' + $s.SignerCertificate.Subject"])
+        .env("TT_SIGNED", file)
+        .env_remove("PSModulePath")
+        .output()
+        .map_err(|e| format!("powershell: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if said.starts_with("Valid|") && said.contains("O=Microsoft Corporation") {
+        Ok(())
+    } else {
+        Err(format!("the signature: {said} {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 /// Where a CoTracker setup is.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum Step {
     #[default]
     Idle,
+    /// Windows' Visual C++ runtime (Windows asks for permission).
+    Runtime,
     Uv,
     Python,
     /// PyTorch for CUDA `cuda`: bytes of it on the disk so far.
@@ -144,6 +268,7 @@ impl Step {
         let gb = |b: u64| b as f64 / 1e9;
         match self {
             Step::Idle => String::new(),
+            Step::Runtime => "trackertools installs the Microsoft Visual C++ runtime from Microsoft (approximately 20 MB). Windows asks for permission. Click Yes.".into(),
             Step::Uv => "trackertools downloads uv, a Python installer (18 MB).".into(),
             Step::Python => "trackertools installs Python 3.12 for CoTracker.".into(),
             Step::Torch { cuda, bytes } => format!("trackertools downloads and installs PyTorch for CUDA {cuda} (approximately 2 GB): {:.1} GB on the disk now.", gb(*bytes)),
@@ -159,6 +284,7 @@ impl Step {
     /// A few words, for the top bar.
     pub fn short(&self) -> String {
         match self {
+            Step::Runtime => "Visual C++".into(),
             Step::Uv | Step::Python => "Python".into(),
             Step::Torch { bytes, .. } => format!("PyTorch, {:.1} GB", *bytes as f64 / 1e9),
             Step::Packages => "packages".into(),
@@ -228,6 +354,13 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
     let cannot_write = |e: std::io::Error| Problem::new("trackertools cannot write to its folder. Make sure that the disk has approximately 6 GB free. Then click Set up CoTracker again.", e);
     std::fs::create_dir_all(dir).map_err(cannot_write)?;
 
+    // First, so that Windows asks for permission while the person reads the setup's steps.
+    let mut restart = false;
+    if cfg!(windows) && !matches!(vc_runtime(), Runtime::Ready(_)) {
+        step(Step::Runtime);
+        restart = install_runtime(dir)?;
+    }
+
     step(Step::Uv);
     let uv = get_uv(dir)?;
 
@@ -277,7 +410,10 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
     }
 
     step(Step::Test);
-    let device = test_worker(&python, &code.join("editor").join("cotracker_worker.py"), &model)?;
+    let device = test_worker(&python, &code.join("editor").join("cotracker_worker.py"), &model).map_err(|p| match restart {
+        true => Problem::new(&format!("Windows must restart to complete the installation of the Microsoft Visual C++ runtime. Restart the computer. {AGAIN}"), p.details),
+        false => p,
+    })?;
     if device != "cuda" {
         return Err(Problem::new(&format!("CoTracker starts, but it cannot use the graphics card. Update the NVIDIA driver. {AGAIN}"), format!("the worker loaded on {device}")));
     }
@@ -512,6 +648,48 @@ mod tests {
         let old_driver = plan(&gpu("NVIDIA GeForce RTX 5080", (12, 0), "572.16")).unwrap_err();
         assert!(old_driver.starts_with("CoTracker needs NVIDIA driver 580 or later. This computer has driver 572.16. Update the NVIDIA driver."), "{old_driver}");
         assert_eq!(plan(&gpu("NVIDIA GeForce GTX 780", (3, 5), "474.30")), Err("The NVIDIA GeForce GTX 780 is too old for CoTracker.".into()));
+    }
+
+    #[test]
+    fn the_visual_cpp_runtime_is_read_from_the_registry() {
+        let key = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64\r\n    Version    REG_SZ    v14.51.36247.00\r\n    Installed    REG_DWORD    0x1\r\n    Major    REG_DWORD    0xe\r\n\r\n";
+        assert_eq!(parse_vc_runtime(key), Some("14.51.36247.00".into()));
+        assert_eq!(parse_vc_runtime(&key.replace("0x1", "0x0")), None, "not installed");
+        assert_eq!(parse_vc_runtime("ERROR: The system was unable to find the specified registry key or value."), None);
+        assert!(new_enough("14.51.36247.00") && new_enough("14.42.34433.00") && new_enough("15.0"));
+        assert!(!new_enough("14.40.33810.00") && !new_enough("14.29.30139.00") && !new_enough("14.0.24215.1"), "older than PyTorch's MSVC 14.42");
+    }
+
+    #[test]
+    fn the_runtime_installers_exit_codes() {
+        assert_eq!(runtime_installed(0).ok(), Some(false));
+        assert_eq!(runtime_installed(1638).ok(), Some(false), "a newer one is there");
+        assert_eq!(runtime_installed(3010).ok(), Some(true), "used after a restart");
+        for no in [1602, 1223, -2_147_023_673] {
+            assert!(runtime_installed(no).unwrap_err().what.starts_with("Windows asked for permission"), "{no}");
+        }
+        assert!(runtime_installed(1603).unwrap_err().what.starts_with("trackertools cannot install the Microsoft Visual C++ runtime."));
+    }
+
+    /// Windows' own curl is signed by Microsoft; this test program isn't signed.
+    #[cfg(windows)]
+    #[test]
+    fn only_microsofts_signature_passes() {
+        signed_by_microsoft(&system32().join("curl.exe")).expect("curl, signed by Microsoft");
+        let why = signed_by_microsoft(&std::env::current_exe().expect("this test")).unwrap_err();
+        assert!(why.contains("NotSigned"), "{why}");
+    }
+
+    /// This computer's runtime (a developer's has one: Visual Studio's).
+    #[cfg(windows)]
+    #[test]
+    fn this_computers_runtime_is_found() {
+        if std::env::var_os("TT_VC_RUNTIME").is_some() || !VC_RUNTIME_DLLS.iter().all(|d| system32().join(d).is_file()) {
+            return;
+        }
+        let runtime = vc_runtime();
+        eprintln!("{runtime:?}");
+        assert_ne!(runtime, Runtime::Missing);
     }
 
     #[test]
