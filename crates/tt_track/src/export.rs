@@ -179,6 +179,11 @@ pub struct Stabilization {
     /// robust estimate): the trackers' error over their spread, plus any roll
     /// faster than a few frames.
     pub jitter: f64,
+    /// Where what it follows is on each frame with a fit (source px, y down),
+    /// as measured (before smoothing): the anchor (the points' centre on the
+    /// reference frame) carried by that frame's motion, or the subject's
+    /// point. The stabilizer holds it still (centred: in the middle).
+    pub followed: Vec<(FrameIndex, [f64; 2])>,
 }
 
 /// The camera's motion on one frame: a point `p` of the reference frame is at
@@ -260,7 +265,7 @@ fn undone(m: &Measured, size: [f64; 2]) -> Stabilization {
             Steady { frame: f, center: [centre[0] / w, centre[1] / h], angle: phi.to_degrees() }
         })
         .collect();
-    Stabilization { keys, reference: m.reference, used: m.used, spread: m.spread, jitter: m.jitter }
+    Stabilization { keys, reference: m.reference, used: m.used, spread: m.spread, jitter: m.jitter, followed: m.followed.clone() }
 }
 
 /// The keys that move something with the trackers' points (the follower):
@@ -284,7 +289,7 @@ fn applied(m: &Measured, size: [f64; 2]) -> Stabilization {
             Steady { frame: f, center: [m.at[i][0] / w, m.at[i][1] / h], angle: m.angle[i].to_degrees() }
         })
         .collect();
-    Stabilization { keys, reference: m.reference, used: m.used, spread: m.spread, jitter: m.jitter }
+    Stabilization { keys, reference: m.reference, used: m.used, spread: m.spread, jitter: m.jitter, followed: m.followed.clone() }
 }
 
 /// A subject's path as a measurement: its point (y up) and its angle
@@ -325,7 +330,8 @@ fn measure_path(path: &[(FrameIndex, [f64; 2], f64)], size: [f64; 2], reference:
     let (angle, ax, ay) = (spring(&angle, smoothing.rotation * fps), spring(&channel(1), smoothing.position * fps), spring(&channel(2), smoothing.position * fps));
     let at: Vec<[f64; 2]> = ax.into_iter().zip(ay).map(|(x, y)| [x, y]).collect();
     let anchor = at[(reference - lo) as usize];
-    Some(Measured { frames: path.iter().map(|p| p.0).collect(), first: lo, angle, at, anchor, reference, used: 1, spread: 0.0, jitter, centred: smoothing.centred })
+    let followed = path.iter().map(|&(f, p, _)| (f, p)).collect();
+    Some(Measured { frames: path.iter().map(|p| p.0).collect(), first: lo, angle, at, anchor, reference, used: 1, spread: 0.0, jitter, centred: smoothing.centred, followed })
 }
 
 /// The points' motion, smoothed, on every frame from the first fitted to the
@@ -343,6 +349,8 @@ struct Measured {
     jitter: f64,
     /// The stabilizer holds the anchor in the middle of the picture.
     centred: bool,
+    /// [`Stabilization::followed`].
+    followed: Vec<(FrameIndex, [f64; 2])>,
 }
 
 fn measure(tracks: &[Vec<(FrameIndex, [f64; 2])>], size: [f64; 2], reference: FrameIndex, smoothing: Smoothing, fps: f64) -> Option<Measured> {
@@ -423,7 +431,9 @@ fn measure(tracks: &[Vec<(FrameIndex, [f64; 2])>], size: [f64; 2], reference: Fr
     let jitter = d2.get(d2.len() / 2).map_or(0.0, |m| (m * 1.4826 / 6f64.sqrt()).to_degrees());
     let (angle, ax, ay) = (spring(&angle, smoothing.rotation * fps), spring(&ax, smoothing.position * fps), spring(&ay, smoothing.position * fps));
     let at = ax.into_iter().zip(ay).map(|(x, y)| [x, y]).collect();
-    Some(Measured { frames: motion.keys().copied().collect(), first: lo, angle, at, anchor, reference, used, spread, jitter, centred: smoothing.centred })
+    // Where the anchor is, as measured: y down again.
+    let followed = motion.iter().map(|(&f, mo)| (f, [mo.at[0], h - mo.at[1]])).collect();
+    Some(Measured { frames: motion.keys().copied().collect(), first: lo, angle, at, anchor, reference, used, spread, jitter, centred: smoothing.centred, followed })
 }
 
 /// A key's values on frame `f`: linear between keys, held beyond them (as
@@ -475,20 +485,25 @@ pub fn rendered_map(keys: &[Steady], size: [f64; 2], framing: Framing, g: FrameI
     key_at(keys, g).map_or(tt_media::render::IDENTITY, |k| framed_map(&k, size, framing))
 }
 
+/// Whether the stabilized picture, framed by `framing`, covers the whole
+/// frame on every one of `frames`: no black edges.
+pub fn hides_the_edges(keys: &[Steady], size: [f64; 2], frames: std::ops::Range<FrameIndex>, framing: Framing) -> bool {
+    let [w, h] = size;
+    frames.filter_map(|f| key_at(keys, f)).all(|k| {
+        let m = framed_map(&k, size, framing);
+        [[0.0, 0.0], [w, 0.0], [0.0, h], [w, h]].iter().all(|q| {
+            let (x, y) = (m[0] * q[0] + m[1] * q[1] + m[2], m[3] * q[0] + m[4] * q[1] + m[5]);
+            (-1e-6..=w + 1e-6).contains(&x) && (-1e-6..=h + 1e-6).contains(&y)
+        })
+    })
+}
+
 /// The least zoom (from 1 up to `max`) at which the stabilized picture,
 /// moved by `offset` (as [`Framing`]'s), covers the whole frame on every
-/// one of `frames`: no black edges.
+/// one of `frames`: no black edges. `max` if even that does not
+/// ([`hides_the_edges`] tells).
 pub fn zoom_to_fill(keys: &[Steady], size: [f64; 2], frames: std::ops::Range<FrameIndex>, offset: [f64; 2], max: f64) -> f64 {
-    let [w, h] = size;
-    let covers = |zoom: f64| {
-        frames.clone().filter_map(|f| key_at(keys, f)).all(|k| {
-            let m = framed_map(&k, size, Framing { zoom, offset });
-            [[0.0, 0.0], [w, 0.0], [0.0, h], [w, h]].iter().all(|q| {
-                let (x, y) = (m[0] * q[0] + m[1] * q[1] + m[2], m[3] * q[0] + m[4] * q[1] + m[5]);
-                (-1e-6..=w + 1e-6).contains(&x) && (-1e-6..=h + 1e-6).contains(&y)
-            })
-        })
-    };
+    let covers = |zoom: f64| hides_the_edges(keys, size, frames.clone(), Framing { zoom, offset });
     if covers(1.0) {
         return 1.0;
     }
@@ -996,9 +1011,46 @@ mod tests {
             })
         };
         assert!(covered(z) && !covered(z * 0.99));
+        assert!(hides_the_edges(&keys, size, 0..30, Framing { zoom: z, offset }) && !hides_the_edges(&keys, size, 0..30, Framing { zoom: z * 0.99, offset }));
         // A still picture moved right by a tenth of its width: its left edge shows until it is 1.2 times as big.
         let still = [Steady { frame: 0, center: [0.5, 0.5], angle: 0.0 }];
         assert!((zoom_to_fill(&still, size, 0..5, [0.1, 0.0], 3.0) - 1.2).abs() < 1e-6);
+        // Moved by half its width it takes twice the size; with less allowed, the most allowed, and the edges show.
+        assert!((zoom_to_fill(&still, size, 0..5, [0.5, 0.0], 4.0) - 2.0).abs() < 1e-6);
+        assert_eq!(zoom_to_fill(&still, size, 0..5, [0.5, 0.0], 1.5), 1.5);
+        assert!(!hides_the_edges(&still, size, 0..5, Framing { zoom: 1.5, offset: [0.5, 0.0] }));
+    }
+
+    #[test]
+    fn what_it_follows_is_the_anchor_the_stabilizer_holds() {
+        let size = [1920.0, 1080.0];
+        // Three points of something that moves and turns; the third is lost now and then.
+        let shape = [[-200.0, -100.0], [200.0, -100.0], [0.0, 200.0]];
+        let at = |f: i64, s: [f64; 2]| {
+            let t = f as f64;
+            let (turn, cx, cy) = (0.004 * t, 700.0 + 3.0 * t, 450.0 + 1.5 * t);
+            [cx + s[0] * turn.cos() - s[1] * turn.sin(), cy + s[0] * turn.sin() + s[1] * turn.cos()]
+        };
+        let tracks: Vec<Vec<(i64, [f64; 2])>> = (0..3).map(|i| (0..60).filter(|f| i != 2 || f % 5 != 3).map(|f| (f, at(f, shape[i]))).collect()).collect();
+        let st = stabilize(&tracks, size, 10, Smoothing { centred: true, ..Smoothing::default() }, 50.0).expect("a stabilizer");
+        assert_eq!(st.followed.len(), 60, "every frame has two or more points");
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-6;
+        let framing = Framing { zoom: 1.3, offset: [0.05, -0.1] };
+        let mid = [size[0] * (0.5 + framing.offset[0]), size[1] * (0.5 + framing.offset[1])];
+        for &(f, p) in &st.followed {
+            // The anchor is the shape's centre on every frame, the third point there or not ...
+            assert!(near(p, at(f, [0.0, 0.0])), "frame {f}: {p:?}");
+            // ... and the export puts it in the middle (moved by the offset).
+            let m = rendered_map(&st.keys, size, framing, f);
+            assert!(near([m[0] * mid[0] + m[1] * mid[1] + m[2], m[3] * mid[0] + m[4] * mid[1] + m[5]], p), "frame {f}");
+        }
+        // Without the third point, the two left are not centred: their mean is somewhere else.
+        let two = [at(3, shape[0]), at(3, shape[1])];
+        assert!(!near([(two[0][0] + two[1][0]) / 2.0, (two[0][1] + two[1][1]) / 2.0], st.followed[3].1));
+        // A subject: its own point.
+        let path: Vec<(i64, [f64; 2], f64)> = (0..20).map(|f| (f, [300.0 + f as f64, 200.0], 0.0)).collect();
+        let s = stabilize_path(&path, size, 5, Smoothing::default(), 50.0).expect("a stabilizer");
+        assert_eq!(s.followed, path.iter().map(|&(f, p, _)| (f, p)).collect::<Vec<_>>());
     }
 
     #[test]
