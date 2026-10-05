@@ -222,6 +222,13 @@ impl Session {
         }
     }
 
+    /// Save now, to resume at `frame` (the one shown, even while playing):
+    /// trackertools starts again after an error ([`crate::recover`]).
+    pub fn save_at(&mut self, frame: FrameIndex) {
+        self.file.frame = frame;
+        self.save();
+    }
+
     /// Reopen the most recent file at its last frame (startup without a file argument).
     pub fn restore_into(&mut self, request: &mut OpenRequest) {
         if let Some(last) = self.file.recent.first().filter(|p| p.exists()) {

@@ -20,7 +20,10 @@
 //!   decoded frames (up to [`ROOT_SEGMENT_BYTES`]) instead of its patches.
 //! - Each job says what it is doing ([`Phase`]): starting, loading its model
 //!   (CoTracker's Python worker), or tracking.
+//! - Each job ends with one message: finished, or failed (a panic in its
+//!   thread too).
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -135,6 +138,8 @@ pub struct JobSpec {
     /// No guide: `guide` is the whole frame, and the search goes around where
     /// the tracker was going (its patch follows it).
     pub root: bool,
+    /// Which tracker it is, for the log ("Tracker 2 (14v1)").
+    pub label: String,
 }
 
 /// What a job is doing.
@@ -157,6 +162,8 @@ pub struct Shared {
     pub limit: AtomicI64,
     /// The last frame produced.
     pub at: AtomicI64,
+    /// The frame it waits for at the limit (or last waited for).
+    pub next: AtomicI64,
     /// Waiting at the limit.
     pub waiting: AtomicBool,
     /// Waiting long enough to have let go of its decoder: not using a job slot.
@@ -171,6 +178,7 @@ impl Shared {
             cancel: AtomicBool::new(false),
             limit: AtomicI64::new(limit),
             at: AtomicI64::new(at),
+            next: AtomicI64::new(at),
             waiting: AtomicBool::new(false),
             parked: AtomicBool::new(false),
             phase: AtomicU8::new(Phase::Starting as u8),
@@ -188,6 +196,21 @@ impl Shared {
     pub fn set_phase(&self, phase: Phase) {
         self.phase.store(phase as u8, Ordering::Relaxed);
     }
+
+    /// Whether the limit lets a job on `side` track frame `f`.
+    pub fn allows(&self, side: Side, f: FrameIndex) -> bool {
+        let limit = self.limit.load(Ordering::Relaxed);
+        match side {
+            Side::Forward => f < limit,
+            Side::Backward => f >= limit,
+        }
+    }
+
+    /// Parked, and its limit still holds it there. (`parked` alone can be
+    /// stale: a new limit may have freed it a moment ago, before it looked.)
+    pub fn held(&self, side: Side) -> bool {
+        self.parked.load(Ordering::Relaxed) && !self.allows(side, self.next.load(Ordering::Relaxed))
+    }
 }
 
 pub enum Msg {
@@ -196,50 +219,72 @@ pub enum Msg {
     Failed(String),
 }
 
-/// Counted in `threads` until the thread exits (cancelled jobs included:
-/// they hold an ffmpeg until they notice).
-struct Alive(Arc<AtomicUsize>);
+/// Counted in each of its counters until the thread exits (cancelled jobs
+/// included: they hold an ffmpeg, or a CoTracker worker, until they notice).
+struct Alive(Vec<Arc<AtomicUsize>>);
 
 impl Drop for Alive {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        for count in &self.0 {
+            count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
-/// Start a job's thread, counted in `threads` while it lives.
-pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<AtomicUsize>) -> JoinHandle<()> {
-    threads.fetch_add(1, Ordering::Relaxed);
-    let alive = Alive(threads.clone());
+/// Start a job's thread, counted in `threads` while it lives, and in
+/// `workers` too if it runs a CoTracker worker ([`JobSpec::starts_worker`]).
+/// The thread always ends with [`Msg::Finished`] or [`Msg::Failed`] (a
+/// panic in it too).
+pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<AtomicUsize>, workers: &Arc<AtomicUsize>) -> JoinHandle<()> {
+    let mut counts = vec![threads.clone()];
+    if spec.starts_worker() {
+        counts.push(workers.clone());
+    }
+    for count in &counts {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+    let alive = Alive(counts);
     std::thread::Builder::new()
         .name(format!("tracker {:?}", spec.side))
         .spawn(move || {
             let _alive = alive;
-            let mut worker = Worker {
-                spec,
-                shared,
-                tx: tx.clone(),
-                out: Vec::new(),
-                flushed: Instant::now(),
-                half: [TEMPLATE_R as f64; 2],
-                margin: TEMPLATE_R as f64 + 2.0,
-                offsets: Vec::new(),
-                stretch: Vec::new(),
-                stretch_bytes: Some(0),
-                near: None,
-            };
-            let result = match worker.spec.method {
-                Method::Template => worker.run(),
-                Method::CoTracker => worker.run_learned(),
-                // (A manual dot is never planned: nothing to track.)
-                Method::Manual => Ok(()),
-            };
-            worker.flush();
+            let out = tx.clone();
+            // (Whatever it held is dropped while unwinding: a CoTracker worker is stopped.)
+            let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                let mut worker = Worker {
+                    spec,
+                    shared,
+                    tx: out,
+                    out: Vec::new(),
+                    flushed: Instant::now(),
+                    half: [TEMPLATE_R as f64; 2],
+                    margin: TEMPLATE_R as f64 + 2.0,
+                    offsets: Vec::new(),
+                    stretch: Vec::new(),
+                    stretch_bytes: Some(0),
+                    near: None,
+                };
+                let result = match worker.spec.method {
+                    Method::Template => worker.run(),
+                    Method::CoTracker => worker.run_learned(),
+                    // (A manual dot is never planned: nothing to track.)
+                    Method::Manual => Ok(()),
+                };
+                worker.flush();
+                result
+            }));
             let _ = tx.send(match result {
-                Ok(()) => Msg::Finished,
-                Err(e) => Msg::Failed(format!("{e:#}")),
+                Ok(Ok(())) => Msg::Finished,
+                Ok(Err(e)) => Msg::Failed(format!("{e:#}")),
+                Err(panic) => Msg::Failed(format!("the tracker stopped on an error: {}", panic_message(panic.as_ref()))),
             });
         })
         .expect("spawn tracker thread")
+}
+
+/// What a panic said.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("no message")
 }
 
 struct Worker {
@@ -532,16 +577,12 @@ impl Worker {
     /// wait calls `park` once (to let go of the decoder) and marks the job parked.
     fn wait_for(&mut self, f: FrameIndex, mut park: impl FnMut()) -> bool {
         let mut since: Option<Instant> = None;
+        self.shared.next.store(f, Ordering::Relaxed);
         loop {
             if self.cancelled() {
                 return false;
             }
-            let limit = self.shared.limit.load(Ordering::Relaxed);
-            let allowed = match self.spec.side {
-                Side::Forward => f < limit,
-                Side::Backward => f >= limit,
-            };
-            if allowed {
+            if self.shared.allows(self.spec.side, f) {
                 self.shared.waiting.store(false, Ordering::Relaxed);
                 self.shared.parked.store(false, Ordering::Relaxed);
                 return true;

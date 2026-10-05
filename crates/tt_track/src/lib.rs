@@ -25,7 +25,8 @@
 //! [`runner`], which runs them in background threads forward and backward
 //! from the anchor, keeps old results on screen as stale until new ones
 //! arrive, and can hold them to the playhead (catch-up mode). Which way
-//! they track is the user's to ask ([`TrackRun`]): new trackers wait.
+//! they track is the user's to ask ([`TrackRun`]): new trackers wait, and so
+//! do CoTracker trackers when their project opens ([`pause_cotrackers_on_open`]).
 
 pub mod export;
 pub mod human;
@@ -44,7 +45,7 @@ use bevy_reflect::Reflect;
 use look::Look;
 use tt_core::history::{History, Tx, edit};
 use tt_core::input::{Action, PendingActions};
-use tt_core::op::{EvalCtx, Footprint, Inputs, Operator, OperatorKind, Output};
+use tt_core::op::{EvalCtx, Footprint, Inputs, Invalidations, OpError, Operator, OperatorKind, Output};
 use tt_core::selection::Selection;
 use tt_core::signal::{Signal, SignalStore};
 use tt_core::time::FrameIndex;
@@ -126,19 +127,72 @@ impl TrackRun {
     }
 }
 
-/// A tracker's run state (one without any, from before: both ways).
+/// A tracker's run state: paused while [`PausedOnOpen`], else what it was
+/// asked (one without any, from before: both ways). Everything that starts
+/// jobs reads it here.
 pub fn run_of(world: &World, tracker: Entity) -> TrackRun {
+    if world.get::<PausedOnOpen>(tracker).is_some() {
+        return TrackRun::Paused;
+    }
+    asked_run(world, tracker)
+}
+
+/// What a tracker was asked, as saved (paused on open or not).
+fn asked_run(world: &World, tracker: Entity) -> TrackRun {
     world.get::<TrackRun>(tracker).copied().unwrap_or(TrackRun::Both)
 }
 
 /// Ask `tracker` to track one way, both, or pause. Like its results, not an
-/// undo step (undoing an edit shouldn't stop tracking), but saved.
+/// undo step (undoing an edit shouldn't stop tracking), but saved. Asked to
+/// track after it stopped on an error, it plans again and tries again, also
+/// when asked the way it already was. Either way it is no longer
+/// [`PausedOnOpen`]: what it is asked now is saved (Pause too).
 pub fn set_run(world: &mut World, tracker: Entity, run: TrackRun) {
-    if !is_tracker(world, tracker) || run_of(world, tracker) == run {
+    if !is_tracker(world, tracker) {
         return;
     }
-    world.entity_mut(tracker).insert(run);
-    world.resource_mut::<History>().touch();
+    let paused_on_open = world.get::<PausedOnOpen>(tracker).is_some();
+    if paused_on_open {
+        world.entity_mut(tracker).remove::<PausedOnOpen>();
+    }
+    // (As an input edit would: a failed job's tracker otherwise waits for its inputs to change.)
+    if run != TrackRun::Paused && world.get::<OpError>(tracker).is_some() {
+        let frames = tt_core::op::extent(world);
+        world.resource_mut::<Invalidations>().recompute(tracker, frames);
+    }
+    if paused_on_open || asked_run(world, tracker) != run {
+        world.entity_mut(tracker).insert(run);
+        world.resource_mut::<History>().touch();
+    }
+}
+
+/// A CoTracker tracker paused because its project opened
+/// ([`pause_cotrackers_on_open`]), and what it was asked (still its saved
+/// [`TrackRun`]): it counts as paused ([`run_of`]). Never saved, so the
+/// project keeps what it was asked, and the next open pauses it again;
+/// gone once it is asked again ([`set_run`]).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PausedOnOpen(pub TrackRun);
+
+/// Opening a project never starts CoTracker by itself (each job starts a
+/// Python worker that loads its model onto the graphics card): every
+/// CoTracker tracker asked to track is held paused by a [`PausedOnOpen`],
+/// which keeps how it was asked. Its saved [`TrackRun`] stays: not an undo
+/// step, not a change to save, and later saves keep what it was asked (call
+/// it right after loading). Returns the trackers paused, in creation order.
+pub fn pause_cotrackers_on_open(world: &mut World) -> Vec<Entity> {
+    let mut q = world.query::<(Entity, &Tracker, Option<&TrackRun>)>();
+    let mut asked: Vec<Entity> = q
+        .iter(world)
+        .filter(|(_, t, run)| t.method == Method::CoTracker && run.copied().unwrap_or(TrackRun::Both) != TrackRun::Paused)
+        .map(|(e, _, _)| e)
+        .collect();
+    tt_core::meta::creation_order(world, &mut asked);
+    for e in &asked {
+        let was = asked_run(world, *e);
+        world.entity_mut(*e).insert(PausedOnOpen(was));
+    }
+    asked
 }
 
 /// What new trackers start with.
@@ -540,6 +594,7 @@ impl Module for TrackModule {
             .component::<human::AutoOutput>(Class::Document)
             .component::<human::HumanLayer>(Class::Document)
             .declare::<human::Composed>(Class::Derived)
+            .declare::<PausedOnOpen>(Class::Derived)
             .declare::<human::DrawTool>(Class::Derived)
             .init_resource::<human::DrawTool>()
             .declare::<NewTrackers>(Class::Session)

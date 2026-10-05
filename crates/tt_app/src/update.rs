@@ -398,6 +398,8 @@ pub fn drive(ctx: &egui::Context, world: &mut World) {
 pub fn restart_if_updated(world: &World) {
     if let Some(exe) = &world.resource::<RestartWith>().0 {
         let mut cmd = Command::new(exe);
+        // (Not a start after an error, even if this one was.)
+        cmd.env_remove(crate::recover::RECOVERED);
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }

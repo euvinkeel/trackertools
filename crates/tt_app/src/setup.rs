@@ -76,21 +76,37 @@ pub fn start_logging() {
     tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(file).init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        tracing::error!("{PANIC}{info}\n{}", std::backtrace::Backtrace::force_capture());
-        if !cfg!(debug_assertions) && std::thread::current().name() == Some("main") {
-            message("trackertools stopped because of an error.\n\nStart trackertools again. Then click Report a problem at the top of the window.");
+        let name = std::thread::current().name().unwrap_or("unnamed").to_string();
+        if name.starts_with("tracker ") {
+            // (A tracker's job catches it and reports it as its error: the app goes on.)
+            tracing::error!("panic in the thread {name:?} (the app goes on): {info}\n{}", std::backtrace::Backtrace::force_capture());
+        } else {
+            tracing::error!("{PANIC}{info}\n{}", std::backtrace::Backtrace::force_capture());
+        }
+        if name == "main" {
+            // The app ends: start it again where it was (crate::recover), else say what to do.
+            if crate::recover::after_panic(info) {
+                std::process::exit(3);
+            }
+            if !cfg!(debug_assertions) {
+                message(if crate::recover::gpu_panic(info) {
+                    crate::recover::GPU_STOPPED
+                } else {
+                    "trackertools stopped because of an error.\n\nStart trackertools again. Then click Report a problem at the top of the window."
+                });
+            }
         }
         default(info);
     }));
 }
 
-/// The last run stopped on an error (a panic in its log).
+/// The last run stopped on an error (a panic, or the graphics device lost, in its log).
 pub fn last_run_failed() -> bool {
-    std::fs::read_to_string(logs_dir().join(PREVIOUS_LOG)).is_ok_and(|t| t.contains(PANIC))
+    std::fs::read_to_string(logs_dir().join(PREVIOUS_LOG)).is_ok_and(|t| t.contains(PANIC) || t.contains(crate::recover::GPU_LOST_MARK))
 }
 
 /// A message box, when there is no window of ours to say it in.
-fn message(text: &str) {
+pub fn message(text: &str) {
     let _ = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("trackertools")
@@ -331,6 +347,9 @@ fn report_from(checked: &Checked, graphics: Option<&str>, logs: &Path, when: Str
     let _ = writeln!(r, "\nchecks:");
     for c in &checked.checks {
         let _ = writeln!(r, "  [{}] {}", c.tag(), c.text);
+    }
+    if let Ok(crumb) = std::fs::read_to_string(logs.join(crate::recover::BREADCRUMB)) {
+        let _ = writeln!(r, "\nthe last start after an error ({}):\n{}", crate::recover::BREADCRUMB, crumb.trim_end());
     }
     for (title, name, keep) in [("the last run's log", PREVIOUS_LOG, 150), ("this run's log", LOG, 250)] {
         let Ok(text) = std::fs::read_to_string(logs.join(name)) else { continue };

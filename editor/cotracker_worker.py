@@ -28,6 +28,13 @@ downloaded it) and `--device cpu|cuda|mps` (default: CUDA when available,
 else Apple Silicon's GPU (MPS) if a trial window runs there, else the CPU;
 `TT_COTRACKER_DEVICE` sets it too).
 The weights are Meta's, CC-BY-NC 4.0: not part of this repository.
+
+Switches in the environment (the app's own, inherited), for finding out
+what makes a graphics card reset:
+- `TT_COTRACKER_GRAPHS=0`: no CUDA graphs (each window runs its kernels one
+  by one, slower).
+- `TT_COTRACKER_BENCHMARK=0`: cuDNN does not try out its algorithms on the
+  first window (`torch.backends.cudnn.benchmark` off).
 """
 
 import argparse
@@ -64,10 +71,12 @@ class Engine(v1.TrackingEngine):
 
     def __init__(self, weights: str, device: str):
         self.device = device
+        graphs = os.environ.get("TT_COTRACKER_GRAPHS") != "0"
+        benchmark = os.environ.get("TT_COTRACKER_BENCHMARK") != "0"
         if device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = benchmark
         model = build_cotracker(checkpoint=None, offline=False, window_len=16)
         state = torch.load(weights, map_location="cpu")
         model.load_state_dict(state.get("model", state) if isinstance(state, dict) else state)
@@ -80,7 +89,9 @@ class Engine(v1.TrackingEngine):
         self.radius = self.model.corr_radius
         self.iters = 6
         self.fp16_encoder = False
-        self.graphed = v1.GraphedWindow(self) if device == "cuda" else None
+        self.graphed = v1.GraphedWindow(self) if device == "cuda" and graphs else None
+        if not (graphs and benchmark):
+            print(f"CUDA graphs {'on' if graphs else 'off'}, cuDNN benchmark {'on' if benchmark else 'off'}", file=sys.stderr)
 
 
 def pick_engine(weights: str, asked: Optional[str]) -> "Engine":

@@ -112,7 +112,11 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         let automatic: Vec<Entity> = trackers.iter().copied().filter(|t| !tt_track::human::is_manual(world, *t)).collect();
         if !automatic.is_empty() {
             for (run, _, item, tip) in super::tracks::RUNS {
-                if ui.add_enabled(now != run || automatic.len() > 1, egui::Button::new(item)).on_hover_text(tip).clicked() {
+                // (The current one too after an error: asking again tries again. And
+                // paused when the project opened, Pause keeps it paused for good.)
+                let failed = world.get::<tt_core::op::OpError>(*first).is_some();
+                let paused_on_open = world.get::<tt_track::PausedOnOpen>(*first).is_some();
+                if ui.add_enabled(now != run || automatic.len() > 1 || paused_on_open || failed && run != tt_track::TrackRun::Paused, egui::Button::new(item)).on_hover_text(tip).clicked() {
                     super::tracks::ask(world, &automatic, run);
                     ui.close();
                 }

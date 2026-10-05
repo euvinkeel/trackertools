@@ -24,6 +24,8 @@ pub struct ProjectFile {
     seen_generation: u64,
     /// (revision, wall time) of the last change seen, for the debounce.
     last_change: (u64, f64),
+    /// CoTracker trackers the status line says are paused since the project opened (0: it says nothing of them).
+    paused_line: usize,
 }
 
 impl ProjectFile {
@@ -61,6 +63,12 @@ pub fn save_if_dirty(world: &mut World) {
     }
 }
 
+/// The status line after CoTracker trackers were paused on open (ASD-STE100).
+fn paused_on_open(n: usize) -> String {
+    let which = if n == 1 { "1 CoTracker tracker is paused".to_string() } else { format!("{n} CoTracker trackers are paused") };
+    format!("{which}: CoTracker does not start when a project opens. To start one, select it. Then click Back, Both or Forward.")
+}
+
 fn track_project(world: &mut World) {
     let Some((generation, video)) = world.get_resource::<Media>().map(|m| (m.generation, m.index().path.clone())) else {
         return;
@@ -69,11 +77,25 @@ fn track_project(world: &mut World) {
     // A different video was opened: save the old project, then switch.
     if generation != world.resource::<ProjectFile>().seen_generation {
         save_if_dirty(world);
+        world.resource_mut::<ProjectFile>().paused_line = 0;
         persist::clear_document(world);
         let path = tt_media::proxy::source_key(&video).ok().map(|k| tt_media::proxy::data_dir().join("projects").join(format!("{k}.ttproj")));
         if let Some(p) = path.as_ref().filter(|p| p.exists()) {
             match persist::load(world, p) {
-                Ok(()) => tracing::info!("loaded project {}", p.display()),
+                Ok(()) => {
+                    tracing::info!("loaded project {}", p.display());
+                    // CoTracker loads a model onto the graphics card: never by itself when a project opens.
+                    let paused = tt_track::pause_cotrackers_on_open(world).len();
+                    if paused > 0 {
+                        tracing::info!("paused {paused} CoTracker tracker(s) on open");
+                        world.resource_mut::<crate::media::StatusLine>().0 = Some((paused_on_open(paused), false));
+                        world.resource_mut::<ProjectFile>().paused_line = paused;
+                        // (A start after an error says it too.)
+                        if let Some(mut notice) = world.get_resource_mut::<crate::recover::Notice>() {
+                            notice.paused = paused;
+                        }
+                    }
+                }
                 Err(e) => {
                     // Keep the file: the next autosave would otherwise overwrite it.
                     persist::clear_document(world);
@@ -96,6 +118,8 @@ fn track_project(world: &mut World) {
         return;
     }
 
+    follow_paused_line(world);
+
     // Autosave once edits have settled.
     let now = world.resource::<WallClock>().now;
     let revision = world.resource::<History>().revision();
@@ -107,6 +131,25 @@ fn track_project(world: &mut World) {
     if settled {
         save_if_dirty(world);
     }
+}
+
+/// The open-time line follows the trackers: once one is asked to track
+/// again it counts one less, and goes when none is left (unless another
+/// message has replaced it).
+fn follow_paused_line(world: &mut World) {
+    let shown = world.resource::<ProjectFile>().paused_line;
+    if shown == 0 {
+        return;
+    }
+    let now = world.query::<&tt_track::PausedOnOpen>().iter(world).count();
+    if now == shown {
+        return;
+    }
+    let ours = world.resource::<crate::media::StatusLine>().0.as_ref().is_some_and(|(m, _)| *m == paused_on_open(shown));
+    if ours {
+        world.resource_mut::<crate::media::StatusLine>().0 = (now > 0).then(|| (paused_on_open(now), false));
+    }
+    world.resource_mut::<ProjectFile>().paused_line = if ours { now } else { 0 };
 }
 
 pub struct ProjectModule;
