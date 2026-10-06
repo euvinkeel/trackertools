@@ -17,15 +17,23 @@ use tt_core::time::FrameIndex;
 use tt_track::look::Look;
 use tt_track::{Method, NewTrackers, TrackRun};
 
+/// `=export-fill`: how long the window stays as it opened before the drag (s).
+const DRAG_AFTER: f64 = 15.0;
+
 /// The scene being built. `TT_SCENE_DEMO=settings` then shows the Settings
 /// tab (a click egui sees, at `tab`), `=export` opens the stabilized export
-/// window on the subject once it has frames.
+/// window on the subject once it has frames (`=export-framed`: zoomed in and
+/// moved; `=export-fill`: zoomed in to hide the black edges and moved, then,
+/// [`DRAG_AFTER`] seconds later, the picture dragged in the preview).
 pub struct Scene {
     sketch: Option<Entity>,
     subject: Option<Entity>,
     mode: String,
     /// Built: frames since (the Settings tab is clicked a few frames later).
     after: Option<u32>,
+    /// The export window opened (wall clock), and the drag's steps since.
+    opened: Option<f64>,
+    dragged: u32,
     /// Input events for egui's next frame.
     pub inject: Vec<egui::Event>,
     /// Where the Settings tab is (points).
@@ -37,26 +45,40 @@ impl Scene {
         let mode = std::env::var("TT_SCENE_DEMO").ok()?;
         // (The Settings tab in the default layout of a 1600 × 950 window; TT_SCENE_TAB=x,y for another.)
         let tab = std::env::var("TT_SCENE_TAB").ok().and_then(|s| s.split_once(',').and_then(|(x, y)| Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))));
-        Some(Self { sketch: None, subject: None, mode, after: None, inject: Vec::new(), tab: tab.or(Some(egui::pos2(1427.0, 35.0))) })
+        Some(Self { sketch: None, subject: None, mode, after: None, opened: None, dragged: 0, inject: Vec::new(), tab: tab.or(Some(egui::pos2(1427.0, 35.0))) })
     }
 
     /// One app frame (the video is open). True: done.
     pub fn drive(&mut self, world: &mut World) -> bool {
         if let Some(n) = self.after.as_mut() {
             // The export waits for the subject's frames (its members tracking).
-            if self.mode == "export"
+            if self.mode.starts_with("export")
                 && let Some(s) = self.subject
             {
                 if tt_track::export::subject_path(world, s).len() < 100 && *n < 3000 {
                     *n += 1;
                     return false;
                 }
+                // `=export-framed`: zoomed in and moved, for the preview; `=export-fill`: zoomed in just enough.
+                let framing = match self.mode.as_str() {
+                    "export-framed" => Some((false, 1.6, [0.08, -0.05])),
+                    "export-fill" => Some((true, 1.0, [0.08, -0.05])),
+                    _ => None,
+                };
+                if let Some(f) = framing {
+                    let mut d = world.resource_mut::<tt_track::export::StabilizerDefaults>();
+                    (d.fill, d.zoom, d.offset) = f;
+                }
                 crate::panels::export::open(world, crate::panels::export::Kind::Stabilized, crate::panels::export::Source::Subject(s));
+                tracing::info!("scene demo: the export window");
                 self.subject = None;
                 return false;
             }
             *n += 1;
             use egui::{Event, Modifiers, PointerButton};
+            if self.mode == "export-fill" {
+                return self.drag_the_preview(world);
+            }
             if *n == 5
                 && self.mode == "settings"
                 && let Some(p) = self.tab
@@ -94,6 +116,34 @@ impl Scene {
                     self.subject = rest(world, s);
                     self.after = Some(0);
                 }
+            }
+        }
+        false
+    }
+
+    /// `=export-fill`, after the window opens: [`DRAG_AFTER`] seconds as it is,
+    /// then a drag of the picture in the preview, 40 points right and 20 down. True: done.
+    fn drag_the_preview(&mut self, world: &World) -> bool {
+        use egui::{Event, Modifiers, PointerButton};
+        let now = world.resource::<tt_core::time::WallClock>().now;
+        let opened = *self.opened.get_or_insert(now);
+        if now - opened < DRAG_AFTER {
+            return false;
+        }
+        let Some(p) = crate::panels::export::preview_rect(world).map(|r| r.center()) else { return true };
+        let (k, button) = (self.dragged, |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+        self.dragged += 1;
+        match k {
+            0 => {
+                tracing::info!("scene demo: dragging the picture in the preview");
+                self.inject.extend([Event::PointerMoved(p), button(p, true)]);
+            }
+            1..=20 => self.inject.push(Event::PointerMoved(p + egui::vec2(2.0 * k as f32, k as f32))),
+            21 => self.inject.push(button(p + egui::vec2(40.0, 20.0), false)),
+            // (The release goes in with the next frame's input: the scene stays until then.)
+            _ => {
+                tracing::info!("scene demo: dragged");
+                return true;
             }
         }
         false

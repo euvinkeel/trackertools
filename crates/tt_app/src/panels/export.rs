@@ -5,6 +5,11 @@
 //! the frames from the in point to the out point (`tt_core::marks`, I and O
 //! on the timeline; they can be moved while the window is open), or the
 //! whole video.
+//!
+//! A stabilized copy can be zoomed and moved in its frame
+//! (`tt_track::export::Framing`), and a small preview shows the playhead's
+//! frame as the export renders it: the decoded frame drawn on the CPU
+//! through the export's own map (`rendered_map`), with guidelines over it.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -14,12 +19,20 @@ use std::time::Instant;
 
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
+use egui::{Color32, Stroke, Vec2};
+use tt_core::input::{Action, PendingActions};
 use tt_core::time::FrameIndex;
-use tt_media::render::{Codec, IDENTITY, render_marker, render_warped};
-use tt_track::export::{StabilizerDefaults, Steady, follow, follow_path, follower_at, good_points, key_at, stabilize, stabilize_path, stabilizer_map, subject_path, zoom_to_fill};
+use tt_media::render::{Codec, invert, nv12_preview, render_marker, render_warped};
+use tt_track::export::{Framing, Smoothing, StabilizerDefaults, Steady, follow, follow_path, follower_at, good_points, hides_the_edges, rendered_map, stabilize, stabilize_path, subject_path, zoom_to_fill};
 
-use crate::media::{Media, StatusLine};
+use crate::media::{Media, StatusLine, Which};
 use crate::style;
+
+/// The preview fits in this (points), at the output's aspect ratio.
+const PREVIEW: Vec2 = Vec2::new(320.0, 240.0);
+/// The most zoom the slider offers, and how far the picture moves (a fraction of the frame).
+const MAX_ZOOM: f32 = 4.0;
+const MAX_OFFSET: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -39,6 +52,38 @@ pub struct ExportWindow {
     request: Option<Request>,
     job: Option<Job>,
     done: Option<Result<PathBuf, String>>,
+    preview: Preview,
+}
+
+/// The stabilized export's preview: the playhead's frame as the export renders it, small.
+struct Preview {
+    texture: Option<egui::TextureHandle>,
+    /// What the texture shows (made again when any of it changes).
+    shows: Option<Shown>,
+    /// Over it: the centre cross and the thirds; the point it follows.
+    guides: bool,
+    point: bool,
+    /// Where it was drawn last (points).
+    rect: Option<egui::Rect>,
+}
+
+impl Default for Preview {
+    fn default() -> Self {
+        Self { texture: None, shows: None, guides: true, point: true, rect: None }
+    }
+}
+
+/// A preview picture: which decoded frame (the media's generation, the
+/// proxy's or the original's, the presented frame and its grid frame), the
+/// framing and the size in pixels.
+#[derive(Clone, Copy, PartialEq)]
+struct Shown {
+    generation: u64,
+    proxy: bool,
+    presented: usize,
+    grid: FrameIndex,
+    framing: Framing,
+    pixels: [usize; 2],
 }
 
 struct Request {
@@ -51,20 +96,36 @@ struct Request {
     here: FrameIndex,
     reference: FrameIndex,
     keys: Vec<Steady>,
-    /// How the motion is used (smoothing, rotation, placement), as the keys were made.
+    /// How the motion is used (smoothing, rotation, placement) as the keys
+    /// were made, and how the picture is framed (zoom, position).
     options: StabilizerDefaults,
+    /// Where what it follows is on each frame with a fit, as the keys were
+    /// made (source px, y down; `Stabilization::followed`): what the
+    /// stabilizer holds still.
+    followed: Vec<(FrameIndex, [f64; 2])>,
+    /// Several points: each one's frames (source px, y down). Else empty.
+    points: Vec<Vec<(FrameIndex, [f64; 2])>>,
     /// The source video (the default name is made from it).
     source: PathBuf,
     codec: Codec,
     /// The whole video, even with in and out points marked.
     whole: bool,
-    /// Zoom in to hide the black edges (stabilized), by [`Request::zoom`].
-    fill: bool,
-    /// That zoom, for the frames it was worked out for.
-    zoom: Option<(Range<FrameIndex>, f64)>,
+    /// The zoom that hides the black edges ([`Request::fill_zoom`]).
+    zoom: Option<FillZoom>,
     path: PathBuf,
     /// The path is the default one (a change of format changes its extension).
     default_path: bool,
+}
+
+/// The least zoom that hides the black edges (up to [`MAX_ZOOM`]), for the
+/// frames and offset it was worked out for, and whether it does hide them
+/// (else it is the most).
+#[derive(Clone)]
+struct FillZoom {
+    frames: Range<FrameIndex>,
+    offset: [f64; 2],
+    zoom: f64,
+    hides: bool,
 }
 
 struct Job {
@@ -76,22 +137,47 @@ struct Job {
 }
 
 impl Request {
-    /// The least zoom that hides the black edges on every one of `frames` (worked out again when they change).
-    fn zoom(&mut self, size: [f64; 2], frames: &Range<FrameIndex>) -> f64 {
+    /// The least zoom that hides the black edges on every one of `frames`,
+    /// the picture moved as the options say. It takes a pass over the frames
+    /// for each step of a search, so it is worked out again only when the
+    /// frames or the offset change (or the keys: `zoom` is cleared), and not
+    /// while the pointer is held (`settled` false: a drag goes on). Then
+    /// the last one serves until the drag ends.
+    fn fill_zoom(&mut self, size: [f64; 2], frames: &Range<FrameIndex>, settled: bool) -> FillZoom {
+        let offset = self.options.offset();
         match &self.zoom {
-            Some((for_frames, z)) if for_frames == frames => *z,
+            Some(z) if (z.frames == *frames && z.offset == offset) || !settled => z.clone(),
             _ => {
-                let z = zoom_to_fill(&self.keys, size, frames.clone(), 3.0);
-                self.zoom = Some((frames.clone(), z));
-                z
+                let zoom = zoom_to_fill(&self.keys, size, frames.clone(), offset, MAX_ZOOM as f64);
+                // Below the most, it hides them; at the most, perhaps not.
+                let hides = zoom < MAX_ZOOM as f64 || hides_the_edges(&self.keys, size, frames.clone(), Framing { zoom, offset });
+                let made = FillZoom { frames: frames.clone(), offset, zoom, hides };
+                self.zoom = Some(made.clone());
+                made
             }
         }
+    }
+
+    /// The zoom that hides the black edges if it is known for `frames` and the offset as they are now.
+    fn known_fill_zoom(&self, frames: &Range<FrameIndex>) -> Option<FillZoom> {
+        self.zoom.clone().filter(|z| z.frames == *frames && z.offset == self.options.offset())
+    }
+
+    /// How the export frames the picture: the zoom that hides the edges or the one chosen, and the offset.
+    fn framing(&mut self, size: [f64; 2], frames: &Range<FrameIndex>, settled: bool) -> Framing {
+        let zoom = if self.options.fill { self.fill_zoom(size, frames, settled).zoom } else { self.options.zoom.clamp(1.0, MAX_ZOOM) as f64 };
+        Framing { zoom, offset: self.options.offset() }
     }
 }
 
 /// The export window is open (the viewport dims what it leaves out).
 pub fn is_open(world: &World) -> bool {
     world.get_resource::<ExportWindow>().is_some_and(|w| w.request.is_some())
+}
+
+/// Where the open window's preview is on screen (points; the scene demo drags in it).
+pub fn preview_rect(world: &World) -> Option<egui::Rect> {
+    world.get_resource::<ExportWindow>().filter(|w| w.request.is_some()).and_then(|w| w.preview.rect)
 }
 
 /// What an export renders: from the in point to the out point, or the whole video.
@@ -145,10 +231,15 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
         Source::Points(p) if p.len() == 1 => world.get::<Name>(p[0]).map_or("the point".to_string(), |n| n.to_string()),
         Source::Points(p) => format!("{} points", p.len()),
     };
+    let points = match &source {
+        Source::Points(p) if p.len() > 1 => p.iter().map(|e| good_points(world, *e)).collect(),
+        _ => Vec::new(),
+    };
     let codec = if kind == Kind::Stabilized { Codec::ProRes422Hq } else { Codec::H264 };
     let path = default_path(&index.path, kind, &name, codec);
     let w = &mut *world.resource_mut::<ExportWindow>();
     w.done = None;
+    w.preview.shows = None;
     let video_path = index.path.clone();
     w.request = Some(Request {
         kind,
@@ -159,10 +250,11 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
         reference: made.reference,
         keys: made.keys,
         options,
+        followed: made.followed,
+        points,
         source: video_path,
         codec,
         whole: false,
-        fill: false,
         zoom: None,
         path,
         default_path: true,
@@ -182,8 +274,8 @@ fn default_path(source: &Path, kind: Kind, name: &str, codec: Codec) -> PathBuf 
         .expect("a free name")
 }
 
-/// Render `frames` of the source as `r` says, `zoom`ed (stabilized), on a thread of its own.
-fn start(world: &World, r: &Request, frames: Range<FrameIndex>, zoom: f64) -> Option<Job> {
+/// Render `frames` of the source as `r` says, framed by `framing` (stabilized), on a thread of its own.
+fn start(world: &World, r: &Request, frames: Range<FrameIndex>, framing: Framing) -> Option<Job> {
     let index = world.get_resource::<Media>()?.original.index.clone();
     let total = (frames.end - frames.start).max(0) as usize;
     let size = [index.width as f64, index.height as f64];
@@ -194,12 +286,114 @@ fn start(world: &World, r: &Request, frames: Range<FrameIndex>, zoom: f64) -> Op
     let half = (size[0].min(size[1]) / 24.0).clamp(16.0, 120.0);
     let handle = std::thread::spawn(move || {
         let made = match kind {
-            Kind::Stabilized => render_warped(&index, &out, codec, frames, &|g| key_at(&keys, g).map_or(IDENTITY, |k| stabilizer_map(&k, size, zoom)), &done, &stop),
+            Kind::Stabilized => render_warped(&index, &out, codec, frames, &|g| rendered_map(&keys, size, framing, g), &done, &stop),
             Kind::Target => render_marker(&index, &out, codec, frames, &|g| follower_at(&keys, size, g), half, &done, &stop),
         };
         made.map(|()| out).map_err(|e| format!("{e:#}"))
     });
     Some(Job { progress, total, cancel, handle: Some(handle), started: Instant::now() })
+}
+
+/// The preview's size (points): the output's aspect ratio, inside [`PREVIEW`].
+fn preview_size(size: [f64; 2]) -> Vec2 {
+    let aspect = (size[0] / size[1].max(1.0)) as f32;
+    if aspect >= PREVIEW.x / PREVIEW.y { Vec2::new(PREVIEW.x, (PREVIEW.x / aspect).round()) } else { Vec2::new((PREVIEW.y * aspect).round(), PREVIEW.y) }
+}
+
+/// Makes the preview's picture again when what it shows changes: the
+/// decoded frame nearest the playhead's (the proxy's if it has it: plenty
+/// for a small picture) through the export's own map, as `framing` frames
+/// it. True: it shows the playhead's frame (else a neighbour, until that
+/// one is decoded).
+fn refresh_preview(ctx: &egui::Context, world: &World, p: &mut Preview, r: &Request, size: [f64; 2], framing: Framing) -> bool {
+    let Some(media) = world.get_resource::<Media>() else { return true };
+    let wanted = media.presented(world.resource::<tt_core::transport::Transport>().frame());
+    let exact = |w: Which| media.source(w).and_then(|s| s.player.frame(wanted)).map(|d| (w, wanted, d));
+    let nearest = |w: Which| media.source(w).and_then(|s| s.player.frame_or_nearest(wanted)).map(|(q, d)| (w, q, d));
+    let Some((which, presented, data)) = exact(Which::Proxy).or_else(|| exact(Which::Original)).or_else(|| nearest(Which::Proxy)).or_else(|| nearest(Which::Original)) else {
+        return false;
+    };
+    // As many pixels as it takes on screen, up to 480 across.
+    let display = preview_size(size);
+    let scale = ctx.pixels_per_point().min(480.0 / display.x);
+    let pixels = [((display.x * scale).round() as usize).max(1), ((display.y * scale).round() as usize).max(1)];
+    let grid = media.index().grid_of[presented];
+    let shown = Shown { generation: media.generation, proxy: which == Which::Proxy, presented, grid, framing, pixels };
+    if p.shows != Some(shown) {
+        let src = media.source(which).expect("it gave the frame");
+        let (fw, fh) = (src.index.width as usize, src.index.height as usize);
+        // Preview pixels, to output pixels, to source pixels (the export's map), to this rendition's pixels.
+        let m = rendered_map(&r.keys, size, framing, grid);
+        let (sx, sy) = (size[0] / pixels[0] as f64, size[1] / pixels[1] as f64);
+        let (fx, fy) = (fw as f64 / size[0], fh as f64 / size[1]);
+        let map = [fx * m[0] * sx, fx * m[1] * sy, fx * m[2], fy * m[3] * sx, fy * m[4] * sy, fy * m[5]];
+        let image = egui::ColorImage::from_rgb(pixels, &nv12_preview(&data, fw, fh, media.color, &map, pixels));
+        match &mut p.texture {
+            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
+            None => p.texture = Some(ctx.load_texture("export-preview", image, egui::TextureOptions::LINEAR)),
+        }
+        p.shows = Some(shown);
+    }
+    presented == wanted
+}
+
+/// The preview (`display` points) and what is over it. Returns where it is,
+/// and how far it was dragged this frame (a part of its width and height).
+fn preview_ui(ui: &mut egui::Ui, p: &Preview, r: &Request, size: [f64; 2], display: Vec2) -> (egui::Rect, Option<Vec2>) {
+    let (rect, response) = ui.allocate_exact_size(display, egui::Sense::drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, Color32::BLACK);
+    match &p.texture {
+        Some(t) => {
+            painter.image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Decoding\u{2026}", egui::FontId::proportional(13.0), style::MUTED);
+        }
+    }
+    if p.guides {
+        let faint = Stroke::new(1.0, Color32::from_white_alpha(70));
+        for t in [1.0 / 3.0, 2.0 / 3.0] {
+            painter.vline(rect.left() + rect.width() * t, rect.y_range(), faint);
+            painter.hline(rect.x_range(), rect.top() + rect.height() * t, faint);
+        }
+        // The centre: a cross, edged in dark so it shows on a bright picture too.
+        let (c, arm) = (rect.center(), 10.0);
+        for stroke in [Stroke::new(3.0, Color32::from_black_alpha(120)), Stroke::new(1.0, Color32::from_white_alpha(210))] {
+            painter.hline(c.x - arm..=c.x + arm, c.y, stroke);
+            painter.vline(c.x, c.y - arm..=c.y + arm, stroke);
+        }
+    }
+    // Where what it follows is in the output: the export's map, the other way.
+    // The ring: what the stabilizer holds (the points' anchor, the subject's
+    // point), on the frames it was measured on. Several points: a dot on each one there.
+    if p.point
+        && let Some(shown) = p.shows
+        && let Some(back) = invert(&rendered_map(&r.keys, size, shown.framing, shown.grid))
+    {
+        let on_screen = |s: [f64; 2]| {
+            let o = [back[0] * s[0] + back[1] * s[1] + back[2], back[3] * s[0] + back[4] * s[1] + back[5]];
+            rect.min + Vec2::new((o[0] / size[0]) as f32 * rect.width(), (o[1] / size[1]) as f32 * rect.height())
+        };
+        let at = |t: &[(FrameIndex, [f64; 2])]| t.binary_search_by_key(&shown.grid, |(f, _)| *f).ok().map(|i| t[i].1);
+        let colour = if matches!(r.follows, Source::Subject(_)) { style::SUBJECT } else { style::AUTO };
+        for s in r.points.iter().filter_map(|t| at(t)) {
+            painter.circle_filled(on_screen(s), 2.0, colour);
+        }
+        if let Some(s) = at(&r.followed) {
+            painter.circle_stroke(on_screen(s), 5.0, Stroke::new(1.5, colour));
+        }
+    }
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, style::RULER), egui::StrokeKind::Inside);
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let d = response.drag_delta();
+        return (rect, (d != Vec2::ZERO).then(|| Vec2::new(d.x / rect.width(), d.y / rect.height())));
+    }
+    if response.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    (rect, None)
 }
 
 /// The window (drawn every frame; empty unless an export was asked for).
@@ -229,10 +423,28 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
     // In and out, as they are now (they can be moved while the window is open).
     let marked = tt_core::marks::marks(world);
     let frames = frames_to_export(world, state.request.as_ref().is_some_and(|r| r.whole), count);
-    let zoom = state.request.as_mut().map_or(1.0, |r| r.zoom(size, &frames));
+    // Stabilized: the framing in effect, the zoom that hides the edges (worked
+    // out only when it is on, and not during a drag), and the preview's picture.
+    let settled = !ctx.input(|i| i.pointer.any_down());
+    let (fill, framing) = match state.request.as_mut() {
+        Some(r) if r.kind == Kind::Stabilized => {
+            let framing = r.framing(size, &frames, settled);
+            (if r.options.fill { r.zoom.clone() } else { r.known_fill_zoom(&frames) }, framing)
+        }
+        _ => (None, Framing::default()),
+    };
+    if let Some(r) = state.request.as_ref().filter(|r| r.kind == Kind::Stabilized)
+        && !refresh_preview(ctx, world, &mut state.preview, r, size, framing)
+    {
+        // Until the playhead's frame is decoded (the preview shows a neighbour meanwhile).
+        ctx.request_repaint_after(std::time::Duration::from_millis(40));
+    }
+    let playhead = world.resource::<tt_core::transport::Transport>().frame();
+    let display = preview_size(size);
     let mut open = true;
     let mut go = false;
     let mut options_changed: Option<StabilizerDefaults> = None;
+    let mut seek: Option<FrameIndex> = None;
     let title = match state.request.as_ref().map(|r| r.kind) {
         Some(Kind::Stabilized) => "Export stabilized video",
         _ => "Export tracking target video",
@@ -243,7 +455,11 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
             let about = match r.kind {
                 Kind::Stabilized => {
                     let how = if r.options.rotation { "moved and turned" } else { "moved (never turned)" };
-                    let place = if r.options.centre { format!("{} stays in the middle of the picture", r.name) } else { format!("{} holds still as it is on frame {}", r.name, r.reference) };
+                    let place = match (r.options.centre, r.options.offset != [0.0; 2]) {
+                        (true, false) => format!("{} stays in the middle of the picture", r.name),
+                        (true, true) => format!("{} stays in one place in the picture, where Position puts it", r.name),
+                        (false, _) => format!("{} holds still as it is on frame {}", r.name, r.reference),
+                    };
                     format!(
                         "A new video file, the same size and frame rate as {}, every frame {how} so that {place}. \
                          The sound comes along. Use it in any editor like any other clip: there is nothing to set up or keep working there.",
@@ -302,11 +518,86 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                                 .on_hover_text("The classic stabilizer: the picture keeps its framing on that frame.");
                         });
                         ui.end_row();
-                        ui.label("Edges");
+                        // How the picture sits in the frame (remembered; rendered exports only).
+                        ui.label("Zoom");
                         ui.vertical(|ui| {
-                            ui.radio_value(&mut r.fill, false, "Keep the whole picture (black shows where it moved away)");
-                            ui.radio_value(&mut r.fill, true, format!("Zoom in just enough to hide the black edges (\u{d7}{zoom:.2})"))
-                                .on_hover_text("The least zoom that covers the frame on every frame exported; the same all through. Centred, it is worked out with the subject in the middle.");
+                            let least = "The least zoom that covers the frame on every frame you export, with the picture where Position puts it. \
+                                         It is the same on all frames. With the subject in the middle, it keeps the subject in the middle.";
+                            let (text, tip) = match &fill {
+                                Some(z) if !z.hides => (
+                                    egui::RichText::new(format!("Cannot hide every black edge, even at \u{d7}{:.2}", z.zoom)).color(style::LIVE),
+                                    "Even the most zoom does not cover the frame on every frame you export. When this is on, the export zooms in that much. \
+                                     To hide the edges, move the picture back to the middle (Position), or export fewer frames.",
+                                ),
+                                Some(z) => (egui::RichText::new(format!("Just enough to hide the black edges (\u{d7}{:.2})", z.zoom)), least),
+                                None => (egui::RichText::new("Just enough to hide the black edges"), least),
+                            };
+                            ui.checkbox(&mut o.fill, text).on_hover_text(tip);
+                            // (Clamped on edits only: a value shown is never rounded and written back, which would turn the option above off.)
+                            let mut z = framing.zoom as f32;
+                            let tip = if o.fill {
+                                "The zoom in use. Move the slider to set a zoom of your own."
+                            } else {
+                                "Your zoom, the same on all frames. At \u{d7}1.00 you see the whole picture: black shows where the picture moved away."
+                            };
+                            let slider = egui::Slider::new(&mut z, 1.0..=MAX_ZOOM).clamping(egui::SliderClamping::Edits).max_decimals(2).prefix("\u{d7}");
+                            if ui.add(slider).on_hover_text(tip).changed() {
+                                (o.fill, o.zoom) = (false, z);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Position");
+                        ui.vertical(|ui| {
+                            // (Clamped on edits only, and one axis at a time: a dragged offset is kept as it is, not rounded.)
+                            let mut percent = o.offset.map(|v| v * 100.0);
+                            let range = -MAX_OFFSET * 100.0..=MAX_OFFSET * 100.0;
+                            let x = ui
+                                .add(egui::Slider::new(&mut percent[0], range.clone()).clamping(egui::SliderClamping::Edits).max_decimals(1).suffix("%").text("X"))
+                                .on_hover_text("Moves the picture to the right (more than 0) or to the left (less than 0). The value is a percentage of the width.");
+                            let y = ui
+                                .add(egui::Slider::new(&mut percent[1], range).clamping(egui::SliderClamping::Edits).max_decimals(1).suffix("%").text("Y"))
+                                .on_hover_text("Moves the picture down (more than 0) or up (less than 0). The value is a percentage of the height.");
+                            if x.changed() {
+                                o.offset[0] = percent[0] / 100.0;
+                            }
+                            if y.changed() {
+                                o.offset[1] = percent[1] / 100.0;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(o.offset != [0.0; 2], egui::Button::new("Reset")).on_hover_text("Puts the picture back where the stabilizer puts it.").clicked() {
+                                    o.offset = [0.0; 2];
+                                }
+                                ui.label(egui::RichText::new("You can also drag the picture in the preview.").weak().small());
+                            });
+                        });
+                        ui.end_row();
+                        ui.label("Preview");
+                        ui.vertical(|ui| {
+                            let (at, dragged) = preview_ui(ui, &state.preview, r, size, display);
+                            state.preview.rect = Some(at);
+                            if let Some(d) = dragged {
+                                o.offset = [(o.offset[0] + d.x).clamp(-MAX_OFFSET, MAX_OFFSET), (o.offset[1] + d.y).clamp(-MAX_OFFSET, MAX_OFFSET)];
+                            }
+                            let point = match &r.follows {
+                                Source::Points(p) if p.len() > 1 => "A dot on each point, and a ring on the point that the stabilizer holds (their centre).".to_string(),
+                                _ => format!("A ring where {} is.", r.name),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut state.preview.guides, "Guidelines").on_hover_text("A cross at the centre, and lines at one third and two thirds.");
+                                ui.checkbox(&mut state.preview.point, "Point").on_hover_text(point);
+                            });
+                            let last = (frames.end - 1).max(frames.start);
+                            let mut f = playhead.clamp(frames.start, last);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().slider_width = (display.x - 90.0).max(80.0);
+                                let frame = ui.add(egui::Slider::new(&mut f, frames.start..=last).prefix("frame "));
+                                if frame.on_hover_text("The frame in the preview: the playhead. Move it here or on the timeline.").changed() {
+                                    seek = Some(f);
+                                }
+                            });
+                            if !frames.contains(&playhead) {
+                                ui.label(egui::RichText::new(format!("Frame {playhead} is outside the frames to export.")).weak().small());
+                            }
                         });
                         ui.end_row();
                     }
@@ -371,24 +662,34 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
         }
     });
     // Another way to use the motion: the keys again (and the zoom that hides the edges), remembered.
+    // Another zoom or position: the same keys, framed another way.
     if let Some(o) = options_changed
         && let Some(r) = state.request.as_mut()
     {
-        if let Some(made) = make(world, r.kind, &r.follows, r.here, o) {
-            (r.keys, r.reference) = (made.keys, made.reference);
+        if Smoothing::from(o) != Smoothing::from(r.options) {
+            if let Some(made) = make(world, r.kind, &r.follows, r.here, o) {
+                (r.keys, r.reference, r.followed) = (made.keys, made.reference, made.followed);
+            }
+            r.zoom = None;
+            state.preview.shows = None;
         }
-        (r.options, r.zoom) = (o, None);
+        r.options = o;
         *world.resource_mut::<StabilizerDefaults>() = o;
     }
-    if go && let Some(r) = state.request.as_ref() {
+    if let Some(f) = seek {
+        world.resource_mut::<PendingActions>().push(Action::Seek(f));
+    }
+    if go && let Some(r) = state.request.as_mut() {
         state.done = None;
-        state.job = start(world, r, frames, if r.fill { zoom } else { 1.0 });
+        let framing = r.framing(size, &frames, true);
+        state.job = start(world, r, frames, framing);
     }
     if !open {
         if let Some(job) = &state.job {
             job.cancel.store(true, Ordering::Relaxed);
         }
         state.request = None;
+        (state.preview.texture, state.preview.shows) = (None, None);
     }
     *world.resource_mut::<ExportWindow>() = state;
 }

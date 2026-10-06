@@ -78,6 +78,60 @@ pub type Affine = [f64; 6];
 
 pub const IDENTITY: Affine = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 
+/// The map the other way (source pixels → output pixels); None if `m`
+/// flattens the picture.
+pub fn invert(m: &Affine) -> Option<Affine> {
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det.abs() < 1e-12 || !det.is_finite() {
+        return None;
+    }
+    let (a, b, d, e) = (m[4] / det, -m[1] / det, -m[3] / det, m[0] / det);
+    Some([a, b, -(a * m[2] + b * m[5]), d, e, -(d * m[2] + e * m[5])])
+}
+
+/// A small RGB picture (`out` = width, height; 3 bytes a pixel, rows top
+/// down) of an NV12 frame of `w` × `h` (as the decoder gives it), drawn
+/// through `map` (picture pixels → frame pixels, as [`Affine`]): four
+/// nearest samples a pixel, averaged; outside the frame, black. For a
+/// preview: quick, not exact.
+pub fn nv12_preview(nv12: &[u8], w: usize, h: usize, color: crate::ColorInfo, map: &Affine, out: [usize; 2]) -> Vec<u8> {
+    let [ow, oh] = out;
+    let mut rgb = vec![0u8; ow * oh * 3];
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    if w == 0 || h == 0 || nv12.len() < w * h + cw * ch * 2 {
+        return rgb;
+    }
+    let (luma, chroma) = nv12.split_at(w * h);
+    // As the viewport's shader: the range expanded, then BT.709 or BT.601.
+    let (bt601, full) = (color.matrix == crate::Matrix::Bt601, color.full_range);
+    let to_rgb = |y: u8, u: u8, v: u8| -> [f32; 3] {
+        let (y, u, v) = (y as f32 / 255.0, u as f32 / 255.0, v as f32 / 255.0);
+        let (y, cb, cr) = if full { (y, u - 0.5, v - 0.5) } else { ((y - 16.0 / 255.0) * (255.0 / 219.0), (u - 128.0 / 255.0) * (255.0 / 224.0), (v - 128.0 / 255.0) * (255.0 / 224.0)) };
+        let c = if bt601 { [y + 1.402 * cr, y - 0.344136 * cb - 0.714136 * cr, y + 1.772 * cb] } else { [y + 1.5748 * cr, y - 0.187324 * cb - 0.468124 * cr, y + 1.8556 * cb] };
+        c.map(|v| v.clamp(0.0, 1.0))
+    };
+    for (j, row) in rgb.chunks_mut(ow * 3).enumerate() {
+        for (i, px) in row.chunks_mut(3).enumerate() {
+            let mut sum = [0.0f32; 3];
+            for (dx, dy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                let (x, y) = (i as f64 + dx, j as f64 + dy);
+                let (sx, sy) = (map[0] * x + map[1] * y + map[2], map[3] * x + map[4] * y + map[5]);
+                if !(sx >= 0.0 && sy >= 0.0 && sx < w as f64 && sy < h as f64) {
+                    continue;
+                }
+                let (sx, sy) = (sx as usize, sy as usize);
+                let c = (sy / 2) * cw * 2 + (sx / 2) * 2;
+                let s = to_rgb(luma[sy * w + sx], chroma[c], chroma[c + 1]);
+                sum = [sum[0] + s[0], sum[1] + s[1], sum[2] + s[2]];
+            }
+            for (p, s) in px.iter_mut().zip(sum) {
+                *p = (s / 4.0 * 255.0).round() as u8;
+            }
+        }
+    }
+    rgb
+}
+
 /// What the render needs to know about the source's video and audio.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StreamInfo {
@@ -485,6 +539,50 @@ mod tests {
         let mut dst16 = vec![0u8; w * h * 2];
         warp::<2>(&src16, &mut dst16, w, h, &IDENTITY, 0);
         assert_eq!(dst16, src16, "the identity leaves it as it is");
+    }
+
+    #[test]
+    fn a_preview_is_the_frame_through_the_map_in_colour_and_black_outside() {
+        use crate::{ColorInfo, Matrix};
+        // 8 × 4, limited range: the left half black, the right half white; neutral chroma.
+        let (w, h) = (8usize, 4usize);
+        let mut frame: Vec<u8> = (0..w * h).map(|i| if i % w < 4 { 16 } else { 235 }).collect();
+        frame.extend(std::iter::repeat_n(128u8, w.div_ceil(2) * h.div_ceil(2) * 2));
+        let limited = ColorInfo { matrix: Matrix::Bt709, full_range: false };
+        // Half size: a picture pixel is two frame pixels.
+        let half = nv12_preview(&frame, w, h, limited, &[2.0, 0.0, 0.0, 0.0, 2.0, 0.0], [4, 2]);
+        assert_eq!(half.len(), 4 * 2 * 3);
+        assert_eq!(&half[..3], &[0, 0, 0], "black stays black");
+        assert_eq!(&half[3 * 3..4 * 3], &[255, 255, 255], "white, the range expanded");
+        // Moved 6 frame pixels left: the right of the picture is outside the frame, black.
+        let moved = nv12_preview(&frame, w, h, limited, &[2.0, 0.0, 6.0, 0.0, 2.0, 0.0], [4, 2]);
+        assert_eq!(&moved[..3], &[255, 255, 255]);
+        assert_eq!(&moved[3..6], &[0, 0, 0], "outside: black");
+        // Half a picture pixel over the edge: two samples of four inside, half as bright.
+        let edge = nv12_preview(&frame, w, h, limited, &[2.0, 0.0, 7.0, 0.0, 2.0, 0.0], [1, 1]);
+        assert_eq!(edge, vec![128, 128, 128]);
+        // Colour: BT.709 limited red, and full range BT.601 grey.
+        let mut red = vec![63u8; 4];
+        red.extend([102, 240]);
+        let r = nv12_preview(&red, 2, 2, limited, &IDENTITY, [1, 1]);
+        assert!(r[0] == 255 && r[1] < 3 && r[2] < 3, "{r:?}");
+        let grey = nv12_preview(&[100, 100, 100, 100, 128, 128], 2, 2, ColorInfo { matrix: Matrix::Bt601, full_range: true }, &IDENTITY, [1, 1]);
+        assert!(grey.iter().all(|&v| v.abs_diff(100) <= 1), "{grey:?}");
+        // Too little data: all black, no panic.
+        assert_eq!(nv12_preview(&[1, 2, 3], w, h, limited, &IDENTITY, [2, 2]), vec![0; 12]);
+    }
+
+    #[test]
+    fn an_inverted_map_takes_its_points_back() {
+        let m = [1.3, -0.4, 20.0, 0.25, 0.9, -7.0];
+        let back = invert(&m).expect("invertible");
+        for p in [[0.0, 0.0], [100.0, 50.0], [-3.0, 400.0]] {
+            let q = [m[0] * p[0] + m[1] * p[1] + m[2], m[3] * p[0] + m[4] * p[1] + m[5]];
+            let r = [back[0] * q[0] + back[1] * q[1] + back[2], back[3] * q[0] + back[4] * q[1] + back[5]];
+            assert!((r[0] - p[0]).abs() < 1e-9 && (r[1] - p[1]).abs() < 1e-9, "{p:?} {r:?}");
+        }
+        assert_eq!(invert(&IDENTITY), Some(IDENTITY));
+        assert_eq!(invert(&[1.0, 2.0, 0.0, 2.0, 4.0, 0.0]), None, "flat");
     }
 
     #[test]
