@@ -285,6 +285,72 @@ pub fn erase_drawn(world: &mut World, tracker: Entity, frames: Option<std::ops::
     edit(world, &format!("Erase {name}'s drawing"), |tx| tx.signal(id).clear(r))
 }
 
+/// Merge the manual dots `dots` into `tracker`, as one undo step: what each
+/// dot has drawn inside its lifetime goes into the tracker's human layer
+/// (a later dot over an earlier one, both over what the tracker had drawn
+/// there), so it overrides the tracker's automatic results on those frames.
+/// Then the dots go, with their views; whatever used a dot (a subject's
+/// member, a tracker's guide) uses the tracker instead. The tracker is
+/// selected. Returns how many frames were written (None: nothing to merge).
+pub fn merge_dots(world: &mut World, dots: &[Entity], tracker: Entity) -> Option<usize> {
+    let live = |w: &World, e: Entity| w.get_entity(e).is_ok_and(|r| !r.contains::<Disabled>());
+    if !live(world, tracker) || !is_tracker(world, tracker) {
+        return None;
+    }
+    let dots: Vec<Entity> = dots.iter().copied().filter(|d| *d != tracker && live(world, *d) && is_manual(world, *d)).collect();
+    let mut points: Vec<(FrameIndex, Option<[f64; 2]>)> = Vec::new();
+    for &d in &dots {
+        let span = tt_core::span::span_of(world, d);
+        let Some(sig) = human_signal(world, d) else { continue };
+        let Some((lo, hi)) = sig.present_hull() else { continue };
+        for (r, _) in sig.runs(lo..hi + 1) {
+            points.extend(r.filter(|f| span.contains(*f)).filter_map(|f| sig.get(f).map(|v| (f, Some([v[0] as f64, v[1] as f64])))));
+        }
+    }
+    if dots.is_empty() || points.is_empty() {
+        return None;
+    }
+    // Their views go with them; everything else that used a dot uses the tracker.
+    let mut doomed = dots.clone();
+    for &d in &dots {
+        doomed.extend(tt_core::view::view_of(world, d));
+    }
+    let users: Vec<(Entity, Vec<(String, Entity)>)> = {
+        let mut q = world.query_filtered::<(Entity, &Inputs), Without<Disabled>>();
+        q.iter(world)
+            .filter(|(e, i)| !doomed.contains(e) && i.0.iter().any(|(_, p)| dots.contains(p)))
+            .map(|(e, i)| {
+                let mut inputs: Vec<(String, Entity)> = Vec::new();
+                for (slot, p) in &i.0 {
+                    let p = if dots.contains(p) { tracker } else { *p };
+                    // (A subject with both the dot and the tracker as members keeps the tracker once.)
+                    if !(p == e || inputs.iter().any(|(s, q)| *s == *slot && *q == p)) {
+                        inputs.push((slot.clone(), p));
+                    }
+                }
+                (e, inputs)
+            })
+            .collect()
+    };
+    let name = |w: &World, e: Entity| w.get::<Name>(e).map_or("the tracker".to_string(), |n| n.to_string());
+    let label = match dots.as_slice() {
+        [one] => format!("Merge {} into {}", name(world, *one), name(world, tracker)),
+        _ => format!("Merge {} dots into {}", dots.len(), name(world, tracker)),
+    };
+    let n = points.len();
+    edit(world, &label, |tx| {
+        write_drawn(tx, tracker, &points);
+        for (e, inputs) in users {
+            tx.modify::<Inputs>(e, |i| i.0 = inputs);
+        }
+        for e in doomed {
+            tx.delete(e);
+        }
+    });
+    world.resource_mut::<Selection>().select_only(tracker);
+    Some(n)
+}
+
 fn manual_count(world: &mut World) -> usize {
     let mut q = world.query::<&Tracker>();
     q.iter(world).filter(|t| t.method == Method::Manual).count()
