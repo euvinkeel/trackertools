@@ -18,7 +18,7 @@ use bevy_ecs::prelude::*;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use tt_core::autospeed::AutoSpeedState;
 use tt_core::transport::Transport;
-use tt_core::view::{ActiveView, SpaceMap, chain, map_at, sketch_framed};
+use tt_core::view::{ActiveView, SpaceMap, chain, followed, map_at};
 use tt_core::{AppBuilder, Class, Module, Set};
 use tt_core::input::{Action, PendingActions};
 
@@ -413,11 +413,11 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     world.resource_mut::<WaitingForFrame>().0 = !exact || easing;
 }
 
-/// `Source ▸ Sketch 1 ▸ Sketch 3`: where the viewport is; click a level to go there.
+/// `Source ▸ Sketch 1 ▸ Tracker 2`: where the viewport is; click a level to go there.
 fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Entity>, frame: tt_core::time::FrameIndex) {
     let chain = chain(world, active);
-    let selected = world.resource::<tt_core::selection::Selection>().primary().and_then(|e| tt_core::sketch::sketch_of(world, e));
-    let name = |w: &World, e: Entity| sketch_framed(w, e).and_then(|s| w.get::<Name>(s)).map_or("view".to_string(), |n| n.to_string());
+    let selected = world.resource::<tt_core::selection::Selection>().primary().and_then(|e| tt_core::view::followable(world, e));
+    let name = |w: &World, e: Entity| followed(w, e).and_then(|s| w.get::<Name>(s)).map_or("view".to_string(), |n| n.to_string());
     let mut go: Option<Option<Entity>> = None;
     // Its own layer above the video: a click here is the breadcrumb's, never a
     // press on the video. (Not in front of windows, like the export window.)
@@ -444,13 +444,13 @@ fn breadcrumb(ui: &mut egui::Ui, world: &mut World, at: Pos2, active: Option<Ent
                     }
                 }
                 if let Some(v) = active
-                    && let Some(s) = sketch_framed(world, v)
+                    && let Some(s) = followed(world, v)
                     && world.get::<tt_core::op::Output>(s).and_then(|o| world.resource::<tt_core::signal::SignalStore>().get(o.0)).is_some_and(|sig| sig.get(frame).is_none())
                 {
-                    ui.label(egui::RichText::new("· outside this sketch: nearest framing").monospace().size(12.0).color(Color32::from_rgb(0xfb, 0xbf, 0x24)));
+                    ui.label(egui::RichText::new(format!("· outside {}: nearest framing", if tt_core::sketch::is_sketch(world, s) { "this sketch" } else { "its frames" })).monospace().size(12.0).color(Color32::from_rgb(0xfb, 0xbf, 0x24)));
                 }
-                let hint = match (selected, active.and_then(|v| sketch_framed(world, v))) {
-                    (Some(s), current) if Some(s) != current => Some(format!("· Tab: view {}", world.get::<Name>(s).map_or("sketch".into(), |n| n.to_string()))),
+                let hint = match (selected, active.and_then(|v| followed(world, v))) {
+                    (Some(s), current) if Some(s) != current => Some(format!("· Tab: view {}", world.get::<Name>(s).map_or("it".into(), |n| n.to_string()))),
                     _ if active.is_some() => Some("· Shift+Tab: up".to_string()),
                     _ => None,
                 };

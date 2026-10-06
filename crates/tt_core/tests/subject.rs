@@ -123,3 +123,26 @@ fn a_subject_and_its_keys_save_and_load() {
     assert_eq!(got, want);
     let _ = std::fs::remove_file(path);
 }
+
+/// Tab on a subject enters a view that keeps it centred, the same as on a sketch.
+#[test]
+fn tab_follows_a_subject() {
+    use tt_core::input::Action;
+    use tt_core::selection::Selection;
+    use tt_core::view::{ActiveView, followed, map_at};
+    let mut d = Driver::new();
+    let (a, b) = two_points(&mut d);
+    let s = make_subject(&mut d.core.world, &[a, b], 150).expect("a subject");
+    d.frames(2, |_| [0.0, 0.0], UP);
+    d.core.world.resource_mut::<Selection>().select_only(s);
+    d.frame(|_| [0.0, 0.0], common::Input { action: Some(Action::EnterView), ..UP });
+    d.frames(3, |_| [0.0, 0.0], UP);
+    let view = d.core.world.resource::<ActiveView>().0.expect("in a view");
+    assert_eq!(followed(&d.core.world, view), Some(s));
+    for f in [20, 150, 400] {
+        let want = value_at(&d.core.world, s, f).expect("a value");
+        let m = map_at(&d.core.world, Some(view), f);
+        let centre = m.to_source([m.canvas[0] / 2.0, m.canvas[1] / 2.0]);
+        assert!((centre[0] - want[0]).abs() < 1.0 && (centre[1] - want[1]).abs() < 1.0, "frame {f}: centre {centre:?}, subject {want:?}");
+    }
+}

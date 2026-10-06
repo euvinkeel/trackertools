@@ -119,6 +119,51 @@ fn drawn_frames_are_the_output_there_and_erasing_brings_the_results_back() {
 }
 
 /// One app frame of the Draw tool: the pointer at `at` (shown space = source), with the button's transitions.
+/// Tab on a tracker (or one of its looks) enters a view that keeps it
+/// centred; Shift+Tab selects it again; deleting it takes its view along.
+#[test]
+fn tab_follows_a_tracker_like_a_sketch() {
+    use tt_core::input::{Action, PendingActions};
+    use tt_core::view::{ActiveView, followed, map_at, view_of};
+    let mut core = core(50);
+    let op = tracker_with_results(&mut core);
+    let look = core.world.spawn(Look::new(0, [100.0, 50.0], [5.0, 5.0])).id();
+    core.world.get_mut::<Inputs>(op).expect("inputs").0.push(("look".into(), look));
+    let press = |core: &mut Core, a: Action| {
+        core.world.resource_mut::<PendingActions>().push(a);
+        for _ in 0..3 {
+            core.run_pre_ui();
+            core.run_post_ui();
+        }
+    };
+    // From the look: the view follows its tracker.
+    core.world.resource_mut::<Selection>().select_only(look);
+    press(&mut core, Action::EnterView);
+    let view = core.world.resource::<ActiveView>().0.expect("in a view");
+    assert_eq!(followed(&core.world, view), Some(op));
+    for f in [5, 25, 40] {
+        let m = map_at(&core.world, Some(view), f);
+        let centre = m.to_source([m.canvas[0] / 2.0, m.canvas[1] / 2.0]);
+        assert!((centre[0] - (100.0 + f as f64)).abs() < 1.0 && (centre[1] - 50.0).abs() < 1e-3, "frame {f}: centred on {centre:?}");
+    }
+    // Frame 30 is lost: the view carries on through it instead of jumping.
+    let x = |f: i64| {
+        let m = map_at(&core.world, Some(view), f);
+        m.to_source([m.canvas[0] / 2.0, m.canvas[1] / 2.0])[0]
+    };
+    assert!((x(30) - 130.0).abs() < 1.0, "through the lost frame: {}", x(30));
+    press(&mut core, Action::ExitView);
+    assert_eq!(core.world.resource::<ActiveView>().0, None);
+    assert_eq!(core.world.resource::<Selection>().primary(), Some(op), "Shift+Tab selects the tracker");
+    // Tab again: the same view.
+    press(&mut core, Action::EnterView);
+    assert_eq!(core.world.resource::<ActiveView>().0, Some(view));
+    tt_core::commands::delete(&mut core.world, &[op]);
+    core.run_pre_ui();
+    assert_eq!(view_of(&mut core.world, op), None, "its view went with it");
+    assert_eq!(core.world.resource::<ActiveView>().0, None, "the viewport is back on the source");
+}
+
 fn pointer(core: &mut Core, t: f64, at: [f64; 2], pressed: bool, down: bool, released: bool) {
     *core.world.resource_mut::<PointerFrame>() = PointerFrame {
         samples: if released { Vec::new() } else { vec![[t, at[0], at[1]]] },

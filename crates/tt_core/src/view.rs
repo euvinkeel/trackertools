@@ -1,6 +1,8 @@
-//! Derived views (DESIGN §10): a sketch's region becomes a virtual camera.
+//! Derived views (DESIGN §10): anything with a box (a sketch, a tracker, a
+//! subject) becomes a virtual camera that follows it.
 //!
-//! - The `frame` operator turns a sketch (input "box") into a per-frame crop
+//! - The `frame` operator turns a box (input "box": a sketch, tracker or
+//!   subject; see [`followable`]) into a per-frame crop
 //!   of the source: `[cx, cy, crop_w, crop_h, canvas_w, canvas_h]`, all in
 //!   source pixels. The *canvas* is the view's own pixel grid, as big as its
 //!   largest crop ("display size = max size"), so 1 view pixel = 1 source
@@ -11,9 +13,10 @@
 //!   source pixels and re-tuning V later never moves it. Its framing may
 //!   still lean on V (the `parent` input: influence and zoom limits).
 //! - [`ActiveView`] is what the viewport shows (None = the source). Tab
-//!   enters the selected sketch's view (creating it on first use, undoably)
-//!   and clears the selection, so the next hold nests a new sketch there;
-//!   Shift+Tab goes back to its parent and selects the sketch just left.
+//!   enters the view of the selected sketch, tracker or subject (creating it
+//!   on first use, undoably) and clears the selection, so the next hold nests
+//!   a new sketch there; Shift+Tab goes back to its parent and selects what
+//!   the view followed.
 
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
@@ -140,25 +143,46 @@ pub fn is_view(world: &World, e: Entity) -> bool {
     world.get::<Operator>(e).is_some_and(|o| o.kind == "frame")
 }
 
-/// The view framing `sketch`, if there is one.
-pub fn view_of(world: &mut World, sketch: Entity) -> Option<Entity> {
+/// Operators whose output starts with a box `[x, y, left, top, right, bottom]`
+/// in source pixels (channel 7, when there is one, flags frames not to
+/// trust): what a view can follow.
+const FOLLOWABLE: [&str; 3] = ["sketch", "track", "subject"];
+
+/// What a view of `e` would follow: `e` itself when it is a sketch, a
+/// tracker or a subject; a stroke's sketch; a look's tracker. None: nothing
+/// to follow.
+pub fn followable(world: &mut World, e: Entity) -> Option<Entity> {
+    if let Some(s) = sketch_of(world, e) {
+        return Some(s);
+    }
+    if world.get::<Operator>(e).is_some_and(|o| FOLLOWABLE.contains(&o.kind.as_str())) {
+        return Some(e);
+    }
+    // A tracker's look stands for its tracker.
     let mut q = world.query::<(Entity, &Operator, &Inputs)>();
-    q.iter(world).find(|(_, o, i)| o.kind == "frame" && i.0.iter().any(|(s, p)| s == "box" && *p == sketch)).map(|(e, _, _)| e)
+    q.iter(world).find(|(_, o, i)| o.kind == "track" && i.0.iter().any(|(s, p)| s == "look" && *p == e)).map(|(t, _, _)| t)
 }
 
-/// The sketch a view frames.
-pub fn sketch_framed(world: &World, view: Entity) -> Option<Entity> {
+/// The view following `target` (a sketch, tracker or subject), if there is one.
+pub fn view_of(world: &mut World, target: Entity) -> Option<Entity> {
+    let mut q = world.query::<(Entity, &Operator, &Inputs)>();
+    q.iter(world).find(|(_, o, i)| o.kind == "frame" && i.0.iter().any(|(s, p)| s == "box" && *p == target)).map(|(e, _, _)| e)
+}
+
+/// What a view follows (a sketch, tracker or subject).
+pub fn followed(world: &World, view: Entity) -> Option<Entity> {
     world.get::<Inputs>(view)?.0.iter().find(|(s, _)| s == "box").map(|(_, e)| *e)
 }
 
-/// The view a sketch was drawn in (its home space); None = the source.
-pub fn home_of(world: &World, sketch: Entity) -> Option<Entity> {
-    world.get::<Inputs>(sketch)?.0.iter().find(|(s, _)| s == "space").map(|(_, e)| *e).filter(|e| is_live(world, *e))
+/// The view `e` was made in (its home space: a sketch drawn there, a tracker
+/// tracking there); None = the source.
+pub fn home_of(world: &World, e: Entity) -> Option<Entity> {
+    world.get::<Inputs>(e)?.0.iter().find(|(s, _)| s == "space").map(|(_, e)| *e).filter(|e| is_live(world, *e))
 }
 
-/// A view's parent view (the home of the sketch it frames); None = the source.
+/// A view's parent view (the home of what it follows); None = the source.
 pub fn parent_of(world: &World, view: Entity) -> Option<Entity> {
-    home_of(world, sketch_framed(world, view)?)
+    home_of(world, followed(world, view)?)
 }
 
 /// The views from the outermost down to `view`.
@@ -176,18 +200,19 @@ pub fn chain(world: &World, view: Option<Entity>) -> Vec<Entity> {
     out
 }
 
-/// The view framing `sketch`, created (as one undo step) if it has none yet.
-pub fn ensure_view(world: &mut World, sketch: Entity) -> Entity {
-    if let Some(v) = view_of(world, sketch) {
+/// The view following `target` (a sketch, tracker or subject), created (as
+/// one undo step) if it has none yet.
+pub fn ensure_view(world: &mut World, target: Entity) -> Entity {
+    if let Some(v) = view_of(world, target) {
         return v;
     }
-    let name = world.get::<Name>(sketch).map_or("sketch".to_string(), |n| n.to_string());
-    let home = home_of(world, sketch);
+    let name = world.get::<Name>(target).map_or("it".to_string(), |n| n.to_string());
+    let home = home_of(world, target);
     let params = world.get_resource::<ViewDefaults>().map(|d| d.params.clone()).unwrap_or_default();
     let mut view = None;
     edit(world, &format!("View of {name}"), |tx| {
         let out = tx.create_signal(VIEW_CHANNELS);
-        let mut inputs = vec![("box".to_string(), sketch)];
+        let mut inputs = vec![("box".to_string(), target)];
         inputs.extend(home.map(|h| ("parent".to_string(), h)));
         view = Some(tx.spawn((Name::new(format!("{name} view")), Operator { kind: "frame".into() }, Inputs(inputs), Output(out), params)));
     });
@@ -196,7 +221,7 @@ pub fn ensure_view(world: &mut World, sketch: Entity) -> Entity {
 
 // ---- the frame operator --------------------------------------------------------------------
 
-/// How a view frames its sketch (Cinemachine's framing controls, DESIGN §10.1).
+/// How a view frames what it follows (Cinemachine's framing controls, DESIGN §10.1).
 #[derive(Component, Reflect, Clone, Debug, PartialEq)]
 #[reflect(Component)]
 pub struct FrameParams {
@@ -259,8 +284,8 @@ pub struct ViewDefaults {
     pub params: FrameParams,
 }
 
-/// `frame`: a sketch (input "box") and optionally its parent view (input
-/// "parent") → the view's per-frame crop.
+/// `frame`: a box to follow (input "box": a sketch, tracker or subject) and
+/// optionally its parent view (input "parent") → the view's per-frame crop.
 pub struct FrameKind;
 
 impl OperatorKind for FrameKind {
@@ -439,18 +464,18 @@ fn apply_view_actions(world: &mut World) {
     for a in actions {
         match a {
             Action::EnterView => {
-                let Some(sketch) = world.resource::<Selection>().primary().and_then(|e| sketch_of(world, e)) else { continue };
-                let view = ensure_view(world, sketch);
+                let Some(target) = world.resource::<Selection>().primary().and_then(|e| followable(world, e)) else { continue };
+                let view = ensure_view(world, target);
                 world.resource_mut::<ActiveView>().0 = Some(view);
-                // Inside a view, a hold starts a new sketch nested in it; editing the
-                // sketch that defines the view takes selecting it first (a click on its box).
+                // Inside a view, a hold starts a new sketch nested in it; editing what
+                // the view follows takes selecting it first (a click on its box).
                 world.resource_mut::<Selection>().clear();
             }
             Action::ExitView => {
                 let current = world.resource::<ActiveView>().0;
                 let up = current.and_then(|v| parent_of(world, v));
-                // Leaving selects the sketch whose view we were in, so Tab goes straight back.
-                if let Some(s) = current.and_then(|v| sketch_framed(world, v)) {
+                // Leaving selects what the view followed, so Tab goes straight back.
+                if let Some(s) = current.and_then(|v| followed(world, v)) {
                     world.resource_mut::<Selection>().select_only(s);
                 }
                 world.resource_mut::<ActiveView>().0 = up;
@@ -468,8 +493,8 @@ fn prune_active_view(world: &mut World) {
     }
     // Walk up through the (possibly deleted) chain to the first live view.
     let raw_parent = |v: Entity| {
-        let sketch = sketch_framed(world, v)?;
-        world.get::<Inputs>(sketch)?.0.iter().find(|(s, _)| s == "space").map(|(_, e)| *e)
+        let target = followed(world, v)?;
+        world.get::<Inputs>(target)?.0.iter().find(|(s, _)| s == "space").map(|(_, e)| *e)
     };
     let mut up = raw_parent(v);
     for _ in 0..64 {

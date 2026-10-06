@@ -25,7 +25,7 @@ use tt_core::meta::{Created, creation_order};
 use tt_core::op::{OpError, Operator};
 use tt_core::selection::Selection;
 use tt_core::sketch::{Capture, sketch_of};
-use tt_core::view::{home_of, sketch_framed};
+use tt_core::view::{followed, home_of};
 
 use super::menu;
 use crate::style;
@@ -99,9 +99,10 @@ pub fn sketch_tree(world: &mut World) -> Vec<(Entity, usize)> {
     out
 }
 
-/// The sketch whose view `s` was drawn in.
+/// The sketch whose view `s` was drawn in (None when it was drawn in a
+/// tracker's or subject's view: the sketch is listed at the top level).
 fn parent_sketch(world: &World, s: Entity) -> Option<Entity> {
-    home_of(world, s).and_then(|v| sketch_framed(world, v))
+    home_of(world, s).and_then(|v| followed(world, v))
 }
 
 /// Unfold what hides `e`'s row: a stroke's list of strokes, and every sketch it is nested under.

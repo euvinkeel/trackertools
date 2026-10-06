@@ -46,7 +46,7 @@ use tt_core::capture::LiveCapture;
 use tt_core::op::Output;
 use tt_core::selection::Selection;
 use tt_core::signal::{FrameState, SignalStore};
-use tt_core::sketch::{ClockMap, sketch_of};
+use tt_core::sketch::ClockMap;
 
 use tt_core::span::{Edge, extent_of, span_of};
 use tt_track::runner::TrackStatus;
@@ -376,8 +376,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     {
         let under = hits.at(pos);
         if response.double_clicked() {
-            // Double-click a lane: into that sketch's view.
-            if let Some(e) = under.and_then(|e| sketch_of(world, e)) {
+            // Double-click a lane: into the view that follows it.
+            if let Some(e) = under.and_then(|e| tt_core::view::followable(world, e)) {
                 world.resource_mut::<Selection>().select_only(e);
                 actions.push(Action::EnterView);
             }
@@ -556,7 +556,7 @@ pub enum LaneKind {
 /// The lanes, top to bottom: subjects, then each sketch in the outliner's
 /// tree order, then its view and its trackers (indented), then the sketches
 /// nested in its view; trackers with no sketch (or following something
-/// else) come last.
+/// else) come last. A subject's or tracker's view comes right under it.
 pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
     let tree = super::outliner::sketch_tree(world);
     let mut out = Vec::new();
@@ -565,17 +565,27 @@ pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
         q.iter(world).filter(|(_, o)| o.kind == "subject").map(|(e, _)| e).collect()
     };
     tt_core::meta::creation_order(world, &mut subjects);
-    out.extend(subjects.into_iter().map(|s| (s, 0, LaneKind::Subject)));
-    for (s, depth) in tree {
-        out.push((s, depth, LaneKind::Sketch));
-        if let Some(v) = tt_core::view::view_of(world, s).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
+    // Each lane, then the view that follows it (if it has a live one), one level in.
+    let with_view = |world: &mut World, out: &mut Vec<(Entity, usize, LaneKind)>, e: Entity, depth: usize, kind: LaneKind| {
+        out.push((e, depth, kind));
+        if let Some(v) = tt_core::view::view_of(world, e).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
             out.push((v, depth + 1, LaneKind::View));
         }
-        out.extend(tt_track::trackers_of(world, s).into_iter().map(|t| (t, depth + 1, LaneKind::Tracker)));
+    };
+    for s in subjects {
+        with_view(world, &mut out, s, 0, LaneKind::Subject);
+    }
+    for (s, depth) in tree {
+        with_view(world, &mut out, s, depth, LaneKind::Sketch);
+        for t in tt_track::trackers_of(world, s) {
+            with_view(world, &mut out, t, depth + 1, LaneKind::Tracker);
+        }
     }
     let mut rest: Vec<Entity> = tracks::list(world).into_iter().map(|(e, _)| e).filter(|e| !out.iter().any(|(l, _, _)| l == e)).collect();
     tt_core::meta::creation_order(world, &mut rest);
-    out.extend(rest.into_iter().map(|t| (t, 0, LaneKind::Tracker)));
+    for t in rest {
+        with_view(world, &mut out, t, 0, LaneKind::Tracker);
+    }
     out
 }
 

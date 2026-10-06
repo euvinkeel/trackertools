@@ -52,8 +52,9 @@ pub fn delete(world: &mut World, targets: &[Entity]) -> usize {
         doomed.push(e);
         if is_sketch(world, e) {
             doomed.extend(strokes_of(world, e));
-            doomed.extend(view_of(world, e));
         }
+        // A sketch, tracker or subject goes with the view that follows it.
+        doomed.extend(view_of(world, e));
     }
     doomed.sort();
     doomed.dedup();
