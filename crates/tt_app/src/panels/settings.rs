@@ -423,7 +423,7 @@ fn describe(action: Action) -> &'static str {
         Tool(_) => "Sketch tool on/off",
         Cancel => "Cancel the stroke, or leave the tool",
         DeselectAll => "Deselect all",
-        EnterView => "Enter the selected sketch's view",
+        EnterView => "Enter a view that follows the selected sketch, tracker or subject",
         ExitView => "Back out to the parent view",
         Delete => "Delete the selection",
         Duplicate => "Duplicate the selected sketches",

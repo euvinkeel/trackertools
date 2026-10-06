@@ -233,7 +233,7 @@ fn side(v: &[f32]) -> f64 {
 /// The sketches whose future the look-ahead reads: the parent (the box the
 /// view being drawn in frames), and/or the sketch the stroke edits.
 fn foresight_sources(world: &World, live: &Live, foresight: Foresight) -> Vec<Entity> {
-    let parent = live.drawn_in.and_then(|v| crate::view::sketch_framed(world, v)).filter(|e| world.get::<bevy_ecs::entity_disabling::Disabled>(*e).is_none());
+    let parent = live.drawn_in.and_then(|v| crate::view::followed(world, v)).filter(|e| world.get::<bevy_ecs::entity_disabling::Disabled>(*e).is_none());
     let mut out: Vec<Entity> = match foresight {
         Foresight::Parent => parent.or(live.target).into_iter().collect(),
         Foresight::Editing => live.target.into_iter().collect(),

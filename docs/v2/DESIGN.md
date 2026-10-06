@@ -500,14 +500,15 @@ Each modifier is an operator entity in an ordered chain, with an enable toggle a
 
 ## 10. Flagship: derived views
 
-*(As built in M4.)* A **view** is a `frame` operator on a sketch: per frame, a crop of the source `[cx, cy, crop_w, crop_h, canvas_w, canvas_h]` in source pixels. Its *canvas*, the view's own pixel grid, is as big as its widest crop ("display size = max size"): 1 view pixel = 1 source pixel at the widest framing, and the view magnifies as the crop shrinks. Views keep the video's aspect.
+*(As built in M4.)* A **view** is a `frame` operator on anything with a box: a sketch, a tracker or a subject *(trackers and subjects added on request: "make it so i can focus on anything not just a sketch… generalize that feature")*. Per frame, a crop of the source `[cx, cy, crop_w, crop_h, canvas_w, canvas_h]` in source pixels. Its *canvas*, the view's own pixel grid, is as big as its widest crop ("display size = max size"): 1 view pixel = 1 source pixel at the widest framing, and the view magnifies as the crop shrinks. Views keep the video's aspect.
 
 - **Every view maps straight to the source** (`SpaceMap`: `source = a · p + b`), so nesting doesn't need a transform chain. The chain is provenance: the breadcrumb, the parent's influence and zoom limits.
 - **Strokes drawn in a view are stored through it.** The hand pipeline (lag, smoothing, jiggle) runs in the view's pixels, where the hand actually moved. Each stroke records the view's mapping for every frame it touched (`Through`), and its per-frame results reach the source through that record.
   - Consequence: re-tuning a parent view never moves a child sketch that already tracks something. *(Changed from "children re-derive when parents are re-tuned": a face track must not drift because the body's camera damping changed.)*
 - **The motion union of a sketch drawn in a view is measured in that view** (its *home*, input `space`). In a stabilized view the subject barely moves, so nested sketches stay tight.
-- **Entering views:** `Tab` enters the selected sketch's view, creating it on first use as one undo step, and clears the selection. So a hold inside a view starts a new sketch nested there. To edit the sketch that defines the view from inside it, click its box first.
-  - `Shift+Tab` backs out to the parent and selects the sketch just left, so `Tab` goes straight back in.
+- **Entering views:** `Tab` (or the menu's *Enter view*, or a double-click on its timeline lane) enters the view of the selected sketch, tracker or subject; a selected stroke stands for its sketch, a look for its tracker. It creates the view on first use as one undo step, and clears the selection. So a hold inside a view starts a new sketch nested there. To edit what the view follows from inside it, click its box first.
+  - A tracker's view nests in the view it tracks in (its guide sketch's); a subject's is a view of the source. Frames a tracker flags as lost are bridged, as in any box. A view goes when what it follows is deleted. A sketch drawn in a tracker's or subject's view is listed at the outliner's top level.
+  - `Shift+Tab` backs out to the parent and selects what the view followed, so `Tab` goes straight back in.
   - A breadcrumb (`Source ▸ Sketch 1 ▸ …`, on its own layer so its clicks never reach the video) jumps to any level.
   - Each view keeps its own zoom and pan.
   - Outside the frames a sketch covers, its view holds the nearest framing, labelled in the breadcrumb.

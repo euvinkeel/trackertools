@@ -26,6 +26,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     let busy = world.resource::<LiveCapture>().0.is_some();
     let sketch = primary.and_then(|e| sketch_of(world, e));
     let any_sketch = selection.iter().any(|e| sketch_of(world, *e).is_some());
+    let followable = primary.and_then(|e| tt_core::view::followable(world, e));
     let mut push: Option<Action> = None;
 
     if selection.is_empty() {
@@ -37,8 +38,8 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         };
         ui.label(egui::RichText::new(what).strong());
         ui.separator();
-        if let Some(s) = sketch
-            && ui.button(format!("Enter view{}", chord(Action::EnterView))).on_hover_text("See this sketch's view; sketch inside it for detail").clicked()
+        if let Some(s) = followable
+            && ui.button(format!("Enter view{}", chord(Action::EnterView))).on_hover_text("See a view that follows it and keeps it in the centre; sketch inside it for detail").clicked()
         {
             world.resource_mut::<Selection>().select_only(s);
             push = Some(Action::EnterView);
