@@ -120,6 +120,8 @@ pub struct VideoRenderer {
     /// (media generation, presented frame) currently in the textures.
     shown: Option<(u64, usize)>,
     srgb_target: bool,
+    /// A frame size the card can't hold (said once in the log).
+    refused: Option<(u32, u32)>,
 }
 
 impl VideoRenderer {
@@ -226,11 +228,23 @@ impl VideoRenderer {
             planes: None,
             shown: None,
             srgb_target: target.is_srgb(),
+            refused: None,
         }
     }
 
     fn ensure_planes(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self.planes.as_ref().is_some_and(|p| p.width == width && p.height == height) {
+            return;
+        }
+        // Larger than the card's textures (or empty): no video rather than
+        // invalid textures that would fail every frame.
+        let max = device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            if self.refused != Some((width, height)) {
+                tracing::warn!("the video is {width}×{height}: larger than this graphics card's textures ({max} px), so it is not shown");
+                self.refused = Some((width, height));
+            }
+            (self.planes, self.shown) = (None, None);
             return;
         }
         let texture = |label, w, h, format| {

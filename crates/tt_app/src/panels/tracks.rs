@@ -249,8 +249,9 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             icons::activity(painter, label_at + Vec2::new(4.0, 6.0), 4.0, a, now);
         }
     }
+    // (30 a second is enough for a spinner: the card has tracking to do.)
     if moving {
-        painter.ctx().request_repaint();
+        painter.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
 
@@ -541,7 +542,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             icons::activity(ui.painter(), rect.center(), 5.0, activity, ui.input(|i| i.time));
             ui.label(egui::RichText::new(activity.words()).color(activity.color()));
             if activity.moving() {
-                ui.ctx().request_repaint();
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
             }
         });
         // Which way to track (for every selected tracker): nothing runs until asked.
@@ -560,6 +561,11 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         }
         if run == TrackRun::Paused && !status.busy() {
             ui.label(egui::RichText::new("Paused: Back, Both or Forward tracks it (what it has tracked stays)").color(style::LIVE));
+            // CoTracker doesn't start by itself when a project opens: say what it was asked.
+            if let Some(was) = world.get::<tt_track::PausedOnOpen>(e).map(|p| p.0).filter(|r| *r != TrackRun::Paused) {
+                let word = RUNS.iter().find(|r| r.0 == was).map_or("Both", |r| r.2);
+                ui.label(egui::RichText::new(format!("Paused when the project opened. Before, it was set to: {word}.")).color(style::MUTED));
+            }
         }
         let (covered, lost) = counts(ui, world, e);
         ui.add(

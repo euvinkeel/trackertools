@@ -16,11 +16,19 @@
 //!   turning stops the jobs it no longer asks for; their results stay. A running job stays if its inputs didn't
 //!   change and it covers exactly what is left on its side; otherwise it is
 //!   cancelled and replaced.
+//! - At most [`MAX_JOBS`] jobs work at once, and one CoTracker job with a
+//!   worker ([`cotracker_jobs`]): the others wait their turn, in creation
+//!   order, forward before backward.
+//! - A failed job stops its tracker (an [`OpError`]) until its inputs change
+//!   or it is asked to track again (`crate::set_run`). A job thread that
+//!   ends without saying how counts as failed.
 //! - Results land as they arrive; old ones stay on screen as stale until
 //!   replaced (stale-while-revalidate), and dependents update chunk by chunk.
 //! - A [`TrackBook`] (saved) stamps the inputs complete results came from, so
 //!   a reopened project keeps them instead of tracking again. The stamp is 0
-//!   while results are incomplete or mixed.
+//!   while results are incomplete or mixed. Results arriving are a change to
+//!   save at most every [`RESULTS_SAVED_EVERY`] s, so autosave keeps a
+//!   running tracker's results too.
 //! - A tracker's span (`tt_core::span::Span`, its lifetime on the timeline)
 //!   says where its jobs stop: they still start at the anchor (the path
 //!   depends on where it began), but track nothing past the span's edges.
@@ -40,18 +48,19 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use bevy_ecs::entity_disabling::Disabled;
+use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
 use tt_core::history::History;
 use tt_core::op::{Dirty, Inputs, Invalidations, OpError, Operator, Output, extent};
 use tt_core::ranges::RangeSet;
 use tt_core::signal::{FrameState, SignalId, SignalStore};
-use tt_core::time::FrameIndex;
+use tt_core::time::{FrameIndex, WallClock};
 use tt_core::transport::Transport;
 use tt_core::view::{SpaceMap, home_of, map_at};
 use tt_media::{DecodeOptions, VideoIndex};
@@ -96,6 +105,12 @@ pub struct TrackStatus {
     /// Asked to track, with frames left, but no job yet: waiting for a free
     /// slot (at most [`MAX_JOBS`] at once) or for its inputs to settle.
     pub queued: bool,
+    /// Queued because another CoTracker job runs (one at a time, [`cotracker_jobs`]).
+    pub waits_for_cotracker: bool,
+    /// Catch-up mode: frames left to track, but past the playhead, and the
+    /// CoTracker worker is taken (by a job waiting at the playhead too). It
+    /// starts when the playhead gets there. Not queued: nothing to do now.
+    pub waits_at_playhead: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -137,6 +152,29 @@ impl TrackStatus {
 /// stop; jobs parked at the playhead don't.
 pub const MAX_JOBS: usize = 4;
 
+/// Results arriving mark the document changed at most this often (seconds),
+/// so autosave keeps a running tracker's results without being put off by
+/// every chunk (it waits for 1.5 s without changes).
+pub const RESULTS_SAVED_EVERY: f64 = 5.0;
+
+/// CoTracker jobs with a worker alive at once, across trackers: 1, or
+/// `TT_COTRACKER_JOBS` (1 to 4). Each worker is a Python process with the
+/// model on the graphics card, and several starting at once have made the
+/// card reset. They count from start until their thread ends, parked and
+/// cancelled ones included (they hold their worker until then); they count
+/// toward [`MAX_JOBS`] too. A tracker's two sides run one after the other.
+pub fn cotracker_jobs() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let asked = std::env::var("TT_COTRACKER_JOBS").ok();
+        let n = asked.as_deref().and_then(|v| v.trim().parse::<usize>().ok()).map_or(1, |n| n.clamp(1, 4));
+        if let Some(v) = asked {
+            tracing::info!("TT_COTRACKER_JOBS={v}: {n} CoTracker job(s) at once");
+        }
+        n
+    })
+}
+
 #[derive(Resource, Default)]
 pub struct TrackJobs {
     running: HashMap<(Entity, Side), Running>,
@@ -144,11 +182,25 @@ pub struct TrackJobs {
     basis: HashMap<Entity, Basis>,
     /// Worker threads alive, cancelled ones included.
     threads: Arc<AtomicUsize>,
+    /// Of those, the ones running a CoTracker worker.
+    workers: Arc<AtomicUsize>,
     /// The video of the document the jobs belong to.
     video: Option<Arc<VideoIndex>>,
     /// A tracker has work it hasn't started (inputs still settling, a drag
     /// in progress, no free slot).
     pending: bool,
+    /// A CoTracker job that could track now waited for a worker, this pass
+    /// and the one before: jobs parked at the playhead let theirs go, and
+    /// jobs that could only wait there don't take one.
+    worker_wanted: bool,
+    worker_wanted_before: bool,
+    /// The same, waiting for a free slot ([`MAX_JOBS`]) instead: jobs that
+    /// could only wait at the playhead don't take the worker either.
+    worker_queued: bool,
+    worker_queued_before: bool,
+    /// When drained results last marked the document changed (`WallClock`
+    /// seconds): at most every [`RESULTS_SAVED_EVERY`].
+    results_touched: Option<f64>,
 }
 
 impl TrackJobs {
@@ -160,6 +212,12 @@ impl TrackJobs {
     /// Worker threads alive, including cancelled ones still winding down.
     pub fn threads(&self) -> usize {
         self.threads.load(Ordering::Relaxed)
+    }
+
+    /// CoTracker workers alive: job threads running one, parked and
+    /// cancelled ones included until they end (at most [`cotracker_jobs`]).
+    pub fn cotracker_workers(&self) -> usize {
+        self.workers.load(Ordering::Relaxed)
     }
 
     /// Whether results are on their way or work is waiting to start: the
@@ -179,6 +237,8 @@ struct Running {
     shared: Arc<Shared>,
     /// (In a mutex only because resources must be `Sync`.)
     rx: Mutex<Receiver<Msg>>,
+    /// It runs a CoTracker worker.
+    worker: bool,
     /// Frames this job will produce and hasn't yet.
     owned: RangeSet,
     from: FrameIndex,
@@ -199,7 +259,8 @@ struct Basis {
     plan: Arc<Plan>,
     /// Frames whose results came from `plan`'s inputs.
     done: RangeSet,
-    /// A job failed: nothing restarts until the inputs change.
+    /// A job failed: nothing restarts until the inputs change (or it is
+    /// asked to track again: `set_run` plans again).
     failed: bool,
     /// Results changed since the last re-centring.
     unsettled: bool,
@@ -346,6 +407,8 @@ pub fn run_trackers(world: &mut World) {
         jobs.running.retain(|(e, _), _| live.contains(e));
         jobs.basis.retain(|e, _| live.contains(e));
         jobs.pending = false;
+        jobs.worker_wanted_before = std::mem::take(&mut jobs.worker_wanted);
+        jobs.worker_queued_before = std::mem::take(&mut jobs.worker_queued);
     }
     let Some(footage) = world.get_resource::<Footage>().cloned() else { return };
     // Another video: its document replaces this one later this frame
@@ -391,9 +454,18 @@ pub fn run_trackers(world: &mut World) {
         stop_unwanted(world, op);
         let waiting = start_jobs(world, op, &footage);
         settle(world, op);
-        update_status(world, op);
+        update_status(world, op, waiting);
         let dirty = world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty());
-        world.resource_mut::<TrackJobs>().pending |= waiting || dirty;
+        // (Work that can only wait at the playhead keeps nothing busy: moving the playhead runs a frame anyway.)
+        world.resource_mut::<TrackJobs>().pending |= matches!(waiting, Waiting::Yes | Waiting::ForCoTracker) || dirty;
+    }
+    // A CoTracker job that could track waits for a worker: jobs parked at the
+    // playhead (catch-up mode), and still held there, let theirs go. Their
+    // results stay; they go on from there when they can track again and a
+    // worker is free.
+    let mut jobs = world.resource_mut::<TrackJobs>();
+    if jobs.worker_wanted {
+        jobs.running.retain(|(_, side), j| !(j.worker && j.shared.held(*side)));
     }
 }
 
@@ -404,8 +476,24 @@ fn drain(world: &mut World, op: Entity) {
     {
         let jobs = world.resource::<TrackJobs>();
         for side in [Side::Forward, Side::Backward] {
-            if let Some(job) = jobs.running.get(&(op, side)) {
-                msgs.extend(job.rx.lock().expect("not poisoned").try_iter().map(|m| (side, m)));
+            let Some(job) = jobs.running.get(&(op, side)) else { continue };
+            let rx = job.rx.lock().expect("not poisoned");
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => {
+                        let last = matches!(m, Msg::Finished | Msg::Failed(_));
+                        msgs.push((side, m));
+                        if last {
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    // (Its thread ended without saying how: it failed.)
+                    Err(TryRecvError::Disconnected) => {
+                        msgs.push((side, Msg::Failed("the tracker stopped on an error (its job ended without a result)".into())));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -442,6 +530,13 @@ fn drain(world: &mut World, op: Entity) {
                         basis.done.insert(*f..*f + 1);
                     }
                     basis.unsettled = true;
+                }
+                // Results are part of the document: now and then, a change to save.
+                let now = world.get_resource::<WallClock>().map_or(0.0, |c| c.now);
+                let mut jobs = world.resource_mut::<TrackJobs>();
+                if jobs.results_touched.is_none_or(|t| now - t >= RESULTS_SAVED_EVERY || now < t) {
+                    jobs.results_touched = Some(now);
+                    world.resource_mut::<History>().touch();
                 }
             }
             Msg::Finished => {
@@ -580,21 +675,39 @@ fn stop_unwanted(world: &mut World, op: Entity) {
     }
 }
 
+/// Whether a tracker's work waits to start, and for what.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Waiting {
+    No,
+    /// For a free slot ([`MAX_JOBS`]), or for new dirt to be planned first.
+    Yes,
+    /// For another CoTracker job's worker to end ([`cotracker_jobs`]).
+    ForCoTracker,
+    /// CoTracker work that could only wait at the playhead anyway, while the
+    /// worker is taken: nothing to do until the playhead moves.
+    AtPlayhead,
+}
+
 /// Start a job on each side that has frames to do (that the tracker is
-/// asked to track) and no job. True if some work is waiting (for a free
-/// slot, or for new dirt to be planned first).
-fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
+/// asked to track) and no job, and say whether some work waits.
+///
+/// A side that can track now goes first (in catch-up mode, the side the
+/// playhead is on). A CoTracker job waits while [`cotracker_jobs`] workers
+/// are alive; one that could only wait at the playhead also waits while a
+/// CoTracker job that could track wants a worker (or a slot, to start one).
+fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> Waiting {
     let Some((plan, done)) = world.resource::<TrackJobs>().basis.get(&op).filter(|b| !b.failed).map(|b| (b.plan.clone(), b.done.clone())) else {
-        return false;
+        return Waiting::No;
     };
     if world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty()) {
-        return true; // the plan is about to change
+        return Waiting::Yes; // the plan is about to change
     }
-    let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0) else { return false };
+    let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0) else { return Waiting::No };
     // Where the tracker itself was: its results minus the re-centring shift
     // (not what a person drew: drawing never changes what it tracks).
     let offset = world.get::<TrackBook>(op).map_or([0.0; 2], |b| b.offset);
     let run = run_of(world, op);
+    let mut specs = Vec::new();
     for side in [Side::Forward, Side::Backward] {
         if world.resource::<TrackJobs>().running.contains_key(&(op, side)) {
             continue;
@@ -603,9 +716,6 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
         let want = plan.wanted(side, run);
         let todo = difference(&RangeSet::from_range(want.clone()), &done);
         let Some(hull) = todo.hull() else { continue };
-        if world.resource::<TrackJobs>().working() >= MAX_JOBS {
-            return true;
-        }
         // From the frame nearest the anchor still to do, resuming from the result just before it.
         let (from, before) = match side {
             Side::Forward => (hull.start, hull.start - 1),
@@ -618,15 +728,38 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> bool {
             (None, Side::Backward) => plan.anchor - 1,
         };
         let to = if side == Side::Forward { want.end - 1 } else { want.start };
-        start_job(world, op, side, &plan, from, to, resume, footage);
+        let limit = catch_up_limit(world, op, side);
+        let now = if side == Side::Forward { from < limit } else { from >= limit };
+        let label = world.get::<Name>(op).map_or_else(|| format!("tracker {op}"), |n| format!("{n} ({op})"));
+        specs.push((now, job_spec(&plan, side, from, to, resume, footage, label)));
     }
-    false
+    specs.sort_by_key(|(now, _)| !*now);
+    for (now, spec) in specs {
+        {
+            let mut jobs = world.resource_mut::<TrackJobs>();
+            if spec.starts_worker() {
+                if jobs.cotracker_workers() >= cotracker_jobs() {
+                    jobs.worker_wanted |= now;
+                    return if now { Waiting::ForCoTracker } else { Waiting::AtPlayhead };
+                }
+                if !now && (jobs.worker_wanted_before || jobs.worker_queued_before) {
+                    return Waiting::AtPlayhead;
+                }
+            }
+            if jobs.working() >= MAX_JOBS {
+                jobs.worker_queued |= now && spec.starts_worker();
+                return Waiting::Yes;
+            }
+        }
+        start_job(world, op, spec);
+    }
+    Waiting::No
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: FrameIndex, to: FrameIndex, resume: Option<([f64; 2], f32)>, footage: &Footage) {
+/// What a job needs from the tracker's plan.
+fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: Option<([f64; 2], f32)>, footage: &Footage, label: String) -> JobSpec {
     let p = &plan.params;
-    let spec = JobSpec {
+    JobSpec {
         side,
         anchor: plan.anchor,
         from,
@@ -647,13 +780,18 @@ fn start_job(world: &mut World, op: Entity, side: Side, plan: &Plan, from: Frame
         fuse: p.fuse,
         method: p.method,
         root: plan.root,
-    };
+        label,
+    }
+}
+
+fn start_job(world: &mut World, op: Entity, spec: JobSpec) {
+    let (side, from, to, worker) = (spec.side, spec.from, spec.to, spec.starts_worker());
     let shared = Arc::new(Shared::new(catch_up_limit(world, op, side), from));
     let (tx, rx) = channel();
     let owned = RangeSet::from_range(from.min(to)..from.max(to) + 1);
-    let threads = world.resource::<TrackJobs>().threads.clone();
-    spawn(spec, shared.clone(), tx, &threads);
-    let job = Running { shared, rx: Mutex::new(rx), owned, from, to, started: Instant::now(), produced: 0 };
+    let jobs = world.resource::<TrackJobs>();
+    spawn(spec, shared.clone(), tx, &jobs.threads, &jobs.workers);
+    let job = Running { shared, rx: Mutex::new(rx), worker, owned, from, to, started: Instant::now(), produced: 0 };
     world.resource_mut::<TrackJobs>().running.insert((op, side), job);
 }
 
@@ -751,8 +889,9 @@ fn recenter(world: &mut World, op: Entity) {
     set_book(world, op, TrackBook { offset: new, ..book });
 }
 
-/// Move the catch-up limits and refresh the status.
-fn update_status(world: &mut World, op: Entity) {
+/// Move the catch-up limits and refresh the status. `waiting`: what its
+/// work waits for (from [`start_jobs`]).
+fn update_status(world: &mut World, op: Entity, waiting: Waiting) {
     let limits = [Side::Forward, Side::Backward].map(|s| catch_up_limit(world, op, s));
     let run = run_of(world, op);
     let jobs = world.resource::<TrackJobs>();
@@ -788,6 +927,12 @@ fn update_status(world: &mut World, op: Entity) {
             !jobs.running.contains_key(&(op, s)) && b.done.intersect(&w).len() < w.end - w.start
         });
     }
+    // (What is left waits for the playhead, not for a turn.)
+    if waiting == Waiting::AtPlayhead {
+        status.waits_at_playhead = status.queued;
+        status.queued = false;
+    }
+    status.waits_for_cotracker = status.queued && waiting == Waiting::ForCoTracker;
     world.entity_mut(op).insert(status);
 }
 

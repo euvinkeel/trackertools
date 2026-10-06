@@ -187,6 +187,77 @@ fn a_cotracker_has_one_reset_point_a_frame() {
     assert_eq!(w.resource::<History>().undo_label(), Some("Add reset point"));
 }
 
+/// Opening a project pauses the CoTracker trackers asked to track (each
+/// would start a worker with the model on the graphics card), and only
+/// those: not an undo step, nothing to save, and a save keeps what they were
+/// asked (the next open pauses them again). Asking one again, Pause too,
+/// is what it is asked from then on.
+#[test]
+fn opening_a_project_pauses_its_cotracker_trackers() {
+    use tt_track::{PausedOnOpen, pause_cotrackers_on_open, run_of, set_run};
+    let mut core = core(100);
+    let tracker = |core: &mut Core, method: Method, run: TrackRun| {
+        *core.world.resource_mut::<NewTrackers>() = NewTrackers { method, run };
+        tt_track::add_unguided_tracker(&mut core.world, Look::new(20, [100.0, 100.0], [8.0, 8.0])).expect("tracker")
+    };
+    let forward = tracker(&mut core, Method::CoTracker, TrackRun::Forward);
+    let paused = tracker(&mut core, Method::CoTracker, TrackRun::Paused);
+    let old = tracker(&mut core, Method::CoTracker, TrackRun::Paused);
+    core.world.entity_mut(old).remove::<TrackRun>(); // (saved before TrackRun: tracks both ways)
+    let template = tracker(&mut core, Method::Template, TrackRun::Both);
+    let mut dot = None;
+    edit(&mut core.world, "Draw", |tx| dot = Some(tt_track::human::spawn_manual_dot(tx, "Manual dot 1".into(), 10)));
+    let dot = dot.expect("a manual dot");
+    core.world.entity_mut(dot).insert(TrackRun::Both);
+    core.run_pre_ui();
+    let (revision, label) = {
+        let h = core.world.resource::<History>();
+        (h.revision(), h.undo_label().map(str::to_string))
+    };
+
+    assert_eq!(pause_cotrackers_on_open(&mut core.world), vec![forward, old], "the CoTracker trackers asked to track, in creation order");
+    let w = &core.world;
+    assert_eq!([forward, old].map(|t| run_of(w, t)), [TrackRun::Paused; 2]);
+    assert_eq!(w.get::<PausedOnOpen>(forward), Some(&PausedOnOpen(TrackRun::Forward)));
+    assert_eq!(w.get::<PausedOnOpen>(old), Some(&PausedOnOpen(TrackRun::Both)));
+    assert!(w.get::<PausedOnOpen>(paused).is_none(), "already paused: nothing to remember");
+    assert_eq!((run_of(w, template), run_of(w, dot)), (TrackRun::Both, TrackRun::Both), "templates and manual dots are left alone");
+    assert!(w.get::<PausedOnOpen>(template).is_none() && w.get::<PausedOnOpen>(dot).is_none());
+    assert_eq!(w.resource::<History>().revision(), revision, "nothing to save");
+    assert_eq!(w.resource::<History>().undo_label().map(str::to_string), label, "not an undo step");
+    let class = w.resource::<tt_core::meta::ComponentMetas>().get(std::any::TypeId::of::<PausedOnOpen>()).map(|m| m.class);
+    assert_eq!(class, Some(tt_core::meta::Class::Derived), "never saved");
+    core.run_pre_ui();
+    assert_eq!(core.world.resource::<History>().revision(), revision, "still nothing to save");
+
+    // Saved meanwhile (another change), the project keeps what they were asked.
+    assert_eq!(core.world.get::<TrackRun>(forward), Some(&TrackRun::Forward), "its saved run state stays");
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("paused_on_open_{}.ttproj", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    tt_core::persist::save(&mut core.world, &path).expect("saved");
+    let mut reopened = self::core(100);
+    tt_core::persist::load(&mut reopened.world, &path).expect("loaded");
+    let _ = std::fs::remove_file(&path);
+    let named = |w: &mut World, name: &str| {
+        let mut q = w.query::<(Entity, &bevy_ecs::name::Name)>();
+        q.iter(w).find(|(_, n)| n.as_str() == name).map(|(e, _)| e).expect("saved")
+    };
+    let first = named(&mut reopened.world, "Tracker 1");
+    assert_eq!(reopened.world.get::<TrackRun>(first), Some(&TrackRun::Forward), "saved as it was asked, not paused");
+    assert!(reopened.world.get::<PausedOnOpen>(first).is_none(), "the pause itself is not saved");
+    assert_eq!(pause_cotrackers_on_open(&mut reopened.world).len(), 2, "opened again: paused again");
+    assert_eq!(reopened.world.get::<PausedOnOpen>(first), Some(&PausedOnOpen(TrackRun::Forward)));
+
+    // Asked again (the way it was, or another), it forgets: also when asked to stay paused.
+    set_run(&mut core.world, forward, TrackRun::Forward);
+    set_run(&mut core.world, old, TrackRun::Paused);
+    let w = &core.world;
+    assert_eq!((run_of(w, forward), run_of(w, old)), (TrackRun::Forward, TrackRun::Paused));
+    assert!(w.get::<PausedOnOpen>(forward).is_none() && w.get::<PausedOnOpen>(old).is_none());
+    assert_eq!(w.get::<TrackRun>(old), Some(&TrackRun::Paused), "asked to pause: saved paused");
+    assert!(w.resource::<History>().revision() > revision, "what it is asked now is a change to save");
+}
+
 fn fixture() -> Option<PathBuf> {
     let name = "sprite_1080p60.mp4";
     if let Some(dir) = std::env::var_os("TT_FIXTURES") {

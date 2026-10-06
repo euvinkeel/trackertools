@@ -89,6 +89,8 @@ impl Shell {
         style::apply(&cc.egui_ctx);
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             video::VideoRenderer::install(rs);
+            // The card's driver can reset it: start again instead of panicking (recover.rs).
+            crate::recover::watch(rs, &cc.egui_ctx);
         }
         let mut app = AppBuilder::new();
         // Modules build as they're added, and the session applies the remembered
@@ -114,7 +116,7 @@ impl Shell {
                 format!("{} ({:?}{driver})", i.name, i.backend)
             });
             doctor.setup = !ready;
-            doctor.last_run_failed = crate::setup::last_run_failed();
+            doctor.last_run_failed = crate::setup::last_run_failed() || crate::recover::recovered().is_some();
             if !ready {
                 doctor.recheck();
             }
@@ -131,6 +133,7 @@ impl Shell {
             });
         }
 
+        core.world.insert_resource(crate::recover::Notice { why: crate::recover::recovered(), paused: 0 });
         if let Some(probe) = crate::input_probe::InputProbe::start() {
             core.world.insert_resource(probe);
         }
@@ -219,7 +222,14 @@ impl Shell {
 }
 
 impl eframe::App for Shell {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The graphics device is lost (the card's driver reset it): painting this
+        // frame would panic. Save, start again, exit (recover.rs).
+        crate::recover::simulate(ctx, frame);
+        crate::recover::check(frame);
+        if crate::recover::gpu_lost() {
+            crate::recover::after_gpu_loss(&mut self.core.world);
+        }
         // The setup comes first: the app waits (a video it would reopen needs FFmpeg).
         if self.core.world.resource::<crate::setup::Doctor>().setup {
             return;
@@ -328,6 +338,11 @@ impl eframe::App for Shell {
             return;
         }
         panels::draw(ui, &mut self.core.world);
+        if crate::recover::notice(ui.ctx(), &mut self.core.world) {
+            let mut doctor = self.core.world.resource_mut::<crate::setup::Doctor>();
+            (doctor.open, doctor.last_run_failed) = (true, false);
+            doctor.recheck();
+        }
         self.was_typing = ui.ctx().egui_wants_keyboard_input();
 
         let had_actions = !self.core.world.resource::<PendingActions>().0.is_empty();

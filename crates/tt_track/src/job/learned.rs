@@ -24,22 +24,66 @@
 //!   frame is flagged lost (its position stays the model's estimate).
 //! - Catch-up mode works, but the model finalizes frames a half window (8)
 //!   at a time, so the last few frames before the playhead wait for more.
+//! - **Workers:** each job starts its own (a Python process with the model on
+//!   the graphics card), and the runner lets one such job live at a time
+//!   (`runner::cotracker_jobs`). The anchor alone (the forward side of a
+//!   tracker asked only backward) needs none: it is the seed.
+//! - **A stuck worker** (the graphics card stopped answering, say) is stopped
+//!   after [`HANG`] with nothing from it while its job waits on it (to take
+//!   a frame, or for its last results), and the job fails; a
+//!   cancelled job's worker is stopped within [`CANCEL_GRACE`] even if the
+//!   job is stuck writing to it. Loading the model has no time limit (the
+//!   first time takes long); only a cancel ends it. Each worker's start and
+//!   end are logged, and a failed one's last messages.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tt_core::time::FrameIndex;
 use tt_media::FrameStream;
 
-use super::{MAX_PATCHES, SEGMENT, Side, Worker};
+use super::{JobSpec, MAX_PATCHES, SEGMENT, Shared, Side, Worker};
+use crate::Method;
 use crate::image::{Grid, Luma, chroma_planes, resample_xy, with_colour};
 
 /// The model's input size.
 pub const CROP_W: usize = 512;
 pub const CROP_H: usize = 384;
+
+/// A worker that sends nothing for this long while it owes results (and its
+/// job isn't waiting at the playhead) is stuck: it is stopped, and the job fails.
+const HANG: Duration = Duration::from_secs(120);
+/// A cancelled job's worker is stopped after this long if the job still
+/// holds it (stuck writing to a worker that doesn't read).
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// A worker whose input is closed has this long to exit by itself (it
+/// finishes at the end of its input); then it is stopped.
+const EXIT_GRACE: Duration = Duration::from_secs(1);
+/// How often waits look at the job's cancel flag, and the watchdog at the worker.
+const POLL: Duration = Duration::from_millis(50);
+
+impl JobSpec {
+    /// The frames a CoTracker job streams to its worker: where the stream
+    /// starts (the anchor, or the frame before `from` when resuming), and how many.
+    fn stream(&self) -> (FrameIndex, usize) {
+        let dir: FrameIndex = if self.side == Side::Forward { 1 } else { -1 };
+        let start = if self.resume.is_some() { self.from - dir } else { self.anchor };
+        (start, ((self.to - start) * dir + 1).max(1) as usize)
+    }
+
+    /// Whether the job starts a CoTracker worker (a Python process with the
+    /// model on the graphics card): not for the anchor alone.
+    pub fn starts_worker(&self) -> bool {
+        self.method == Method::CoTracker && self.stream().1 > 1
+    }
+}
 
 /// Where the app's doctor sets CoTracker up on a computer without the
 /// repository (tt_app::cotracker): `cotracker\` in the data folder.
@@ -141,17 +185,92 @@ enum Reply {
     Error(String),
 }
 
-/// The worker process: its stdin, its replies (read on a thread), and the
-/// end of its stderr (for errors).
+/// What a worker's watchdog knows: its job's cancel flag, and how the
+/// worker answers (told by the thread reading its replies).
+struct Watch {
+    job: Arc<Shared>,
+    start: Instant,
+    /// It said it is ready (its model is loaded).
+    ready: AtomicBool,
+    /// The job waits on it: writing a frame to it (it reads the next once it
+    /// has tracked a window), or waiting for its last results. (Not while the
+    /// job decodes, or waits at the playhead.)
+    owed: AtomicBool,
+    /// When it last said anything, ms after `start`.
+    heard: AtomicU64,
+    /// Its owner is stopping it: the watchdog goes.
+    stop: AtomicBool,
+    /// The watchdog stopped it: it sent nothing for [`HANG`].
+    hung: AtomicBool,
+}
+
+impl Watch {
+    fn new(job: Arc<Shared>) -> Self {
+        let no = || AtomicBool::new(false);
+        Self { job, start: Instant::now(), ready: no(), owed: no(), heard: AtomicU64::new(0), stop: no(), hung: no() }
+    }
+
+    fn hear(&self) {
+        self.heard.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn last_heard(&self) -> Instant {
+        self.start + Duration::from_millis(self.heard.load(Ordering::Relaxed))
+    }
+}
+
+/// Stop the worker when it is stuck (nothing from it for [`HANG`] while its
+/// job waits on it), or when its job was cancelled [`CANCEL_GRACE`] ago and
+/// still holds it. Stopping it ends the job's waits and writes. Leaves when
+/// the worker's owner stops it.
+fn watchdog(child: &Mutex<Child>, w: &Watch, name: &str) {
+    let mut excused = Instant::now();
+    let mut cancelled: Option<Instant> = None;
+    loop {
+        std::thread::sleep(POLL);
+        if w.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if w.job.cancel.load(Ordering::Relaxed) {
+            if cancelled.get_or_insert_with(Instant::now).elapsed() < CANCEL_GRACE {
+                continue;
+            }
+            tracing::info!("CoTracker worker {name}: its job was cancelled and still holds it; stopping it");
+        } else {
+            if !(w.ready.load(Ordering::Relaxed) && w.owed.load(Ordering::Relaxed)) {
+                excused = Instant::now();
+            }
+            if excused.max(w.last_heard()).elapsed() < HANG {
+                continue;
+            }
+            w.hung.store(true, Ordering::Relaxed);
+            tracing::warn!("CoTracker worker {name}: no answer for {} s; stopping it", HANG.as_secs());
+        }
+        let _ = child.lock().unwrap_or_else(PoisonError::into_inner).kill();
+        return;
+    }
+}
+
+/// The worker process: its stdin, its replies (read on a thread), the end of
+/// its stderr (for errors), and its watchdog. Lives on the job's thread
+/// (in `run_learned`), so stopping it never holds up the app.
 struct Process {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     replies: Receiver<Reply>,
-    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    log: Arc<Mutex<Vec<String>>>,
+    /// The thread reading its stderr (it ends when the worker does).
+    stderr: JoinHandle<()>,
+    watch: Arc<Watch>,
+    /// "pid 1234 (Tracker 2, Forward, 61 frames)", for the log.
+    name: String,
+    /// It sent `done`: the job ended as it should.
+    finished: bool,
 }
 
 impl Process {
-    fn start() -> Result<Self> {
+    /// Start the worker for the job sharing `job`; `what` says which, for the log.
+    fn start(job: Arc<Shared>, what: &str) -> Result<Self> {
         let (python, script) = worker_command();
         let mut cmd = Command::new(&python);
         cmd.arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -164,14 +283,20 @@ impl Process {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: the app has no console
         }
         let mut child = cmd.spawn().with_context(|| format!("starting the CoTracker worker ({} {})", python.display(), script.display()))?;
+        let name = format!("pid {} ({what})", child.id());
+        tracing::info!("CoTracker worker {name} started: {} {}", python.display(), script.display());
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
+        let watch = Arc::new(Watch::new(job));
         let (tx, replies) = channel();
+        let heard = watch.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
+                heard.hear();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 let reply = if v.get("ready").is_some() {
+                    heard.ready.store(true, Ordering::Relaxed);
                     Reply::Ready
                 } else if let Some(f) = v.get("f").and_then(|f| f.as_u64()) {
                     let points = v["points"]
@@ -189,11 +314,11 @@ impl Process {
                 }
             }
         });
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let sink = log.clone();
-        std::thread::spawn(move || {
+        let stderr = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut l = sink.lock().expect("not poisoned");
+                let mut l = sink.lock().unwrap_or_else(PoisonError::into_inner);
                 l.push(line);
                 if l.len() > 20 {
                     l.remove(0);
@@ -201,24 +326,73 @@ impl Process {
             }
         });
         let stdin = child.stdin.take();
-        Ok(Self { child, stdin, replies, log })
+        let child = Arc::new(Mutex::new(child));
+        {
+            let (child, watch, name) = (child.clone(), watch.clone(), name.clone());
+            std::thread::spawn(move || watchdog(&child, &watch, &name));
+        }
+        Ok(Self { child, stdin, replies, log, stderr, watch, name, finished: false })
     }
 
+    /// Write to it (waiting on it while it tracks: the pipe holds little).
     fn send(&mut self, bytes: &[u8]) -> Result<()> {
         let stdin = self.stdin.as_mut().context("the worker's input is closed")?;
-        stdin.write_all(bytes).map_err(|e| anyhow::anyhow!("the CoTracker worker stopped ({e}): {}", self.log_tail()))
+        self.watch.owed.store(true, Ordering::Relaxed);
+        let written = stdin.write_all(bytes);
+        self.watch.owed.store(false, Ordering::Relaxed);
+        written.map_err(|e| self.stopped(Some(&e)))
     }
 
-    fn log_tail(&self) -> String {
-        self.log.lock().expect("not poisoned").iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | ")
+    /// Why the worker can't be talked to any more: it was stuck (its watchdog
+    /// stopped it), or it stopped by itself (and what it said last). `why`:
+    /// what failed here.
+    fn stopped(&self, why: Option<&dyn std::fmt::Display>) -> anyhow::Error {
+        if self.watch.hung.load(Ordering::Relaxed) {
+            return anyhow!("CoTracker stopped answering.");
+        }
+        let why = why.map_or(String::new(), |e| format!(" ({e})"));
+        anyhow!("the CoTracker worker stopped{why}: {}", self.last_words(3, " | "))
+    }
+
+    /// The last `n` lines of its stderr, joined by `sep` (waiting a moment
+    /// for the rest when it is ending).
+    fn last_words(&self, n: usize, sep: &str) -> String {
+        let until = Instant::now() + Duration::from_millis(250);
+        while !self.stderr.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        log[log.len().saturating_sub(n)..].join(sep)
     }
 }
 
 impl Drop for Process {
+    /// Close its input and give it [`EXIT_GRACE`] to exit by itself, then
+    /// stop it. Logs how it ended, and a failed one's last messages.
     fn drop(&mut self) {
+        self.watch.stop.store(true, Ordering::Relaxed);
         drop(self.stdin.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let (status, stopped) = {
+            let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+            let deadline = Instant::now() + EXIT_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break (Some(status), false),
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                    _ => {
+                        let _ = child.kill();
+                        break (child.wait().ok(), true);
+                    }
+                }
+            }
+        };
+        let secs = self.watch.start.elapsed().as_secs_f64();
+        let status = status.map_or("status unknown".to_string(), |s| s.to_string());
+        let how = if stopped { "was stopped" } else { "exited" };
+        tracing::info!("CoTracker worker {} {how} after {secs:.1} s ({status})", self.name);
+        if !self.finished && !self.watch.job.cancel.load(Ordering::Relaxed) {
+            tracing::warn!("CoTracker worker {} failed; its last messages:\n{}", self.name, self.last_words(20, "\n"));
+        }
     }
 }
 
@@ -287,21 +461,34 @@ impl Worker {
         }
         let seed = s.seed.map_or_else(|| self.guide_point(anchor), |p| self.map(anchor).from_source(p));
         // Where the stream starts: the frame before `from` when resuming, else the anchor.
-        let (start, first_seed) = match s.resume {
-            Some((src, _)) => (s.from - dir, self.map(s.from - dir).from_source(src)),
-            None => (anchor, seed),
+        let (start, n) = s.stream();
+        // The anchor alone is the seed: no worker for it.
+        if n == 1 && s.resume.is_none() {
+            if s.side == Side::Forward && self.wait_for(anchor, || {}) {
+                self.emit(anchor, seed, 1.0, false);
+            }
+            return Ok(());
+        }
+        let first_seed = match s.resume {
+            Some((src, _)) => self.map(start).from_source(src),
+            None => seed,
         };
         let to = s.to;
-        let n = ((to - start) * dir + 1).max(1) as usize;
         let scale = self.crop_scale((0..n).map(|i| start + dir * i as FrameIndex));
         let mut stream = Stream { start, dir, grids: Vec::with_capacity(n) };
 
         self.shared.set_phase(super::Phase::Loading);
-        let mut worker = Process::start()?;
-        match worker.replies.recv() {
-            Ok(Reply::Ready) => {}
-            Ok(Reply::Error(e)) => bail!("CoTracker: {e}"),
-            _ => bail!("the CoTracker worker didn't start: {}", worker.log_tail()),
+        let what = format!("{}, {:?}, {n} frames", s.label, s.side);
+        let mut worker = Process::start(self.shared.clone(), &what)?;
+        // (No time limit: loading takes long the first time. A cancel ends it.)
+        loop {
+            match worker.replies.recv_timeout(POLL) {
+                Ok(Reply::Ready) => break,
+                Ok(Reply::Error(e)) => bail!("CoTracker: {e}"),
+                Err(RecvTimeoutError::Timeout) if self.cancelled() => return Ok(()),
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(_) | Err(RecvTimeoutError::Disconnected) => bail!("the CoTracker worker didn't start: {}", worker.last_words(3, " | ")),
+            }
         }
         self.shared.set_phase(super::Phase::Tracking);
         // Seeds, in crop pixels on their frames: the start, and each look's aligned point further on.
@@ -372,17 +559,21 @@ impl Worker {
         }
         worker.send(b"E")?;
         drop(worker.stdin.take());
+        // (A worker that stops answering is stopped by its watchdog: the replies end.)
+        worker.watch.owed.store(true, Ordering::Relaxed);
         loop {
-            match worker.replies.recv() {
-                Ok(reply) if self.cancelled() => drop(reply),
-                Ok(Reply::Frame(i, points)) => self.take(&stream, &queries, i, &points),
-                Ok(Reply::Done) => return Ok(()),
-                Ok(Reply::Error(e)) => bail!("CoTracker: {e}"),
-                Ok(Reply::Ready) => {}
-                Err(_) => bail!("the CoTracker worker stopped: {}", worker.log_tail()),
-            }
             if self.cancelled() {
                 return Ok(());
+            }
+            match worker.replies.recv_timeout(POLL) {
+                Ok(Reply::Frame(i, points)) => self.take(&stream, &queries, i, &points),
+                Ok(Reply::Done) => {
+                    worker.finished = true;
+                    return Ok(());
+                }
+                Ok(Reply::Error(e)) => bail!("CoTracker: {e}"),
+                Ok(Reply::Ready) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err(worker.stopped(None)),
             }
         }
     }

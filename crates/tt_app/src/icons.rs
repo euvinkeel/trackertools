@@ -208,6 +208,9 @@ pub enum Activity {
     Waiting,
     /// Asked to track, waiting for a free job slot or its inputs.
     Queued,
+    /// A CoTracker waiting for its turn: one tracks at a time (each loads a
+    /// model onto the graphics card).
+    Turn,
     Paused,
     /// Nothing to do: tracked as far as it was asked.
     Done,
@@ -229,7 +232,11 @@ impl Activity {
                 return if sides.iter().flatten().all(|x| x.waiting) { Activity::Waiting } else { Activity::Tracking };
             }
             if s.queued {
-                return Activity::Queued;
+                return if s.waits_for_cotracker { Activity::Turn } else { Activity::Queued };
+            }
+            // (Catch-up: its frames are past the playhead, and the CoTracker worker is taken.)
+            if s.waits_at_playhead {
+                return Activity::Waiting;
             }
         }
         if tt_track::run_of(world, tracker) == tt_track::TrackRun::Paused { Activity::Paused } else { Activity::Done }
@@ -237,7 +244,7 @@ impl Activity {
 
     /// Something is happening (the panel keeps repainting).
     pub fn moving(self) -> bool {
-        matches!(self, Activity::Starting(_) | Activity::Tracking | Activity::Queued)
+        matches!(self, Activity::Starting(_) | Activity::Tracking | Activity::Queued | Activity::Turn)
     }
 
     /// In a few words.
@@ -248,6 +255,7 @@ impl Activity {
             Activity::Tracking => "tracking",
             Activity::Waiting => "waiting for the playhead",
             Activity::Queued => "queued: waiting for a free slot",
+            Activity::Turn => "waiting for its turn: another CoTracker is tracking",
             Activity::Paused => "paused",
             Activity::Done => "done",
             Activity::Failed => "stopped by an error",
@@ -258,7 +266,7 @@ impl Activity {
         match self {
             Activity::Starting(_) => style::LIVE,
             Activity::Tracking => style::AUTO,
-            Activity::Waiting | Activity::Queued | Activity::Paused => style::MUTED,
+            Activity::Waiting | Activity::Queued | Activity::Turn | Activity::Paused => style::MUTED,
             Activity::Done => style::AUTO,
             Activity::Failed => style::LOST,
         }
@@ -272,9 +280,9 @@ impl Activity {
 pub fn activity(painter: &Painter, o: Pos2, r: f32, a: Activity, t: f64) {
     let c = a.color();
     match a {
-        Activity::Starting(_) | Activity::Tracking | Activity::Queued => {
+        Activity::Starting(_) | Activity::Tracking | Activity::Queued | Activity::Turn => {
             // A ring with a turning arc (slower while queued).
-            let speed = if a == Activity::Queued { 1.5 } else { 5.0 };
+            let speed = if matches!(a, Activity::Queued | Activity::Turn) { 1.5 } else { 5.0 };
             painter.circle_stroke(o, r, Stroke::new(1.0, c.gamma_multiply(0.25)));
             let start = (t * speed) as f32;
             let pts: Vec<Pos2> = (0..=16).map(|i| start + i as f32 / 16.0 * 4.2).map(|ang| o + r * Vec2::new(ang.cos(), ang.sin())).collect();

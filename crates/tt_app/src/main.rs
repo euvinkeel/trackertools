@@ -14,6 +14,7 @@ mod media;
 mod panels;
 mod pointer;
 mod project;
+mod recover;
 mod session;
 mod reflect_ui;
 mod scene;
@@ -24,6 +25,8 @@ mod update;
 mod video;
 
 fn main() -> eframe::Result {
+    // (Started again after an error: the old process has exited before the log opens.)
+    recover::wait_for_old();
     setup::start_logging();
     // FFmpeg isn't part of trackertools: without it, a small setup window comes first.
     setup::apply_location();
