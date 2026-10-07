@@ -23,6 +23,7 @@ mod scene;
 mod setup;
 mod shell;
 mod style;
+mod tree;
 mod update;
 mod video;
 
