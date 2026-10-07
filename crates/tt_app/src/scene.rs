@@ -79,8 +79,9 @@ impl Scene {
             if self.mode == "export-fill" {
                 return self.drag_the_preview(world);
             }
+            // (`=settings-top`: the tab opened, not scrolled: Updates.)
             if *n == 5
-                && self.mode == "settings"
+                && self.mode.starts_with("settings")
                 && let Some(p) = self.tab
             {
                 self.inject.extend([

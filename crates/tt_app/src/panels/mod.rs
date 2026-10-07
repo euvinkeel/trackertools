@@ -26,6 +26,7 @@ use crate::style;
 
 pub fn draw(ui: &mut egui::Ui, world: &mut World) {
     crate::update::drive(ui.ctx(), world);
+    crate::rebuild::drive(ui.ctx(), world);
     egui::Panel::top("top_bar").show(ui, |ui| top_bar(ui, world));
     egui::CentralPanel::no_frame().show(ui, |ui| {
         world.resource_scope(|world, mut layout: Mut<Layout>| {

@@ -12,6 +12,7 @@ use crate::style;
 pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
         updates(ui, world);
+        build_from_code(ui, world);
 
         ui.separator();
         ui.heading("Doctor");
@@ -156,6 +157,100 @@ fn updates(ui: &mut egui::Ui, world: &mut World) {
             world.resource_mut::<Updater>().check_on_start = on_start;
         }
     });
+}
+
+/// Build from your code and restart (`crate::rebuild`): only on a computer
+/// with this program's source checkout. Its branch (switch to another, a
+/// pull request's after Fetch), then one button.
+fn build_from_code(ui: &mut egui::Ui, world: &mut World) {
+    use crate::rebuild::{Rebuild, State};
+    let Some(dir) = world.resource::<Rebuild>().dir.clone() else { return };
+    if world.resource::<Rebuild>().checkout.is_none() {
+        world.resource_mut::<Rebuild>().refresh();
+    }
+    let rb = world.resource::<Rebuild>().clone();
+    let state = rb.state();
+    // Re-read the checkout once a git step ends.
+    let id = egui::Id::new("rebuild-was-busy");
+    let was_busy = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    if was_busy && !rb.busy() {
+        world.resource_mut::<Rebuild>().refresh();
+    }
+    ui.data_mut(|d| d.insert_temp(id, rb.busy()));
+    let Some(co) = world.resource::<Rebuild>().checkout.clone() else { return };
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Build from your code").strong());
+    ui.label(egui::RichText::new(dir.display().to_string()).monospace().small().color(style::MUTED));
+    ui.label(format!("Branch {} \u{b7} {}", co.branch, co.commit)).on_hover_text("What the next build is made from");
+    let mut switch_to = None;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!rb.busy() && co.dirty == 0, |ui| {
+            egui::ComboBox::from_id_salt("rebuild-branch").selected_text("Switch to\u{2026}").show_ui(ui, |ui| {
+                for b in co.local.iter().filter(|b| **b != co.branch) {
+                    if ui.selectable_label(false, b).clicked() {
+                        switch_to = Some(b.clone());
+                    }
+                }
+                if !co.remote.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("On GitHub").small().color(style::MUTED));
+                    for b in &co.remote {
+                        if ui.selectable_label(false, b).on_hover_text("A branch on GitHub, such as a pull request's: it is copied here to build it").clicked() {
+                            switch_to = Some(b.clone());
+                        }
+                    }
+                }
+            });
+        });
+        if ui.add_enabled(!rb.busy(), egui::Button::new("Fetch")).on_hover_text("Get GitHub's branches (pull requests too) so you can switch to them").clicked() {
+            rb.fetch();
+        }
+    });
+    if co.dirty > 0 {
+        ui.label(egui::RichText::new(format!("{} files have changes that aren't committed, so switching branches is off. The build uses them as they are.", co.dirty)).small().color(style::MUTED));
+    }
+    if let Some(b) = switch_to {
+        rb.switch(&b);
+    }
+    let exe = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("trackertools.exe")));
+    let tip = format!(
+        "Builds branch {} and puts it at {}. Then trackertools saves your work, closes and starts the new build. The first build takes several minutes; later ones are faster.",
+        co.branch,
+        exe.map_or_else(|| "this program's folder".to_string(), |e| e.display().to_string())
+    );
+    if ui.add_enabled(!rb.busy(), egui::Button::new("Build and restart")).on_hover_text(tip).clicked() {
+        rb.build_and_restart();
+    }
+    match &state {
+        State::Running { what } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(what);
+            });
+        }
+        State::Done => {
+            ui.label(egui::RichText::new("Built. Restarting\u{2026}").color(style::ACCENT));
+        }
+        State::Failed(why) => {
+            ui.label(egui::RichText::new(why).color(egui::Color32::from_rgb(0xf4, 0x3f, 0x5e)));
+        }
+        State::Idle => {}
+    }
+    let log = rb.log();
+    if !log.is_empty() {
+        let running = matches!(state, State::Running { .. });
+        if let Some(last) = log.last().filter(|_| running) {
+            ui.label(egui::RichText::new(last).monospace().small().color(style::MUTED));
+        }
+        egui::CollapsingHeader::new("Build output").id_salt("rebuild-log").default_open(matches!(state, State::Failed(_))).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
+                for line in &log {
+                    ui.label(egui::RichText::new(line).monospace().small());
+                }
+            });
+        });
+    }
 }
 
 /// How a view follows its sketch (Tab into a sketch; tt_core::view's
