@@ -66,7 +66,12 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     }
     let uv = in.p * u.scale + u.offset;
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) {
-        return vec4<f32>(u.bg.rgb * a, a);
+        // Outside the picture: a grey checkerboard (12 px squares), so no
+        // picture never looks like a black one.
+        let cell = vec2<i32>(floor(in.pos.xy / 12.0));
+        let light = ((cell.x + cell.y) & 1) == 0;
+        let bg = select(u.bg.rgb + vec3<f32>(0.035), u.bg.rgb + vec3<f32>(0.075), light);
+        return vec4<f32>(bg * a, a);
     }
     var y: f32;
     var c: vec2<f32>;

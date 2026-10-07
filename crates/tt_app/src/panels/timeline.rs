@@ -700,6 +700,7 @@ fn lanes(
 ) -> Hits {
     use crate::icons::{self, Activity, Glyph};
     let tree = lane_list(world);
+    let colors = crate::colors::Colors::new(world);
     let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
     let live = world.resource::<LiveCapture>().0.as_ref();
@@ -798,6 +799,7 @@ fn lanes(
             painter.rect_filled(lane, 0.0, egui::Color32::from_white_alpha(9));
         }
         let glyph = Glyph::of(world, e);
+        let own = colors.of(world, e, glyph);
         let method = world.get::<tt_track::Tracker>(e).map(|t| t.method);
         let manual = method == Some(tt_track::Method::Manual);
         // The name column: indent, (a tracker's) spinner, icon, name.
@@ -808,7 +810,7 @@ fn lanes(
             icons::activity(&painter, Pos2::new(x + 5.0, y + LANE_H / 2.0), 4.5, a, time);
             x += 13.0;
         }
-        icons::paint(&painter, Rect::from_center_size(Pos2::new(x + 6.0, y + LANE_H / 2.0), Vec2::splat(12.0)), glyph, selected);
+        icons::paint_in(&painter, Rect::from_center_size(Pos2::new(x + 6.0, y + LANE_H / 2.0), Vec2::splat(12.0)), glyph, selected, own);
         x += 16.0;
         let name = world.get::<Name>(e).map_or("item".into(), |n| n.to_string());
         let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
@@ -817,7 +819,7 @@ fn lanes(
         let alive = span.range();
         // (bar, state, inside its lifetime), in this lane's colour.
         let mut bars: Vec<(Rect, FrameState, bool)> = Vec::new();
-        let color = if selected { glyph.color() } else { glyph.color().gamma_multiply(0.6) };
+        let color = if selected { own } else { own.gamma_multiply(0.6) };
         match kind {
             LaneKind::Sketch | LaneKind::Subject => {
                 if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {

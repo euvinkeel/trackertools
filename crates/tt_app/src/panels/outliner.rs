@@ -283,6 +283,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         st.scroll = (st.scroll - bg.drag_delta().y).max(0.0);
     }
     let selection = world.resource::<Selection>().clone();
+    let colors = crate::colors::Colors::new(world);
     let mods = ui.input(|i| i.modifiers);
     let adding = mods.shift || mods.ctrl || mods.command;
     let pointer = ui.input(|i| i.pointer.interact_pos());
@@ -341,7 +342,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                             None => ui.add_space(h),
                         }
                         // What it is, in the visual language's colours.
-                        crate::icons::icon(ui, crate::icons::Glyph::of(world, e), selection.is_selected(e));
+                        let glyph = crate::icons::Glyph::of(world, e);
+                        crate::icons::icon_in(ui, glyph, selection.is_selected(e), colors.of(world, e, glyph));
                         if let Some((re, text, focused)) = st.renaming.as_mut().filter(|(re, _, _)| *re == e) {
                             let te = ui.add(egui::TextEdit::singleline(text).desired_width(150.0));
                             if !*focused {

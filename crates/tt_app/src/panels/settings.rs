@@ -34,6 +34,12 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             ui.add(egui::DragValue::new(&mut pv.clear_radius).range(0.0..=200.0).speed(0.5).suffix(" pt"))
                 .on_hover_text("The video inside this radius is shown raw: no boxes, trails or text over it. 0 = off.");
         });
+        ui.add_space(6.0);
+        ui.label("On the video");
+        ui.checkbox(&mut pv.ants, "Moving outline on the selected box")
+            .on_hover_text("A black and white outline that moves around the selected sketch's box and the box being recorded, so you can see it on light and dark pictures.");
+        ui.checkbox(&mut pv.dim_outside, "In a view, dim what is outside its box")
+            .on_hover_text("Inside a sketch's view, the picture outside the box it follows is darker and has moving lines, so the box is clear.");
         if pv != *world.resource::<PointerView>() {
             *world.resource_mut::<PointerView>() = pv;
         }

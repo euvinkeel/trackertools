@@ -139,11 +139,16 @@ pub struct PointerView {
     /// stroke: the video inside it is shown raw, with nothing drawn over it
     /// (boxes, trails, HUD), and a thin ring at its edge. 0 = off.
     pub clear_radius: f32,
+    /// The selected sketch's box (and the one being recorded) gets a moving
+    /// black-and-white outline (marching ants), seen on any picture.
+    pub ants: bool,
+    /// In a view, outside the box it follows is dimmed and hatched.
+    pub dim_outside: bool,
 }
 
 impl Default for PointerView {
     fn default() -> Self {
-        Self { hide_pointer: true, clear_radius: 24.0 }
+        Self { hide_pointer: true, clear_radius: 24.0, ants: true, dim_outside: true }
     }
 }
 
@@ -337,6 +342,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         None => format!("frame {shown_grid} · decoding…"),
     };
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
+    super::overlay::dim_outside(&painter, &mapping, world, shown_grid, active_view, eased);
     super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid, active_view, eased);
     super::tracks::draw_tool(ui, &painter, &response, world, &mapping);
     breadcrumb(ui, world, rect.left_top() + Vec2::new(10.0, 34.0), active_view, shown_grid);
@@ -518,6 +524,9 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
     let r = Align2::RIGHT_TOP.anchor_size(rect.right_top() + Vec2::new(-10.0, 8.0), galley.size()).expand(5.0);
     painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
     painter.galley(r.min + Vec2::splat(5.0), galley, color);
+    if auto {
+        busy_meter(painter, r.right_bottom() + Vec2::new(0.0, 6.0), rate, world);
+    }
 
     if age < FLASH {
         let alpha = (1.0 - ((age - FULL) / (FLASH - FULL)).clamp(0.0, 1.0)) as f32;
@@ -527,6 +536,49 @@ fn speed(painter: &egui::Painter, rect: Rect, rate: f64, world: &mut World) {
         painter.galley(r.min + Vec2::splat(18.0), galley, color.gamma_multiply(alpha));
         painter.ctx().request_repaint();
     }
+}
+
+/// While auto speed drives: how erratic the sketch it reads is just ahead
+/// (calm to busy), and where the speed sits on the same scale (calm plays
+/// at the fastest, busy at the slowest, log in between), under the badge at
+/// `at` (its top right). The sketch's name says which one it reads.
+fn busy_meter(painter: &egui::Painter, at: Pos2, rate: f64, world: &World) {
+    let a = world.resource::<AutoSpeedState>();
+    let Some(u) = a.busy else { return };
+    let (slowest, fastest) = world.resource::<tt_core::autospeed::AutoSpeed>().range();
+    // Where a rate sits from fastest (0, calm) to slowest (1, busy), log scale.
+    let place = |r: f64| if fastest > slowest { ((fastest / r.max(1e-6)).ln() / (fastest / slowest).ln()).clamp(0.0, 1.0) } else { 0.0 };
+    let name = a.reading.and_then(|e| world.get::<bevy_ecs::name::Name>(e)).map_or("the sketch".to_string(), |n| n.to_string());
+    let (w, h) = (260.0, 10.0);
+    let panel = Rect::from_min_size(at - Vec2::new(w + 20.0, 0.0), Vec2::new(w + 20.0, 58.0));
+    painter.rect_filled(panel, 4.0, Color32::from_black_alpha(190));
+    let bar = Rect::from_min_size(panel.min + Vec2::new(10.0, 22.0), Vec2::new(w, h));
+    // Calm (cyan) to busy (red), filled as far as it is now.
+    let mix = |t: f32| {
+        let (c, b) = (style::ACCENT, style::LOST);
+        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+        Color32::from_rgb(m(c.r(), b.r()), m(c.g(), b.g()), m(c.b(), b.b()))
+    };
+    painter.rect_filled(bar, 2.0, Color32::from_white_alpha(18));
+    let filled = u.clamp(0.0, 1.0) as f32;
+    const STEPS: usize = 24;
+    for i in 0..STEPS {
+        let (t0, t1) = (i as f32 / STEPS as f32, (i + 1) as f32 / STEPS as f32);
+        if t0 >= filled {
+            break;
+        }
+        let seg = Rect::from_x_y_ranges(bar.min.x + w * t0..=bar.min.x + w * t1.min(filled), bar.y_range());
+        painter.rect_filled(seg, 0.0, mix(t0));
+    }
+    painter.rect_stroke(bar, 2.0, egui::Stroke::new(1.0, Color32::from_white_alpha(60)), egui::StrokeKind::Outside);
+    // The speed now, on the same scale: a mark through the bar.
+    let x = bar.min.x + w * place(rate) as f32;
+    painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x, bar.max.y + 1.0), Pos2::new(x - 5.0, bar.max.y + 8.0), Pos2::new(x + 5.0, bar.max.y + 8.0)], style::TEXT, egui::Stroke::NONE));
+    painter.line_segment([Pos2::new(x, bar.min.y - 2.0), Pos2::new(x, bar.max.y + 1.0)], egui::Stroke::new(1.5, style::TEXT));
+    let small = FontId::proportional(11.0);
+    painter.text(panel.min + Vec2::new(10.0, 5.0), Align2::LEFT_TOP, format!("{name} ahead: {:.0}% erratic", u * 100.0), small.clone(), style::TEXT);
+    painter.text(Pos2::new(bar.min.x, bar.max.y + 10.0), Align2::LEFT_TOP, format!("calm \u{b7} \u{d7}{fastest:.2}"), small.clone(), style::MUTED);
+    painter.text(Pos2::new(bar.max.x, bar.max.y + 10.0), Align2::RIGHT_TOP, format!("\u{d7}{slowest:.2} \u{b7} busy"), small, style::MUTED);
 }
 
 /// When the playback speed last changed (for the flash).
