@@ -8,6 +8,13 @@
 //! tag, `TT_VERSION` at build time) and can replace itself; a copy built from
 //! source says so and leaves updating to git.
 //!
+//! The download is checked before anything is installed: it must come over
+//! HTTPS (a redirect to plain http is refused), and its SHA-256 must match
+//! the one GitHub records for the release file (the asset's `digest`), or the
+//! `.sha256` file the workflow publishes beside it. A release with neither
+//! isn't installed. (This catches a broken or swapped download; it can't
+//! catch a bad release published from the repository's own account.)
+//!
 //! No libraries for it: downloads go through `curl` and the zip opens with
 //! `tar`, both part of Windows 10/11 and macOS. Installing renames each file it
 //! replaces to `<name>.old` (Windows lets a running program be renamed, not
@@ -60,8 +67,20 @@ pub struct Release {
     pub notes: String,
     /// Its page on GitHub.
     pub page: String,
-    /// The download for this computer and its size in bytes, if there is one.
-    pub download: Option<(String, u64)>,
+    /// The download for this computer, if there is one.
+    pub download: Option<Download>,
+}
+
+/// A release's file for this computer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Download {
+    pub url: String,
+    /// Bytes (0 if unknown).
+    pub size: u64,
+    /// Its SHA-256 (lowercase hex) as GitHub records it, if it does.
+    pub sha256: Option<String>,
+    /// The `.sha256` file published beside it, if there is one.
+    pub sha256_url: Option<String>,
 }
 
 /// Something went wrong: what to tell a person, and what to tell a developer.
@@ -149,13 +168,14 @@ impl Updater {
         if self.busy() {
             return;
         }
-        let Some((url, size)) = release.download.clone() else { return };
+        let Some(file) = release.download.clone() else { return };
+        let size = file.size;
         self.set(State::Downloading { release: release.clone(), got: 0, total: size });
         let me = self.clone();
         std::thread::spawn(move || {
             let dir = std::env::temp_dir().join(format!("trackertools-update-{}", release.version));
             let progress = |got| me.set(State::Downloading { release: release.clone(), got, total: size });
-            me.set(match download(&url, size, &dir, progress) {
+            me.set(match download(&file, &dir, progress) {
                 Ok(staged) => State::Ready { release, staged },
                 Err(e) => State::Failed(e),
             });
@@ -201,10 +221,25 @@ pub(crate) fn system_tool(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Where curl may go for `url`: an https address only over https (redirects
+/// too). A `file://` one only in tests or with `TT_UPDATE_FEED` set (a
+/// developer's feed); anything else is refused.
+pub(crate) fn protocols(url: &str) -> Result<[&'static str; 4], Problem> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        Ok(["--proto", "=https", "--proto-redir", "=https"])
+    } else if lower.starts_with("file://") && (cfg!(test) || std::env::var_os("TT_UPDATE_FEED").is_some()) {
+        Ok(["--proto", "=file", "--proto-redir", "=file"])
+    } else {
+        Err(Problem::new("The update address is not a secure (https) address, so trackertools does not use it.", url))
+    }
+}
+
 /// The latest release, from GitHub's API (or a `file://` feed, for tests).
 pub fn fetch_release(url: &str) -> Result<Release, Problem> {
     let out = quiet(system_tool("curl"))
         .args(["-sS", "-L", "--max-time", "20", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: trackertools-updater", "-w", "\n%{http_code}"])
+        .args(protocols(url)?)
         .arg(url)
         .output()
         .map_err(|e| Problem::new("Couldn't start the download tool (curl), which comes with Windows 10 and later.", e))?;
@@ -227,8 +262,12 @@ pub fn parse_release(json: &str) -> Result<Release, Problem> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|e| Problem::new("GitHub's answer didn't make sense.", e))?;
     let tag = v["tag_name"].as_str().ok_or_else(|| Problem::new("GitHub's answer didn't make sense.", "no tag_name"))?;
     let download = asset_name().and_then(|name| {
-        let a = v["assets"].as_array()?.iter().find(|a| a["name"].as_str() == Some(name))?;
-        Some((a["browser_download_url"].as_str()?.to_string(), a["size"].as_u64().unwrap_or(0)))
+        let assets = v["assets"].as_array()?;
+        let a = assets.iter().find(|a| a["name"].as_str() == Some(name))?;
+        let sha256 = a["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(str::to_ascii_lowercase);
+        let sidecar = format!("{name}.sha256");
+        let sha256_url = assets.iter().find(|a| a["name"].as_str() == Some(sidecar.as_str())).and_then(|a| a["browser_download_url"].as_str()).map(str::to_string);
+        Some(Download { url: a["browser_download_url"].as_str()?.to_string(), size: a["size"].as_u64().unwrap_or(0), sha256, sha256_url })
     });
     Ok(Release {
         version: tag.trim_start_matches('v').to_string(),
@@ -238,15 +277,46 @@ pub fn parse_release(json: &str) -> Result<Release, Problem> {
     })
 }
 
-/// Downloads `url` (`size` bytes, 0 if unknown) into `dir` and unpacks it;
-/// returns the folder holding the new program. `progress` hears the bytes so far.
-pub fn download(url: &str, size: u64, dir: &Path, progress: impl Fn(u64)) -> Result<PathBuf, Problem> {
+/// The SHA-256 the download must have: GitHub's record of it, else the
+/// `.sha256` file beside it. Neither: no update (a release can't be checked).
+fn expected_sha256(file: &Download) -> Result<String, Problem> {
+    let cannot = "This version can't be checked, so trackertools doesn't install it. Download it from the release page instead.";
+    let text = match (&file.sha256, &file.sha256_url) {
+        (Some(h), _) => h.clone(),
+        (None, Some(url)) => {
+            let out = quiet(system_tool("curl"))
+                .args(["-sS", "-L", "--fail", "--max-time", "30", "-H", "User-Agent: trackertools-updater"])
+                .args(protocols(url)?)
+                .arg(url)
+                .output()
+                .map_err(|e| Problem::new(cannot, e))?;
+            if !out.status.success() {
+                return Err(Problem::new(cannot, format!("{url}: {}", String::from_utf8_lossy(&out.stderr).trim())));
+            }
+            String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or_default().to_ascii_lowercase()
+        }
+        (None, None) => return Err(Problem::new(cannot, format!("{}: no digest and no .sha256 file", file.url))),
+    };
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Problem::new(cannot, format!("not a SHA-256: {text:?}")));
+    }
+    Ok(text)
+}
+
+/// Downloads `file` into `dir`, checks it and unpacks it; returns the folder
+/// holding the new program. `progress` hears the bytes so far.
+pub fn download(file: &Download, dir: &Path, progress: impl Fn(u64)) -> Result<PathBuf, Problem> {
+    let (url, size) = (file.url.as_str(), file.size);
+    let protocols = protocols(url)?;
+    let expected = expected_sha256(file)?;
     // Our own folder in the temp directory, left from an earlier try at most.
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| Problem::new("Couldn't make a folder for the download.", e))?;
     let zip = dir.join("update.zip");
     let mut child = quiet(system_tool("curl"))
-        .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-updater", "-o"])
+        .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-updater"])
+        .args(protocols)
+        .arg("-o")
         .arg(&zip)
         .arg(url)
         .spawn()
@@ -265,6 +335,11 @@ pub fn download(url: &str, size: u64, dir: &Path, progress: impl Fn(u64)) -> Res
     }
     if size > 0 && got != size {
         return Err(Problem::new("The download came out incomplete. Try again.", format!("{got} of {size} bytes")));
+    }
+    let actual = crate::setup::sha256(&zip).map_err(|e| Problem::new("Couldn't check the download.", e))?;
+    if actual != expected {
+        let _ = std::fs::remove_file(&zip);
+        return Err(Problem::new("The download is not the published file, so trackertools doesn't install it. Try again later.", format!("SHA-256 {actual}, expected {expected}")));
     }
     let staged = dir.join("new");
     std::fs::create_dir_all(&staged).map_err(|e| Problem::new("Couldn't unpack the update.", e))?;
@@ -455,12 +530,13 @@ mod tests {
         let json = format!(
             r#"{{"tag_name": "v0.3.1", "html_url": "https://github.com/x/y/releases/tag/v0.3.1", "body": "Sketches work as trackers.\n",
                 "assets": [{{"name": "other.zip", "browser_download_url": "https://x/other.zip", "size": 1}},
-                           {{"name": "{name}", "browser_download_url": "https://x/{name}", "size": 1234}}]}}"#
+                           {{"name": "{name}", "browser_download_url": "https://x/{name}", "size": 1234, "digest": "sha256:ABC123"}}]}}"#
         );
         let r = parse_release(&json).expect("reads");
         assert_eq!((r.version.as_str(), r.notes.as_str()), ("0.3.1", "Sketches work as trackers."));
         if asset_name().is_some() {
-            assert_eq!(r.download, Some((format!("https://x/{name}"), 1234)));
+            let d = r.download.expect("a download");
+            assert_eq!((d.url, d.size, d.sha256.as_deref()), (format!("https://x/{name}"), 1234, Some("abc123")));
         }
         let none = parse_release(r#"{"tag_name": "v0.3.2", "assets": []}"#).expect("reads");
         assert_eq!(none.download, None, "no download for this computer");
@@ -489,13 +565,25 @@ mod tests {
         let size = std::fs::metadata(&zip).unwrap().len();
         let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
         let feed = root.join("latest.json");
-        std::fs::write(&feed, format!(r#"{{"tag_name": "v9.9.9", "assets": [{{"name": "trackertools-windows-x64.zip", "browser_download_url": "{url}", "size": {size}}}]}}"#)).unwrap();
+        let digest = crate::setup::sha256(&zip).unwrap();
+        std::fs::write(&feed, format!(r#"{{"tag_name": "v9.9.9", "assets": [{{"name": "trackertools-windows-x64.zip", "browser_download_url": "{url}", "size": {size}, "digest": "sha256:{digest}"}}]}}"#)).unwrap();
 
         let release = fetch_release(&format!("file:///{}", feed.display().to_string().replace('\\', "/"))).expect("the feed reads");
         assert_eq!(release.version, "9.9.9");
-        let (url, size) = release.download.expect("a download");
+        let file = release.download.expect("a download");
+        let size = file.size;
+        // A download that isn't the published file is refused (and one with no checksum at all).
+        let wrong = Download { sha256: Some("0".repeat(64)), ..file.clone() };
+        let refused = download(&wrong, &root.join("dl"), |_| ()).expect_err("a wrong checksum is refused");
+        assert!(refused.details.contains("expected 000"), "{}", refused.details);
+        let unchecked = Download { sha256: None, sha256_url: None, ..file.clone() };
+        assert!(download(&unchecked, &root.join("dl"), |_| ()).is_err(), "no checksum: no update");
+        // The `.sha256` file beside it counts when GitHub has no digest.
+        std::fs::write(root.join("sidecar.sha256"), format!("{digest}  trackertools-windows-x64.zip\n")).unwrap();
+        let sidecar = Download { sha256: None, sha256_url: Some(format!("file:///{}", root.join("sidecar.sha256").display().to_string().replace('\\', "/"))), ..file.clone() };
+        assert!(download(&sidecar, &root.join("dl"), |_| ()).is_ok(), "checked against the .sha256 file");
         let seen = std::sync::Mutex::new(0);
-        let staged = download(&url, size, &root.join("dl"), |n| *seen.lock().unwrap() = n).expect("downloads and unpacks");
+        let staged = download(&file, &root.join("dl"), |n| *seen.lock().unwrap() = n).expect("downloads and unpacks");
         assert_eq!(*seen.lock().unwrap(), size, "progress reaches the whole size");
         install_into(&staged, &home).expect("installs");
         assert_eq!(std::fs::read(home.join(&exe)).unwrap(), b"new program");
@@ -506,5 +594,13 @@ mod tests {
         clean_up_after_update(&home);
         assert!(!old_name(&home.join(&exe)).exists(), "and deleted at the next start");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_https_addresses_are_used() {
+        assert!(protocols("https://github.com/x").is_ok());
+        assert_eq!(protocols("HTTPS://github.com/x").unwrap(), ["--proto", "=https", "--proto-redir", "=https"], "redirects stay on https");
+        assert!(protocols("http://github.com/x").is_err());
+        assert!(protocols("ftp://x/y").is_err());
     }
 }

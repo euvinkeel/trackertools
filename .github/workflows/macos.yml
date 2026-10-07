@@ -9,6 +9,10 @@ name: macOS
 on:
   workflow_dispatch:
 
+# It only reads the code.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: macos-15
