@@ -151,6 +151,22 @@ pub fn save(world: &mut World, path: &Path) -> Result<SaveStats> {
     Ok(stats)
 }
 
+/// A project's own metadata (what [`ProjectMeta`] held when it was saved:
+/// the app's keys, such as `media.path`), without loading it.
+pub fn read_meta(path: &Path) -> Result<BTreeMap<String, String>> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let meta: HashMap<String, String> = conn
+        .prepare("SELECT key, value FROM meta")
+        .with_context(|| format!("{} is not a trackertools project", path.display()))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if meta.get("format").map(String::as_str) != Some(FORMAT) {
+        bail!("{} is not a trackertools project", path.display());
+    }
+    Ok(meta.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("app.")?.to_string(), v))).collect())
+}
+
 /// Load a project into `world` (built with the same modules; normally fresh).
 pub fn load(world: &mut World, path: &Path) -> Result<()> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

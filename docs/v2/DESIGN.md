@@ -597,6 +597,7 @@ app.component::<SketchParams>(Meta::document())   // persisted + undoable + insp
   - Signals and streams are stored as content-hashed, zstd-compressed chunk blobs; only those a saved component refers to (a deleted entity's signals stay in memory for undo, not in the file).
   - Saves are incremental (only dirty chunks), transactional and crash-safe.
   - Schema migrations are versioned from day one.
+- **Several projects on one video** *(on request: "add save file option so we can save specific project info so we can have multiple projects on the same video file")*: each video has its own project in the data folder (`projects/<key>.ttproj`) and can have more anywhere (`tt_app::project`). The top bar's *Project* menu, beside the video's name, lists the video's projects (the open one selected; a file that has gone can be taken off the list). It also has *New project…* (an empty project in a file you choose; the open one is saved first), *Save project as…* (a copy; changes then save to the new file and the old file keeps what it had), *Open project…* (a `.ttproj` with its video: the `media.path` it was saved with; on the open video when that path is gone) and *Show the project file*. The session remembers each video's projects, the one used last first, so a video opens with the project used last on it, after a restart too. Autosave writes to whichever project is open.
 - **Media paths** are stored both absolute and relative to the project, fixing v1's orphaned-project problem.
 
 ### 12.1 Starting again after an error

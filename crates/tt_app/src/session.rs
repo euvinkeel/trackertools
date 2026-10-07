@@ -2,7 +2,7 @@
 //! JSON file in the per-user data dir; the real project file (SQLite
 //! `.ttproj`, DESIGN §12) arrives with M2 and will absorb this.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ use crate::update::Updater;
 use crate::panels::viewport::PointerView;
 
 const MAX_RECENT: usize = 10;
+/// Project files remembered per video.
+const MAX_PROJECTS: usize = 20;
 /// The settings' layout version (see [`SettingsFile::apply`]).
 const SETTINGS_VERSION: u32 = 4;
 
@@ -30,6 +32,10 @@ struct SessionFile {
     recent: Vec<PathBuf>,
     /// Frame of the most recent file when last seen.
     frame: FrameIndex,
+    /// Each video's project files, the one open last first. A video without
+    /// an entry opens its own project (in the data folder).
+    #[serde(default)]
+    projects: std::collections::BTreeMap<PathBuf, Vec<PathBuf>>,
     /// Read leniently: a bad value (another build's, a hand edit) resets the
     /// settings, not the recent files with them.
     #[serde(default, deserialize_with = "lenient")]
@@ -217,6 +223,28 @@ pub struct Session {
 impl Session {
     pub fn recent(&self) -> &[PathBuf] {
         &self.file.recent
+    }
+
+    /// The project files used with `video`, the one open last first.
+    pub fn projects_of(&self, video: &Path) -> &[PathBuf] {
+        self.file.projects.get(video).map_or(&[], Vec::as_slice)
+    }
+
+    /// `project` is the one open on `video` now (first in its list).
+    pub fn note_project(&mut self, video: &Path, project: &Path) {
+        let list = self.file.projects.entry(video.to_path_buf()).or_default();
+        list.retain(|p| p != project);
+        list.insert(0, project.to_path_buf());
+        list.truncate(MAX_PROJECTS);
+        self.save();
+    }
+
+    /// Take `project` off `video`'s list (the file is gone).
+    pub fn forget_project(&mut self, video: &Path, project: &Path) {
+        if let Some(list) = self.file.projects.get_mut(video) {
+            list.retain(|p| p != project);
+        }
+        self.save();
     }
 
     fn path() -> PathBuf {
