@@ -22,10 +22,16 @@
 //! - a clip's timing: where in the clip it starts, its speed, and what
 //!   happens at its end ([`EndMode`]).
 //!
-//! Lost frames of a tracker (flags) are bridged, as a view does. The Select
-//! tool drags a layer by its picture: its offset changes on the shown frame,
-//! keyed when that offset already has keys or [`AutoKey`] is on, else its
-//! fixed value (one undo step per drag).
+//! Lost frames of a tracker (flags) are bridged, as a view does; its motion
+//! can be smoothed for the layer (`smoothing`, zero-phase) without touching
+//! the tracking. Layers stack by `depth`, then the order they were made, and
+//! blend over what's under them in exports by [`BlendMode`].
+//!
+//! The Select tool edits the selected layer on the video ([`Handle`]): its
+//! picture drags its offset, a corner its scale, just outside a corner its
+//! rotation, and Alt on its picture its anchor (the picture stays put). Each
+//! changes the value on the shown frame, keyed when it already has keys or
+//! [`AutoKey`] is on, else its fixed value; one undo step per drag.
 
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
@@ -149,6 +155,44 @@ pub enum EndMode {
     PingPong,
 }
 
+/// How a layer's colours combine with what's under it (in exports; the
+/// preview draws them all as Normal).
+#[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    /// Over it, by its alpha.
+    #[default]
+    Normal,
+    /// Added (light only: glows, fire, sparks).
+    Add,
+    /// Lighter: one minus the product of the inverses (light, softer than Add).
+    Screen,
+    /// Multiplied (dark only: shadows, ink).
+    Multiply,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 4] = [BlendMode::Normal, BlendMode::Add, BlendMode::Screen, BlendMode::Multiply];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Add => "Add",
+            BlendMode::Screen => "Screen",
+            BlendMode::Multiply => "Multiply",
+        }
+    }
+
+    /// The layer's colour `s` over `d` (each 0–1), before its alpha.
+    pub fn mix(self, d: f64, s: f64) -> f64 {
+        match self {
+            BlendMode::Normal => s,
+            BlendMode::Add => (d + s).min(1.0),
+            BlendMode::Screen => 1.0 - (1.0 - d) * (1.0 - s),
+            BlendMode::Multiply => d * s,
+        }
+    }
+}
+
 /// A layer's parameters (its operator's params).
 #[derive(Component, Reflect, Clone, Debug, PartialEq)]
 #[reflect(Component)]
@@ -182,6 +226,14 @@ pub struct LayerParams {
     /// The point of the picture on the target's point: fractions of its width and height.
     pub anchor_x: Animated,
     pub anchor_y: Animated,
+    /// Seconds of zero-phase smoothing on what it follows (0: as tracked).
+    #[reflect(default)]
+    pub smoothing: f32,
+    /// Its place in the stack: higher is on top (then the order layers were made).
+    #[reflect(default)]
+    pub depth: i32,
+    #[reflect(default)]
+    pub blend: BlendMode,
 }
 
 impl Default for LayerParams {
@@ -204,6 +256,9 @@ impl Default for LayerParams {
             opacity: Animated::fixed(1.0),
             anchor_x: Animated::fixed(0.5),
             anchor_y: Animated::fixed(0.5),
+            smoothing: 0.0,
+            depth: 0,
+            blend: BlendMode::Normal,
         }
     }
 }
@@ -340,12 +395,49 @@ pub fn placed_at(world: &World, e: Entity, f: FrameIndex) -> Option<Placed> {
     Placed::of(v)
 }
 
-/// The live layers, bottom to top (the order they were made).
+/// The live layers, bottom to top: by depth, then the order they were made.
 pub fn layers(world: &mut World) -> Vec<Entity> {
     let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
     let mut v: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "layer").map(|(e, _)| e).collect();
     crate::meta::creation_order(world, &mut v);
+    v.sort_by_key(|e| world.get::<LayerParams>(*e).map_or(0, |p| p.depth));
     v
+}
+
+/// Where a layer goes in the stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restack {
+    Front,
+    Up,
+    Down,
+    Back,
+}
+
+/// Move layer `e` in the stack (one undo step): to the top or bottom, or
+/// past its neighbour. The others keep their order.
+pub fn restack(world: &mut World, e: Entity, to: Restack) {
+    let order = layers(world);
+    let Some(i) = order.iter().position(|l| *l == e) else { return };
+    let mut next = order.clone();
+    let item = next.remove(i);
+    let j = match to {
+        Restack::Front => next.len(),
+        Restack::Back => 0,
+        Restack::Up => (i + 1).min(next.len()),
+        Restack::Down => i.saturating_sub(1),
+    };
+    next.insert(j, item);
+    if next == order {
+        return;
+    }
+    let name = world.get::<Name>(e).map_or("layer".to_string(), |n| n.to_string());
+    edit(world, &format!("Restack {name}"), |tx| {
+        for (d, l) in next.iter().enumerate() {
+            if tx.world().get::<LayerParams>(*l).is_some_and(|p| p.depth != d as i32) {
+                tx.modify::<LayerParams>(*l, |p| p.depth = d as i32);
+            }
+        }
+    });
 }
 
 /// The top layer whose picture is under `pos` (source px) on frame `f`.
@@ -356,24 +448,50 @@ pub fn pick_layer(world: &mut World, f: FrameIndex, pos: [f64; 2]) -> Option<Ent
     })
 }
 
-/// Which layer a Select-tool press at `src` (source px) on frame `f` drags,
-/// if any: the selected layer when it is under it; none when the selected
-/// subject's point is (within `grab` px: the subject's drag takes it); else
-/// the top layer under it.
-pub fn press_on_layer(world: &mut World, f: FrameIndex, src: [f64; 2], grab: f64) -> Option<Entity> {
+/// What a Select-tool press takes hold of on a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    /// Its picture: moves it (with Alt: its anchor, the picture staying put).
+    Body,
+    /// A corner (of 4): scales it about its anchor.
+    Corner(usize),
+    /// Just outside a corner: turns it about its anchor.
+    Rotate(usize),
+}
+
+/// The handle of the selected layer `e` at `src` (source px) on frame `f`:
+/// a corner within `grab` px, the ring out to 2.5 × `grab` beyond it
+/// (outside its picture), or its picture.
+pub fn handle_at(world: &World, e: Entity, f: FrameIndex, src: [f64; 2], grab: f64) -> Option<Handle> {
+    let size = world.get::<LayerParams>(e)?.media_size;
+    let pl = placed_at(world, e, f)?;
+    let corners = pl.corners(size);
+    let inside = pl.contains(size, src);
+    let near = corners.iter().enumerate().map(|(i, c)| (i, (c[0] - src[0]).hypot(c[1] - src[1]))).min_by(|a, b| a.1.total_cmp(&b.1))?;
+    if near.1 <= grab {
+        return Some(Handle::Corner(near.0));
+    }
+    if !inside && near.1 <= 2.5 * grab {
+        return Some(Handle::Rotate(near.0));
+    }
+    inside.then_some(Handle::Body)
+}
+
+/// Which layer a Select-tool press at `src` (source px) on frame `f` takes,
+/// and by what, if any: the selected layer when the press is on it or its
+/// handles; none when the selected subject's point is under it (within
+/// `grab` px: the subject's drag takes it); else the top layer under it.
+pub fn press_on_layer(world: &mut World, f: FrameIndex, src: [f64; 2], grab: f64) -> Option<(Entity, Handle)> {
     if let Some(p) = world.resource::<Selection>().primary() {
         if is_layer(world, p) {
-            let size = world.get::<LayerParams>(p).map(|q| q.media_size);
-            if let (Some(size), Some(pl)) = (size, placed_at(world, p, f))
-                && pl.contains(size, src)
-            {
-                return Some(p);
+            if let Some(h) = handle_at(world, p, f, src, grab) {
+                return Some((p, h));
             }
         } else if crate::subject::pick_subject(world, f, src, grab) == Some(p) {
             return None;
         }
     }
-    pick_layer(world, f, src)
+    pick_layer(world, f, src).map(|e| (e, Handle::Body))
 }
 
 /// Attach a new layer showing `params.media` to `target`, as one undo step;
@@ -468,7 +586,18 @@ pub fn place(target: &Signal, p: &LayerParams, angled: bool, start: Option<Frame
         .collect();
     known.iter().any(Option::is_some).then_some(())?;
     fill(&mut known);
-    let at = |f: FrameIndex| known[(f.clamp(lo, hi) - lo) as usize].expect("filled");
+    let mut known: Vec<[f64; 5]> = known.into_iter().map(|v| v.expect("filled")).collect();
+    // Smoothed for the layer (zero-phase), each channel on its own.
+    let sigma = p.smoothing.max(0.0) as f64 * fps;
+    if sigma >= 0.5 {
+        for c in 0..5 {
+            let ch: Vec<f64> = known.iter().map(|v| v[c]).collect();
+            for (v, s) in known.iter_mut().zip(crate::sketch::gauss(&ch, sigma)) {
+                v[c] = s;
+            }
+        }
+    }
+    let at = |f: FrameIndex| known[(f.clamp(lo, hi) - lo) as usize];
     let first = start.unwrap_or(lo).clamp(lo, hi);
     let r = at(p.size_frame.unwrap_or(first));
     let (w0, h0) = (r[2].max(1e-6), r[3].max(1e-6));
@@ -523,14 +652,30 @@ fn fill(v: &mut [Option<[f64; 5]>]) {
 
 // ---- dragging -------------------------------------------------------------------------------
 
-/// The Select tool's drag of a layer.
+/// What a drag changes.
+#[derive(Clone, Copy, Debug)]
+enum Doing {
+    Move,
+    /// About the anchor: the press's distance from it then.
+    Scale(f64),
+    /// About the anchor: the press's direction from it then (radians).
+    Rotate(f64),
+    Anchor,
+}
+
+/// The Select tool's drag of a layer: the press (source px), the frame, the
+/// layer as it was then (its values there, where it was), moved yet.
 #[derive(Clone, Copy, Debug)]
 struct Grab {
     layer: Entity,
-    /// The press (source px), the frame, its offset then, the target's turn then.
+    doing: Doing,
     from: [f64; 2],
     frame: FrameIndex,
     offset: [f32; 2],
+    scale: f32,
+    rotation: f32,
+    placed: Placed,
+    /// The target's own turn then (the offset is in its turned frame).
     turn: f64,
     moved: bool,
 }
@@ -538,9 +683,9 @@ struct Grab {
 #[derive(Resource, Debug, Default)]
 struct LayerDrag(Option<Grab>);
 
-/// `Set::Tools`: in the Select tool, a press on a layer's picture and a
-/// drag moves it (module docs). A press that doesn't move is a click, which
-/// selects it (tool.rs).
+/// `Set::Tools`: in the Select tool, a press on a layer (or the selected
+/// one's handles) and a drag edits it (module docs). A press that doesn't
+/// move is a click, which selects it (tool.rs).
 fn drag_layer(world: &mut World) {
     if world.resource::<ActiveTool>().0 != Tool::Select {
         if world.resource_mut::<LayerDrag>().0.take().is_some_and(|d| d.moved) {
@@ -552,40 +697,90 @@ fn drag_layer(world: &mut World) {
     let frame = world.resource::<Transport>().frame();
     let map = map_at(world, world.resource::<ActiveView>().0, frame);
     let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
+    let alt = world.get_resource::<crate::input::KeysHeld>().is_some_and(|k| k.mods.alt);
     if let Some(t) = p.pressed
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
     {
         let src = map.to_source(at);
-        let grab = (12.0 / scale) * map.a;
-        if let Some(e) = press_on_layer(world, frame, src, grab)
-            && let (Some(params), Some(pl)) = (world.get::<LayerParams>(e), placed_at(world, e, frame))
+        let grab = (8.0 / scale) * map.a;
+        if let Some((e, handle)) = press_on_layer(world, frame, src, grab)
+            && let (Some(q), Some(pl)) = (world.get::<LayerParams>(e).cloned(), placed_at(world, e, frame))
         {
-            let turn = pl.angle - (params.rotation.at(frame) as f64).to_radians();
-            let off = [params.offset_x.at(frame), params.offset_y.at(frame)];
-            world.resource_mut::<LayerDrag>().0 = Some(Grab { layer: e, from: src, frame, offset: off, turn, moved: false });
+            let selected = world.resource::<Selection>().primary() == Some(e);
+            let doing = match handle {
+                Handle::Body if alt && selected => Doing::Anchor,
+                Handle::Body => Doing::Move,
+                Handle::Corner(_) => Doing::Scale((src[0] - pl.at[0]).hypot(src[1] - pl.at[1]).max(1e-6)),
+                Handle::Rotate(_) => Doing::Rotate((src[1] - pl.at[1]).atan2(src[0] - pl.at[0])),
+            };
+            world.resource_mut::<LayerDrag>().0 = Some(Grab {
+                layer: e,
+                doing,
+                from: src,
+                frame,
+                offset: [q.offset_x.at(frame), q.offset_y.at(frame)],
+                scale: q.scale.at(frame),
+                rotation: q.rotation.at(frame),
+                placed: pl,
+                turn: pl.angle - (q.rotation.at(frame) as f64).to_radians(),
+                moved: false,
+            });
         }
     }
     let Some(g) = world.resource::<LayerDrag>().0 else { return };
-    let Grab { layer: e, from, frame: f, offset: off, turn, moved } = g;
+    let e = g.layer;
     let ended = p.released.is_some() || !p.down;
     if let Some(now) = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover) {
         let src = map.to_source(now);
-        let (dx, dy) = (src[0] - from[0], src[1] - from[1]);
+        let (dx, dy) = (src[0] - g.from[0], src[1] - g.from[1]);
         let far = dx.hypot(dy) * scale / map.a.max(1e-9) >= CLICK_MOVE;
-        if moved || far {
-            if !moved {
+        if g.moved || far {
+            if !g.moved {
                 let name = world.get::<Name>(e).map_or("layer".to_string(), |n| n.to_string());
-                world.resource_mut::<History>().begin(format!("Move {name}"));
+                let what = match g.doing {
+                    Doing::Move => "Move",
+                    Doing::Scale(_) => "Scale",
+                    Doing::Rotate(_) => "Turn",
+                    Doing::Anchor => "Move the anchor of",
+                };
+                world.resource_mut::<History>().begin(format!("{what} {name}"));
                 world.resource_mut::<Selection>().select_only(e);
                 world.resource_mut::<LayerDrag>().0 = Some(Grab { moved: true, ..g });
             }
-            // The move in the target's own turned frame (the offset's).
-            let (s, c) = turn.sin_cos();
-            let (lx, ly) = (c * dx + s * dy, -s * dx + c * dy);
+            // A move in source px, in the target's own turned frame (the offset's).
+            let local = |dx: f64, dy: f64| {
+                let (s, c) = g.turn.sin_cos();
+                [c * dx + s * dy, -s * dx + c * dy]
+            };
             let key = world.resource::<AutoKey>().0;
-            set_params(world, e, "Move", |p| {
-                p.offset_x.set(f, off[0] + lx as f32, key);
-                p.offset_y.set(f, off[1] + ly as f32, key);
+            let f = g.frame;
+            let size = world.get::<LayerParams>(e).map_or([1.0, 1.0], |q| q.media_size);
+            set_params(world, e, "Edit", |q| match g.doing {
+                Doing::Move => {
+                    let [lx, ly] = local(dx, dy);
+                    q.offset_x.set(f, g.offset[0] + lx as f32, key);
+                    q.offset_y.set(f, g.offset[1] + ly as f32, key);
+                }
+                Doing::Scale(d0) => {
+                    let d = (src[0] - g.placed.at[0]).hypot(src[1] - g.placed.at[1]);
+                    q.scale.set(f, (g.scale as f64 * d / d0).max(1e-4) as f32, key);
+                }
+                Doing::Rotate(a0) => {
+                    let a = (src[1] - g.placed.at[1]).atan2(src[0] - g.placed.at[0]);
+                    let turn = (a - a0).to_degrees();
+                    // (Unwrapped: past ±180° keeps turning the same way.)
+                    let turn = turn - 360.0 * ((turn + 180.0) / 360.0).floor();
+                    q.rotation.set(f, g.rotation + turn as f32, key);
+                }
+                Doing::Anchor => {
+                    // The picture's point under the pointer (as it was) becomes the anchor; it stays put.
+                    let m = g.placed.from_source(size, src);
+                    q.anchor_x.set(f, (m[0] / size[0].max(1e-6) as f64) as f32, key);
+                    q.anchor_y.set(f, (m[1] / size[1].max(1e-6) as f64) as f32, key);
+                    let [lx, ly] = local(src[0] - g.placed.at[0], src[1] - g.placed.at[1]);
+                    q.offset_x.set(f, g.offset[0] + lx as f32, key);
+                    q.offset_y.set(f, g.offset[1] + ly as f32, key);
+                }
             });
         }
     }

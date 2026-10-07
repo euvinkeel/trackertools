@@ -144,11 +144,40 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &mut World, frame: 
             painter.circle_stroke(a, 5.0, Stroke::new(1.5, style::LAYER));
             painter.line_segment([a - egui::vec2(8.0, 0.0), a + egui::vec2(8.0, 0.0)], Stroke::new(1.0, style::LAYER));
             painter.line_segment([a - egui::vec2(0.0, 8.0), a + egui::vec2(0.0, 8.0)], Stroke::new(1.0, style::LAYER));
+            // Its handles (the Select tool): a square at each corner scales it; just outside one turns it.
+            if world.resource::<tt_core::tool::ActiveTool>().0 == tt_core::tool::Tool::Select {
+                for c in corners {
+                    let r = egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0));
+                    painter.rect_filled(r, 1.0, Color32::from_black_alpha(160));
+                    painter.rect_stroke(r, 1.0, Stroke::new(1.5, style::LAYER), egui::StrokeKind::Inside);
+                }
+                hover_cursor(painter, map, world, e, frame, shown);
+            }
         }
     }
     if loading {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+/// Over the selected layer's handles, the pointer says what a drag does.
+fn hover_cursor(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, frame: FrameIndex, shown: SpaceMap) {
+    use tt_core::layer::Handle;
+    let ctx = painter.ctx();
+    let Some(pos) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| map.panel.contains(*p)) else { return };
+    let src = shown.to_source(map.to_canvas(pos));
+    let grab = 8.0 / map.points_per_canvas() * shown.a;
+    let alt = ctx.input(|i| i.modifiers.alt);
+    let icon = match tt_core::layer::handle_at(world, e, frame, src, grab) {
+        Some(Handle::Corner(i)) => {
+            if i % 2 == 0 { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw }
+        }
+        Some(Handle::Rotate(_)) => egui::CursorIcon::Alias,
+        Some(Handle::Body) if alt => egui::CursorIcon::Crosshair,
+        Some(Handle::Body) => egui::CursorIcon::Move,
+        None => return,
+    };
+    ctx.set_cursor_icon(icon);
 }
 
 /// The parameters of a new layer showing `path` (probed: its size and length).

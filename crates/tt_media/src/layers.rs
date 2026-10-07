@@ -13,7 +13,11 @@
 //!
 //! A layer's picture is sampled bilinearly from its media's frames (read at
 //! their own size, up to a memory limit: `overlay::fit`), its alpha times
-//! its opacity, composited in the order given (bottom first).
+//! its opacity, composited in the order given (bottom first). Over the
+//! video a layer's blend mode (Add, Screen, Multiply) mixes it with the
+//! pixel under it in R'G'B' (that pixel converted back from the source's
+//! codes); alone on transparency every layer is Normal (there is nothing
+//! under it to mix with).
 
 use std::io::{BufReader, Read};
 use std::ops::Range;
@@ -23,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
-use tt_core::layer::Placed;
+use tt_core::layer::{BlendMode, Placed};
 use tt_core::time::FrameIndex;
 
 use crate::VideoIndex;
@@ -36,6 +40,7 @@ pub struct Overlay<'a> {
     pub frames: Arc<Frames>,
     pub size: [f32; 2],
     pub placed: &'a (dyn Fn(FrameIndex) -> Option<Placed> + Sync),
+    pub blend: BlendMode,
 }
 
 /// The transparent formats.
@@ -92,6 +97,16 @@ impl ToYuv {
             None => (0.2126, 0.0722),
         };
         Self { kr, kb, full, scale: if deep { 256.0 } else { 1.0 } }
+    }
+
+    /// R'G'B' (0–1) for `[Y, Cb, Cr]` codes (the other way from [`ToYuv::yuv`]).
+    pub fn rgb(&self, yuv: [f64; 3]) -> [f64; 3] {
+        let [y, cb, cr] = yuv.map(|v| v / self.scale);
+        let (y, cb, cr) = if self.full { (y / 255.0, (cb - 128.0) / 255.0, (cr - 128.0) / 255.0) } else { ((y - 16.0) / 219.0, (cb - 128.0) / 224.0, (cr - 128.0) / 224.0) };
+        let r = y + 2.0 * (1.0 - self.kr) * cr;
+        let b = y + 2.0 * (1.0 - self.kb) * cb;
+        let g = (y - self.kr * r - self.kb * b) / (1.0 - self.kr - self.kb);
+        [r, g, b].map(|v| v.clamp(0.0, 1.0))
     }
 
     /// `[Y, Cb, Cr]` codes for R'G'B' in 0–1.
@@ -175,6 +190,11 @@ fn rows_each(h: usize) -> usize {
     h.div_ceil(threads).max(1)
 }
 
+/// Sample `i` of a plane (`B` bytes a sample).
+fn read<const B: usize>(plane: &[u8], i: usize) -> f64 {
+    if B == 2 { u16::from_le_bytes([plane[2 * i], plane[2 * i + 1]]) as f64 } else { plane[i] as f64 }
+}
+
 /// Blends the colour `yuv` at alpha `a` into sample `i` of a plane (`B` bytes a sample).
 fn blend<const B: usize>(plane: &mut [u8], i: usize, v: f64, a: f64) {
     if B == 2 {
@@ -205,7 +225,15 @@ fn composite<const B: usize>(buf: &mut [u8], w: usize, h: usize, on: &[(&Overlay
                 for (ov, pl, frame) in on {
                     cover(ov, pl, frame, w, rows.clone(), |yy, x, c| {
                         let i = (yy - first) * w + x;
-                        let [cy, cb, cr] = conv.yuv([c[0], c[1], c[2]]);
+                        // Not Normal: mixed with the pixel under it, in R'G'B'.
+                        let rgb = match ov.blend {
+                            BlendMode::Normal => [c[0], c[1], c[2]],
+                            mode => {
+                                let under = conv.rgb([read::<B>(yb, i), read::<B>(ub, i), read::<B>(vb, i)]);
+                                std::array::from_fn(|k| mode.mix(under[k], c[k]))
+                            }
+                        };
+                        let [cy, cb, cr] = conv.yuv(rgb);
                         blend::<B>(yb, i, cy, c[3]);
                         blend::<B>(ub, i, cb, c[3]);
                         blend::<B>(vb, i, cr, c[3]);
@@ -393,6 +421,33 @@ mod tests {
     }
 
     #[test]
+    fn blend_modes_mix_with_whats_under() {
+        // A mid-grey video under a mid-grey layer: Add brightens, Multiply darkens, Screen in between.
+        let (w, h) = (8, 8);
+        let conv = ToYuv::new(Some("bt709"), 1080, true, false);
+        let grey = Arc::new(Frames { width: 1, height: 1, fps: 0.0, frames: vec![vec![128, 128, 128, 255]] });
+        let place = |_: FrameIndex| Some(placed([4.0, 4.0], 8.0));
+        let y_after = |mode: BlendMode| {
+            let ov = Overlay { frames: grey.clone(), size: [1.0, 1.0], placed: &place, blend: mode };
+            let on = on_frame(std::slice::from_ref(&ov), 0);
+            let mut planes = vec![128u8; w * h];
+            planes.extend(std::iter::repeat_n(128u8, 2 * w * h));
+            composite::<1>(&mut planes, w, h, &on, &conv);
+            planes[4 * w + 4]
+        };
+        let (normal, add, screen, multiply) = (y_after(BlendMode::Normal), y_after(BlendMode::Add), y_after(BlendMode::Screen), y_after(BlendMode::Multiply));
+        assert_eq!(normal, 128);
+        assert!(add >= 254, "{add}");
+        assert!((190..=193).contains(&screen), "{screen}");
+        assert!((63..=65).contains(&multiply), "{multiply}");
+        // And back: R'G'B' to codes to R'G'B', in each range.
+        for c in [conv, ToYuv::new(Some("bt709"), 1080, false, true)] {
+            let back = c.rgb(c.yuv([0.3, 0.5, 0.7]));
+            assert!(back.iter().zip([0.3, 0.5, 0.7]).all(|(a, b)| (a - b).abs() < 1e-9), "{back:?}");
+        }
+    }
+
+    #[test]
     fn colours_convert_with_the_sources_matrix_and_range() {
         let hd = ToYuv::new(Some("bt709"), 1080, false, false);
         let [y, cb, cr] = hd.yuv([1.0, 0.0, 0.0]);
@@ -405,7 +460,7 @@ mod tests {
     fn layers_are_drawn_over_transparency_and_into_the_video() {
         let frames = red_square();
         let place = |g: FrameIndex| (g == 0).then(|| placed([10.0, 10.0], 2.0));
-        let ov = Overlay { frames: frames.clone(), size: [4.0, 4.0], placed: &place };
+        let ov = Overlay { frames: frames.clone(), size: [4.0, 4.0], placed: &place, blend: BlendMode::Normal };
         let on = on_frame(std::slice::from_ref(&ov), 0);
         assert_eq!(on.len(), 1);
         assert!(on_frame(std::slice::from_ref(&ov), 1).is_empty(), "not placed: not drawn");

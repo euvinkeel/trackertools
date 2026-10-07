@@ -129,3 +129,86 @@ fn a_layer_saves_and_loads() {
     assert_eq!(got, want);
     let _ = std::fs::remove_file(path);
 }
+
+/// A press-drag-release in the Select tool from `from` to `to` (source px; the test's view is the source).
+fn drag(d: &mut Driver, from: [f64; 2], to: [f64; 2]) {
+    drag_with(d, from, to, false);
+}
+
+fn drag_with(d: &mut Driver, from: [f64; 2], to: [f64; 2], alt: bool) {
+    let t0 = d.now;
+    let path = move |t: f64| {
+        let u = ((t - t0 - 0.02) / 0.1).clamp(0.0, 1.0);
+        [from[0] + (to[0] - from[0]) * u, from[1] + (to[1] - from[1]) * u]
+    };
+    d.frame(path, common::Input { alt, ..PRESS });
+    d.frames(30, path, common::Input { alt, ..HOLD });
+    d.frame(path, common::Input { alt, ..UP });
+    d.frames(2, |_| [0.0, 0.0], UP);
+}
+
+/// The selected layer's handles: a corner scales it about its anchor, the
+/// ring outside a corner turns it, Alt on its picture moves its anchor and
+/// the picture stays put; each one undo step.
+#[test]
+fn the_selected_layers_handles_scale_turn_and_move_its_anchor() {
+    let mut d = Driver::new();
+    let (_, l) = layered(&mut d);
+    d.core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    d.core.world.resource_mut::<Transport>().seek(100);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    d.core.world.resource_mut::<Selection>().select_only(l);
+    let at = |w: &World| placed_at(w, l, 100).expect("placed");
+    let size = [40.0f32, 20.0];
+    // Its bottom right corner is (320, 310) (40 × 20 around (300, 300)): drag it out to twice as far.
+    let c = at(&d.core.world).corners(size)[2];
+    assert_eq!(c, [320.0, 310.0]);
+    drag(&mut d, c, [340.0, 320.0]);
+    assert!((at(&d.core.world).scale[0] - 2.0).abs() < 1e-3, "twice the size: {:?}", at(&d.core.world));
+    assert_eq!(d.core.world.resource::<History>().undo_label(), Some("Scale face"));
+    // Just outside its top right corner (now (340, 280)): a quarter turn about its anchor.
+    let c = at(&d.core.world).corners(size)[1];
+    let from = [c[0] + 10.0, c[1] - 6.0];
+    let (dx, dy) = (from[0] - 300.0, from[1] - 300.0);
+    drag(&mut d, from, [300.0 - dy, 300.0 + dx]);
+    assert!((at(&d.core.world).angle.to_degrees() - 90.0).abs() < 0.5, "a quarter turn: {}", at(&d.core.world).angle.to_degrees());
+    assert_eq!(at(&d.core.world).at, [300.0, 300.0], "about its anchor: it stays put");
+    assert_eq!(d.core.world.resource::<History>().undo_label(), Some("Turn face"));
+    // Alt-drag on its picture: the anchor goes where the pointer lets go, and the picture doesn't move.
+    let corners = at(&d.core.world).corners(size);
+    drag_with(&mut d, [302.0, 304.0], [290.0, 310.0], true);
+    let after = at(&d.core.world);
+    assert!((after.at[0] - 290.0).abs() < 1e-3 && (after.at[1] - 310.0).abs() < 1e-3, "the anchor is where it was let go: {after:?}");
+    for (a, b) in corners.iter().zip(after.corners(size)) {
+        assert!((a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3, "the picture stays put: {a:?} → {b:?}");
+    }
+    undo(&mut d.core.world);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    assert_eq!(at(&d.core.world).at, [300.0, 300.0], "one undo puts the anchor back");
+}
+
+/// Layers stack by depth (Front, Back…), one undo step each; smoothing
+/// steadies what a layer follows without touching the tracking.
+#[test]
+fn layers_restack_and_smooth() {
+    use tt_core::layer::{Restack, layers, restack, set_params};
+    let mut d = Driver::new();
+    let (s, a) = layered(&mut d);
+    let params = LayerParams { media: "b.png".into(), media_size: [10.0, 10.0], ..LayerParams::default() };
+    let b = attach(&mut d.core.world, s, params, 100).expect("attached");
+    d.frames(2, |_| [0.0, 0.0], UP);
+    assert_eq!(layers(&mut d.core.world), vec![a, b], "the order they were made");
+    restack(&mut d.core.world, b, Restack::Back);
+    assert_eq!(layers(&mut d.core.world), vec![b, a]);
+    restack(&mut d.core.world, b, Restack::Up);
+    assert_eq!(layers(&mut d.core.world), vec![a, b]);
+    undo(&mut d.core.world);
+    assert_eq!(layers(&mut d.core.world), vec![b, a], "one undo step");
+
+    // A subject moving 2 px a frame, jittered ±3 px on alternate frames: smoothed, the layer barely jitters.
+    let w = &mut d.core.world;
+    set_params(w, a, "smooth", |p| p.smoothing = 0.1);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let x = |f: i64| placed_at(&d.core.world, a, f).expect("placed").at[0];
+    assert!((x(300) - x(299) - 2.0).abs() < 1e-3, "a steady motion stays the same: {}", x(300) - x(299));
+}

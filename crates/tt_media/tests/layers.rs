@@ -63,7 +63,7 @@ fn a_layer_rendered_over_the_video_and_alone() {
     };
     let index = VideoIndex::open(&clip).expect("indexes the clip");
     let (frames, at) = red();
-    let overlays = [Overlay { frames, size: [10.0, 10.0], placed: &at }];
+    let overlays = [Overlay { frames, size: [10.0, 10.0], placed: &at, blend: tt_core::layer::BlendMode::Normal }];
     let (progress, cancel) = (AtomicUsize::new(0), AtomicBool::new(false));
 
     // Over the video (H.264: what's measured is the picture, near lossless).
