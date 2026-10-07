@@ -590,38 +590,22 @@ pub enum LaneKind {
     Tracker,
 }
 
-/// The lanes, top to bottom: subjects, then each sketch in the outliner's
-/// tree order, then its view and its trackers (indented), then the sketches
-/// nested in its view; trackers with no sketch (or following something
-/// else) come last. A subject's or tracker's view comes right under it.
+/// The lanes, top to bottom, in the outliner's order (`crate::tree`: each
+/// thing under what it was made relative to), each followed by its view's
+/// lane (one level in) when it has one.
 pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
-    let tree = super::outliner::sketch_tree(world);
+    use crate::tree::Node;
     let mut out = Vec::new();
-    let mut subjects: Vec<Entity> = {
-        let mut q = world.query_filtered::<(Entity, &tt_core::op::Operator), bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
-        q.iter(world).filter(|(_, o)| o.kind == "subject").map(|(e, _)| e).collect()
-    };
-    tt_core::meta::creation_order(world, &mut subjects);
-    // Each lane, then the view that follows it (if it has a live one), one level in.
-    let with_view = |world: &mut World, out: &mut Vec<(Entity, usize, LaneKind)>, e: Entity, depth: usize, kind: LaneKind| {
+    for (e, depth, node) in crate::tree::tree(world) {
+        let kind = match node {
+            Node::Subject => LaneKind::Subject,
+            Node::Sketch => LaneKind::Sketch,
+            Node::Tracker => LaneKind::Tracker,
+        };
         out.push((e, depth, kind));
         if let Some(v) = tt_core::view::view_of(world, e).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
             out.push((v, depth + 1, LaneKind::View));
         }
-    };
-    for s in subjects {
-        with_view(world, &mut out, s, 0, LaneKind::Subject);
-    }
-    for (s, depth) in tree {
-        with_view(world, &mut out, s, depth, LaneKind::Sketch);
-        for t in tt_track::trackers_of(world, s) {
-            with_view(world, &mut out, t, depth + 1, LaneKind::Tracker);
-        }
-    }
-    let mut rest: Vec<Entity> = tracks::list(world).into_iter().map(|(e, _)| e).filter(|e| !out.iter().any(|(l, _, _)| l == e)).collect();
-    tt_core::meta::creation_order(world, &mut rest);
-    for t in rest {
-        with_view(world, &mut out, t, 0, LaneKind::Tracker);
     }
     out
 }
