@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod ffmpeg;
 pub mod index;
+pub mod layers;
 pub mod overlay;
 pub mod player;
 pub mod probe;

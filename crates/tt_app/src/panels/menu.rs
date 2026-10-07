@@ -45,6 +45,25 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             crate::layers::attach_dialog(world, t);
             return;
         }
+        // A layer: its exports; anything with a position (a layer too): its motion as data.
+        let layer = primary.filter(|p| tt_core::layer::is_layer(world, *p));
+        if layer.is_some()
+            && ui.button("Export layers\u{2026}").on_hover_text("The video with the layers on top, the layers alone on transparency, or their motion as JSON").clicked()
+        {
+            crate::panels::layer_export::open(world);
+            ui.close();
+        }
+        if let Some(e) = layer.or(followable) {
+            if ui.button("Copy as After Effects keyframes").on_hover_text("Its position (and turn, size and opacity for a layer), one key a frame from the in point: select a layer in After Effects and paste").clicked() {
+                crate::panels::layer_export::copy_ae_keyframes(ui.ctx(), world, e);
+                ui.close();
+            }
+            if ui.button("Save its motion as data (JSON)\u{2026}").on_hover_text("Every frame from the in point to the out point: where it is, its box, its turn, and whether the frame can be trusted").clicked() {
+                ui.close();
+                crate::panels::layer_export::save_motion(world, e);
+                return;
+            }
+        }
         if let Some(s) = followable
             && ui.button(format!("Enter view{}", chord(Action::EnterView))).on_hover_text("See a view that follows it and keeps it in the centre; sketch inside it for detail").clicked()
         {

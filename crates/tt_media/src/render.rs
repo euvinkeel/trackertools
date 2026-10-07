@@ -55,7 +55,7 @@ impl Codec {
         }
     }
 
-    fn video_args(self) -> &'static [&'static str] {
+    pub(crate) fn video_args(self) -> &'static [&'static str] {
         match self {
             Codec::ProRes422Hq => &["-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"],
             Codec::DnxhrHqx => &["-c:v", "dnxhd", "-profile:v", "dnxhr_hqx", "-pix_fmt", "yuv422p10le"],
@@ -181,7 +181,7 @@ fn parse_probe(text: &str) -> StreamInfo {
     info
 }
 
-fn command(program: &Path) -> Command {
+pub(crate) fn command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
@@ -192,7 +192,7 @@ fn command(program: &Path) -> Command {
 }
 
 /// A child's stderr, kept (the last lines) for error reports.
-fn keep_log(child: &mut Child) -> Arc<Mutex<Vec<String>>> {
+pub(crate) fn keep_log(child: &mut Child) -> Arc<Mutex<Vec<String>>> {
     let log = Arc::new(Mutex::new(Vec::new()));
     if let Some(stderr) = child.stderr.take() {
         let sink = log.clone();
@@ -209,34 +209,34 @@ fn keep_log(child: &mut Child) -> Arc<Mutex<Vec<String>>> {
     log
 }
 
-fn last_lines(log: &Arc<Mutex<Vec<String>>>) -> String {
+pub(crate) fn last_lines(log: &Arc<Mutex<Vec<String>>>) -> String {
     log.lock().map(|l| l.join("\n")).unwrap_or_default()
 }
 
 /// The file written while rendering: renamed to `out` when complete.
-fn partial(out: &Path) -> PathBuf {
+pub(crate) fn partial(out: &Path) -> PathBuf {
     let mut name = out.file_name().unwrap_or_default().to_owned();
     name.push(".part");
     out.with_file_name(name)
 }
 
 /// The sound to carry over: `from`'s first audio stream, `seconds` of it from `start`.
-struct Sound<'a> {
-    from: &'a Path,
-    start: f64,
-    seconds: f64,
+pub(crate) struct Sound<'a> {
+    pub(crate) from: &'a Path,
+    pub(crate) start: f64,
+    pub(crate) seconds: f64,
 }
 
 impl<'a> Sound<'a> {
     /// The source's sound under grid frames `frames`.
-    fn under(index: &'a VideoIndex, frames: &Range<FrameIndex>) -> Self {
+    pub(crate) fn under(index: &'a VideoIndex, frames: &Range<FrameIndex>) -> Self {
         let fps = index.fps.as_f64();
         Self { from: &index.path, start: frames.start as f64 / fps, seconds: (frames.end - frames.start) as f64 / fps }
     }
 }
 
 /// `frames` within the video (grid frames); an error if none are.
-fn within(index: &VideoIndex, frames: Range<FrameIndex>) -> Result<Range<FrameIndex>> {
+pub(crate) fn within(index: &VideoIndex, frames: Range<FrameIndex>) -> Result<Range<FrameIndex>> {
     let frames = frames.start.max(0)..frames.end.min(index.frame_count());
     if frames.is_empty() {
         bail!("no frames to render");
@@ -245,16 +245,17 @@ fn within(index: &VideoIndex, frames: Range<FrameIndex>) -> Result<Range<FrameIn
 }
 
 /// Everything a frame of the encode needs: the encoder, its input and its log.
-struct Encoder {
-    child: Child,
-    input: BufWriter<std::process::ChildStdin>,
-    log: Arc<Mutex<Vec<String>>>,
-    part: PathBuf,
+pub(crate) struct Encoder {
+    pub(crate) child: Child,
+    pub(crate) input: BufWriter<std::process::ChildStdin>,
+    pub(crate) log: Arc<Mutex<Vec<String>>>,
+    /// The file being written, renamed to the output when complete (None: written in place, a picture sequence).
+    pub(crate) part: Option<PathBuf>,
 }
 
 impl Encoder {
     /// ffmpeg reading raw `pix` frames of `w` × `h` at the grid's rate from its stdin, encoding them with `codec` to `out`'s partial file (and `sound` along).
-    fn start(index: &VideoIndex, out: &Path, codec: Codec, pix: &str, tags: &[(String, String)], sound: Option<Sound>) -> Result<Self> {
+    pub(crate) fn start(index: &VideoIndex, out: &Path, codec: Codec, pix: &str, tags: &[(String, String)], sound: Option<Sound>) -> Result<Self> {
         let part = partial(out);
         let mut cmd = command(&crate::ffmpeg::tool("ffmpeg", "FFMPEG"));
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", pix])
@@ -284,31 +285,36 @@ impl Encoder {
         let mut child = cmd.spawn().context("starting ffmpeg to encode")?;
         let log = keep_log(&mut child);
         let input = BufWriter::with_capacity(16 << 20, child.stdin.take().context("ffmpeg stdin")?);
-        Ok(Self { child, input, log, part })
+        Ok(Self { child, input, log, part: Some(part) })
     }
 
-    fn write(&mut self, frame: &[u8]) -> Result<()> {
+    pub(crate) fn write(&mut self, frame: &[u8]) -> Result<()> {
         self.input.write_all(frame).map_err(|e| anyhow!("ffmpeg stopped taking frames ({e}): {}", last_lines(&self.log)))
     }
 
-    fn finish(self, out: &Path) -> Result<()> {
+    pub(crate) fn finish(self, out: &Path) -> Result<()> {
         let Encoder { mut child, input, log, part } = self;
         drop(input.into_inner().map_err(|e| anyhow!("ffmpeg stopped taking frames: {e}"))?);
         let status = child.wait()?;
         if !status.success() {
-            let _ = std::fs::remove_file(&part);
+            if let Some(part) = &part {
+                let _ = std::fs::remove_file(part);
+            }
             bail!("ffmpeg could not encode: {}", last_lines(&log));
         }
+        let Some(part) = part else { return Ok(()) };
         if out.exists() {
             std::fs::remove_file(out).with_context(|| format!("replacing {}", out.display()))?;
         }
         std::fs::rename(&part, out).with_context(|| format!("writing {}", out.display()))
     }
 
-    fn abandon(mut self) {
+    pub(crate) fn abandon(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.part);
+        if let Some(part) = &self.part {
+            let _ = std::fs::remove_file(part);
+        }
     }
 }
 
