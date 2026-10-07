@@ -115,11 +115,15 @@ pub struct Updater {
     state: Arc<Mutex<State>>,
     /// Look for a new version when trackertools starts (a user setting).
     pub check_on_start: bool,
+    /// A version the user chose to skip: no prompt for it (a user setting).
+    pub skipped: Option<String>,
+    /// A version whose prompt was closed with Later, this run.
+    pub later: Option<String>,
 }
 
 impl Default for Updater {
     fn default() -> Self {
-        Self { state: Arc::new(Mutex::new(State::Idle)), check_on_start: true }
+        Self { state: Arc::new(Mutex::new(State::Idle)), check_on_start: true, skipped: None, later: None }
     }
 }
 
@@ -134,6 +138,19 @@ impl Updater {
 
     fn set(&self, s: State) {
         *self.state.lock().expect("updater state") = s;
+    }
+
+    /// A new version this copy can install, if one was found.
+    pub fn available(&self) -> Option<Release> {
+        match self.state() {
+            State::Available(r) if installable() && r.download.is_some() => Some(r),
+            _ => None,
+        }
+    }
+
+    /// [`available`](Self::available), unless the user skipped that version: what the dot on the Settings tab shows.
+    pub fn news(&self) -> Option<Release> {
+        self.available().filter(|r| self.skipped.as_deref() != Some(r.version.as_str()))
     }
 
     pub fn busy(&self) -> bool {
@@ -469,6 +486,74 @@ pub fn drive(ctx: &egui::Context, world: &mut World) {
     }
 }
 
+/// GitHub's generated release notes as plain lines: no headings or the
+/// "Full Changelog" link, bullets as bullets, and no "by @someone in <link>"
+/// after each change.
+pub fn plain_notes(notes: &str) -> String {
+    notes
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("**Full Changelog**"))
+        .map(|l| {
+            let l = l.strip_prefix("* ").or_else(|| l.strip_prefix("- ")).map_or_else(|| l.to_string(), |rest| format!("\u{2022} {rest}"));
+            match l.rfind(" by @") {
+                Some(i) if l[i..].contains(" in http") => l[..i].to_string(),
+                _ => l,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// When a new version is found (at start, or by Check for updates): a
+/// window asks once, as most programs do, with what's new. Update and
+/// restart, Later (until the next start; the dot on the Settings tab and the
+/// top bar's button stay), or Skip this version (no more asking for it).
+pub fn prompt(ctx: &egui::Context, world: &mut World) {
+    let up = world.resource::<Updater>().clone();
+    let Some(release) = up.available() else { return };
+    if up.skipped.as_deref() == Some(release.version.as_str()) || up.later.as_deref() == Some(release.version.as_str()) {
+        return;
+    }
+    let mut answer = None;
+    egui::Window::new("A new version of trackertools")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(egui::RichText::new(format!("trackertools {} is out. You have {}.", release.version, version())).strong());
+            ui.label("Updating saves your work, closes trackertools and opens the new version. It takes about a minute.");
+            if !release.notes.is_empty() {
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("What's new").default_open(true).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        ui.label(plain_notes(&release.notes));
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(egui::RichText::new("Update and restart").strong()).clicked() {
+                    answer = Some(0);
+                }
+                if ui.button("Later").on_hover_text("Ask again when trackertools starts. The Settings tab and the top bar keep a way to update.").clicked() {
+                    answer = Some(1);
+                }
+                if ui.button("Skip this version").on_hover_text("Don't ask about this version again. You can still update from Settings, Updates.").clicked() {
+                    answer = Some(2);
+                }
+            });
+        });
+    let mut up = world.resource_mut::<Updater>();
+    match answer {
+        Some(0) => up.update(release),
+        Some(1) => up.later = Some(release.version),
+        Some(2) => up.skipped = Some(release.version),
+        _ => {}
+    }
+}
+
 /// After the app saved and is closing: start the new version, if one was installed.
 pub fn restart_if_updated(world: &World) {
     if let Some(exe) = &world.resource::<RestartWith>().0 {
@@ -602,5 +687,11 @@ mod tests {
         assert_eq!(protocols("HTTPS://github.com/x").unwrap(), ["--proto", "=https", "--proto-redir", "=https"], "redirects stay on https");
         assert!(protocols("http://github.com/x").is_err());
         assert!(protocols("ftp://x/y").is_err());
+    }
+
+    #[test]
+    fn release_notes_read_as_plain_lines() {
+        let notes = "## What's Changed\n* Several projects on one video by @euvinkeel in https://github.com/x/y/pull/17\n* Sketch colours\n\n**Full Changelog**: https://github.com/x/y/compare/v0.2.0...v0.2.1";
+        assert_eq!(plain_notes(notes), "\u{2022} Several projects on one video\n\u{2022} Sketch colours");
     }
 }

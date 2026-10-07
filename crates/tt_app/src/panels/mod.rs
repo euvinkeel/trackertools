@@ -35,6 +35,7 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
         });
     });
     export::ui(ui.ctx(), world);
+    crate::update::prompt(ui.ctx(), world);
     crate::setup::window(ui.ctx(), &mut world.resource_mut::<crate::setup::Doctor>());
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
@@ -393,6 +394,15 @@ impl egui_tiles::Behavior<Pane> for Behavior<'_> {
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
+        // A new version out: a red dot on the Settings tab (its Updates section has it).
+        if *pane == Pane::Settings && self.world.resource::<crate::update::Updater>().news().is_some() {
+            let mut job = egui::text::LayoutJob::default();
+            // (The tab's own colour for its name, PLACEHOLDER; the dot red, centred on the line.)
+            let font = egui::TextFormat { font_id: egui::FontId::proportional(14.0), color: egui::Color32::PLACEHOLDER, valign: egui::Align::Center, ..Default::default() };
+            job.append(pane.title(), 0.0, font.clone());
+            job.append("\u{2022}", 3.0, egui::TextFormat { color: style::LOST, font_id: egui::FontId::proportional(22.0), valign: egui::Align::Max, ..font });
+            return job.into();
+        }
         pane.title().into()
     }
 
