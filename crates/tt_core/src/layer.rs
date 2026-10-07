@@ -477,17 +477,23 @@ pub fn handle_at(world: &World, e: Entity, f: FrameIndex, src: [f64; 2], grab: f
     inside.then_some(Handle::Body)
 }
 
+/// How far (screen points) a press reaches a layer's corner handle, and a subject's point.
+pub const HANDLE_REACH: f64 = 8.0;
+pub const POINT_REACH: f64 = 12.0;
+
 /// Which layer a Select-tool press at `src` (source px) on frame `f` takes,
 /// and by what, if any: the selected layer when the press is on it or its
-/// handles; none when the selected subject's point is under it (within
-/// `grab` px: the subject's drag takes it); else the top layer under it.
-pub fn press_on_layer(world: &mut World, f: FrameIndex, src: [f64; 2], grab: f64) -> Option<(Entity, Handle)> {
+/// handles; none when the selected subject's point is under it (the
+/// subject's drag takes it); else the top layer under it. `px`: source
+/// pixels per screen point (the reaches are in points). The subject's drag
+/// asks the same question, so one press never moves both.
+pub fn press_on_layer(world: &mut World, f: FrameIndex, src: [f64; 2], px: f64) -> Option<(Entity, Handle)> {
     if let Some(p) = world.resource::<Selection>().primary() {
         if is_layer(world, p) {
-            if let Some(h) = handle_at(world, p, f, src, grab) {
+            if let Some(h) = handle_at(world, p, f, src, HANDLE_REACH * px) {
                 return Some((p, h));
             }
-        } else if crate::subject::pick_subject(world, f, src, grab) == Some(p) {
+        } else if crate::subject::pick_subject(world, f, src, POINT_REACH * px) == Some(p) {
             return None;
         }
     }
@@ -504,6 +510,8 @@ pub fn attach(world: &mut World, target: Entity, mut params: LayerParams, frame:
         params.scale = Animated::fixed((h / params.media_size[1].max(1.0) as f64) as f32);
     }
     params.follow_rotation = has_angle(world, target);
+    // On top of every layer there is.
+    params.depth = layers(world).iter().filter_map(|l| world.get::<LayerParams>(*l)).map(|p| p.depth + 1).max().unwrap_or(0);
     let name = std::path::Path::new(&params.media).file_stem().map_or("Layer".to_string(), |s| s.to_string_lossy().into_owned());
     let mut made = None;
     edit(world, &format!("Attach {name}"), |tx| {
@@ -658,8 +666,8 @@ enum Doing {
     Move,
     /// About the anchor: the press's distance from it then.
     Scale(f64),
-    /// About the anchor: the press's direction from it then (radians).
-    Rotate(f64),
+    /// About the anchor: the pointer's direction from it last time (radians), and how far it has turned since the press.
+    Rotate(f64, f64),
     Anchor,
 }
 
@@ -702,8 +710,7 @@ fn drag_layer(world: &mut World) {
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
     {
         let src = map.to_source(at);
-        let grab = (8.0 / scale) * map.a;
-        if let Some((e, handle)) = press_on_layer(world, frame, src, grab)
+        if let Some((e, handle)) = press_on_layer(world, frame, src, map.a / scale)
             && let (Some(q), Some(pl)) = (world.get::<LayerParams>(e).cloned(), placed_at(world, e, frame))
         {
             let selected = world.resource::<Selection>().primary() == Some(e);
@@ -711,7 +718,7 @@ fn drag_layer(world: &mut World) {
                 Handle::Body if alt && selected => Doing::Anchor,
                 Handle::Body => Doing::Move,
                 Handle::Corner(_) => Doing::Scale((src[0] - pl.at[0]).hypot(src[1] - pl.at[1]).max(1e-6)),
-                Handle::Rotate(_) => Doing::Rotate((src[1] - pl.at[1]).atan2(src[0] - pl.at[0])),
+                Handle::Rotate(_) => Doing::Rotate((src[1] - pl.at[1]).atan2(src[0] - pl.at[0]), 0.0),
             };
             world.resource_mut::<LayerDrag>().0 = Some(Grab {
                 layer: e,
@@ -740,7 +747,7 @@ fn drag_layer(world: &mut World) {
                 let what = match g.doing {
                     Doing::Move => "Move",
                     Doing::Scale(_) => "Scale",
-                    Doing::Rotate(_) => "Turn",
+                    Doing::Rotate(..) => "Turn",
                     Doing::Anchor => "Move the anchor of",
                 };
                 world.resource_mut::<History>().begin(format!("{what} {name}"));
@@ -754,8 +761,19 @@ fn drag_layer(world: &mut World) {
             };
             let key = world.resource::<AutoKey>().0;
             let f = g.frame;
+            // Turning: the step since last time (the shorter way), added up, so it keeps
+            // turning past half a turn rather than jumping back a whole one.
+            let mut doing = g.doing;
+            if let Doing::Rotate(last, total) = doing {
+                let a = (src[1] - g.placed.at[1]).atan2(src[0] - g.placed.at[0]);
+                let step = (a - last + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+                doing = Doing::Rotate(a, total + step);
+                if let Some(d) = world.resource_mut::<LayerDrag>().0.as_mut() {
+                    d.doing = doing;
+                }
+            }
             let size = world.get::<LayerParams>(e).map_or([1.0, 1.0], |q| q.media_size);
-            set_params(world, e, "Edit", |q| match g.doing {
+            set_params(world, e, "Edit", |q| match doing {
                 Doing::Move => {
                     let [lx, ly] = local(dx, dy);
                     q.offset_x.set(f, g.offset[0] + lx as f32, key);
@@ -765,12 +783,8 @@ fn drag_layer(world: &mut World) {
                     let d = (src[0] - g.placed.at[0]).hypot(src[1] - g.placed.at[1]);
                     q.scale.set(f, (g.scale as f64 * d / d0).max(1e-4) as f32, key);
                 }
-                Doing::Rotate(a0) => {
-                    let a = (src[1] - g.placed.at[1]).atan2(src[0] - g.placed.at[0]);
-                    let turn = (a - a0).to_degrees();
-                    // (Unwrapped: past ±180° keeps turning the same way.)
-                    let turn = turn - 360.0 * ((turn + 180.0) / 360.0).floor();
-                    q.rotation.set(f, g.rotation + turn as f32, key);
+                Doing::Rotate(_, total) => {
+                    q.rotation.set(f, g.rotation + total.to_degrees() as f32, key);
                 }
                 Doing::Anchor => {
                     // The picture's point under the pointer (as it was) becomes the anchor; it stays put.

@@ -361,7 +361,7 @@ fn drag_subject(world: &mut World) {
         let src = map.to_source(at);
         let grab = (12.0 / scale) * map.a;
         // (A layer's picture over the point takes the press, unless this subject is selected.)
-        if crate::layer::press_on_layer(world, frame, src, grab).is_none()
+        if crate::layer::press_on_layer(world, frame, src, map.a / scale).is_none()
             && let Some(e) = pick_subject(world, frame, src, grab)
             && let Some(v) = value_at(world, e, frame)
         {

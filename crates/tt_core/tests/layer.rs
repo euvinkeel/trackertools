@@ -212,3 +212,62 @@ fn layers_restack_and_smooth() {
     let x = |f: i64| placed_at(&d.core.world, a, f).expect("placed").at[0];
     assert!((x(300) - x(299) - 2.0).abs() < 1e-3, "a steady motion stays the same: {}", x(300) - x(299));
 }
+
+/// Fixes from review: a trim re-times a clip; one press never moves both a
+/// selected subject and the layer over it; a new layer goes on top after a
+/// restack; turning keeps going past half a turn.
+#[test]
+fn trims_presses_new_layers_and_long_turns() {
+    use tt_core::layer::{Restack, layers, restack, set_params};
+    let mut d = Driver::new();
+    let (s, l) = layered(&mut d);
+    // A 2 s clip at 10 fps, its lane trimmed to start on frame 150: its first frame shows there.
+    set_params(&mut d.core.world, l, "clip", |p| {
+        p.clip_duration = 2.0;
+        p.clip_fps = 10.0;
+    });
+    d.frames(2, |_| [0.0, 0.0], UP);
+    tt_core::span::set_span(&mut d.core.world, l, tt_core::span::Span { first: Some(150), last: None });
+    d.frames(2, |_| [0.0, 0.0], UP);
+    assert_eq!(placed_at(&d.core.world, l, 150).expect("placed").clip_time, 0.0, "the clip starts where the lane does");
+    tt_core::span::set_span(&mut d.core.world, l, tt_core::span::Span::default());
+    d.frames(2, |_| [0.0, 0.0], UP);
+
+    // The subject selected, the layer over its point: a press 10 px from the point moves the subject only.
+    d.core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    d.core.world.resource_mut::<Transport>().seek(100);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    d.core.world.resource_mut::<Selection>().select_only(s);
+    let before = placed_at(&d.core.world, l, 100).expect("placed").at;
+    let offset = d.core.world.get::<LayerParams>(l).unwrap().offset_x.clone();
+    drag(&mut d, [before[0] + 10.0, before[1]], [before[0] + 40.0, before[1]]);
+    assert_eq!(d.core.world.get::<LayerParams>(l).unwrap().offset_x, offset, "the layer's own offset didn't change");
+    assert_eq!(d.core.world.resource::<History>().undo_label(), Some("Move Subject 1"), "one drag, the subject's");
+
+    // After a restack, a new layer goes on top.
+    let b = attach(&mut d.core.world, s, LayerParams { media: "b.png".into(), media_size: [10.0, 10.0], ..LayerParams::default() }, 100).expect("b");
+    restack(&mut d.core.world, b, Restack::Back);
+    let c = attach(&mut d.core.world, s, LayerParams { media: "c.png".into(), media_size: [10.0, 10.0], ..LayerParams::default() }, 100).expect("c");
+    assert_eq!(layers(&mut d.core.world).last(), Some(&c), "on top");
+
+    // Turning the selected layer three quarters round, the long way: 270°, not −90°.
+    d.core.world.resource_mut::<Selection>().select_only(c);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let pl = placed_at(&d.core.world, c, 100).expect("placed");
+    let corner = pl.corners([10.0, 10.0])[2];
+    let (r0, a0) = ((corner[0] - pl.at[0]).hypot(corner[1] - pl.at[1]) + 12.0, (corner[1] - pl.at[1]).atan2(corner[0] - pl.at[0]));
+    let centre = pl.at;
+    let t0 = d.now;
+    let path = move |t: f64| {
+        let u = ((t - t0 - 0.02) / 0.3).clamp(0.0, 1.0);
+        let a = a0 + u * 1.5 * std::f64::consts::PI;
+        [centre[0] + r0 * a.cos(), centre[1] + r0 * a.sin()]
+    };
+    d.frame(path, PRESS);
+    // (Past the path's end: a test frame is a few ms.)
+    d.frames(80, path, HOLD);
+    d.frame(path, UP);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let turned = d.core.world.get::<LayerParams>(c).unwrap().rotation.at(100);
+    assert!((turned - 270.0).abs() < 1.0, "three quarters, the way it went: {turned}");
+}

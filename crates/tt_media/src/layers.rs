@@ -371,6 +371,8 @@ pub fn render_alpha(index: &VideoIndex, out: &Path, format: AlphaFormat, frames:
         AlphaFormat::PngSequence => {
             std::fs::create_dir_all(out).with_context(|| format!("making {}", out.display()))?;
             let stem = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "layers".into());
+            // An earlier export's pictures of the same name go (else a shorter one leaves some behind).
+            remove_pictures(out, &stem);
             let pattern = out.join(format!("{stem}_%06d.png"));
             cmd.args(["-c:v", "png", "-pix_fmt", "rgba", "-start_number", &frames.start.to_string(), "-f", "image2"]).arg(&pattern);
             (out.to_path_buf(), None)
@@ -392,11 +394,30 @@ pub fn render_alpha(index: &VideoIndex, out: &Path, format: AlphaFormat, frames:
         }
         Ok(())
     })();
-    match result {
+    let sequence = format == AlphaFormat::PngSequence;
+    let stem = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "layers".into());
+    let made = match result {
         Ok(()) => encoder.finish(&target),
         Err(e) => {
             encoder.abandon();
             Err(e)
+        }
+    };
+    // A sequence cut short or failed: its pictures go too (nothing half saved).
+    if made.is_err() && sequence {
+        remove_pictures(out, &stem);
+    }
+    made
+}
+
+/// The pictures `<stem>_<number>.png` in `dir` (a sequence this module wrote), removed.
+fn remove_pictures(dir: &Path, stem: &str) {
+    let prefix = format!("{stem}_");
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let numbered = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".png")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if numbered {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

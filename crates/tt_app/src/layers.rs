@@ -3,8 +3,9 @@
 //!
 //! - **The preview** decodes each media file once, in the background, at
 //!   most [`PREVIEW_SIDE`] on its longer side and [`PREVIEW_BYTES`] for all
-//!   its frames (an export reads it again at its own size). One texture per
-//!   file, updated when the frame shown changes.
+//!   its frames (an export reads it again at its own size). A texture per
+//!   frame shown (two layers on one file can show different frames at once),
+//!   the most recently shown kept, up to [`TEXTURES`] a file.
 //! - **On the video**, between the picture and the editor's marks: each
 //!   layer where its output puts it on the shown frame, through the shown
 //!   view, at its opacity; the selected one outlined, with its anchor. A
@@ -40,9 +41,13 @@ enum Load {
     Failed(String),
 }
 
+/// Textures kept per file (its frames shown most recently).
+const TEXTURES: usize = 48;
+
 struct Entry {
     load: Arc<Mutex<Load>>,
-    texture: Option<(TextureHandle, usize)>,
+    /// (frame index, its texture), most recently shown last.
+    textures: Vec<(usize, TextureHandle)>,
 }
 
 /// The decoded media of the open project's layers (session only).
@@ -64,7 +69,7 @@ impl LayerMedia {
                     Err(e) => Load::Failed(format!("{e:#}")),
                 };
             });
-            Entry { load, texture: None }
+            Entry { load, textures: Vec::new() }
         });
         match &*entry.load.lock().expect("media") {
             Load::Loading => Ok(None),
@@ -78,20 +83,23 @@ impl LayerMedia {
         let Some(frames) = self.get(path)? else { return Ok(None) };
         let i = frames.index_at(t);
         let entry = self.files.get_mut(path).expect("loaded");
-        let image = || egui::ColorImage::from_rgba_unmultiplied([frames.width as usize, frames.height as usize], &frames.frames[i]);
-        match &mut entry.texture {
-            Some((tex, shown)) if *shown == i => Ok(Some(tex.clone())),
-            Some((tex, shown)) => {
-                tex.set(image(), egui::TextureOptions::LINEAR);
-                *shown = i;
-                Ok(Some(tex.clone()))
-            }
-            None => {
-                let tex = ctx.load_texture(format!("layer:{path}"), image(), egui::TextureOptions::LINEAR);
-                entry.texture = Some((tex.clone(), i));
-                Ok(Some(tex))
-            }
+        if let Some(k) = entry.textures.iter().position(|(j, _)| *j == i) {
+            let hit = entry.textures.remove(k);
+            let tex = hit.1.clone();
+            entry.textures.push(hit);
+            return Ok(Some(tex));
         }
+        let image = egui::ColorImage::from_rgba_unmultiplied([frames.width as usize, frames.height as usize], &frames.frames[i]);
+        let tex = if entry.textures.len() >= TEXTURES {
+            // The least recently shown, reused.
+            let (_, mut old) = entry.textures.remove(0);
+            old.set(image, egui::TextureOptions::LINEAR);
+            old
+        } else {
+            ctx.load_texture(format!("layer:{path}:{i}"), image, egui::TextureOptions::LINEAR)
+        };
+        entry.textures.push((i, tex.clone()));
+        Ok(Some(tex))
     }
 
     /// Forget `path` (loaded again next time: a file chosen anew with Locate).
@@ -166,7 +174,7 @@ fn hover_cursor(painter: &Painter, map: &ViewportMapping, world: &World, e: Enti
     let ctx = painter.ctx();
     let Some(pos) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| map.panel.contains(*p)) else { return };
     let src = shown.to_source(map.to_canvas(pos));
-    let grab = 8.0 / map.points_per_canvas() * shown.a;
+    let grab = tt_core::layer::HANDLE_REACH / map.points_per_canvas() * shown.a;
     let alt = ctx.input(|i| i.modifiers.alt);
     let icon = match tt_core::layer::handle_at(world, e, frame, src, grab) {
         Some(Handle::Corner(i)) => {

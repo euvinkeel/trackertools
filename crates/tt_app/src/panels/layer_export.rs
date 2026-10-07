@@ -293,6 +293,8 @@ type Gathered = Vec<(String, [f32; 2], tt_core::layer::BlendMode, Placements)>;
 fn gather(world: &World, layers: &[Entity], frames: &Range<FrameIndex>) -> Gathered {
     layers
         .iter()
+        // (Deleted since the window opened: not exported.)
+        .filter(|e| world.get::<bevy_ecs::entity_disabling::Disabled>(**e).is_none())
         .filter_map(|e| {
             let p = world.get::<LayerParams>(*e)?;
             Some((p.media.clone(), p.media_size, p.blend, frames.clone().map(|g| placed_at(world, *e, g)).collect()))
@@ -448,16 +450,19 @@ pub fn ae_keyframes(world: &World, e: Entity, frames: Range<FrameIndex>) -> Opti
     let (w, h) = index.as_ref().map_or((1920, 1080), |i| (i.width, i.height));
     let fps = world.resource::<tt_core::transport::Transport>().fps.as_f64();
     let first = frames.start;
-    // (frame in the comp, position, angle in degrees, scale %, opacity %)
-    type AeKey = (FrameIndex, [f64; 2], Option<f64>, Option<f64>, Option<f64>);
+    // (frame in the comp, position, angle in degrees, scale %, opacity %, anchor point in the layer's px)
+    type AeKey = (FrameIndex, [f64; 2], Option<f64>, Option<f64>, Option<f64>, Option<[f64; 2]>);
     let mut keys: Vec<AeKey> = Vec::new();
+    let size = world.get::<LayerParams>(e).map(|p| p.media_size);
     for g in frames {
         if tt_core::layer::is_layer(world, e) {
             if let Some(pl) = placed_at(world, e, g) {
-                keys.push((g - first, pl.at, Some(pl.angle.to_degrees()), Some(pl.scale[0] * 100.0), Some(pl.opacity * 100.0)));
+                // After Effects' Position is where its Anchor Point is: the same point as ours.
+                let anchor = size.map(|s| [pl.anchor[0] * s[0] as f64, pl.anchor[1] * s[1] as f64]);
+                keys.push((g - first, pl.at, Some(pl.angle.to_degrees()), Some(pl.scale[0] * 100.0), Some(pl.opacity * 100.0), anchor));
             }
         } else if let Some((b, angle, _)) = tracked_at(world, e, g) {
-            keys.push((g - first, [b[0], b[1]], angle.map(f64::to_degrees), None, None));
+            keys.push((g - first, [b[0], b[1]], angle.map(f64::to_degrees), None, None, None));
         }
     }
     if keys.is_empty() {
@@ -465,6 +470,14 @@ pub fn ae_keyframes(world: &World, e: Entity, frames: Range<FrameIndex>) -> Opti
     }
     let mut t = String::from("Adobe After Effects 8.0 Keyframe Data\r\n\r\n");
     t += &format!("\tUnits Per Second\t{}\r\n\tSource Width\t{w}\r\n\tSource Height\t{h}\r\n\tSource Pixel Aspect Ratio\t1\r\n\tComp Pixel Aspect Ratio\t1\r\n\r\n", (fps * 1000.0).round() / 1000.0);
+    if keys.iter().any(|k| k.5.is_some()) {
+        t += "Transform\tAnchor Point\r\n\tFrame\tX pixels\tY pixels\tZ pixels\t\r\n";
+        for (f, .., a) in &keys {
+            let a = a.unwrap_or([0.0, 0.0]);
+            t += &format!("\t{f}\t{:.3}\t{:.3}\t0\t\r\n", a[0], a[1]);
+        }
+        t += "\r\n";
+    }
     t += "Transform\tPosition\r\n\tFrame\tX pixels\tY pixels\tZ pixels\t\r\n";
     for (f, p, ..) in &keys {
         t += &format!("\t{f}\t{:.3}\t{:.3}\t0\t\r\n", p[0], p[1]);
@@ -477,14 +490,14 @@ pub fn ae_keyframes(world: &World, e: Entity, frames: Range<FrameIndex>) -> Opti
     }
     if keys.iter().any(|k| k.3.is_some()) {
         t += "\r\nTransform\tScale\r\n\tFrame\tX percent\tY percent\tZ percent\t\r\n";
-        for (f, _, _, s, _) in &keys {
+        for (f, _, _, s, ..) in &keys {
             let s = s.unwrap_or(100.0);
             t += &format!("\t{f}\t{s:.3}\t{s:.3}\t100\t\r\n");
         }
     }
     if keys.iter().any(|k| k.4.is_some()) {
         t += "\r\nTransform\tOpacity\r\n\tFrame\tpercent\t\r\n";
-        for (f, .., o) in &keys {
+        for (f, _, _, _, o, _) in &keys {
             t += &format!("\t{f}\t{:.2}\t\r\n", o.unwrap_or(100.0));
         }
     }
@@ -563,6 +576,7 @@ mod tests {
         let ae = ae_keyframes(w, l, 2..10).expect("keys");
         assert!(ae.starts_with("Adobe After Effects 8.0 Keyframe Data"));
         assert!(ae.contains("Transform\tPosition") && ae.contains("Transform\tScale") && ae.contains("Transform\tOpacity"));
+        assert!(ae.contains("Transform\tAnchor Point") && ae.contains("\t0\t5.000\t5.000\t0\t"), "its anchor point, the middle of its 10 px picture");
         assert!(ae.contains("\t0\t107.000\t50.000\t0\t"), "frame 2 of the video is the comp's 0:\n{ae}");
         assert!(ae.trim_end().ends_with("End of Keyframe Data"));
         let tracked = ae_keyframes(w, t, 0..10).expect("keys");

@@ -167,7 +167,7 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         let specs: [(f64, &str, f64, Option<std::ops::RangeInclusive<f64>>); 7] = [
             (0.5, " px", 1.0, None),
             (0.5, " px", 1.0, None),
-            (0.005, "\u{d7}", 1.0, Some(0.0..=100.0)),
+            (0.005, "\u{d7}", 1.0, Some(0.0..=f64::INFINITY)),
             (0.2, "\u{b0}", 1.0, None),
             (0.005, "", 1.0, Some(0.0..=1.0)),
             (0.002, "", 1.0, None),
@@ -187,9 +187,10 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             let (speed, suffix, _, range) = &specs[i];
             ui.label(label).on_hover_text(tips[i]);
             let mut v = a.at(here) as f64;
+            // (A value outside the range, set on the video, stays as it is until edited here.)
             let mut drag = egui::DragValue::new(&mut v).speed(*speed).suffix(*suffix).max_decimals(3);
             if let Some(r) = range.clone() {
-                drag = drag.range(r);
+                drag = drag.range(r).clamp_existing_to_range(false);
             }
             let r = ui.add(drag);
             started |= r.drag_started();
