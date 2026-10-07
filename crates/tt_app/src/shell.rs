@@ -107,7 +107,8 @@ impl Shell {
             .add_module(crate::setup::SetupModule)
             .add_module(SessionModule)
             .add_module(crate::project::ProjectModule)
-            .add_module(crate::layers::LayersModule);
+            .add_module(crate::layers::LayersModule)
+            .add_module(crate::panels::layer_export::LayerExportModule);
         let mut core = app.build();
         crate::update::on_start(&core.world);
         {

@@ -118,7 +118,7 @@ impl Scene {
                     self.after = Some(0);
                     // `=layer`: the files in TT_SCENE_MEDIA (`;` between them) attached, the
                     // first to the subject, the next to the tracker selected; the first selected.
-                    if self.mode == "layer" {
+                    if self.mode.starts_with("layer") {
                         let loose = world.resource::<tt_core::selection::Selection>().primary();
                         let media = std::env::var("TT_SCENE_MEDIA").unwrap_or_default();
                         let targets = [self.subject, loose];
@@ -131,6 +131,10 @@ impl Scene {
                         }
                         if let Some(l) = first {
                             world.resource_mut::<tt_core::selection::Selection>().select_only(l);
+                        }
+                        // `=layer-export`: and the Export layers window.
+                        if self.mode == "layer-export" {
+                            crate::panels::layer_export::open(world);
                         }
                     }
                     // `=sketch`: a second sketch (its own colour), the first selected (its moving
