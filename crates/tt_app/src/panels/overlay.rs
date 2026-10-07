@@ -122,6 +122,23 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         }
     }
 
+    // A drag holding the views still: where it began, and a line saying the view catches up after.
+    if let Some(from) = world.resource::<tt_core::view::ViewsHeld>().0
+        && view.is_some()
+    {
+        if let Some(src) = from {
+            let p = map.to_screen(shown_from_source(&space(frame), src));
+            painter.circle_stroke(p, 6.0, Stroke::new(1.5, Color32::from_white_alpha(160)));
+            painter.circle_stroke(p, 7.5, Stroke::new(1.0, Color32::from_black_alpha(160)));
+            if let Some(h) = painter.ctx().input(|i| i.pointer.hover_pos()) {
+                painter.add(Shape::dashed_line(&[p, h], Stroke::new(1.0, Color32::from_white_alpha(120)), 4.0, 4.0));
+            }
+        }
+        let galley = painter.layout_no_wrap("The view holds still while you drag. It catches up when you let go.".into(), FontId::proportional(13.0), style::TEXT);
+        let r = Align2::CENTER_TOP.anchor_size(map.panel.center_top() + Vec2::new(0.0, 40.0), galley.size()).expand(6.0);
+        painter.rect_filled(r, 4.0, Color32::from_black_alpha(190));
+        painter.galley(r.min + Vec2::splat(6.0), galley, style::TEXT);
+    }
     // Recording: a red frame round the video, so it is never in doubt.
     if live.is_some() {
         painter.rect_stroke(map.panel.shrink(1.5), 0.0, Stroke::new(3.0, RECORDING), StrokeKind::Inside);
@@ -226,6 +243,12 @@ fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             painter.text(p + Vec2::new(r + 4.0, -r - 2.0), Align2::LEFT_BOTTOM, name.as_str(), FontId::proportional(12.0), color);
         }
     }
+}
+
+/// A source point in the shown space's pixels, through `m`.
+fn shown_from_source(m: &SpaceMap, p: [f64; 2]) -> [f64; 2] {
+    let b = m.box_from_source([p[0], p[1], p[0], p[1], p[0], p[1]]);
+    [b[0], b[1]]
 }
 
 /// SpringFocuses: a viewfinder's corners round its box and its point, its

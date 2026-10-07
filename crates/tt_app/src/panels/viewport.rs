@@ -342,6 +342,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         None => format!("frame {shown_grid} · decoding…"),
     };
     hud(&painter, rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &state, if exact { style::TEXT } else { Color32::from_rgb(0xfb, 0xbf, 0x24) });
+    crate::layers::draw(&painter, &mapping, world, shown_grid, eased);
     super::overlay::dim_outside(&painter, &mapping, world, shown_grid, active_view, eased);
     super::overlay::draw(ui, &painter, &response, world, &mapping, shown_grid, active_view, eased);
     super::tracks::draw_tool(ui, &painter, &response, world, &mapping);

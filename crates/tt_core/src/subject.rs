@@ -341,6 +341,10 @@ pub fn remove_offset_key(world: &mut World, subject: Entity, frame: FrameIndex) 
 #[derive(Resource, Debug, Default)]
 struct SubjectDrag(Option<(Entity, [f64; 2], FrameIndex, bool)>);
 
+/// Where the dragged subject was when its drag began (source px).
+#[derive(Resource, Debug, Default)]
+struct SubjectDragFrom(Option<[f64; 2]>);
+
 /// `Set::Tools`: in the Select tool, a press on a subject's point and a drag
 /// moves it: its offset is keyed on the shown frame (one undo step per drag).
 /// A press that doesn't move is a click, which selects it (tool.rs).
@@ -360,13 +364,20 @@ fn drag_subject(world: &mut World) {
     {
         let src = map.to_source(at);
         let grab = (12.0 / scale) * map.a;
-        if let Some(e) = pick_subject(world, frame, src, grab)
+        // (A layer's picture over the point takes the press, unless this subject is selected.)
+        if crate::layer::press_on_layer(world, frame, src, map.a / scale).is_none()
+            && let Some(e) = pick_subject(world, frame, src, grab)
             && let Some(v) = value_at(world, e, frame)
         {
             world.resource_mut::<SubjectDrag>().0 = Some((e, [v[0] - src[0], v[1] - src[1]], frame, false));
+            world.resource_mut::<SubjectDragFrom>().0 = Some([v[0], v[1]]);
         }
     }
     let Some((e, hold, f, moved)) = world.resource::<SubjectDrag>().0 else { return };
+    // While it's held, the views hold still (view::HoldViews): one following the
+    // subject would otherwise move under the pointer, and the drag run away.
+    let start = world.resource::<SubjectDragFrom>().0;
+    crate::view::HoldViews::ask(world, start);
     let ended = p.released.is_some() || !p.down;
     if let Some(now) = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover) {
         let src = map.to_source(now);
@@ -397,6 +408,7 @@ pub struct SubjectModule;
 
 impl Module for SubjectModule {
     fn build(&self, app: &mut AppBuilder) {
+        app.declare::<SubjectDragFrom>(Class::Derived).init_resource::<SubjectDragFrom>();
         app.operator(SubjectKind)
             .operator_params::<Subject>()
             .register_type::<OffsetKey>()

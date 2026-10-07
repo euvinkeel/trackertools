@@ -485,6 +485,50 @@ fn apply_view_actions(world: &mut World) {
     }
 }
 
+/// A drag on the video asks every view to hold still while it lasts
+/// (`hold_views`): set by a tool on each frame it drags (the Draw tool's
+/// stroke, a subject's or a layer's drag), cleared once read. With
+/// `from`: where what's dragged was when the drag began (source px), shown
+/// as a mark while it holds.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct HoldViews {
+    pub asked: bool,
+    pub from: Option<[f64; 2]>,
+}
+
+impl HoldViews {
+    pub fn ask(world: &mut World, from: Option<[f64; 2]>) {
+        let mut h = world.resource_mut::<HoldViews>();
+        h.asked = true;
+        h.from = from.or(h.from);
+    }
+}
+
+/// Whether the views are holding still for a drag right now, and where it began (the overlay says so).
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct ViewsHeld(pub Option<Option<[f64; 2]>>);
+
+/// `Set::Intents`, after the tools: while a drag on the video goes on, every
+/// view waits to be recomputed (`op::Held`) and catches up when it ends. A
+/// view that follows what's being dragged (a subject dragged in its own
+/// view, a tracker's point drawn in its own) would otherwise move under the
+/// pointer on every frame, so the next position would land further out and
+/// the drag would run away.
+fn hold_views(world: &mut World) {
+    let ask = std::mem::take(&mut *world.resource_mut::<HoldViews>());
+    let held = if ask.asked {
+        let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
+        q.iter(world).filter(|(_, o)| o.kind == "frame").map(|(e, _)| e).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    world.resource_mut::<ViewsHeld>().0 = ask.asked.then_some(ask.from);
+    let mut h = world.resource_mut::<crate::op::Held>();
+    if h.0 != held {
+        h.0 = held;
+    }
+}
+
 /// A view that was deleted (or undone) hands the viewport to its nearest live ancestor.
 fn prune_active_view(world: &mut World) {
     let Some(v) = world.resource::<ActiveView>().0 else { return };
@@ -519,7 +563,11 @@ impl Module for ViewModule {
             .init_resource::<ViewDefaults>()
             .operator(FrameKind)
             .operator_params::<FrameParams>()
-            .add_systems(apply_view_actions.in_set(Set::Intents))
+            .declare::<HoldViews>(Class::Derived)
+            .declare::<ViewsHeld>(Class::Derived)
+            .init_resource::<HoldViews>()
+            .init_resource::<ViewsHeld>()
+            .add_systems((apply_view_actions, hold_views).in_set(Set::Intents))
             .add_systems(prune_active_view.in_set(Set::Prepare));
     }
 }

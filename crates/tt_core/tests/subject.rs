@@ -146,3 +146,46 @@ fn tab_follows_a_subject() {
         assert!((centre[0] - want[0]).abs() < 1.0 && (centre[1] - want[1]).abs() < 1.0, "frame {f}: centre {centre:?}, subject {want:?}");
     }
 }
+
+/// Dragging a subject inside its own view (the view centred on it): the
+/// view holds still while the drag lasts, so the subject moves exactly as
+/// far as the pointer did (it used to run away: each step moved the view
+/// under the pointer), and the view catches up after.
+#[test]
+fn dragging_a_subject_in_its_own_view_does_not_run_away() {
+    use tt_core::input::Action;
+    use tt_core::selection::Selection;
+    use tt_core::view::{ActiveView, ViewsHeld, map_at};
+    let mut d = Driver::new();
+    let (a, b) = two_points(&mut d);
+    let s = make_subject(&mut d.core.world, &[a, b], 120).expect("a subject");
+    d.core.world.resource_mut::<Transport>().seek(150);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    d.core.world.resource_mut::<Selection>().select_only(s);
+    d.frame(|_| [0.0, 0.0], common::Input { action: Some(Action::EnterView), ..UP });
+    d.frames(3, |_| [0.0, 0.0], UP);
+    let view = d.core.world.resource::<ActiveView>().0.expect("in its view");
+    d.core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    d.core.world.resource_mut::<Selection>().select_only(s);
+    let before = value_at(&d.core.world, s, 150).expect("a value");
+    // Where the subject is in the view's pixels: press there, drag 30 px right, slowly.
+    let m = map_at(&d.core.world, Some(view), 150);
+    let at = m.from_source([before[0], before[1]]);
+    let t0 = d.now;
+    let path = move |t: f64| {
+        let u = ((t - t0 - 0.02) / 0.2).clamp(0.0, 1.0);
+        [at[0] + 30.0 * u, at[1]]
+    };
+    d.frame(path, PRESS);
+    d.frames(60, path, HOLD);
+    assert!(d.core.world.resource::<ViewsHeld>().0.is_some(), "the views hold while it drags");
+    d.frame(path, UP);
+    d.frames(3, |_| [0.0, 0.0], UP);
+    let after = value_at(&d.core.world, s, 150).expect("a value");
+    let moved = (after[0] - before[0]) / m.a;
+    assert!((moved - 30.0).abs() < 0.5, "as far as the pointer: {moved} view px");
+    assert!(d.core.world.resource::<ViewsHeld>().0.is_none(), "and they let go after");
+    let m2 = map_at(&d.core.world, Some(view), 150);
+    let centre = m2.to_source([m2.canvas[0] / 2.0, m2.canvas[1] / 2.0]);
+    assert!((centre[0] - after[0]).abs() < 1.0, "the view caught up: centred on it again");
+}

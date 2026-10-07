@@ -22,6 +22,18 @@ Protocol, little-endian, over stdin / stdout:
   `p` is visibility × confidence, 0–1); `{"done": true}` at the end;
   `{"error": ".."}` if it fails.
 
+**Shared** (`--shared`): one worker, one model on the graphics card, for
+several trackers at once (the app's CoTracker jobs all go through one: each
+its own *stream*, numbered by the app). Every message on stdin starts with
+a tag and the stream's number (u32):
+- `O` + id + the JSON header line above: a stream opens;
+- `F` + id + a frame; `E` + id: its frames end; `X` + id: drop it (its job
+  was cancelled: nothing more is sent about it).
+On stdout the same messages as above, each with `"s": id` (but `ready`,
+once, for all). The streams' windows run in turn, one window each round, so
+they all move on together; a stream that fails says so (`error` with its
+`s`) and the others go on. stdin closing ends the worker.
+
 Arguments: `--weights PATH` (CoTracker3 `scaled_online.pth`; default: the
 `TT_COTRACKER_WEIGHTS` environment variable, else torch hub's cache, where v1
 downloaded it) and `--device cpu|cuda|mps` (default: CUDA when available,
@@ -137,23 +149,35 @@ def read_frames(stdin, n: int, w: int, h: int):
     return out, False
 
 
-def run(eng: Engine, stdin, header: dict):
-    w, h = int(header["width"]), int(header["height"])
-    if (w, h) != (v1.MODEL_W, v1.MODEL_H):
-        raise ValueError(f"crops must be {v1.MODEL_W}×{v1.MODEL_H}, not {w}×{h}")
-    S, step, overlap = eng.S, eng.step, eng.overlap
-    # Tracks: the queries (crop px → the model's pixel indices), and a grid of
-    # support points for joint context, as in v1.
-    queries = [(int(q[0]), float(q[1]) - 0.5, float(q[2]) - 0.5) for q in header["queries"]]
-    tracks = [v1.Track(key=str(i), q=q, x=x, y=y, end=1 << 40) for i, (q, x, y) in enumerate(queries)]
-    pending = sorted(tracks, key=lambda t: t.q)
-    active = []
-    emitted = 0
-    support_q = None
+class Stream:
+    """One tracker's stream through the model: its queries, the support
+    points, the rolling window's cache, and what it has emitted. Fed its
+    frames a window at a time ([`Stream.window`]); `send` takes each result
+    message (with the stream's number added in shared mode)."""
 
-    def emit(f: int, coords, probs, local: int, live):
+    def __init__(self, eng: Engine, header: dict, send):
+        w, h = int(header["width"]), int(header["height"])
+        if (w, h) != (v1.MODEL_W, v1.MODEL_H):
+            raise ValueError(f"crops must be {v1.MODEL_W}×{v1.MODEL_H}, not {w}×{h}")
+        self.eng, self.w, self.h, self.send = eng, w, h, send
+        # Tracks: the queries (crop px → the model's pixel indices), and a grid of
+        # support points for joint context, as in v1.
+        queries = [(int(q[0]), float(q[1]) - 0.5, float(q[2]) - 0.5) for q in header["queries"]]
+        self.tracks = [v1.Track(key=str(i), q=q, x=x, y=y, end=1 << 40) for i, (q, x, y) in enumerate(queries)]
+        self.pending = sorted(self.tracks, key=lambda t: t.q)
+        self.active = []
+        self.emitted = 0
+        self.support_q = None
+        self.ind, self.first, self.cache, self.tail = 0, True, None, None
+        self.over = False
+
+    def need(self) -> int:
+        """Frames its next window takes."""
+        return self.eng.S if self.first else self.eng.step
+
+    def emit(self, f: int, coords, probs, local: int, live):
         points = []
-        for t in tracks:
+        for t in self.tracks:
             j = next((k for k, a in enumerate(live) if a is t), None)
             if j is None or f < t.q:
                 points.append(None)
@@ -162,68 +186,150 @@ def run(eng: Engine, stdin, header: dict):
             else:
                 x, y, p = float(coords[local, j, 0]), float(coords[local, j, 1]), float(probs[local, j])
                 points.append([x + 0.5, y + 0.5, p] if math.isfinite(x) and math.isfinite(y) else None)
-        send({"f": f, "points": points})
+        self.send({"f": f, "points": points})
 
-    ind, first, cache, tail = 0, True, None, None
-    while True:
-        need = S if first else step
-        new, ended = read_frames(stdin, need, w, h)
-        n_new = len(new)
+    def window(self, new, ended: bool):
+        """Track one window with `new` frames (up to [`need`]); `ended`: no
+        frames come after them. Sets `over` when the stream is finished."""
+        eng = self.eng
+        S, step, overlap = eng.S, eng.step, eng.overlap
+        need, n_new = self.need(), len(new)
         if n_new == 0:
             # The stream ended at the previous window's overlap: its tail is final.
-            if tail is not None:
-                live, coords, probs = tail
+            if self.tail is not None:
+                live, coords, probs = self.tail
                 for k in range(overlap):
-                    if ind + k >= emitted:
-                        emit(ind + k, coords, probs, k, live)
-                        emitted = ind + k + 1
-            break
+                    if self.ind + k >= self.emitted:
+                        self.emit(self.ind + k, coords, probs, k, live)
+                        self.emitted = self.ind + k + 1
+            self.over = True
+            return
+        ind, first = self.ind, self.first
         valid = n_new if first else overlap + n_new
         pyr_new = eng.encode(new)
-        pyramid = pyr_new if first else [torch.cat([c, n], dim=1) for c, n in zip(cache, pyr_new)]
+        pyramid = pyr_new if first else [torch.cat([c, n], dim=1) for c, n in zip(self.cache, pyr_new)]
         T = pyramid[0].shape[1]
         if T < S:
             pyramid = [torch.cat([p, p[:, -1:].expand(-1, S - T, -1, -1, -1)], dim=1) for p in pyramid]
-        if support_q is None or ind + step - support_q >= v1.SUPPORT_REFRESH_FRAMES:
+        if self.support_q is None or ind + step - self.support_q >= v1.SUPPORT_REFRESH_FRAMES:
             qs = ind if first else ind + step
             if qs < ind + valid:
-                active = [t for t in active if not t.support]
+                self.active = [t for t in self.active if not t.support]
                 grid = v1.get_points_on_a_grid(v1.SUPPORT_GRID_SIZE, (v1.MODEL_H, v1.MODEL_W))[0]
                 support = [v1.Track(key=f"s{qs}_{i}", q=qs, x=float(p[0]), y=float(p[1]), end=1 << 40, support=True) for i, p in enumerate(grid)]
                 eng.sample_feats(pyramid, support, ind)
-                active.extend(support)
-                support_q = qs
+                self.active.extend(support)
+                self.support_q = qs
         joining = []
-        while pending and pending[0].q < ind + valid:
-            joining.append(pending.pop(0))
+        while self.pending and self.pending[0].q < ind + valid:
+            joining.append(self.pending.pop(0))
         if joining:
             eng.sample_feats(pyramid, joining, ind)
-            active.extend(joining)
+            self.active.extend(joining)
         last = ended or n_new < need
         n_emit = valid if last else min(step, valid)
-        coords, vis, conf = eng.run_window(pyramid, active, ind)
+        coords, vis, conf = eng.run_window(pyramid, self.active, ind)
         probs = torch.sigmoid(vis) * torch.sigmoid(conf)
         coords_cpu, probs_cpu = coords.float().cpu().numpy(), probs.float().cpu().numpy()
         for k in range(n_emit):
-            if ind + k >= emitted:
-                emit(ind + k, coords_cpu, probs_cpu, k, active)
-                emitted = ind + k + 1
-        tail = (list(active), coords_cpu[step:], probs_cpu[step:])
-        for j, t in enumerate(active):
+            if ind + k >= self.emitted:
+                self.emit(ind + k, coords_cpu, probs_cpu, k, self.active)
+                self.emitted = ind + k + 1
+        self.tail = (list(self.active), coords_cpu[step:], probs_cpu[step:])
+        for j, t in enumerate(self.active):
             t.prev_coords = coords[step:, j] / eng.stride
             t.prev_vis = vis[step:, j]
             t.prev_conf = conf[step:, j]
         if last:
-            break
-        cache = [p[:, step:S] for p in pyramid]
-        ind += step
-        first = False
+            self.over = True
+            return
+        self.cache = [p[:, step:S] for p in pyramid]
+        self.ind += step
+        self.first = False
+
+
+def run(eng: Engine, stdin, header: dict):
+    """One stream, the whole worker's (the plain protocol)."""
+    stream = Stream(eng, header, send)
+    while not stream.over:
+        new, ended = read_frames(stdin, stream.need(), stream.w, stream.h)
+        stream.window(new, ended)
+
+
+def read_exact(stdin, n: int) -> bytes:
+    data = stdin.read(n)
+    if len(data) != n:
+        raise EOFError("the input was cut short")
+    return data
+
+
+def run_shared(eng: Engine, stdin):
+    """Many streams, one model (the shared protocol, module docs): read a
+    message; then, while any stream has a window's worth of frames (or its
+    last ones), run one window of each such stream in turn."""
+    streams = {}  # id -> [Stream, frames waiting, ended]
+
+    def sender(sid):
+        return lambda msg: send({"s": sid, **msg})
+
+    def fail(sid, exc):
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        send({"s": sid, "error": f"{type(exc).__name__}: {exc}"})
+        streams.pop(sid, None)
+
+    while True:
+        tag = stdin.read(1)
+        if not tag:
+            return
+        sid = int.from_bytes(read_exact(stdin, 4), "little")
+        if tag == b"O":
+            header = json.loads(stdin.readline())
+            try:
+                streams[sid] = [Stream(eng, header, sender(sid)), [], False]
+            except Exception as exc:  # this stream fails, the others go on
+                fail(sid, exc)
+        elif tag == b"F":
+            entry = streams.get(sid)
+            # (A frame for a stream that failed is read and dropped.)
+            size = entry[0].w * entry[0].h * 3 if entry else v1.MODEL_W * v1.MODEL_H * 3
+            data = read_exact(stdin, size)
+            if entry:
+                entry[1].append(np.frombuffer(data, np.uint8).reshape(entry[0].h, entry[0].w, 3))
+        elif tag == b"E":
+            if sid in streams:
+                streams[sid][2] = True
+        elif tag == b"X":
+            streams.pop(sid, None)
+        else:
+            raise ValueError(f"unknown message {tag!r}")
+        # Windows that can run now, one per stream a round, until none can.
+        progress = True
+        while progress:
+            progress = False
+            for sid in list(streams):
+                stream, frames, ended = streams[sid]
+                need = stream.need()
+                if len(frames) < need and not ended:
+                    continue
+                take, streams[sid][1] = frames[:need], frames[need:]
+                try:
+                    stream.window(take, ended and len(frames) <= need)
+                except Exception as exc:
+                    fail(sid, exc)
+                    continue
+                progress = True
+                if stream.over:
+                    send({"s": sid, "done": True})
+                    streams.pop(sid, None)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default=None)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--shared", action="store_true", help="many streams, one model (module docs)")
     args = ap.parse_args()
     try:
         weights = args.weights or default_weights()
@@ -233,11 +339,14 @@ def main():
         eng = pick_engine(weights, args.device or os.environ.get("TT_COTRACKER_DEVICE"))
         send({"ready": {"device": eng.device, "window": eng.S}})
         stdin = sys.stdin.buffer
-        header = json.loads(stdin.readline())
         with torch.inference_mode():
-            run(eng, stdin, header)
-        send({"done": True})
-    except Exception as exc:  # the job shows it
+            if args.shared:
+                run_shared(eng, stdin)
+            else:
+                header = json.loads(stdin.readline())
+                run(eng, stdin, header)
+                send({"done": True})
+    except Exception as exc:  # the job (every stream, shared) shows it
         import traceback
 
         traceback.print_exc(file=sys.stderr)

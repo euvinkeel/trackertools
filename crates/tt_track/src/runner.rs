@@ -157,17 +157,18 @@ pub const MAX_JOBS: usize = 4;
 /// every chunk (it waits for 1.5 s without changes).
 pub const RESULTS_SAVED_EVERY: f64 = 5.0;
 
-/// CoTracker jobs with a worker alive at once, across trackers: 1, or
-/// `TT_COTRACKER_JOBS` (1 to 4). Each worker is a Python process with the
-/// model on the graphics card, and several starting at once have made the
-/// card reset. They count from start until their thread ends, parked and
-/// cancelled ones included (they hold their worker until then); they count
+/// CoTracker jobs tracking at once, across trackers: 3, or
+/// `TT_COTRACKER_JOBS` (1 to 4). They are streams through one shared worker
+/// (one Python process, the model on the graphics card once: several
+/// processes at once made the card reset), which runs their windows in turn
+/// (job::learned). They count from start until their thread ends, parked and
+/// cancelled ones included (they hold their stream until then); they count
 /// toward [`MAX_JOBS`] too. A tracker's two sides run one after the other.
 pub fn cotracker_jobs() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
         let asked = std::env::var("TT_COTRACKER_JOBS").ok();
-        let n = asked.as_deref().and_then(|v| v.trim().parse::<usize>().ok()).map_or(1, |n| n.clamp(1, 4));
+        let n = asked.as_deref().and_then(|v| v.trim().parse::<usize>().ok()).map_or(3, |n| n.clamp(1, 4));
         if let Some(v) = asked {
             tracing::info!("TT_COTRACKER_JOBS={v}: {n} CoTracker job(s) at once");
         }

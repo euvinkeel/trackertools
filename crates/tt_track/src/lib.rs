@@ -616,7 +616,7 @@ impl Module for TrackModule {
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
             .add_systems((apply_track_actions, look_changed).in_set(Set::Intents))
-            .add_systems((tool::track_tool, (human::draw_tool, human::hold_views_while_drawing).chain()).in_set(Set::Tools))
+            .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
     }
 }

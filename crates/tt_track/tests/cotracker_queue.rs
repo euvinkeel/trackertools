@@ -98,8 +98,10 @@ fn setup(run: TrackRun) -> Option<(Core, Entity)> {
     set_env("TT_FAKE_COTRACKER_DELAY", Some("0.005".as_ref()));
     set_env("TT_FAKE_COTRACKER_FAIL", None);
     set_env("TT_FAKE_COTRACKER_HANG", None);
-    // (Read once, by the first runner pass: the default, one worker at a time.)
+    // (Read once, by the first runner pass: the default, three jobs at once.)
     set_env("TT_COTRACKER_JOBS", None);
+    // A worker left from another test had other switches: it goes.
+    tt_track::job::close_cotracker_worker();
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
     let mut core = app.build();
@@ -162,32 +164,29 @@ fn quiet(core: &mut Core) {
     }
 }
 
+/// Several CoTracker trackers track at once, as streams through one worker
+/// process (the model on the graphics card once).
 #[test]
-fn one_cotracker_worker_at_a_time() {
+fn cotracker_jobs_share_one_worker() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    let started = tt_track::job::cotracker_processes_started();
     let a = add(&mut core, guide);
     let b = add(&mut core, guide);
-    let (mut most, mut b_waited, mut a_waited) = (0, false, false);
-    run(&mut core, &[a, b], |w| {
-        let workers = w.resource::<TrackJobs>().cotracker_workers();
-        assert!(workers <= 1, "{workers} CoTracker workers at once");
-        most = most.max(workers);
-        for t in [a, b] {
-            let s = status(w, t);
-            assert!(!(s.forward.is_some() && s.backward.is_some()), "a tracker's two sides one after the other");
-        }
-        b_waited |= status(w, b).waits_for_cotracker;
-        a_waited |= status(w, a).waits_for_cotracker;
+    let c = add(&mut core, guide);
+    let mut most = 0;
+    run(&mut core, &[a, b, c], |w| {
+        let jobs = w.resource::<TrackJobs>().cotracker_workers();
+        assert!(jobs <= tt_track::runner::cotracker_jobs(), "{jobs} CoTracker jobs at once");
+        most = most.max(jobs);
     });
     let w = &core.world;
-    for t in [a, b] {
+    for t in [a, b, c] {
         assert!(w.get::<OpError>(t).is_none(), "{:?}", w.get::<OpError>(t));
         assert_eq!(coverage(w, t), Some(570..631), "both ways over its span");
     }
-    assert_eq!(most, 1, "a worker ran");
-    assert!(b_waited, "the second tracker said it waits for the first");
-    assert!(a_waited, "the first tracker's backward side waited for its forward side");
+    assert!(most >= 2, "trackers tracked at once: at most {most} together");
+    assert_eq!(tt_track::job::cotracker_processes_started() - started, 1, "one worker process for all of them");
     quiet(&mut core);
     assert_eq!(core.world.resource::<TrackJobs>().cotracker_workers(), 0);
 }
@@ -245,6 +244,8 @@ fn a_cancelled_job_lets_its_worker_go() {
         assert!(core.world.get::<OpError>(op).is_none(), "a cancelled job is not an error");
         set_env("TT_FAKE_COTRACKER_HANG", None);
         quiet(&mut core);
+        // (The shared worker still hangs: the next one is a new one.)
+        tt_track::job::close_cotracker_worker();
     }
 }
 
@@ -334,16 +335,15 @@ fn run_until(core: &mut Core, what: &str, mut done: impl FnMut(&World) -> bool) 
             return;
         }
         assert!(start.elapsed() < Duration::from_secs(20), "{what}");
-        assert!(core.world.resource::<TrackJobs>().cotracker_workers() <= 1);
+        assert!(core.world.resource::<TrackJobs>().cotracker_workers() <= tt_track::runner::cotracker_jobs());
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// Catch-up mode: a side that could only wait at the playhead, the worker
-/// held by the other side's job (waiting at the playhead too), keeps nothing
-/// busy and says it waits for the playhead. The playhead moving to it takes
-/// the worker from the parked job. A parked job that a new limit frees keeps
-/// its worker, and both sides finish.
+/// Catch-up mode, with room for both sides (jobs share one worker): each
+/// side tracks up to the playhead and parks there, keeping nothing busy and
+/// saying so. The playhead moving on lets them go on; a parked job freed by
+/// a new limit goes on (not started again), and both sides finish.
 #[test]
 fn catch_up_waits_quietly_at_the_playhead() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
@@ -353,32 +353,33 @@ fn catch_up_waits_quietly_at_the_playhead() {
     core.world.resource_mut::<Transport>().seek(615);
     set_run(&mut core.world, op, TrackRun::Both);
 
-    // Forward tracks to the playhead and waits there; backward's frames are behind it.
-    run_until(&mut core, "the forward job never got to the playhead", |w| status(w, op).forward.is_some_and(|s| s.waiting));
+    // Forward tracks to the playhead and parks there; backward's frames are behind it: it parks at once.
+    let parked = |w: &World| {
+        let s = status(w, op);
+        s.forward.is_some_and(|f| f.waiting) && s.backward.is_none_or(|b| b.waiting)
+    };
+    run_until(&mut core, "the sides never parked at the playhead", parked);
     let rest = Instant::now();
     while rest.elapsed() < Duration::from_millis(1500) {
         core.run_pre_ui();
         let (w, jobs) = (&core.world, core.world.resource::<TrackJobs>());
         let s = status(w, op);
         assert!(!jobs.active(), "only waiting at the playhead: nothing keeps the app busy ({s:?})");
-        assert!(s.waits_at_playhead && !s.queued && !s.waits_for_cotracker, "{s:?}");
-        assert_eq!(jobs.cotracker_workers(), 1, "the waiting forward job keeps its worker: nothing else could use it");
+        assert!(!s.queued && !s.waits_for_cotracker, "{s:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // The playhead goes before the anchor: backward can track, and takes the worker from the parked forward job.
+    // The playhead goes before the anchor: backward tracks to it and parks there.
     core.world.resource_mut::<Transport>().seek(580);
-    run_until(&mut core, "backward never tracked to the playhead", |w| status(w, op).backward.is_some_and(|s| s.waiting));
+    run_until(&mut core, "backward never tracked to the playhead", |w| status(w, op).backward.is_some_and(|s| s.waiting && s.at <= 581));
     let backward = status(&core.world, op).backward.expect("a backward job");
-    assert!(status(&core.world, op).forward.is_none(), "the forward job let its worker go");
-    // Parked there (after a second) ...
     let rest = Instant::now();
     while rest.elapsed() < Duration::from_millis(1500) {
         core.run_pre_ui();
         assert!(!core.world.resource::<TrackJobs>().active(), "{:?}", status(&core.world, op));
         std::thread::sleep(Duration::from_millis(10));
     }
-    // ... then freed by a new limit (not following the playhead any more) as forward wants the worker too: it keeps it.
+    // ... then freed by a new limit (not following the playhead any more): it goes on, and so does forward.
     core.world.get_mut::<Tracker>(op).expect("tracker").follow_playhead = false;
     run(&mut core, &[op], |w| {
         if let Some(b) = status(w, op).backward {
