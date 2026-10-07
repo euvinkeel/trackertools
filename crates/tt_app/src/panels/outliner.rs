@@ -119,6 +119,7 @@ fn rows(world: &mut World, st: &OutlinerState) -> Vec<Row> {
             Node::Sketch => strokes_of(w, e),
             Node::Tracker => tt_track::look::looks_of(w, e),
             Node::Subject => tt_core::subject::members_of(w, e),
+            Node::Layer => Vec::new(),
         }
     };
     // With a filter: a row shows if it matches, or anything under it does (all unfolded).
@@ -456,7 +457,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
 /// sketches, strokes or views.
 fn other_entities(world: &mut World) -> Vec<Entity> {
     let mut q = world.query_filtered::<(Entity, Option<&Operator>), (With<Created>, Without<Capture>, Without<tt_track::look::Look>, Without<Disabled>)>();
-    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame" || o.kind == "track" || o.kind == "subject")).map(|(e, _)| e).collect();
+    let mut out: Vec<Entity> = q.iter(world).filter(|(_, o)| !o.is_some_and(|o| o.kind == "sketch" || o.kind == "frame" || o.kind == "track" || o.kind == "subject" || o.kind == "layer")).map(|(e, _)| e).collect();
     creation_order(world, &mut out);
     out
 }

@@ -11,6 +11,7 @@ pub mod capture;
 pub mod commands;
 pub mod history;
 pub mod input;
+pub mod layer;
 pub mod marks;
 pub mod meta;
 pub mod op;
@@ -43,6 +44,7 @@ impl Module for CoreModules {
             .add_module(NamesModule)
             .add_module(sketch::SketchModule)
             .add_module(subject::SubjectModule)
+            .add_module(layer::LayerModule)
             .add_module(span::SpanModule)
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)

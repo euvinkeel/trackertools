@@ -12,6 +12,7 @@
 //! - [`VIEW`] (blue): views (a sketch's framing).
 //! - [`LOST`] (red): frames not to trust (lost, outside the sketch), errors.
 //! - [`LIVE`] (amber): being recorded now; warnings.
+//! - [`LAYER`] (mint): layers, the media attached to what's tracked.
 //!
 //! Solid and bright: valid and selected. Dim: stale (being recomputed) or
 //! not selected. Dashed and light: a preview of what a press would make.
@@ -39,6 +40,8 @@ pub const SUBJECT: Color32 = Color32::from_rgb(0xc0, 0x84, 0xfc);
 pub const VIEW: Color32 = Color32::from_rgb(0x60, 0xa5, 0xfa);
 pub const LOST: Color32 = Color32::from_rgb(0xf4, 0x3f, 0x5e);
 pub const LIVE: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+/// Layers: pictures, GIFs and clips attached to what's tracked.
+pub const LAYER: Color32 = Color32::from_rgb(0x5e, 0xea, 0xd4);
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());

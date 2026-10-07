@@ -116,6 +116,23 @@ impl Scene {
                 if ready {
                     self.subject = rest(world, s);
                     self.after = Some(0);
+                    // `=layer`: the files in TT_SCENE_MEDIA (`;` between them) attached, the
+                    // first to the subject, the next to the tracker selected; the first selected.
+                    if self.mode == "layer" {
+                        let loose = world.resource::<tt_core::selection::Selection>().primary();
+                        let media = std::env::var("TT_SCENE_MEDIA").unwrap_or_default();
+                        let targets = [self.subject, loose];
+                        let mut first = None;
+                        for (path, target) in media.split(';').filter(|p| !p.is_empty()).zip(targets) {
+                            if let Some(t) = target {
+                                let l = crate::layers::attach_file(world, t, std::path::Path::new(path));
+                                first = first.or(l);
+                            }
+                        }
+                        if let Some(l) = first {
+                            world.resource_mut::<tt_core::selection::Selection>().select_only(l);
+                        }
+                    }
                     // `=sketch`: a second sketch (its own colour), the first selected (its moving
                     // outline); `=view`: then inside the first's view (outside it dimmed).
                     if self.mode == "sketch" || self.mode == "view" {

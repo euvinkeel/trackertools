@@ -135,9 +135,9 @@ pub fn pick_tracker(world: &mut World, frame: crate::time::FrameIndex, pos: [f64
         .map(|(e, _)| e)
 }
 
-/// A click (in any tool) selects the subject whose point is under it, else
-/// the tracker whose point is, else the sketch whose region is, or clears
-/// the selection.
+/// A click (in any tool) selects the layer whose picture is under it (when
+/// it isn't selected yet), else the subject whose point is, else the tracker
+/// whose point is, else the sketch whose region is, or clears the selection.
 fn select_on_click(world: &mut World) {
     let Some(pos) = world.resource::<PointerFrame>().click else { return };
     // In the Track tool a click places a tracker; in the Draw tool it draws.
@@ -149,7 +149,11 @@ fn select_on_click(world: &mut World) {
     let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);
     let scale = world.resource::<PointerFrame>().scale;
     let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
-    let picked = crate::subject::pick_subject(world, frame, pos, grab)
+    // A layer's picture first (it covers what it's attached to), unless it is
+    // selected already: then what's under it, so a second click reaches that.
+    let layer = crate::layer::pick_layer(world, frame, pos).filter(|l| !world.resource::<crate::selection::Selection>().is_selected(*l));
+    let picked = layer
+        .or_else(|| crate::subject::pick_subject(world, frame, pos, grab))
         .or_else(|| pick_tracker(world, frame, pos, grab))
         .or_else(|| crate::sketch::pick_sketch(world, frame, pos));
     let mut sel = world.resource_mut::<crate::selection::Selection>();

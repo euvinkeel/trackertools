@@ -8,6 +8,7 @@
 //!   tracker, a subject: anything with a position);
 //! - a tracker: the sketch that guides it, else what the view it tracks in
 //!   follows;
+//! - a layer: what it is attached to;
 //! - a subject: nothing (it has several members; they are listed under it
 //!   too, as references).
 //!
@@ -31,6 +32,7 @@ pub enum Node {
     Subject,
     Sketch,
     Tracker,
+    Layer,
 }
 
 impl Node {
@@ -39,6 +41,7 @@ impl Node {
             "subject" => Some(Node::Subject),
             "sketch" => Some(Node::Sketch),
             "track" => Some(Node::Tracker),
+            "layer" => Some(Node::Layer),
             _ => None,
         }
     }
@@ -51,6 +54,7 @@ pub fn parent_of(world: &World, e: Entity) -> Option<Entity> {
         Node::Subject => None,
         Node::Sketch => home_of(world, e).and_then(|v| followed(world, v)),
         Node::Tracker => tt_track::guide_of(world, e).or_else(|| home_of(world, e).and_then(|v| followed(world, v))),
+        Node::Layer => tt_core::layer::target_of(world, e),
     };
     parent.filter(|p| *p != e && live(*p) && Node::of(world, *p).is_some())
 }

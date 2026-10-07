@@ -554,6 +554,19 @@ The `Frame` operator (a virtual camera) turns a Box into a View transform. Its p
 
 ---
 
+### 10.3 Layers: media attached to what's tracked
+
+*(On request: "attach an image/gif/video to that tracking data … imagine im waving my hand at the camera and i want an epic face to be attached to my hand … thats basically how after effects does it"; decisions: "a layer can attach to anything with a position (and rotation optional)", "the size should be optionally following or scaling with any size data if it exists, or constant if not, also animatable and overridable manually through timeline", no text layers for now.)*
+
+- **A layer is an operator** (`tt_core::layer`, kind `layer`): its input `target` is what it is attached to (a sketch, tracker or subject: anything with a position), its output where it sits on every frame the target has: `[x, y, angle, scale x, scale y, opacity, clip time, anchor x, anchor y, flags]`. So its lifetime, lane, undo, saving and re-evaluation when the target changes are the graph's, like a view's. A tracker's lost frames are bridged.
+- **What it follows:** the target's point always; its angle when it has one (a subject) and *Turn with it* is on (the offset turns too); its box's size optionally (*Fixed*, *With the box*, its width or height), relative to the box on a reference frame (its first, or one chosen).
+- **Its own values**, each fixed or keyed (`Animated`: linear between keys, held beyond): offset, scale (1 = its own pixels as video pixels; a new layer starts as tall as the target's box), rotation, opacity, anchor (the point of the picture on the target's point). Changing a value with keys keys it on the shown frame; one without keys changes its fixed value, unless **Auto-key** is on.
+- **A clip's timing:** where in it it starts, its speed, and at its end: loop, hold the last frame, disappear, or back and forth (`LayerParams::clip_time`).
+- **Media** (`tt_media::overlay`): pictures (PNG, JPEG, WebP, BMP, TIFF), GIFs and clips (MP4, MOV, WebM, MKV), read through ffmpeg as straight RGBA with their transparency, every frame evenly timed at the file's frame rate. The preview decodes each file once in the background, at most 512 px on its longer side and 192 MB for all its frames; an export reads it again at its own size.
+- **In the app** (`tt_app::layers`): drawn on the video between the picture and the editor's marks, through the shown view, at its opacity; the selected one outlined (mint, `style::LAYER`) with its anchor. Right-click a sketch, tracker or subject: *Attach a picture, GIF or clip…*; or drop a picture or GIF on the window with one selected. The Inspector has its file (*Locate…* when it moved), *Attached to*, the follow options, a clip's timing and every value with its key button and previous/next key arrows. The timeline's lane shows its frames and keys; the outliner lists it under what it's attached to.
+- **Clicks and drags:** a click on a layer's picture selects it (a second click reaches what's under it); a drag on it in the Select tool moves its offset (one undo step), the selected layer or subject first when they overlap.
+- Measured (`tests/layer.rs`, `layer::tests`, `overlay::tests`): a layer rides on a subject's point and moves with it; a drag moves the fixed offset everywhere, and with Auto-key keys it on the shown frame; one undo each; it saves and loads with its keys and modes; clips loop, hold, hide and ping-pong at the right times; a GIF, a PNG with alpha and an MP4 are probed and decoded.
+
 ## 11. Extensibility: modules
 
 A feature is a module:

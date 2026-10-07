@@ -106,7 +106,8 @@ impl Shell {
             .add_module(crate::rebuild::RebuildModule)
             .add_module(crate::setup::SetupModule)
             .add_module(SessionModule)
-            .add_module(crate::project::ProjectModule);
+            .add_module(crate::project::ProjectModule)
+            .add_module(crate::layers::LayersModule);
         let mut core = app.build();
         crate::update::on_start(&core.world);
         {
@@ -239,7 +240,10 @@ impl eframe::App for Shell {
         self.core.world.resource_mut::<WallClock>().tick(now);
 
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
-            self.core.world.resource_mut::<OpenRequest>().0 = Some(path);
+            // A picture or GIF attaches to the selection as a layer; anything else opens as the video.
+            if !crate::layers::drop_file(&mut self.core.world, &path) {
+                self.core.world.resource_mut::<OpenRequest>().0 = Some(path);
+            }
         }
         let mut frame = crate::pointer::frame(ctx, &self.pointer, &mut self.pointer_read, now, self.core.world.resource::<ViewportMapping>());
         if frame.pressed.is_some() {

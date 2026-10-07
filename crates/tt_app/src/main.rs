@@ -10,6 +10,7 @@ mod files;
 mod icons;
 mod input_probe;
 mod keys;
+mod layers;
 mod layout;
 mod media;
 mod panels;

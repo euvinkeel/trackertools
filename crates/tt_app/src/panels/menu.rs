@@ -38,6 +38,13 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         };
         ui.label(egui::RichText::new(what).strong());
         ui.separator();
+        if let Some(t) = followable
+            && ui.button("Attach a picture, GIF or clip\u{2026}").on_hover_text("A layer that moves with it: an image, an animated GIF or a video clip on top of the video").clicked()
+        {
+            ui.close();
+            crate::layers::attach_dialog(world, t);
+            return;
+        }
         if let Some(s) = followable
             && ui.button(format!("Enter view{}", chord(Action::EnterView))).on_hover_text("See a view that follows it and keeps it in the centre; sketch inside it for detail").clicked()
         {
