@@ -3,6 +3,7 @@
 
 mod brush;
 pub mod export;
+mod focus_inspector;
 mod inspector;
 pub mod look_editor;
 mod menu;

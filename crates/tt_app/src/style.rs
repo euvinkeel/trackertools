@@ -12,6 +12,7 @@
 //! - [`VIEW`] (blue): views (a sketch's framing).
 //! - [`LOST`] (red): frames not to trust (lost, outside the sketch), errors.
 //! - [`LIVE`] (amber): being recorded now; warnings.
+//! - [`FOCUS`] (periwinkle): SpringFocus, moving from one tracked thing to the next.
 //!
 //! Solid and bright: valid and selected. Dim: stale (being recomputed) or
 //! not selected. Dashed and light: a preview of what a press would make.
@@ -39,6 +40,8 @@ pub const SUBJECT: Color32 = Color32::from_rgb(0xc0, 0x84, 0xfc);
 pub const VIEW: Color32 = Color32::from_rgb(0x60, 0xa5, 0xfa);
 pub const LOST: Color32 = Color32::from_rgb(0xf4, 0x3f, 0x5e);
 pub const LIVE: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+/// SpringFocus: one point moving from one tracked thing to the next.
+pub const FOCUS: Color32 = Color32::from_rgb(0xa5, 0xb4, 0xfc);
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());

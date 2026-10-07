@@ -588,6 +588,7 @@ pub enum LaneKind {
     Sketch,
     View,
     Tracker,
+    Focus,
 }
 
 /// The lanes, top to bottom, in the outliner's order (`crate::tree`: each
@@ -601,6 +602,7 @@ pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
             Node::Subject => LaneKind::Subject,
             Node::Sketch => LaneKind::Sketch,
             Node::Tracker => LaneKind::Tracker,
+            Node::Focus => LaneKind::Focus,
         };
         out.push((e, depth, kind));
         if let Some(v) = tt_core::view::view_of(world, e).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
@@ -852,6 +854,11 @@ fn lanes(
                     bars = bars_of(sig, y + 2.0, y + 11.0, &alive);
                 }
             }
+            LaneKind::Focus => {
+                if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
+                    bars = bars_of(sig, y + 6.0, y + 11.0, &alive);
+                }
+            }
             LaneKind::View => {
                 if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
                     bars = bars_of(sig, y + 5.0, y + 9.0, &alive);
@@ -935,6 +942,25 @@ fn lanes(
                     }
                     let x = scale.x(s.at as f64 + 0.5);
                     painter.line_segment([Pos2::new(x, y + 1.0), Pos2::new(x, y + LANE_H - 1.0)], Stroke::new(2.0, c));
+                }
+            }
+        }
+        // A SpringFocus's keys (in the colour of what each focuses on) and its moves.
+        if kind == LaneKind::Focus
+            && let Some(p) = world.get::<tt_core::focus::FocusParams>(e)
+        {
+            let fps = world.resource::<Transport>().fps.as_f64();
+            for (i, k) in p.keys.iter().enumerate() {
+                let start = k.frame - (p.lead as f64 * fps).round() as FrameIndex;
+                let end = start + (p.move_time as f64 * fps).round() as FrameIndex;
+                if i > 0
+                    && let Some(r) = bar(y + 3.0, y + 14.0, start, end.max(start + 1))
+                {
+                    painter.rect_filled(r, 2.0, style::FOCUS.gamma_multiply(0.18));
+                }
+                if visible.contains(&k.frame) {
+                    let c = colors.of(world, k.target, Glyph::of(world, k.target));
+                    icons::diamond(&painter, Pos2::new(scale.x(k.frame as f64 + 0.5), y + 8.5), 4.5, Stroke::new(1.0, egui::Color32::from_black_alpha(170)), Some(c));
                 }
             }
         }

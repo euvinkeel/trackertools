@@ -22,6 +22,7 @@ pub enum Glyph {
     Look,
     ResetPoint,
     Subject,
+    Focus,
     Other,
 }
 
@@ -32,6 +33,7 @@ impl Glyph {
                 "sketch" => Glyph::Sketch,
                 "frame" => Glyph::View,
                 "subject" => Glyph::Subject,
+                "focus" => Glyph::Focus,
                 "track" => Glyph::tracker(world.get::<tt_track::Tracker>(e).map_or(Method::Template, |t| t.method)),
                 _ => Glyph::Other,
             };
@@ -61,6 +63,7 @@ impl Glyph {
             Glyph::Template | Glyph::CoTracker => style::AUTO,
             Glyph::Look | Glyph::ResetPoint => style::PIN,
             Glyph::Subject => style::SUBJECT,
+            Glyph::Focus => style::FOCUS,
             Glyph::Other => style::MUTED,
         }
     }
@@ -77,6 +80,7 @@ impl Glyph {
             Glyph::Look => "look: a pattern a template tracker matches",
             Glyph::ResetPoint => "reset point: the pixel a CoTracker follows from here on",
             Glyph::Subject => "subject: one position its members carry together",
+            Glyph::Focus => "SpringFocus: one point that moves smoothly from one tracked thing to the next",
             Glyph::Other => "item",
         }
     }
@@ -136,6 +140,15 @@ pub fn paint_in(painter: &Painter, rect: Rect, g: Glyph, strong: bool, color: Co
         Glyph::Subject => {
             diamond(painter, o, r * 0.75, stroke, None);
             painter.line_segment([o + Vec2::new(r * 0.75, 0.0), o + Vec2::new(r * 1.15, 0.0)], stroke);
+        }
+        // A viewfinder's corners around a point: a camera that moves on.
+        Glyph::Focus => {
+            let b = Rect::from_center_size(o, Vec2::splat(2.0 * r));
+            let t = r * 0.5;
+            for (p, dx, dy) in [(b.left_top(), 1.0, 1.0), (b.right_top(), -1.0, 1.0), (b.left_bottom(), 1.0, -1.0), (b.right_bottom(), -1.0, -1.0)] {
+                painter.add(Shape::line(vec![p + Vec2::new(dx * t, 0.0), p, p + Vec2::new(0.0, dy * t)], stroke));
+            }
+            painter.circle_filled(o, s * 0.09, c);
         }
         Glyph::Other => {
             painter.circle_stroke(o, r * 0.4, stroke);

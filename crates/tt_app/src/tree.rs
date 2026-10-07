@@ -8,7 +8,7 @@
 //!   tracker, a subject: anything with a position);
 //! - a tracker: the sketch that guides it, else what the view it tracks in
 //!   follows;
-//! - a subject: nothing (it has several members; they are listed under it
+//! - a subject or a SpringFocus: nothing (it has several members; they are listed under it
 //!   too, as references).
 //!
 //! The outliner and the timeline's lanes both walk [`tree`]: the roots in
@@ -31,6 +31,7 @@ pub enum Node {
     Subject,
     Sketch,
     Tracker,
+    Focus,
 }
 
 impl Node {
@@ -39,6 +40,7 @@ impl Node {
             "subject" => Some(Node::Subject),
             "sketch" => Some(Node::Sketch),
             "track" => Some(Node::Tracker),
+            "focus" => Some(Node::Focus),
             _ => None,
         }
     }
@@ -48,7 +50,7 @@ impl Node {
 pub fn parent_of(world: &World, e: Entity) -> Option<Entity> {
     let live = |p: Entity| world.get_entity(p).is_ok_and(|r| !r.contains::<Disabled>());
     let parent = match Node::of(world, e)? {
-        Node::Subject => None,
+        Node::Subject | Node::Focus => None,
         Node::Sketch => home_of(world, e).and_then(|v| followed(world, v)),
         Node::Tracker => tt_track::guide_of(world, e).or_else(|| home_of(world, e).and_then(|v| followed(world, v))),
     };
@@ -64,7 +66,7 @@ pub fn tree(world: &mut World) -> Vec<(Entity, usize, Node)> {
     let mut order: Vec<Entity> = nodes.iter().map(|(e, _)| *e).collect();
     creation_order(world, &mut order);
     let rank: HashMap<Entity, usize> = order.iter().enumerate().map(|(i, e)| (*e, i)).collect();
-    nodes.sort_by_key(|(e, kind)| (*kind != Node::Subject, rank[e]));
+    nodes.sort_by_key(|(e, kind)| (!matches!(kind, Node::Subject | Node::Focus), rank[e]));
     let kinds: HashMap<Entity, Node> = nodes.iter().copied().collect();
     let mut children: HashMap<Entity, Vec<Entity>> = HashMap::new();
     let mut roots = Vec::new();

@@ -146,7 +146,7 @@ pub fn is_view(world: &World, e: Entity) -> bool {
 /// Operators whose output starts with a box `[x, y, left, top, right, bottom]`
 /// in source pixels (channel 7, when there is one, flags frames not to
 /// trust): what a view can follow.
-const FOLLOWABLE: [&str; 3] = ["sketch", "track", "subject"];
+const FOLLOWABLE: [&str; 4] = ["sketch", "track", "subject", "focus"];
 
 /// What a view of `e` would follow: `e` itself when it is a sketch, a
 /// tracker or a subject; a stroke's sketch; a look's tracker. None: nothing
