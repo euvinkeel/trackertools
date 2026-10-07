@@ -488,7 +488,7 @@ fn fetch_and_place(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<(), 
 /// The size of what `url` leads to (0: it doesn't say), and where it leads
 /// after redirects (`url` itself if that can't be found out).
 fn head(url: &str) -> (u64, String) {
-    let Ok(out) = quiet(system_tool("curl")).args(["-sIL", "--max-time", "20", "-w", "\n%{url_effective}"]).arg(url).output() else { return (0, url.to_string()) };
+    let Ok(out) = quiet(system_tool("curl")).args(["-sIL", "--max-time", "20", "-w", "\n%{url_effective}"]).args(https_only(url)).arg(url).output() else { return (0, url.to_string()) };
     let text = String::from_utf8_lossy(&out.stdout);
     let size = text
         .lines()
@@ -500,7 +500,7 @@ fn head(url: &str) -> (u64, String) {
 }
 
 pub(crate) fn fetch_text(url: &str) -> Result<String, String> {
-    let out = quiet(system_tool("curl")).args(["-sS", "-L", "--fail", "--max-time", "30"]).arg(url).output().map_err(|e| e.to_string())?;
+    let out = quiet(system_tool("curl")).args(["-sS", "-L", "--fail", "--max-time", "30"]).args(https_only(url)).arg(url).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!("{url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -510,7 +510,9 @@ pub(crate) fn fetch_text(url: &str) -> Result<String, String> {
 /// `url` to the file `to` (Windows' curl), telling `progress` the bytes so far.
 pub(crate) fn download(url: &str, to: &Path, progress: &dyn Fn(u64)) -> Result<(), Problem> {
     let mut child = quiet(system_tool("curl"))
-        .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-setup", "-o"])
+        .args(["-sS", "-L", "--fail", "--retry", "2", "-H", "User-Agent: trackertools-setup"])
+        .args(https_only(url))
+        .arg("-o")
         .arg(to)
         .arg(url)
         .stderr(Stdio::piped())
@@ -532,6 +534,12 @@ pub(crate) fn download(url: &str, to: &Path, progress: &dyn Fn(u64)) -> Result<(
         return Err(Problem::new(STOPPED, format!("curl: {status}: {}", err.trim())));
     }
     Ok(())
+}
+
+/// For an https address, curl stays on https (a redirect to plain http is
+/// refused). Other addresses are the tests' `file://` ones.
+pub(crate) fn https_only(url: &str) -> &'static [&'static str] {
+    if url.to_ascii_lowercase().starts_with("https://") { &["--proto", "=https", "--proto-redir", "=https"] } else { &[] }
 }
 
 pub(crate) fn sha256(path: &Path) -> std::io::Result<String> {

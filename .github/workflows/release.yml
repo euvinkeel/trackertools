@@ -50,7 +50,12 @@ jobs:
           New-Item -ItemType Directory pkg | Out-Null
           Copy-Item target/release/trackertools.exe pkg/
           Compress-Archive -Path pkg/* -DestinationPath trackertools-windows-x64.zip
-          Get-ChildItem pkg, trackertools-windows-x64.zip | Format-Table Name, Length
+          # Its SHA-256 beside it: the updater checks the download against it
+          # (and against GitHub's own record of the file, when it has one).
+          $hash = (Get-FileHash -Algorithm SHA256 trackertools-windows-x64.zip).Hash.ToLower()
+          "$hash  trackertools-windows-x64.zip" | Out-File -Encoding ascii -NoNewline trackertools-windows-x64.zip.sha256
+          Get-ChildItem pkg, trackertools-windows-x64.zip, trackertools-windows-x64.zip.sha256 | Format-Table Name, Length
+          Get-Content trackertools-windows-x64.zip.sha256
       - name: Publish
         shell: pwsh
         env:
@@ -58,7 +63,7 @@ jobs:
         run: |
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG trackertools-windows-x64.zip --clobber
+            gh release upload $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --clobber
           } else {
-            gh release create $env:TAG trackertools-windows-x64.zip --title "trackertools $env:TAG" --generate-notes
+            gh release create $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --title "trackertools $env:TAG" --generate-notes
           }
