@@ -97,6 +97,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
 
     super::tracks::draw(painter, map, world, &trackers, frame, &space);
     subjects(painter, map, world, &subject_list, &picked, frame, &space);
+    focuses(painter, map, world, &picked, frame, &space);
 
     if let Some(live) = live {
         if live.target.is_none() {
@@ -223,6 +224,52 @@ fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         painter.line_segment([turned(r, 0.0), turned(r + 7.0, 0.0)], Stroke::new(1.5, color));
         if let Some(name) = world.get::<Name>(*e) {
             painter.text(p + Vec2::new(r + 4.0, -r - 2.0), Align2::LEFT_BOTTOM, name.as_str(), FontId::proportional(12.0), color);
+        }
+    }
+}
+
+/// SpringFocuses: a viewfinder's corners round its box and its point, its
+/// name and what it focuses on (or is moving to); the selected one also its
+/// path, and a dashed line to what it's moving to while it moves.
+fn focuses(painter: &Painter, map: &ViewportMapping, world: &World, picked: &[Entity], frame: FrameIndex, space: &dyn Fn(FrameIndex) -> SpaceMap) {
+    let store = world.resource::<SignalStore>();
+    let mut q = world.try_query::<(Entity, &Operator, &Output)>().expect("a query");
+    let list: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(e, o, _)| o.kind == "focus" && world.get::<bevy_ecs::entity_disabling::Disabled>(*e).is_none()).map(|(e, _, o)| (e, o.0)).collect();
+    for (e, sig) in list {
+        let Some(sig) = store.get(sig) else { continue };
+        let selected = picked.contains(&e);
+        let color = if selected { style::FOCUS } else { style::FOCUS.gamma_multiply(0.6) };
+        let to = |f: FrameIndex, v: &[f32]| space(f).box_from_source(std::array::from_fn(|c| v[c] as f64));
+        if selected {
+            path(painter, map, frame, |f| sig.get(f).map(|v| to(f, v)).map(|b| [b[0], b[1]]), color);
+        }
+        let Some(v) = sig.get(frame) else { continue };
+        let b = to(frame, v);
+        let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
+        let t = (r.width().min(r.height()) * 0.25).clamp(4.0, 18.0);
+        let stroke = Stroke::new(if selected { 2.0 } else { 1.5 }, color);
+        for (p, dx, dy) in [(r.left_top(), 1.0, 1.0), (r.right_top(), -1.0, 1.0), (r.left_bottom(), 1.0, -1.0), (r.right_bottom(), -1.0, -1.0)] {
+            let pts = vec![p + Vec2::new(dx * t, 0.0), p, p + Vec2::new(0.0, dy * t)];
+            painter.add(Shape::line(pts.clone(), Stroke::new(stroke.width + 2.0, Color32::from_black_alpha(140))));
+            painter.add(Shape::line(pts, stroke));
+        }
+        let p = map.to_screen([b[0], b[1]]);
+        painter.circle_filled(p, 3.0, color);
+        // What it focuses on now; while moving, a dashed line to it.
+        let Some(params) = world.get::<tt_core::focus::FocusParams>(e) else { continue };
+        let Some(target) = params.target_at(frame) else { continue };
+        if let Some(tv) = world.get::<Output>(target).and_then(|o| store.get(o.0)).and_then(|s| s.get(frame)).filter(|v| v.len() >= 2) {
+            let tb = to(frame, tv);
+            let tp = map.to_screen([tb[0], tb[1]]);
+            if (tp - p).length() > 2.0 {
+                painter.add(Shape::dashed_line(&[p, tp], Stroke::new(1.0, color.gamma_multiply(0.8)), 4.0, 3.0));
+            }
+        }
+        if selected {
+            let name = world.get::<Name>(e).map_or("SpringFocus".to_string(), |n| n.to_string());
+            let on = world.get::<Name>(target).map_or("it".to_string(), |n| n.to_string());
+            let label = format!("{name} \u{b7} on {on}");
+            painter.text(r.left_top() + Vec2::new(0.0, -3.0), Align2::LEFT_BOTTOM, label, FontId::proportional(11.0), color);
         }
     }
 }

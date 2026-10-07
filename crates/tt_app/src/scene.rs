@@ -116,6 +116,16 @@ impl Scene {
                 if ready {
                     self.subject = rest(world, s);
                     self.after = Some(0);
+                    // `=focus`: a SpringFocus on the subject, moving over to the tracker
+                    // selected on frame 600 (the playhead is at 625: mid-move), selected.
+                    if self.mode == "focus"
+                        && let (Some(sub), Some(t)) = (self.subject, world.resource::<tt_core::selection::Selection>().primary())
+                    {
+                        let f = tt_core::focus::make_focus(world, sub, 450);
+                        tt_core::focus::focus_on(world, f, 600, t);
+                        tt_core::focus::set_focus(world, f, "slower", |p| p.move_time = 1.5);
+                        world.resource_mut::<tt_core::selection::Selection>().select_only(f);
+                    }
                     // `=sketch`: a second sketch (its own colour), the first selected (its moving
                     // outline); `=view`: then inside the first's view (outside it dimmed).
                     if self.mode == "sketch" || self.mode == "view" {

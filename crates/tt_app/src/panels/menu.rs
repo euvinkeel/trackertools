@@ -38,6 +38,31 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         };
         ui.label(egui::RichText::new(what).strong());
         ui.separator();
+        // SpringFocus: one point moving from one tracked thing to the next.
+        if let Some(t) = followable.filter(|t| !tt_core::focus::is_focus(world, *t)) {
+            let here = world.resource::<tt_core::transport::Transport>().frame();
+            let name = crate::panels::outliner::label(world, t);
+            for f in tt_core::focus::focuses(world) {
+                let fname = crate::panels::outliner::label(world, f);
+                if ui
+                    .button(format!("{fname}: move over to {name} here"))
+                    .on_hover_text(format!("From frame {here} on, {fname} focuses on {name}: it springs over from what it focused on before (its move time and bounce are in the Inspector)"))
+                    .clicked()
+                {
+                    tt_core::focus::focus_on(world, f, here, t);
+                    world.resource_mut::<Selection>().select_only(f);
+                    ui.close();
+                }
+            }
+            if ui
+                .button(format!("Make a SpringFocus on {name}"))
+                .on_hover_text("One point that follows it, then moves smoothly over to whatever you tell it to later (right-click another sketch, tracker or subject on a later frame). Tab follows it; the stabilized export renders it.")
+                .clicked()
+            {
+                tt_core::focus::make_focus(world, t, here);
+                ui.close();
+            }
+        }
         if let Some(s) = followable
             && ui.button(format!("Enter view{}", chord(Action::EnterView))).on_hover_text("See a view that follows it and keeps it in the centre; sketch inside it for detail").clicked()
         {
@@ -162,7 +187,8 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     // The points: trackers, and sketches (a sketch's point is the hand's path).
     let mut points: Vec<Entity> = Vec::new();
     for e in selection.iter().copied().filter(|e| !subjects.contains(e)) {
-        let p = if tt_track::is_tracker(world, e) { Some(e) } else { sketch_of(world, e) };
+        // (A SpringFocus is a point too: its stabilized export is the smooth camera.)
+        let p = if tt_track::is_tracker(world, e) || tt_core::focus::is_focus(world, e) { Some(e) } else { sketch_of(world, e) };
         if let Some(p) = p.filter(|p| !points.contains(p)) {
             points.push(p);
         }

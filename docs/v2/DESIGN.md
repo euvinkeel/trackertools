@@ -554,6 +554,16 @@ The `Frame` operator (a virtual camera) turns a Box into a View transform. Its p
 
 ---
 
+### 10.4 SpringFocus: moving from one tracked thing to the next
+
+*(On request: "if at the start of the clip i already zoomed in and centered onto something but then i later want to do a tracked mouse shot … without having to hard cut to the mouse and still being able to move the camera smoothly over to it"; "make something called a SpringFocus, make some interface for me to set whatever its tracking at any time, spring settings in inspector".)*
+
+- **An operator** (`tt_core::focus`, kind `focus`) with keys: from a frame on, focus on a target (a sketch, tracker or subject; its inputs `target` follow its keys). Its output is a box in a tracker's layout, so it is followable: Tab follows it (the smooth camera), a layer attaches to it, a subject can take it as a member, and the stabilized export renders it (it counts as a point there).
+- **No lag:** at a key it doesn't chase the new target with a spring (that trails a moving mouse); it blends from what it showed without this key to the new target's own motion by a spring's step response, so both ends keep moving during the move and it lands exactly on the new target at the move time, then sits on it. A key during a move starts from wherever that move was. The box's size moves over the same way.
+- **The spring** (Inspector): move time (to land; 0 is a cut), bounce (damping ratio 1 − bounce: past and back), lead (it starts this long before the key). The step response is tuned to be within 0.2 % at the move time and the remainder added smoothly over the move, so it lands exactly, with no snap. A graph shows one move.
+- **Setting what it focuses on:** right-click a sketch, tracker or subject: *Make a SpringFocus on it*, or *SpringFocus N: move over to it here* (a key on the shown frame); in the Inspector, *Move over to…* on the shown frame, and its keys listed (frame, target, Go to, Remove). On the video: a viewfinder's corners round its box, a dashed line to what it's moving to, its name and target; the timeline: its frames, its keys (diamonds in each target's colour) and its moves shaded. A click on its point selects it.
+- Measured (`tests/focus.rs`, `focus::tests`): on the still target before the key, between them during the move, exactly on the moving target from the move time on (no lag), every step forward and under 60 px; a slower spring is slower and undoes in one step; a view entered with Tab sits on the new target after the move; keys and targets save and load; a bounce overshoots; a key mid-move starts from where it was; a lead starts it sooner.
+
 ## 11. Extensibility: modules
 
 A feature is a module:

@@ -151,6 +151,7 @@ fn select_on_click(world: &mut World) {
     let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
     let picked = crate::subject::pick_subject(world, frame, pos, grab)
         .or_else(|| pick_tracker(world, frame, pos, grab))
+        .or_else(|| crate::focus::pick_focus(world, frame, pos, grab))
         .or_else(|| crate::sketch::pick_sketch(world, frame, pos));
     let mut sel = world.resource_mut::<crate::selection::Selection>();
     match picked {

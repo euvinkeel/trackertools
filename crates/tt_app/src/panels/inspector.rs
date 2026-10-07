@@ -39,6 +39,9 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if tt_core::subject::is_subject(world, e) {
         subject_section(ui, world, e);
     }
+    if tt_core::focus::is_focus(world, e) {
+        super::focus_inspector::section(ui, world, e);
+    }
     if world.get::<SketchParams>(e).is_some() {
         sketch_color(ui, world, e);
         sketch_presets(ui, world, e);
@@ -105,6 +108,8 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                     std::any::TypeId::of::<tt_track::human::HumanLayer>(),
                     // (A sketch's colour has its own row: `sketch_color`.)
                     std::any::TypeId::of::<tt_core::sketch::Tint>(),
+                    // (A SpringFocus's keys and spring have their own section: `focus_inspector`.)
+                    std::any::TypeId::of::<tt_core::focus::FocusParams>(),
                 ];
                 if class == Class::Derived || hidden.contains(&r.type_id()) || (manual && r.type_id() == std::any::TypeId::of::<tt_track::Tracker>()) {
                     return None;
