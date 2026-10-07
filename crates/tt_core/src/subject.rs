@@ -360,7 +360,9 @@ fn drag_subject(world: &mut World) {
     {
         let src = map.to_source(at);
         let grab = (12.0 / scale) * map.a;
-        if let Some(e) = pick_subject(world, frame, src, grab)
+        // (A layer's picture over the point takes the press, unless this subject is selected.)
+        if crate::layer::press_on_layer(world, frame, src, grab).is_none()
+            && let Some(e) = pick_subject(world, frame, src, grab)
             && let Some(v) = value_at(world, e, frame)
         {
             world.resource_mut::<SubjectDrag>().0 = Some((e, [v[0] - src[0], v[1] - src[1]], frame, false));

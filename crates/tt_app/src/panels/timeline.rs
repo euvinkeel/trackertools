@@ -588,6 +588,7 @@ pub enum LaneKind {
     Sketch,
     View,
     Tracker,
+    Layer,
 }
 
 /// The lanes, top to bottom, in the outliner's order (`crate::tree`: each
@@ -601,6 +602,7 @@ pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
             Node::Subject => LaneKind::Subject,
             Node::Sketch => LaneKind::Sketch,
             Node::Tracker => LaneKind::Tracker,
+            Node::Layer => LaneKind::Layer,
         };
         out.push((e, depth, kind));
         if let Some(v) = tt_core::view::view_of(world, e).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
@@ -852,6 +854,11 @@ fn lanes(
                     bars = bars_of(sig, y + 2.0, y + 11.0, &alive);
                 }
             }
+            LaneKind::Layer => {
+                if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
+                    bars = bars_of(sig, y + 4.0, y + 12.0, &alive);
+                }
+            }
             LaneKind::View => {
                 if let Some(sig) = world.get::<Output>(e).and_then(|o| store.get(o.0)) {
                     bars = bars_of(sig, y + 5.0, y + 9.0, &alive);
@@ -936,6 +943,14 @@ fn lanes(
                     let x = scale.x(s.at as f64 + 0.5);
                     painter.line_segment([Pos2::new(x, y + 1.0), Pos2::new(x, y + LANE_H - 1.0)], Stroke::new(2.0, c));
                 }
+            }
+        }
+        // A layer's keys (any of its values keyed on that frame).
+        if kind == LaneKind::Layer
+            && let Some(p) = world.get::<tt_core::layer::LayerParams>(e)
+        {
+            for f in p.key_frames().into_iter().filter(|f| visible.contains(f)) {
+                icons::diamond(&painter, Pos2::new(scale.x(f as f64 + 0.5), y + 8.0), 3.5, Stroke::new(1.0, egui::Color32::from_black_alpha(160)), Some(style::LAYER));
             }
         }
         // A subject's own offset keys.

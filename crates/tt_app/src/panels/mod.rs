@@ -4,6 +4,7 @@
 mod brush;
 pub mod export;
 mod inspector;
+mod layer_inspector;
 pub mod look_editor;
 mod menu;
 pub mod outliner;

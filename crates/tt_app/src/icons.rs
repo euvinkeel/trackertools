@@ -22,6 +22,7 @@ pub enum Glyph {
     Look,
     ResetPoint,
     Subject,
+    Layer,
     Other,
 }
 
@@ -32,6 +33,7 @@ impl Glyph {
                 "sketch" => Glyph::Sketch,
                 "frame" => Glyph::View,
                 "subject" => Glyph::Subject,
+                "layer" => Glyph::Layer,
                 "track" => Glyph::tracker(world.get::<tt_track::Tracker>(e).map_or(Method::Template, |t| t.method)),
                 _ => Glyph::Other,
             };
@@ -61,6 +63,7 @@ impl Glyph {
             Glyph::Template | Glyph::CoTracker => style::AUTO,
             Glyph::Look | Glyph::ResetPoint => style::PIN,
             Glyph::Subject => style::SUBJECT,
+            Glyph::Layer => style::LAYER,
             Glyph::Other => style::MUTED,
         }
     }
@@ -77,6 +80,7 @@ impl Glyph {
             Glyph::Look => "look: a pattern a template tracker matches",
             Glyph::ResetPoint => "reset point: the pixel a CoTracker follows from here on",
             Glyph::Subject => "subject: one position its members carry together",
+            Glyph::Layer => "layer: a picture, GIF or clip that moves with what it's attached to",
             Glyph::Other => "item",
         }
     }
@@ -136,6 +140,13 @@ pub fn paint_in(painter: &Painter, rect: Rect, g: Glyph, strong: bool, color: Co
         Glyph::Subject => {
             diamond(painter, o, r * 0.75, stroke, None);
             painter.line_segment([o + Vec2::new(r * 0.75, 0.0), o + Vec2::new(r * 1.15, 0.0)], stroke);
+        }
+        // A picture: its frame and a hill.
+        Glyph::Layer => {
+            let b = Rect::from_center_size(o, Vec2::new(2.0 * r, 1.6 * r));
+            painter.rect_stroke(b, 1.5, stroke, egui::StrokeKind::Middle);
+            painter.add(Shape::line(vec![b.left_bottom() + Vec2::new(r * 0.2, -r * 0.2), b.center() + Vec2::new(-r * 0.2, r * 0.05), b.right_bottom() + Vec2::new(-r * 0.2, -r * 0.2)], stroke));
+            painter.circle_filled(b.right_top() + Vec2::new(-r * 0.5, r * 0.45), s * 0.06, c);
         }
         Glyph::Other => {
             painter.circle_stroke(o, r * 0.4, stroke);
