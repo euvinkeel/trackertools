@@ -937,12 +937,20 @@ fn stroke_changed(changed: Query<Entity, Changed<Stroke>>, mut inv: ResMut<Inval
 
 pub struct SketchModule;
 
+/// A sketch's own colour (sRGB), chosen in the Inspector. Without one it
+/// takes its place in the app's palette (the order sketches were made in).
+/// Trackers following the sketch take its colour too.
+#[derive(Component, Reflect, Clone, Copy, Debug, PartialEq, Eq)]
+#[reflect(Component)]
+pub struct Tint(pub [u8; 3]);
+
 impl Module for SketchModule {
     fn build(&self, app: &mut AppBuilder) {
         app.component::<Capture>(Class::Document)
             .component::<ClockMap>(Class::Document)
             .component::<Stroke>(Class::Document)
             .component::<Through>(Class::Document)
+            .component::<Tint>(Class::Document)
             .operator(SketchKind)
             .operator_params::<SketchParams>()
             .add_systems(stroke_changed.in_set(Set::Invalidate).before(crate::op::propagate));

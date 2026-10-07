@@ -4,10 +4,16 @@
 //! Sketch tool's cursor and hints. (A click on a region selects its sketch:
 //! tt_core's tool.rs.)
 //!
-//! In the visual language (`style`), sketches are drawn by hand: orange. The
-//! Sketch tool shows, before a press, the box a hold would get, dashed and
-//! light, sized by the hand's jiggle right now (as a held frame is); once
-//! pressed, the box being recorded is solid and thick (amber: live).
+//! Each sketch has its own colour (`crate::colors`: orange, then the
+//! palette, or one chosen in the Inspector). The Sketch tool shows, before a
+//! press, the box a hold would get, dashed and light, sized by the hand's
+//! jiggle right now (as a held frame is); once pressed, the box being
+//! recorded is solid and thick (amber: live) and a red frame goes round the
+//! video. So a box shows on any picture, the selected sketch's box and the
+//! one being recorded get a moving black-and-white outline (marching ants),
+//! the others a thin dark edge; inside a view, the box it follows is dashed.
+//! [`dim_outside`]: inside a view, the picture outside that box is darker,
+//! with slowly moving lines (both are settings, `PointerView`).
 
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
@@ -44,6 +50,11 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     let subject_list: Vec<(Entity, tt_core::signal::SignalId)> = q.iter(world).filter(|(_, o, _)| o.kind == "subject").map(|(e, _, o)| (e, o.0)).collect();
     let trackers = super::tracks::list(world);
     let world: &World = world;
+    let colors = crate::colors::Colors::new(world);
+    let ants = world.resource::<super::viewport::PointerView>().ants;
+    let now = world.resource::<tt_core::time::WallClock>().now;
+    let followed = view.and_then(|v| tt_core::view::followed(world, v));
+    let mut animate = false;
     // The shown space's framing around the playhead, looked up once per frame drawn.
     // (The playhead's frame uses the framing as shown, which may be easing in.)
     let spaces: Vec<SpaceMap> = (frame - PATH_FRAMES..=frame + PATH_FRAMES).map(|f| if f == frame { shown } else { map_at(world, view, f) }).collect();
@@ -60,19 +71,28 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let span = tt_core::span::span_of(world, *e);
         let own = |f: FrameIndex| sig.get(f).filter(|_| span.contains(f)).map(|v| std::array::from_fn::<f64, 6, _>(|c| v[c] as f64));
         let value = |f: FrameIndex| if editing == Some(*e) { live.and_then(|l| l.preview_at(f)).or_else(|| own(f)) } else { own(f) };
+        let own = colors.sketch(*e);
         let color = if editing == Some(*e) {
             LIVE
         } else if lit.contains(e) && live.is_none() {
-            style::HAND
+            own
         } else {
-            style::HAND.gamma_multiply(0.35)
+            own.gamma_multiply(0.75)
         };
         if editing == Some(*e) || (lit.contains(e) && live.is_none()) {
             path(painter, map, frame, |f| value(f).map(|v| to_canvas(f, v)).map(|v| [v[0], v[1]]), color);
         }
         let Some(v) = value(frame) else { continue };
         let stale = editing != Some(*e) && sig.state(frame) == FrameState::Stale;
-        region(painter, map, to_canvas(frame, v), color, stale, editing == Some(*e) && live.is_some_and(|l| l.preview_at(frame).is_some()));
+        let outline = if ants && (editing == Some(*e) || (lit.contains(e) && live.is_none())) {
+            animate = true;
+            Outline::Ants(now)
+        } else if followed == Some(*e) {
+            Outline::Dashed
+        } else {
+            Outline::Halo
+        };
+        region(painter, map, to_canvas(frame, v), color, stale, editing == Some(*e) && live.is_some_and(|l| l.preview_at(frame).is_some()), outline);
     }
 
     super::tracks::draw(painter, map, world, &trackers, frame, &space);
@@ -82,14 +102,15 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         if live.target.is_none() {
             path(painter, map, frame, |f| live.preview_at(f).map(|b| to_canvas(f, b)).map(|b| [b[0], b[1]]), LIVE);
             if let Some(b) = live.preview_at(frame) {
-                region(painter, map, to_canvas(frame, b), LIVE, false, true);
+                animate |= ants;
+                region(painter, map, to_canvas(frame, b), LIVE, false, true, if ants { Outline::Ants(now) } else { Outline::Halo });
             }
         }
         // Playing, the hand is `lag` behind the shown frame: its newest box, dimmed.
         if live.preview_at(frame).is_none()
             && let Some((g, b)) = (frame - 120..frame).rev().find_map(|g| live.visits(g).then(|| live.preview_at(g)).flatten().map(|b| (g, b)))
         {
-            region(painter, map, to_canvas(g, b), LIVE, true, false);
+            region(painter, map, to_canvas(g, b), LIVE, true, false, Outline::Halo);
         }
         // The raw hand over the last half second (in the pixels it was drawn in).
         if live.drawn_in == view {
@@ -98,6 +119,22 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
             let trail: Vec<Pos2> = live.samples[from..].iter().map(|s| map.to_screen([s[1], s[2]])).collect();
             painter.add(Shape::line(trail, Stroke::new(1.0, Color32::from_white_alpha(110))));
         }
+    }
+
+    // Recording: a red frame round the video, so it is never in doubt.
+    if live.is_some() {
+        painter.rect_stroke(map.panel.shrink(1.5), 0.0, Stroke::new(3.0, RECORDING), StrokeKind::Inside);
+    }
+    // The Sketch tool with nothing selected: how to start, in the middle at the bottom.
+    if tool == Tool::Sketch && live.is_none() && selected.is_none() {
+        let galley = painter.layout_no_wrap("Hold on the subject to sketch it. Press Space while you hold to play and follow it.".into(), FontId::proportional(14.0), style::TEXT);
+        let r = Align2::CENTER_BOTTOM.anchor_size(map.panel.center_bottom() - Vec2::new(0.0, 28.0), galley.size()).expand(7.0);
+        painter.rect_filled(r, 5.0, Color32::from_black_alpha(190));
+        painter.galley(r.min + Vec2::splat(7.0), galley, style::TEXT);
+    }
+    if animate {
+        // (The outline moves at 15 frames a second: enough, and cheap.)
+        painter.ctx().request_repaint_after(std::time::Duration::from_millis(66));
     }
 
     // The Sketch tool: a crosshair (none while holding, if so set) and what the keys do.
@@ -221,16 +258,103 @@ fn brush_outline(painter: &Painter, map: &ViewportMapping, world: &World, target
     painter.ctx().request_repaint_after(std::time::Duration::from_millis(33));
 }
 
+/// The red of the frame round the video while recording.
+const RECORDING: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
+
+/// How a box's outline shows on the picture.
+#[derive(Clone, Copy)]
+enum Outline {
+    /// A thin dark edge on both sides of it.
+    Halo,
+    /// Dashed: the box the shown view follows.
+    Dashed,
+    /// Marching ants (black and white, moving with the time given) just outside it.
+    Ants(f64),
+}
+
+/// The four corners of `r`, closed.
+fn ring(r: Rect) -> [Pos2; 5] {
+    [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()]
+}
+
 /// `[x, y, left, top, right, bottom]`: the region's outline and the point;
 /// `thick` while it is being recorded.
-fn region(painter: &Painter, map: &ViewportMapping, b: [f64; 6], color: Color32, stale: bool, thick: bool) {
+fn region(painter: &Painter, map: &ViewportMapping, b: [f64; 6], color: Color32, stale: bool, thick: bool, outline: Outline) {
     let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
     let width = if thick { 3.0 } else if stale { 1.0 } else { 1.5 };
     let stroke = Stroke::new(width, color.gamma_multiply(if stale { 0.5 } else { 1.0 }));
-    painter.rect_stroke(r, 0.0, stroke, StrokeKind::Middle);
     let p = map.to_screen([b[0], b[1]]);
-    painter.line_segment([p - Vec2::new(5.0, 0.0), p + Vec2::new(5.0, 0.0)], stroke);
-    painter.line_segment([p - Vec2::new(0.0, 5.0), p + Vec2::new(0.0, 5.0)], stroke);
+    let cross = [[p - Vec2::new(5.0, 0.0), p + Vec2::new(5.0, 0.0)], [p - Vec2::new(0.0, 5.0), p + Vec2::new(0.0, 5.0)]];
+    // A dark edge under the box and the cross, so they show on light pictures too.
+    let edge = Stroke::new(width + 2.0, Color32::from_black_alpha(if stale { 70 } else { 140 }));
+    match outline {
+        Outline::Dashed => {
+            painter.extend(Shape::dashed_line(&ring(r), Stroke::new(width + 2.0, Color32::from_black_alpha(110)), 6.0, 4.0));
+            painter.extend(Shape::dashed_line(&ring(r), stroke, 6.0, 4.0));
+        }
+        _ => {
+            painter.rect_stroke(r, 0.0, edge, StrokeKind::Middle);
+            painter.rect_stroke(r, 0.0, stroke, StrokeKind::Middle);
+        }
+    }
+    for c in cross {
+        painter.line_segment(c, edge);
+        painter.line_segment(c, stroke);
+    }
+    if let Outline::Ants(t) = outline {
+        let ants = ring(r.expand(width / 2.0 + 1.5));
+        painter.add(Shape::line(ants.to_vec(), Stroke::new(1.0, Color32::BLACK)));
+        let offset = (t * 16.0).rem_euclid(10.0) as f32;
+        painter.extend(Shape::dashed_line_with_offset(&ants, Stroke::new(1.0, Color32::WHITE), &[5.0], &[5.0], offset));
+    }
+}
+
+/// Inside a view: the picture outside the box the view follows, darker,
+/// with diagonal lines that move slowly, so the box (and what is the
+/// editor's, not the video's) is clear even on a dark picture. With the box
+/// off the screen (or none at this frame), nothing.
+pub fn dim_outside(painter: &Painter, map: &ViewportMapping, world: &World, frame: FrameIndex, view: Option<Entity>, shown: SpaceMap) {
+    let Some(target) = view.and_then(|v| tt_core::view::followed(world, v)) else { return };
+    if !world.resource::<super::viewport::PointerView>().dim_outside {
+        return;
+    }
+    let Some(v) = world.get::<Output>(target).and_then(|o| world.resource::<SignalStore>().get(o.0)).and_then(|s| s.get(frame)).filter(|v| v.len() >= 6) else { return };
+    let b = shown.box_from_source(std::array::from_fn(|c| v[c] as f64));
+    let inner = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
+    let outer = map.panel;
+    if !outer.intersects(inner) {
+        return;
+    }
+    let inner = inner.intersect(outer);
+    // The four bands round the box.
+    let bands = [
+        Rect::from_min_max(outer.min, Pos2::new(outer.max.x, inner.min.y)),
+        Rect::from_min_max(Pos2::new(outer.min.x, inner.max.y), outer.max),
+        Rect::from_min_max(Pos2::new(outer.min.x, inner.min.y), Pos2::new(inner.min.x, inner.max.y)),
+        Rect::from_min_max(Pos2::new(inner.max.x, inner.min.y), Pos2::new(outer.max.x, inner.max.y)),
+    ];
+    const GAP: f32 = 11.0;
+    let now = world.resource::<tt_core::time::WallClock>().now;
+    let drift = (now * 5.0).rem_euclid(GAP as f64) as f32;
+    let line = Stroke::new(1.0, Color32::from_white_alpha(16));
+    for band in bands.into_iter().filter(|b| b.width() > 0.5 && b.height() > 0.5) {
+        painter.rect_filled(band, 0.0, Color32::from_black_alpha(125));
+        // Lines going up to the right, x − y = c, every GAP points along x.
+        let clip = painter.with_clip_rect(band.intersect(painter.clip_rect()));
+        let h = band.height();
+        let mut x = band.min.x - h - GAP + drift;
+        while x < band.max.x + GAP {
+            clip.line_segment([Pos2::new(x, band.max.y), Pos2::new(x + h, band.min.y)], line);
+            x += GAP;
+        }
+    }
+    // Which box this is, in words, at the bottom of the video.
+    let name = world.get::<Name>(target).map_or("this".to_string(), |n| n.to_string());
+    let galley = painter.layout_no_wrap(format!("Inside {name}'s view  \u{b7}  Shift+Tab leaves"), FontId::proportional(12.0), style::TEXT);
+    let r = Align2::RIGHT_BOTTOM.anchor_size(outer.right_bottom() - Vec2::new(12.0, 10.0), galley.size()).expand(5.0);
+    painter.rect_filled(r, 4.0, Color32::from_black_alpha(170));
+    painter.galley(r.min + Vec2::splat(5.0), galley, style::TEXT);
+    painter.ctx().request_repaint_after(std::time::Duration::from_millis(100));
 }
 
 /// The point's path around the playhead: behind solid, ahead faint; gaps break it.

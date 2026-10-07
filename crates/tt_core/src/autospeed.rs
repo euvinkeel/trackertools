@@ -133,6 +133,8 @@ pub struct AutoSpeedState {
     pub reason: &'static str,
     /// How busy the stretch ahead is: 0 calm … 1 busy (for the HUD).
     pub busy: Option<f64>,
+    /// The sketch that reading came from (the busiest one read), for the HUD.
+    pub reading: Option<Entity>,
     /// Q/E while it drives: a multiplier on what it picks, kept until changed.
     pub bias: f64,
     /// When `bias` last changed (wall seconds), for the flash.
@@ -146,7 +148,7 @@ pub struct AutoSpeedState {
 
 impl Default for AutoSpeedState {
     fn default() -> Self {
-        Self { run: None, wrote: None, range: None, reason: "", busy: None, bias: 1.0, bias_changed: f64::NEG_INFINITY, refs: HashMap::new(), hand: VecDeque::new() }
+        Self { run: None, wrote: None, range: None, reason: "", busy: None, reading: None, bias: 1.0, bias_changed: f64::NEG_INFINITY, refs: HashMap::new(), hand: VecDeque::new() }
     }
 }
 
@@ -255,7 +257,7 @@ fn calm_of(mut v: Vec<f64>) -> Option<f64> {
 /// How busy the next `look_ahead` seconds are in the foresight sketches
 /// (0 calm … 1 busy; the busier of them), each against its own normal and
 /// against how it has been lately (module docs).
-fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<Entity, (u64, f64, f64)>) -> Option<f64> {
+fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<Entity, (u64, f64, f64)>) -> Option<(f64, Entity)> {
     let t = world.resource::<Transport>();
     let fps = t.fps.as_f64();
     let (f0, n) = (t.frame(), (knobs.look_ahead.max(0.0) as f64 * fps).ceil() as FrameIndex);
@@ -263,7 +265,7 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
     // (Ahead is behind while playing backward, and lately after.)
     let dir: FrameIndex = if t.reverse { -1 } else { 1 };
     let store = world.resource::<SignalStore>();
-    let mut out: Option<f64> = None;
+    let mut out: Option<(f64, Entity)> = None;
     for source in foresight_sources(world, live, knobs.foresight) {
         let Some(sig) = world.get::<Output>(source).and_then(|o| store.get(o.0)) else { continue };
         // Only the frames the sketch is alive on (its span) count, for its normal and ahead.
@@ -301,7 +303,9 @@ fn busy_ahead(world: &World, live: &Live, knobs: &AutoSpeed, refs: &mut HashMap<
         if let Some(l) = calm_of(lately.iter().filter_map(|f| sig.get(*f)).map(side).collect()) {
             u = u.max(change(a, l, sens));
         }
-        out = Some(out.map_or(u, |o| o.max(u)));
+        if out.is_none_or(|(o, _)| u > o) {
+            out = Some((u, source));
+        }
     }
     out
 }
@@ -411,6 +415,7 @@ pub fn auto_speed(world: &mut World) {
             }
         }
         state.busy = None;
+        state.reading = None;
     }
     if let (None, true, Some(start)) = (&state.run, knobs.enabled, stroke) {
         let rate = world.resource::<Transport>().rate;
@@ -428,7 +433,9 @@ pub fn auto_speed(world: &mut World) {
             let scale = world.resource::<PointerFrame>().scale;
             let scale = if scale > 0.0 { scale } else { 1.0 };
             let live = world.resource::<LiveCapture>().0.as_ref().expect("a live stroke");
-            let busy = busy_ahead(world, live, &knobs, &mut state.refs);
+            let read = busy_ahead(world, live, &knobs, &mut state.refs);
+            let busy = read.map(|(u, _)| u);
+            state.reading = read.map(|(_, e)| e);
             let (at_1x, hand_limit) = hand(world, live, &knobs, &mut run.calm, scale, dt);
             if let Some(s) = at_1x {
                 state.hand.push_back(s);

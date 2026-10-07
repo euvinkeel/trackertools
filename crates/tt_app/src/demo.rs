@@ -55,6 +55,12 @@ const NEST_RELEASE: f64 = 6.4;
 /// Anticipatory speed: a new sketch from this frame, from ¼×; wall seconds from
 /// the press: Space taps (play, pause), release.
 const AUTO_FRAME: i64 = 300;
+/// With `TT_SKETCH_DEMO_READ`: inside the first sketch, so auto speed has its frames ahead to read.
+const READ_FRAME: i64 = 130;
+
+fn auto_frame() -> i64 {
+    if std::env::var_os("TT_SKETCH_DEMO_READ").is_some() { READ_FRAME } else { AUTO_FRAME }
+}
 const AUTO_TAPS: [f64; 2] = [0.05, 6.0];
 const AUTO_RELEASE: f64 = 6.4;
 /// The tracker's anchor, and the frames retaken one by one (from here, 3 frames, `RETAKE_DX` right).
@@ -322,15 +328,26 @@ impl SketchDemo {
                     world.resource_mut::<ActiveView>().0 = None;
                     world.resource_mut::<ActiveTool>().0 = Tool::Sketch;
                     self.in_view.clear();
-                    push(world, Action::DeselectAll);
-                    push(world, Action::Seek(AUTO_FRAME));
+                    // `TT_SKETCH_DEMO_READ`: edit the first sketch instead, so auto speed reads it
+                    // ahead (and its meter shows).
+                    let first = std::env::var_os("TT_SKETCH_DEMO_READ").and_then(|_| {
+                        let mut q = world.query::<(Entity, &tt_core::op::Operator)>();
+                        let mut all: Vec<Entity> = q.iter(world).filter(|(_, o)| o.kind == "sketch").map(|(e, _)| e).collect();
+                        tt_core::meta::creation_order(world, &mut all);
+                        all.first().copied()
+                    });
+                    match first {
+                        Some(s) => world.resource_mut::<Selection>().select_only(s),
+                        None => push(world, Action::DeselectAll),
+                    }
+                    push(world, Action::Seek(auto_frame()));
                     push(world, Action::SetRate(1)); // 0.25×
                     self.phase = Phase::AutoReady { since: now, set: true };
-                } else if now - since > LAG + 0.5 && t.frame() == AUTO_FRAME && !t.playing {
+                } else if now - since > LAG + 0.5 && t.frame() == auto_frame() && !t.playing {
                     *frame = PointerFrame { scale: world.resource::<crate::panels::viewport::ViewportMapping>().points_per_canvas(), ..hold(samples, Some(now - 0.002), None) };
                     self.phase = Phase::Auto { t0: now, taps: 0 };
                     self.shots.push(("11-auto-speed", now + 2.5));
-                    tracing::info!("sketch demo: recording with anticipatory speed from frame {AUTO_FRAME}, from ×{:.2}", t.rate);
+                    tracing::info!("sketch demo: recording with anticipatory speed from frame {}, from ×{:.2}", auto_frame(), t.rate);
                 }
             }
             Phase::Auto { t0, taps } => {

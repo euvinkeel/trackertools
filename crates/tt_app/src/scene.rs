@@ -115,6 +115,15 @@ impl Scene {
                 if ready {
                     self.subject = rest(world, s);
                     self.after = Some(0);
+                    // `=sketch`: a second sketch (its own colour), the first selected (its moving
+                    // outline); `=view`: then inside the first's view (outside it dimmed).
+                    if self.mode == "sketch" || self.mode == "view" {
+                        sketch_at(world, 450..750, "Sketch 2", [160.0, -90.0]);
+                        world.resource_mut::<tt_core::selection::Selection>().select_only(s);
+                        if self.mode == "view" {
+                            world.resource_mut::<tt_core::input::PendingActions>().push(tt_core::input::Action::EnterView);
+                        }
+                    }
                 }
             }
         }
@@ -161,12 +170,17 @@ fn sprite(f: f64) -> [f64; 2] {
 
 /// A hand-drawn sketch over `frames`: one stroke following the sprite with a wobble, as the Sketch tool records one.
 fn sketch(world: &mut World, frames: std::ops::Range<FrameIndex>) -> Option<Entity> {
+    sketch_at(world, frames, "Sketch 1", [0.0, 0.0])
+}
+
+/// [`sketch`], named `name`, `off` (px) from the sprite.
+fn sketch_at(world: &mut World, frames: std::ops::Range<FrameIndex>, name: &str, off: [f64; 2]) -> Option<Entity> {
     let secs = (frames.end - frames.start) as f64 / 60.0;
     let samples: Vec<f32> = (0..=(secs * 1000.0) as usize)
         .flat_map(|i| {
             let t = i as f64 / 1000.0;
             let p = sprite(frames.start as f64 + 60.0 * t - 0.5);
-            [t as f32, (p[0] + 4.0 * (7.0 * t).sin()) as f32, (p[1] + 3.0 * (5.0 * t).cos()) as f32]
+            [t as f32, (p[0] + off[0] + 4.0 * (7.0 * t).sin()) as f32, (p[1] + off[1] + 3.0 * (5.0 * t).cos()) as f32]
         })
         .collect();
     let mut clock = ClockMap::default();
@@ -181,7 +195,7 @@ fn sketch(world: &mut World, frames: std::ops::Range<FrameIndex>) -> Option<Enti
         let n = samples.len() / STREAM_CHANNELS;
         let s = tx.spawn((Name::new("Stroke 1"), Capture { rate: 1.0, samples: n as u32 }, clock, Stroke { lag: 0.0, ..Stroke::default() }, Output(stream)));
         let out = tx.create_signal(BOX_CHANNELS);
-        made = Some(tx.spawn((Name::new("Sketch 1"), Operator { kind: "sketch".into() }, Inputs(vec![("stroke".into(), s)]), Output(out), SketchParams { lag: 0.0, ..SketchParams::default() })));
+        made = Some(tx.spawn((Name::new(name.to_string()), Operator { kind: "sketch".into() }, Inputs(vec![("stroke".into(), s)]), Output(out), SketchParams { lag: 0.0, ..SketchParams::default() })));
     });
     made
 }

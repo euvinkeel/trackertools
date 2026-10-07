@@ -78,9 +78,10 @@ enum Mark {
 }
 
 impl Mark {
-    fn color(self) -> Color32 {
+    /// `found`: the colour of what the tracker found (its sketch's, or cyan).
+    fn color(self, found: Color32) -> Color32 {
         match self {
-            Mark::Auto => style::AUTO,
+            Mark::Auto => found,
             Mark::Lost => style::LOST,
             Mark::Drawn => style::HAND,
         }
@@ -100,7 +101,10 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
     let store = world.resource::<SignalStore>();
     let now = world.resource::<tt_core::time::WallClock>().now;
     let mut moving = false;
+    let colors = crate::colors::Colors::new(world);
     for &(e, id) in list {
+        // What it found, in the colour of the sketch it follows (cyan with none).
+        let found = colors.tracker(world, e);
         let Some(sig) = store.get(id) else { continue };
         let looks = looks_of(world, e);
         let method = world.get::<Tracker>(e).map_or(Method::Template, |t| t.method);
@@ -128,7 +132,7 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         let line = |run: &[Pos2], (mark, ahead): (Mark, bool)| {
             if run.len() > 1 {
                 let width = if mark == Mark::Drawn { 1.6 } else { 1.0 };
-                painter.add(Shape::line(run.to_vec(), Stroke::new(width, mark.color().gamma_multiply(fade * if ahead { 0.4 } else { 0.9 }))));
+                painter.add(Shape::line(run.to_vec(), Stroke::new(width, mark.color(found).gamma_multiply(fade * if ahead { 0.4 } else { 0.9 }))));
             }
         };
         let (mut run, mut kind): (Vec<Pos2>, Option<(Mark, bool)>) = (Vec::new(), None);
@@ -209,7 +213,7 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
                 if let Some(a) = auto.and_then(|a| a.get(frame)) {
                     let q = screen(frame, a[0], a[1]);
                     if (q - p).length() > 1.5 {
-                        let c = if tt_track::flags(a) != 0 { style::LOST } else { style::AUTO };
+                        let c = if tt_track::flags(a) != 0 { style::LOST } else { found };
                         dashed(painter, q, p, Stroke::new(1.0, c.gamma_multiply(0.55 * fade)));
                         icons::crosshair(painter, q, 3.5, Stroke::new(1.0, c.gamma_multiply(0.6 * fade)));
                     }
@@ -225,7 +229,7 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             None => {
                 let b = space(frame).box_from_source(std::array::from_fn(|c| v[c] as f64));
                 let flags = tt_track::flags(v);
-                let c = if flags != 0 { style::LOST } else { style::AUTO }.gamma_multiply(fade * if stale { 0.5 } else { 1.0 });
+                let c = if flags != 0 { style::LOST } else { found }.gamma_multiply(fade * if stale { 0.5 } else { 1.0 });
                 let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
                 let stroke = Stroke::new(if lit { 1.5 } else { 1.0 }, c);
                 painter.rect_stroke(r, 2.0, stroke, StrokeKind::Middle);

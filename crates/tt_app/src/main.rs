@@ -3,6 +3,7 @@
 // A release build is a windowed program: no console window beside it.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod colors;
 mod cotracker;
 mod demo;
 mod files;

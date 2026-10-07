@@ -65,6 +65,9 @@ struct SettingsFile {
     /// While holding a stroke: hide the pointer; the clear window's radius (pt, 0 = off).
     hide_pointer: bool,
     clear_radius: f32,
+    /// The selected box's moving outline; in a view, outside its box dimmed.
+    marching_ants: bool,
+    dim_outside_view: bool,
     /// Anticipatory speed: on/off and its knobs.
     auto_speed: AutoSpeed,
     /// New tracker looks get their mask painted automatically.
@@ -100,6 +103,8 @@ impl Default for SettingsFile {
             view_dead_zone: v.params.dead_zone,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
+            marching_ants: p.ants,
+            dim_outside_view: p.dim_outside,
             auto_speed: AutoSpeed::default(),
             auto_mask_looks: LookDefaults::default().auto_mask,
             stabilize_smooth_position: st.smooth_position,
@@ -128,6 +133,8 @@ impl SettingsFile {
             view_dead_zone: v.params.dead_zone,
             hide_pointer: p.hide_pointer,
             clear_radius: p.clear_radius,
+            marching_ants: p.ants,
+            dim_outside_view: p.dim_outside,
             auto_speed: a.clone(),
             auto_mask_looks: l.auto_mask,
             stabilize_smooth_position: st.smooth_position,
@@ -163,7 +170,12 @@ impl SettingsFile {
             v.params.pan_damping = self.view_pan_damping.clamp(0.0, 5.0);
             v.params.dead_zone = self.view_dead_zone.clamp(0.0, 0.5);
         }
-        *world.resource_mut::<PointerView>() = PointerView { hide_pointer: self.hide_pointer, clear_radius: self.clear_radius.clamp(0.0, 200.0) };
+        *world.resource_mut::<PointerView>() = PointerView {
+            hide_pointer: self.hide_pointer,
+            clear_radius: self.clear_radius.clamp(0.0, 200.0),
+            ants: self.marching_ants,
+            dim_outside: self.dim_outside_view,
+        };
         // Version 3 turned anticipatory speed on by default.
         *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };
         if let Some(mut l) = world.get_resource_mut::<LookDefaults>() {

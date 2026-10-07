@@ -84,7 +84,12 @@ impl Glyph {
 
 /// `g` painted in the square `rect`; `strong` (selected) in full colour, else dimmer.
 pub fn paint(painter: &Painter, rect: Rect, g: Glyph, strong: bool) {
-    let c = g.color().gamma_multiply(if strong { 1.0 } else { 0.75 });
+    paint_in(painter, rect, g, strong, g.color());
+}
+
+/// [`paint`] in `color` (a sketch's own, or a tracker's sketch's: `crate::colors`).
+pub fn paint_in(painter: &Painter, rect: Rect, g: Glyph, strong: bool, color: Color32) {
+    let c = color.gamma_multiply(if strong { 1.0 } else { 0.75 });
     let s = rect.width().min(rect.height());
     let o = rect.center();
     let stroke = Stroke::new((s / 9.0).clamp(1.0, 2.0), c);
@@ -140,9 +145,14 @@ pub fn paint(painter: &Painter, rect: Rect, g: Glyph, strong: bool) {
 
 /// An icon the height of a line of text, as a widget (its tooltip says what it is).
 pub fn icon(ui: &mut egui::Ui, g: Glyph, strong: bool) -> egui::Response {
+    icon_in(ui, g, strong, g.color())
+}
+
+/// [`icon`] in `color`.
+pub fn icon_in(ui: &mut egui::Ui, g: Glyph, strong: bool, color: Color32) -> egui::Response {
     let h = ui.text_style_height(&egui::TextStyle::Body).max(12.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(h), egui::Sense::hover());
-    paint(ui.painter(), rect, g, strong);
+    paint_in(ui.painter(), rect, g, strong, color);
     response.on_hover_text(g.name())
 }
 

@@ -40,6 +40,7 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         subject_section(ui, world, e);
     }
     if world.get::<SketchParams>(e).is_some() {
+        sketch_color(ui, world, e);
         sketch_presets(ui, world, e);
     }
     components(ui, world, e);
@@ -47,6 +48,38 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if let Some(view) = tt_core::view::view_of(world, e) {
         ui.separator();
         egui::CollapsingHeader::new("View (Tab to enter)").id_salt(("view", view)).default_open(true).show(ui, |ui| components(ui, world, view));
+    }
+}
+
+/// A sketch's colour: a swatch per choice (one undo step a click), and Auto
+/// (its place in the palette). Its trackers take it too.
+fn sketch_color(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    use tt_core::sketch::Tint;
+    let now = crate::colors::Colors::new(world).sketch(e);
+    let own = world.get::<Tint>(e).copied();
+    let mut pick: Option<Option<Tint>> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Colour").on_hover_text("Its box, path and timeline lane, and the trackers that follow it. Pick one that shows on this video.");
+        let choices = crate::colors::PALETTE.iter().copied().chain([egui::Color32::WHITE, egui::Color32::from_rgb(0x11, 0x11, 0x11), egui::Color32::from_rgb(0x38, 0xbd, 0xf8)]);
+        for c in choices {
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            let chosen = own.is_some() && c == now;
+            ui.painter().rect_filled(rect.shrink(1.0), 3.0, c);
+            ui.painter().rect_stroke(rect.shrink(1.0), 3.0, egui::Stroke::new(if chosen { 2.0 } else { 1.0 }, if chosen { egui::Color32::WHITE } else { egui::Color32::from_gray(70) }), egui::StrokeKind::Inside);
+            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                pick = Some(Some(crate::colors::tint_of(c)));
+            }
+        }
+        if ui.add_enabled(own.is_some(), egui::Button::new("Auto").small()).on_hover_text("Its own place in the palette").clicked() {
+            pick = Some(None);
+        }
+    });
+    if let Some(choice) = pick.filter(|c| *c != own) {
+        let name = world.get::<bevy_ecs::name::Name>(e).map_or("the sketch".to_string(), |n| n.to_string());
+        edit(world, &format!("Colour of {name}"), |tx| match choice {
+            Some(t) => tx.insert(e, t),
+            None => tx.remove::<Tint>(e),
+        });
     }
 }
 
@@ -70,6 +103,8 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                     std::any::TypeId::of::<tt_track::runner::TrackBook>(),
                     std::any::TypeId::of::<tt_track::human::AutoOutput>(),
                     std::any::TypeId::of::<tt_track::human::HumanLayer>(),
+                    // (A sketch's colour has its own row: `sketch_color`.)
+                    std::any::TypeId::of::<tt_core::sketch::Tint>(),
                 ];
                 if class == Class::Derived || hidden.contains(&r.type_id()) || (manual && r.type_id() == std::any::TypeId::of::<tt_track::Tracker>()) {
                     return None;
