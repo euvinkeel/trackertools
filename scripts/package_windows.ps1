@@ -3,21 +3,28 @@
 # Nothing else goes with it: on its first start it sets up FFmpeg itself
 # (crates/tt_app/src/setup.rs), with instructions on screen.
 #
-#   scripts/package_windows.ps1 [-Version v0.1.0] [-InstallTo C:\apps]
+#   scripts/package_windows.ps1 [-Version v0.2.0] [-InstallTo C:\apps]
 #
 # -Version is what the app calls itself (Settings > Updates compares it with
-# GitHub's releases). -InstallTo also puts the program in that folder (a
+# GitHub's releases). Without it, the latest version tag in the repository,
+# so a build of newer code is never offered an older release as an update. -InstallTo also puts the program in that folder (a
 # folder on the PATH: `trackertools` starts it). The build goes to
 # target/portable, so a copy running from target/release is left alone; a
 # copy running from dist/ or the -InstallTo folder is renamed out of the way
 # (Windows lets a running program be renamed, not replaced): the new one
 # starts next time.
 param(
-    [string] $Version = "v0.1.0",
+    [string] $Version = "",
     [string] $InstallTo
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+if (-not $Version) {
+    # (No tag, or no git: git's complaint isn't an error here.)
+    try { $Version = "$(& git -c safe.directory=* -C $repo describe --tags --abbrev=0 2>$null)".Trim() } catch { $Version = "" }
+    if (-not $Version) { $Version = "v0.1.0" }
+}
+"Version $Version"
 
 # Built with the version, and the C runtime linked in (so it runs without
 # Microsoft's Visual C++ redistributable); this shell's settings come back after.
