@@ -412,6 +412,24 @@ fn line(from: Option<(FrameIndex, [f64; 2])>, to: FrameIndex, q: [f64; 2]) -> Ve
     }
 }
 
+/// While a Draw stroke is held, every view waits to be recomputed (`op::Held`)
+/// and catches up when it ends: a view following the tracker being drawn
+/// would otherwise move with each frame drawn, under the pointer, so the
+/// next point would land somewhere else and the drawing would run away.
+pub fn hold_views_while_drawing(world: &mut World) {
+    let drawing = world.resource::<DrawTool>().stroke.is_some();
+    let held = if drawing {
+        let mut q = world.query_filtered::<(Entity, &Operator), Without<Disabled>>();
+        q.iter(world).filter(|(_, o)| o.kind == "frame").map(|(e, _)| e).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let mut h = world.resource_mut::<tt_core::op::Held>();
+    if h.0 != held {
+        h.0 = held;
+    }
+}
+
 /// `Set::Tools`: the Draw tool (module docs).
 pub fn draw_tool(world: &mut World) {
     if world.resource::<ActiveTool>().0 != Tool::Draw {

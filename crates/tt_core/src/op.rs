@@ -371,6 +371,13 @@ fn mark_dirty(world: &mut World, op: Entity, r: Range<FrameIndex>) {
     }
 }
 
+/// Operators that wait to be recomputed (they keep their dirty frames, and
+/// what reads them waits too) until they leave this set. The Draw tool holds
+/// the views while a stroke is drawn: a view that follows the tracker being
+/// drawn would otherwise move under the hand on every frame drawn.
+#[derive(Resource, Debug, Default)]
+pub struct Held(pub std::collections::HashSet<Entity>);
+
 /// Recompute dirty frames, upstream first, within the budget.
 fn evaluate(world: &mut World) {
     let budget = *world.resource::<EvalBudget>();
@@ -382,8 +389,8 @@ fn evaluate(world: &mut World) {
     for op in order {
         let has_dirty = world.get::<Dirty>(op).is_some_and(|d| !d.0.is_empty());
         let inputs: Vec<Entity> = world.get::<Inputs>(op).map(|i| i.0.iter().map(|(_, p)| *p).collect()).unwrap_or_default();
-        // Wait for inputs that are still being recomputed (partial budget).
-        if inputs.iter().any(|p| blocked.contains(p)) {
+        // Wait for inputs that are still being recomputed (partial budget), or held.
+        if inputs.iter().any(|p| blocked.contains(p)) || world.resource::<Held>().0.contains(&op) {
             if has_dirty {
                 blocked.insert(op);
             }
@@ -446,6 +453,7 @@ impl Module for OpsModule {
             .init_resource::<OpRegistry>()
             .init_resource::<Invalidations>()
             .init_resource::<EvalBudget>()
+            .init_resource::<Held>()
             .init_resource::<OpGraph>()
             .add_systems(
                 (mark_graph_stale, recompute_rewired, rebuild_graph, propagate).chain().in_set(Set::Invalidate),
