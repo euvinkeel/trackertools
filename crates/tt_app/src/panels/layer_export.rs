@@ -105,6 +105,32 @@ pub fn open(world: &mut World) {
     x.setup = Some(Setup { what: What::Over, layers, codec, alpha, whole: false, path: default_path(&source, What::Over, codec, alpha), default_path: true });
 }
 
+/// Whether any of `layers` (or what it follows) still has frames to work
+/// out: an export now would miss them, so it waits (a frame or two).
+fn pending(world: &World, layers: &[Entity]) -> bool {
+    let dirty = |e: Entity| world.get::<tt_core::op::Dirty>(e).is_some_and(|d| !d.0.is_empty());
+    layers.iter().any(|l| dirty(*l) || target_of(world, *l).is_some_and(dirty))
+}
+
+/// Start the open window's export as it is set (the scene demo's `=layer-render`):
+/// the whole video's frames 560–620, `alpha` or over the video, to `path`.
+/// False: not yet (the layers are still being worked out).
+pub fn start_now(world: &mut World, alpha: bool, path: PathBuf) -> bool {
+    let chosen: Vec<Entity> = world.resource::<LayerExport>().setup.as_ref().map(|s| s.layers.iter().filter(|(_, _, on)| *on).map(|(e, _, _)| *e).collect()).unwrap_or_default();
+    if chosen.is_empty() || pending(world, &chosen) {
+        return false;
+    }
+    let Some(mut s) = world.resource_mut::<LayerExport>().setup.take() else { return false };
+    s.what = if alpha { What::Alpha } else { What::Over };
+    s.path = path.clone();
+    let layers: Vec<Entity> = s.layers.iter().filter(|(_, _, on)| *on).map(|(e, _, _)| *e).collect();
+    let job = start(world, &layers, s.what, s.codec, s.alpha, 560..620, path);
+    let x = &mut *world.resource_mut::<LayerExport>();
+    x.setup = Some(s);
+    x.job = job;
+    true
+}
+
 /// The window, while open.
 pub fn ui(ctx: &egui::Context, world: &mut World) {
     // A finished job: its result.
@@ -124,6 +150,8 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
     let mut x = std::mem::take(&mut *world.resource_mut::<LayerExport>());
     let (mut open, mut go, mut cancel, mut reveal) = (true, false, false, None);
     let busy = x.job.is_some();
+    // An export waits while the chosen layers are being worked out (else it would miss frames).
+    let waiting = x.setup.as_ref().is_some_and(|s| pending(world, &s.layers.iter().filter(|(_, _, on)| *on).map(|(e, _, _)| *e).collect::<Vec<_>>()));
     let range = frames(world, x.setup.as_ref().is_some_and(|s| s.whole)).unwrap_or(0..0);
     let fps = world.resource::<tt_core::transport::Transport>().fps.as_f64();
     egui::Window::new("Export layers").collapsible(false).resizable(false).default_width(440.0).open(&mut open).show(ctx, |ui| {
@@ -203,6 +231,13 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                 if ui.button("Cancel").clicked() {
                     cancel = true;
                 }
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            None if waiting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Working out where the layers are\u{2026}");
+                });
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             None => {
