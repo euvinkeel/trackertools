@@ -65,6 +65,112 @@ fn update_button(ui: &mut egui::Ui, world: &World) {
     }
 }
 
+/// What the Project menu asks for (done after the top bar is drawn: file dialogs block).
+enum ProjectAction {
+    Switch(std::path::PathBuf),
+    New,
+    SaveAs,
+    Open,
+    Reveal,
+    Forget(std::path::PathBuf),
+}
+
+/// The Project menu beside the video's name: its projects (the open one
+/// selected), and New, Save as, Open and Show the file.
+fn project_menu(ui: &mut egui::Ui, world: &World, video: &std::path::Path) -> Option<ProjectAction> {
+    use crate::project::{own_project, project_name};
+    let current = world.resource::<crate::project::ProjectFile>().path.clone();
+    let own = own_project(video);
+    let mut list: Vec<std::path::PathBuf> = world.resource::<Session>().projects_of(video).to_vec();
+    if let Some(o) = own.clone().filter(|o| !list.contains(o)) {
+        list.push(o);
+    }
+    let name = current.as_deref().map_or_else(|| "none".to_string(), |p| project_name(video, p));
+    let mut action = None;
+    ui.menu_button(format!("Project: {name} \u{23f7}"), |ui| {
+        ui.label(egui::RichText::new("This video's projects").color(style::MUTED).small());
+        for p in &list {
+            let open = current.as_deref() == Some(p.as_path());
+            let gone = !p.exists() && own.as_deref() != Some(p.as_path());
+            if gone {
+                let tip = format!("{} is not there now. Click to remove it from this list.", p.display());
+                if ui.button(egui::RichText::new(format!("{} (file not found)", project_name(video, p))).color(style::MUTED)).on_hover_text(tip).clicked() {
+                    action = Some(ProjectAction::Forget(p.clone()));
+                }
+                continue;
+            }
+            if ui.add(egui::Button::new(project_name(video, p)).selected(open)).on_hover_text(p.display().to_string()).clicked() && !open {
+                action = Some(ProjectAction::Switch(p.clone()));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("New project\u{2026}").on_hover_text("An empty project on this video, in a file you choose. The open project is saved first.").clicked() {
+            action = Some(ProjectAction::New);
+            ui.close();
+        }
+        if ui.button("Save project as\u{2026}").on_hover_text("A copy of this project in a file you choose. Changes then save to that file. The old file keeps what it had.").clicked() {
+            action = Some(ProjectAction::SaveAs);
+            ui.close();
+        }
+        if ui.button("Open project\u{2026}").on_hover_text("Open a .ttproj file, and its video with it").clicked() {
+            action = Some(ProjectAction::Open);
+            ui.close();
+        }
+        if ui.add_enabled(current.as_ref().is_some_and(|p| p.exists()), egui::Button::new("Show the project file")).clicked() {
+            action = Some(ProjectAction::Reveal);
+            ui.close();
+        }
+    });
+    action
+}
+
+fn run_project_action(world: &mut World, action: ProjectAction) {
+    use crate::project::EXTENSION;
+    let video = world.get_resource::<Media>().map(|m| m.index().path.clone());
+    let dialog = || {
+        let mut d = rfd::FileDialog::new().add_filter("trackertools project", &[EXTENSION]);
+        if let Some(dir) = video.as_ref().and_then(|v| v.parent()) {
+            d = d.set_directory(dir);
+        }
+        d
+    };
+    let suggested = || {
+        let stem = video.as_ref().and_then(|v| v.file_stem()).map_or_else(|| "project".to_string(), |s| s.to_string_lossy().into_owned());
+        format!("{stem} project.{EXTENSION}")
+    };
+    match action {
+        // The video's own project before anything was saved in it: an empty one.
+        ProjectAction::Switch(p) if !p.exists() => {
+            crate::project::new_project(world, p);
+        }
+        ProjectAction::Switch(p) => {
+            crate::project::open_project(world, p);
+        }
+        ProjectAction::New => {
+            if let Some(p) = dialog().set_title("New project on this video").set_file_name(suggested()).save_file() {
+                crate::project::new_project(world, p);
+            }
+        }
+        ProjectAction::SaveAs => {
+            if let Some(p) = dialog().set_title("Save project as").set_file_name(suggested()).save_file() {
+                crate::project::save_as(world, p);
+            }
+        }
+        ProjectAction::Open => {
+            if let Some(p) = dialog().set_title("Open project").pick_file() {
+                crate::project::open_project(world, p);
+            }
+        }
+        ProjectAction::Forget(p) => crate::project::forget(world, &p),
+        ProjectAction::Reveal => {
+            if let Some(p) = world.resource::<crate::project::ProjectFile>().path.clone() {
+                crate::files::reveal(&p);
+            }
+        }
+    }
+}
+
 fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut open = false;
     let mut reopen = None;
@@ -73,6 +179,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut track_kind = None;
     let mut report_problem = false;
     let mut open_doctor = false;
+    let mut project_action = None;
     let tracking = tracks::summary(world);
     let kind = world.resource::<tt_track::NewTrackers>().method;
     let cotracker = tt_track::job::cotracker_availability();
@@ -96,6 +203,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             Some(m) => {
                 let i = m.index();
                 ui.label(egui::RichText::new(&m.name).strong());
+                project_action = project_menu(ui, world, &i.path);
                 // (Short: the top bar holds the tools too. The codec and the exact rate on hover.)
                 ui.label(egui::RichText::new(format!("{}×{} \u{b7} {:.2} fps", i.width, i.height, i.fps.as_f64())).color(style::MUTED))
                     .on_hover_text(format!("{} \u{b7} {} frames @ {:.3} fps", i.codec, i.frame_count(), i.fps.as_f64()));
@@ -239,6 +347,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     });
     if open {
         world.resource_mut::<PendingActions>().push(Action::OpenFile);
+    }
+    if let Some(a) = project_action {
+        run_project_action(world, a);
     }
     if report_problem {
         let mut doctor = world.resource_mut::<crate::setup::Doctor>();
