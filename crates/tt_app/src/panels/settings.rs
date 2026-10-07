@@ -126,7 +126,7 @@ fn updates(ui: &mut egui::Ui, world: &mut World) {
             }
             if !release.notes.is_empty() {
                 ui.collapsing("What's new", |ui| {
-                    ui.label(&release.notes);
+                    ui.label(crate::update::plain_notes(&release.notes));
                 });
             }
             if !release.page.is_empty() {

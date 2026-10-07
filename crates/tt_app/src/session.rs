@@ -91,6 +91,8 @@ struct SettingsFile {
     stabilize_offset: [f32; 2],
     /// Look for a new version at start.
     check_for_updates: bool,
+    /// A version whose update prompt was answered with Skip.
+    skipped_update: Option<String>,
 }
 
 impl Default for SettingsFile {
@@ -121,6 +123,7 @@ impl Default for SettingsFile {
             stabilize_zoom: st.zoom,
             stabilize_offset: st.offset,
             check_for_updates: Updater::default().check_on_start,
+            skipped_update: None,
         }
     }
 }
@@ -151,6 +154,7 @@ impl SettingsFile {
             stabilize_zoom: st.zoom,
             stabilize_offset: st.offset,
             check_for_updates: u.check_on_start,
+            skipped_update: u.skipped.clone(),
         }
     }
 
@@ -189,6 +193,7 @@ impl SettingsFile {
         }
         if let Some(mut u) = world.get_resource_mut::<Updater>() {
             u.check_on_start = self.check_for_updates;
+            u.skipped = self.skipped_update.clone();
         }
         if let Some(mut st) = world.get_resource_mut::<StabilizerDefaults>() {
             st.smooth_position = self.stabilize_smooth_position.clamp(0.0, 2.0);
