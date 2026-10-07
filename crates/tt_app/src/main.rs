@@ -15,6 +15,7 @@ mod media;
 mod panels;
 mod pointer;
 mod project;
+mod rebuild;
 mod recover;
 mod session;
 mod reflect_ui;

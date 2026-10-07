@@ -103,6 +103,7 @@ impl Shell {
             .add_module(TimelineModule)
             .add_module(tt_track::TrackModule)
             .add_module(crate::update::UpdateModule)
+            .add_module(crate::rebuild::RebuildModule)
             .add_module(crate::setup::SetupModule)
             .add_module(SessionModule)
             .add_module(crate::project::ProjectModule);
