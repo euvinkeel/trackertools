@@ -227,6 +227,53 @@ fn pointer(core: &mut Core, t: f64, at: [f64; 2], pressed: bool, down: bool, rel
     core.run_pre_ui();
 }
 
+/// Drawing a tracker's point inside the view that follows it: the view
+/// holds still while the hand draws (a point held still on screen lands where
+/// the view showed it before the stroke, frame after frame), and follows the
+/// drawing once the stroke ends.
+#[test]
+fn drawing_in_a_trackers_own_view_does_not_run_away() {
+    use tt_core::input::{Action, PendingActions};
+    use tt_core::view::{ActiveView, map_at};
+    let mut core = core(50);
+    let op = tracker_with_results(&mut core);
+    core.world.resource_mut::<Selection>().select_only(op);
+    core.world.resource_mut::<PendingActions>().push(Action::EnterView);
+    for _ in 0..3 {
+        core.run_pre_ui();
+        core.run_post_ui();
+    }
+    let view = core.world.resource::<ActiveView>().0.expect("in the tracker's view");
+    core.world.resource_mut::<Selection>().select_only(op);
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Draw;
+    // 30 px right of the view's centre, held still on screen while frames 10–20 go by.
+    let before: Vec<_> = (0..50).map(|f| map_at(&core.world, Some(view), f)).collect();
+    let at = [before[10].canvas[0] / 2.0 + 30.0, before[10].canvas[1] / 2.0];
+    core.world.resource_mut::<Transport>().seek(10);
+    pointer(&mut core, 1.0, at, true, true, false);
+    for (i, f) in (11..=20).enumerate() {
+        core.world.resource_mut::<Transport>().seek(f);
+        pointer(&mut core, 1.1 + 0.1 * i as f64, at, false, true, false);
+        core.run_post_ui();
+    }
+    for f in 10..=20 {
+        let want = before[f as usize].to_source(at);
+        let got = drawn_at(&core.world, op, f).expect("drawn");
+        assert!((got[0] - want[0]).abs() < 1e-3 && (got[1] - want[1]).abs() < 1e-3, "frame {f}: drawn at {got:?}, the view showed {want:?} there");
+    }
+    // Released: the view follows the drawing now (it is the tracker's output there), through its smoothing.
+    pointer(&mut core, 3.0, at, false, false, true);
+    for _ in 0..3 {
+        core.run_pre_ui();
+        core.run_post_ui();
+    }
+    let m = map_at(&core.world, Some(view), 15);
+    let centre = m.to_source([m.canvas[0] / 2.0, m.canvas[1] / 2.0]);
+    let drawn = drawn_at(&core.world, op, 15).unwrap();
+    let old = before[15].to_source([before[15].canvas[0] / 2.0, before[15].canvas[1] / 2.0]);
+    assert!(centre[0] - old[0] > 10.0 && centre[0] <= drawn[0] + 1e-6, "after the stroke the view moves toward it: centre {centre:?} (was {old:?}), drawn {drawn:?}");
+}
+
 #[test]
 fn the_draw_tool_makes_a_manual_dot_and_a_hold_is_one_undo_step() {
     let mut core = core(100);
