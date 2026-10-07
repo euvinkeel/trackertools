@@ -48,6 +48,7 @@ pub use learned::{
 };
 
 pub use learned::worker_command;
+pub use learned::{close_worker as close_cotracker_worker, processes_started as cotracker_processes_started};
 
 /// A look, as a job reads it: a frame, a rectangle there (source px), a mask.
 #[derive(Clone, Debug, PartialEq)]
@@ -575,7 +576,14 @@ impl Worker {
 
     /// Wait until frame `f` is within the limit. False if cancelled. A long
     /// wait calls `park` once (to let go of the decoder) and marks the job parked.
-    fn wait_for(&mut self, f: FrameIndex, mut park: impl FnMut()) -> bool {
+    fn wait_for(&mut self, f: FrameIndex, park: impl FnMut()) -> bool {
+        self.wait_while(f, park, |_| true)
+    }
+
+    /// [`Self::wait_for`], calling `tick` now and then while it waits (a
+    /// CoTracker job takes the results still coming in). `tick` false: stop
+    /// waiting (false, as for a cancel).
+    fn wait_while(&mut self, f: FrameIndex, mut park: impl FnMut(), mut tick: impl FnMut(&mut Self) -> bool) -> bool {
         let mut since: Option<Instant> = None;
         self.shared.next.store(f, Ordering::Relaxed);
         loop {
@@ -587,7 +595,10 @@ impl Worker {
                 self.shared.parked.store(false, Ordering::Relaxed);
                 return true;
             }
-            if !self.shared.waiting.swap(true, Ordering::Relaxed) {
+            if !tick(self) {
+                return false;
+            }
+            if !self.shared.waiting.swap(true, Ordering::Relaxed) || !self.out.is_empty() {
                 self.flush();
             }
             let since = *since.get_or_insert_with(Instant::now);

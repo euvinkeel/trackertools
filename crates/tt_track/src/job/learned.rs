@@ -24,25 +24,32 @@
 //!   frame is flagged lost (its position stays the model's estimate).
 //! - Catch-up mode works, but the model finalizes frames a half window (8)
 //!   at a time, so the last few frames before the playhead wait for more.
-//! - **Workers:** each job starts its own (a Python process with the model on
-//!   the graphics card), and the runner lets one such job live at a time
-//!   (`runner::cotracker_jobs`). The anchor alone (the forward side of a
-//!   tracker asked only backward) needs none: it is the seed.
+//! - **One worker for all of them** (on request: "ensure that multi
+//!   cotracker processing is in"): every CoTracker job is a *stream* through
+//!   one Python process (`--shared`), so the model is on the graphics card
+//!   once, in one context, its windows running one at a time: several jobs
+//!   in their own processes at once made the card reset (2026-10-04). The
+//!   worker runs the streams' windows in turn, so several trackers move on
+//!   together (`runner::cotracker_jobs` of them), and only the first job
+//!   waits for the model to load. It closes once no stream has used it for
+//!   [`IDLE`]. The anchor alone (the forward side of a tracker asked only
+//!   backward) needs no stream: it is the seed.
 //! - **A stuck worker** (the graphics card stopped answering, say) is stopped
-//!   after [`HANG`] with nothing from it while its job waits on it (to take
-//!   a frame, or for its last results), and the job fails; a
-//!   cancelled job's worker is stopped within [`CANCEL_GRACE`] even if the
-//!   job is stuck writing to it. Loading the model has no time limit (the
-//!   first time takes long); only a cancel ends it. Each worker's start and
-//!   end are logged, and a failed one's last messages.
+//!   after [`HANG`] with nothing from it while a stream waits on it (to take
+//!   a frame, or for its last results), and the jobs on it fail; the next
+//!   job starts another. A stream whose job is cancelled is dropped by the
+//!   worker (the others go on). Loading the model has no time limit (the
+//!   first time takes long); only a cancel ends a job's wait. The worker's
+//!   start and end and each stream are logged, and a failed worker's last
+//!   messages.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -57,15 +64,17 @@ use crate::image::{Grid, Luma, chroma_planes, resample_xy, with_colour};
 pub const CROP_W: usize = 512;
 pub const CROP_H: usize = 384;
 
-/// A worker that sends nothing for this long while it owes results (and its
-/// job isn't waiting at the playhead) is stuck: it is stopped, and the job fails.
+/// A worker that sends nothing for this long while a stream waits on it is
+/// stuck: it is stopped, and the jobs using it fail.
 const HANG: Duration = Duration::from_secs(120);
-/// A cancelled job's worker is stopped after this long if the job still
-/// holds it (stuck writing to a worker that doesn't read).
-const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// A worker no stream has used for this long closes (its model leaves the
+/// graphics card); the next CoTracker job starts it again.
+const IDLE: Duration = Duration::from_secs(30);
 /// A worker whose input is closed has this long to exit by itself (it
 /// finishes at the end of its input); then it is stopped.
 const EXIT_GRACE: Duration = Duration::from_secs(1);
+/// Messages waiting for the worker to read them (a few frames).
+const QUEUE: usize = 6;
 /// How often waits look at the job's cancel flag, and the watchdog at the worker.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -177,7 +186,7 @@ pub fn weights() -> Option<PathBuf> {
     Some(hub.join("checkpoints").join("scaled_online.pth"))
 }
 
-/// A worker's message.
+/// A stream's message from the worker.
 enum Reply {
     Ready,
     Frame(usize, Vec<Option<[f64; 3]>>),
@@ -185,31 +194,59 @@ enum Reply {
     Error(String),
 }
 
-/// What a worker's watchdog knows: its job's cancel flag, and how the
-/// worker answers (told by the thread reading its replies).
-struct Watch {
-    job: Arc<Shared>,
-    start: Instant,
-    /// It said it is ready (its model is loaded).
-    ready: AtomicBool,
-    /// The job waits on it: writing a frame to it (it reads the next once it
-    /// has tracked a window), or waiting for its last results. (Not while the
-    /// job decodes, or waits at the playhead.)
-    owed: AtomicBool,
-    /// When it last said anything, ms after `start`.
-    heard: AtomicU64,
-    /// Its owner is stopping it: the watchdog goes.
-    stop: AtomicBool,
-    /// The watchdog stopped it: it sent nothing for [`HANG`].
-    hung: AtomicBool,
+/// Worker processes started (tests count them: jobs share one).
+static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many CoTracker worker processes have started since the app did.
+pub fn processes_started() -> usize {
+    STARTED.load(Ordering::Relaxed)
 }
 
-impl Watch {
-    fn new(job: Arc<Shared>) -> Self {
-        let no = || AtomicBool::new(false);
-        Self { job, start: Instant::now(), ready: no(), owed: no(), heard: AtomicU64::new(0), stop: no(), hung: no() }
+/// Close the shared worker now (its streams' jobs fail); the next CoTracker
+/// job starts another. For a worker set up anew (the doctor), and tests
+/// whose fake worker's switches changed.
+pub fn close_worker() {
+    if let Some(p) = SHARED.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        p.dead.store(true, Ordering::Relaxed);
+        drop(p.queue.lock().unwrap_or_else(PoisonError::into_inner).take());
     }
+}
 
+/// The worker all CoTracker jobs share, while it lives.
+static SHARED: Mutex<Option<Arc<Proc>>> = Mutex::new(None);
+
+/// The one worker process (module docs): the model on the graphics card
+/// once, every CoTracker job a stream through it. Its threads read its
+/// replies (routing each to its stream), its stderr, and watch it: stopped
+/// when it hangs, closed once no stream has used it for [`IDLE`].
+struct Proc {
+    child: Mutex<Child>,
+    /// Whole messages for its input, written in order by its writer thread
+    /// (so a job never blocks on a worker that doesn't read: it waits for
+    /// room here, and a cancel ends the wait). None: closed.
+    queue: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
+    /// Each open stream's way to its job.
+    routes: Mutex<HashMap<u32, std::sync::mpsc::Sender<Reply>>>,
+    next: AtomicU32,
+    /// Its model is loaded.
+    ready: AtomicBool,
+    /// It is gone or going (failed, hung, idle): the next job starts another.
+    dead: AtomicBool,
+    /// Its watchdog stopped it: nothing came from it for [`HANG`].
+    hung: AtomicBool,
+    start: Instant,
+    /// When it last said anything, ms after `start`.
+    heard: AtomicU64,
+    /// Streams waiting on it now (writing a frame, or waiting for their last results).
+    owed: AtomicUsize,
+    /// Streams open.
+    open: AtomicUsize,
+    log: Arc<Mutex<Vec<String>>>,
+    /// "pid 1234", for the log.
+    name: String,
+}
+
+impl Proc {
     fn hear(&self) {
         self.heard.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
@@ -217,63 +254,28 @@ impl Watch {
     fn last_heard(&self) -> Instant {
         self.start + Duration::from_millis(self.heard.load(Ordering::Relaxed))
     }
-}
 
-/// Stop the worker when it is stuck (nothing from it for [`HANG`] while its
-/// job waits on it), or when its job was cancelled [`CANCEL_GRACE`] ago and
-/// still holds it. Stopping it ends the job's waits and writes. Leaves when
-/// the worker's owner stops it.
-fn watchdog(child: &Mutex<Child>, w: &Watch, name: &str) {
-    let mut excused = Instant::now();
-    let mut cancelled: Option<Instant> = None;
-    loop {
-        std::thread::sleep(POLL);
-        if w.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        if w.job.cancel.load(Ordering::Relaxed) {
-            if cancelled.get_or_insert_with(Instant::now).elapsed() < CANCEL_GRACE {
-                continue;
-            }
-            tracing::info!("CoTracker worker {name}: its job was cancelled and still holds it; stopping it");
-        } else {
-            if !(w.ready.load(Ordering::Relaxed) && w.owed.load(Ordering::Relaxed)) {
-                excused = Instant::now();
-            }
-            if excused.max(w.last_heard()).elapsed() < HANG {
-                continue;
-            }
-            w.hung.store(true, Ordering::Relaxed);
-            tracing::warn!("CoTracker worker {name}: no answer for {} s; stopping it", HANG.as_secs());
-        }
-        let _ = child.lock().unwrap_or_else(PoisonError::into_inner).kill();
-        return;
+    /// The last `n` lines of its stderr, joined by `sep`.
+    fn last_words(&self, n: usize, sep: &str) -> String {
+        let log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        log[log.len().saturating_sub(n)..].join(sep)
     }
-}
 
-/// The worker process: its stdin, its replies (read on a thread), the end of
-/// its stderr (for errors), and its watchdog. Lives on the job's thread
-/// (in `run_learned`), so stopping it never holds up the app.
-struct Process {
-    child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
-    replies: Receiver<Reply>,
-    log: Arc<Mutex<Vec<String>>>,
-    /// The thread reading its stderr (it ends when the worker does).
-    stderr: JoinHandle<()>,
-    watch: Arc<Watch>,
-    /// "pid 1234 (Tracker 2, Forward, 61 frames)", for the log.
-    name: String,
-    /// It sent `done`: the job ended as it should.
-    finished: bool,
-}
+    /// The live shared worker, started if there is none.
+    fn current() -> Result<Arc<Proc>> {
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = shared.as_ref().filter(|p| !p.dead.load(Ordering::Relaxed)) {
+            return Ok(p.clone());
+        }
+        let p = Proc::spawn()?;
+        *shared = Some(p.clone());
+        Ok(p)
+    }
 
-impl Process {
-    /// Start the worker for the job sharing `job`; `what` says which, for the log.
-    fn start(job: Arc<Shared>, what: &str) -> Result<Self> {
+    fn spawn() -> Result<Arc<Proc>> {
         let (python, script) = worker_command();
         let mut cmd = Command::new(&python);
-        cmd.arg(&script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.arg(&script).arg("--shared").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(w) = weights().filter(|w| w.is_file()) {
             cmd.arg("--weights").arg(w);
         }
@@ -283,22 +285,63 @@ impl Process {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: the app has no console
         }
         let mut child = cmd.spawn().with_context(|| format!("starting the CoTracker worker ({} {})", python.display(), script.display()))?;
-        let name = format!("pid {} ({what})", child.id());
-        tracing::info!("CoTracker worker {name} started: {} {}", python.display(), script.display());
+        STARTED.fetch_add(1, Ordering::Relaxed);
+        let name = format!("pid {}", child.id());
+        tracing::info!("CoTracker worker {name} started (shared by every CoTracker job): {} {}", python.display(), script.display());
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
-        let watch = Arc::new(Watch::new(job));
-        let (tx, replies) = channel();
-        let heard = watch.clone();
+        let mut stdin = child.stdin.take().expect("piped");
+        let (queue, outbox) = std::sync::mpsc::sync_channel::<Vec<u8>>(QUEUE);
+        let p = Arc::new(Proc {
+            child: Mutex::new(child),
+            queue: Mutex::new(Some(queue)),
+            routes: Mutex::new(HashMap::new()),
+            next: AtomicU32::new(1),
+            ready: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            hung: AtomicBool::new(false),
+            start: Instant::now(),
+            heard: AtomicU64::new(0),
+            owed: AtomicUsize::new(0),
+            open: AtomicUsize::new(0),
+            log: Arc::new(Mutex::new(Vec::new())),
+            name,
+        });
+        // Its input: the queued messages, in order (closing the queue closes it).
+        let me = p.clone();
+        std::thread::spawn(move || {
+            for msg in outbox {
+                if stdin.write_all(&msg).and_then(|()| stdin.flush()).is_err() {
+                    me.dead.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+        // Its replies, each to its stream.
+        let me = p.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                heard.hear();
+                me.hear();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                let reply = if v.get("ready").is_some() {
-                    heard.ready.store(true, Ordering::Relaxed);
-                    Reply::Ready
-                } else if let Some(f) = v.get("f").and_then(|f| f.as_u64()) {
+                let routes = me.routes.lock().unwrap_or_else(PoisonError::into_inner);
+                if v.get("ready").is_some() {
+                    me.ready.store(true, Ordering::Relaxed);
+                    for tx in routes.values() {
+                        let _ = tx.send(Reply::Ready);
+                    }
+                    continue;
+                }
+                let Some(sid) = v.get("s").and_then(|s| s.as_u64()) else {
+                    // The worker failed as a whole: every stream hears it.
+                    let e = v.get("error").and_then(|e| e.as_str()).unwrap_or("the worker failed").to_string();
+                    me.dead.store(true, Ordering::Relaxed);
+                    for tx in routes.values() {
+                        let _ = tx.send(Reply::Error(e.clone()));
+                    }
+                    continue;
+                };
+                let reply = if let Some(f) = v.get("f").and_then(|f| f.as_u64()) {
                     let points = v["points"]
                         .as_array()
                         .map(|a| a.iter().map(|p| p.as_array().filter(|p| p.len() == 3).map(|p| [0, 1, 2].map(|i| p[i].as_f64().unwrap_or(f64::NAN)))).collect())
@@ -309,90 +352,205 @@ impl Process {
                 } else {
                     Reply::Error(v.get("error").and_then(|e| e.as_str()).unwrap_or("the worker failed").to_string())
                 };
-                if tx.send(reply).is_err() {
-                    break;
+                if let Some(tx) = routes.get(&(sid as u32)) {
+                    let _ = tx.send(reply);
                 }
             }
+            // It ended: every stream's replies end (their jobs see it).
+            me.dead.store(true, Ordering::Relaxed);
+            me.routes.lock().unwrap_or_else(PoisonError::into_inner).clear();
         });
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let sink = log.clone();
-        let stderr = std::thread::spawn(move || {
+        // Its stderr, the last lines kept.
+        let sink = p.log.clone();
+        std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 let mut l = sink.lock().unwrap_or_else(PoisonError::into_inner);
                 l.push(line);
-                if l.len() > 20 {
+                if l.len() > 30 {
                     l.remove(0);
                 }
             }
         });
-        let stdin = child.stdin.take();
-        let child = Arc::new(Mutex::new(child));
-        {
-            let (child, watch, name) = (child.clone(), watch.clone(), name.clone());
-            std::thread::spawn(move || watchdog(&child, &watch, &name));
-        }
-        Ok(Self { child, stdin, replies, log, stderr, watch, name, finished: false })
+        let me = p.clone();
+        std::thread::spawn(move || me.watch());
+        Ok(p)
     }
 
-    /// Write to it (waiting on it while it tracks: the pipe holds little).
-    fn send(&mut self, bytes: &[u8]) -> Result<()> {
-        let stdin = self.stdin.as_mut().context("the worker's input is closed")?;
-        self.watch.owed.store(true, Ordering::Relaxed);
-        let written = stdin.write_all(bytes);
-        self.watch.owed.store(false, Ordering::Relaxed);
-        written.map_err(|e| self.stopped(Some(&e)))
+    /// Its watchdog: stops it when it hangs (nothing from it for [`HANG`]
+    /// while a stream waits on it, once its model is loaded: loading takes
+    /// long the first time), closes it once no stream has used it for
+    /// [`IDLE`], and logs how it ended.
+    fn watch(self: Arc<Self>) {
+        let mut idle: Option<Instant> = None;
+        let mut excused = Instant::now();
+        let (closed, killed) = loop {
+            std::thread::sleep(POLL);
+            if self.dead.load(Ordering::Relaxed) {
+                break (false, false);
+            }
+            if self.open.load(Ordering::Relaxed) == 0 {
+                if idle.get_or_insert_with(Instant::now).elapsed() >= IDLE {
+                    // Nothing uses it: it goes (its model leaves the graphics card).
+                    self.dead.store(true, Ordering::Relaxed);
+                    drop(self.queue.lock().unwrap_or_else(PoisonError::into_inner).take());
+                    break (true, false);
+                }
+            } else {
+                idle = None;
+            }
+            if !(self.ready.load(Ordering::Relaxed) && self.owed.load(Ordering::Relaxed) > 0) {
+                excused = Instant::now();
+            }
+            if excused.max(self.last_heard()).elapsed() >= HANG {
+                self.hung.store(true, Ordering::Relaxed);
+                self.dead.store(true, Ordering::Relaxed);
+                tracing::warn!("CoTracker worker {}: no answer for {} s; stopping it", self.name, HANG.as_secs());
+                let _ = self.child.lock().unwrap_or_else(PoisonError::into_inner).kill();
+                break (false, true);
+            }
+        };
+        // Its end: given EXIT_GRACE to go by itself, then stopped.
+        let status = {
+            let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+            let deadline = Instant::now() + EXIT_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                    _ => {
+                        let _ = child.kill();
+                        break child.wait().ok();
+                    }
+                }
+            }
+        };
+        let secs = self.start.elapsed().as_secs_f64();
+        let status = status.map_or("status unknown".to_string(), |s| s.to_string());
+        let how = if closed { format!("closed after {} s unused", IDLE.as_secs()) } else if killed { "was stopped".to_string() } else { "ended".to_string() };
+        tracing::info!("CoTracker worker {} {how}, {secs:.1} s after it started ({status})", self.name);
+        if !closed {
+            tracing::warn!("CoTracker worker {}: its last messages:\n{}", self.name, self.last_words(20, "\n"));
+        }
+    }
+}
+
+/// A job's stream through the shared worker: its number, and its replies.
+struct Process {
+    proc: Arc<Proc>,
+    /// Its job (its cancel flag ends a wait for room in the worker's queue).
+    job: Arc<Shared>,
+    id: u32,
+    replies: Receiver<Reply>,
+    /// "Tracker 2, Forward, 61 frames", for the log.
+    name: String,
+    /// It ended as it should (`done`).
+    finished: bool,
+    /// It counts in the worker's `owed` (waiting for its last results).
+    owing: bool,
+}
+
+impl Process {
+    /// A stream for the job sharing `job` on the shared worker (started if
+    /// none runs); `what` says which, for the log.
+    fn start(job: Arc<Shared>, what: &str) -> Result<Self> {
+        let proc = Proc::current()?;
+        let id = proc.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, replies) = channel();
+        {
+            let mut routes = proc.routes.lock().unwrap_or_else(PoisonError::into_inner);
+            if proc.ready.load(Ordering::Relaxed) {
+                let _ = tx.send(Reply::Ready);
+            }
+            routes.insert(id, tx);
+        }
+        proc.open.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("CoTracker worker {}: stream {id} for {what}", proc.name);
+        Ok(Self { proc, job, id, replies, name: what.to_string(), finished: false, owing: false })
+    }
+
+    /// Send a message (`tag`, the stream's number, `payload`), whole: into
+    /// the worker's queue, waiting for room while it tracks (and counted as
+    /// waiting on it then). A cancel ends the wait (the message is dropped).
+    fn send(&mut self, tag: u8, payload: &[u8]) -> Result<()> {
+        let mut msg = Vec::with_capacity(5 + payload.len());
+        msg.push(tag);
+        msg.extend(self.id.to_le_bytes());
+        msg.extend_from_slice(payload);
+        let Some(queue) = self.proc.queue.lock().unwrap_or_else(PoisonError::into_inner).clone() else { return Err(self.stopped(None)) };
+        let mut waiting = false;
+        let sent = loop {
+            if self.proc.dead.load(Ordering::Relaxed) {
+                break Err(self.stopped(None));
+            }
+            match queue.try_send(msg) {
+                Ok(()) => break Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if self.job.cancel.load(Ordering::Relaxed) {
+                        break Ok(());
+                    }
+                    if !waiting {
+                        waiting = true;
+                        self.proc.owed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    msg = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break Err(self.stopped(None)),
+            }
+        };
+        if waiting {
+            self.proc.owed.fetch_sub(1, Ordering::Relaxed);
+        }
+        sent
+    }
+
+    /// Its frames end: from now on it waits for its last results (the watchdog counts it).
+    fn end(&mut self) -> Result<()> {
+        self.send(b'E', &[])?;
+        if !self.owing {
+            self.owing = true;
+            self.proc.owed.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Why the worker can't be talked to any more: it was stuck (its watchdog
     /// stopped it), or it stopped by itself (and what it said last). `why`:
     /// what failed here.
     fn stopped(&self, why: Option<&dyn std::fmt::Display>) -> anyhow::Error {
-        if self.watch.hung.load(Ordering::Relaxed) {
+        if self.proc.hung.load(Ordering::Relaxed) {
             return anyhow!("CoTracker stopped answering.");
         }
+        // (A moment for its last words to arrive.)
+        std::thread::sleep(Duration::from_millis(100));
         let why = why.map_or(String::new(), |e| format!(" ({e})"));
         anyhow!("the CoTracker worker stopped{why}: {}", self.last_words(3, " | "))
     }
 
-    /// The last `n` lines of its stderr, joined by `sep` (waiting a moment
-    /// for the rest when it is ending).
     fn last_words(&self, n: usize, sep: &str) -> String {
-        let until = Instant::now() + Duration::from_millis(250);
-        while !self.stderr.is_finished() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
-        log[log.len().saturating_sub(n)..].join(sep)
+        self.proc.last_words(n, sep)
     }
 }
 
 impl Drop for Process {
-    /// Close its input and give it [`EXIT_GRACE`] to exit by itself, then
-    /// stop it. Logs how it ended, and a failed one's last messages.
+    /// The stream closes: dropped by the worker if it hadn't finished (its
+    /// job was cancelled or failed), and taken off the worker's streams.
     fn drop(&mut self) {
-        self.watch.stop.store(true, Ordering::Relaxed);
-        drop(self.stdin.take());
-        let (status, stopped) = {
-            let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
-            let deadline = Instant::now() + EXIT_GRACE;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break (Some(status), false),
-                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-                    _ => {
-                        let _ = child.kill();
-                        break (child.wait().ok(), true);
-                    }
-                }
+        if !self.finished && !self.proc.dead.load(Ordering::Relaxed) {
+            // (Best effort, never waiting: a worker that reads again drops it; one that doesn't is stopped by its watchdog.)
+            let mut msg = vec![b'X'];
+            msg.extend(self.id.to_le_bytes());
+            if let Some(q) = self.proc.queue.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+                let _ = q.try_send(msg);
             }
-        };
-        let secs = self.watch.start.elapsed().as_secs_f64();
-        let status = status.map_or("status unknown".to_string(), |s| s.to_string());
-        let how = if stopped { "was stopped" } else { "exited" };
-        tracing::info!("CoTracker worker {} {how} after {secs:.1} s ({status})", self.name);
-        if !self.finished && !self.watch.job.cancel.load(Ordering::Relaxed) {
-            tracing::warn!("CoTracker worker {} failed; its last messages:\n{}", self.name, self.last_words(20, "\n"));
         }
+        if self.owing {
+            self.proc.owed.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.proc.routes.lock().unwrap_or_else(PoisonError::into_inner).remove(&self.id);
+        self.proc.open.fetch_sub(1, Ordering::Relaxed);
+        let how = if self.finished { "done" } else { "dropped" };
+        tracing::info!("CoTracker worker {}: stream {} for {} {how}", self.proc.name, self.id, self.name);
     }
 }
 
@@ -503,7 +661,7 @@ impl Worker {
             }
         }
         let header = serde_json::json!({ "width": CROP_W, "height": CROP_H, "queries": queries.iter().map(|(i, p)| [*i as f64, p[0], p[1]]).collect::<Vec<_>>() });
-        worker.send(format!("{header}\n").as_bytes())?;
+        worker.send(b'O', format!("{header}\n").as_bytes())?;
 
         // The anchor itself is the seed (when not resuming, on the forward side).
         if s.resume.is_none() && s.side == Side::Forward && self.wait_for(anchor, || {}) {
@@ -517,7 +675,7 @@ impl Worker {
                 for i in 0..n {
                     let f = stream.frame(i);
                     // (Frames other than the start are sent only once the catch-up limit allows.)
-                    if i > 0 && !self.wait_for(f, || decoder = None) {
+                    if i > 0 && !self.wait_taking(f, || decoder = None, &mut worker, &stream, &queries)? {
                         return Ok(());
                     }
                     if decoder.is_none() {
@@ -548,7 +706,7 @@ impl Worker {
                     }
                     drop(decoder);
                     for (f, (grid, rgb)) in (lo..=hi).rev().zip(crops.into_iter().rev()) {
-                        if f != start && !self.wait_for(f, || {}) {
+                        if f != start && !self.wait_taking(f, || {}, &mut worker, &stream, &queries)? {
                             return Ok(());
                         }
                         self.send_frame(&mut worker, &mut stream, grid, &rgb, &queries)?;
@@ -557,10 +715,8 @@ impl Worker {
                 }
             }
         }
-        worker.send(b"E")?;
-        drop(worker.stdin.take());
+        worker.end()?;
         // (A worker that stops answering is stopped by its watchdog: the replies end.)
-        worker.watch.owed.store(true, Ordering::Relaxed);
         loop {
             if self.cancelled() {
                 return Ok(());
@@ -584,8 +740,27 @@ impl Worker {
             return Ok(());
         }
         stream.grids.push(grid);
-        worker.send(b"F")?;
-        worker.send(rgb)?;
+        worker.send(b'F', rgb)?;
+        self.take_replies(worker, stream, queries)
+    }
+
+    /// Wait for frame `f` to be within the catch-up limit ([`Self::wait_for`]),
+    /// taking the results that come in meanwhile (so a job waiting at the
+    /// playhead shows all it has tracked). Ok(false): cancelled.
+    fn wait_taking(&mut self, f: FrameIndex, park: impl FnMut(), worker: &mut Process, stream: &Stream, queries: &[usize]) -> Result<bool> {
+        let mut failed = None;
+        let go = self.wait_while(f, park, |me| match me.take_replies(worker, stream, queries) {
+            Ok(()) => true,
+            Err(e) => {
+                failed = Some(e);
+                false
+            }
+        });
+        failed.map_or(Ok(go), Err)
+    }
+
+    /// Take whatever results have come back.
+    fn take_replies(&mut self, worker: &mut Process, stream: &Stream, queries: &[usize]) -> Result<()> {
         while let Ok(reply) = worker.replies.try_recv() {
             match reply {
                 Reply::Frame(i, points) => self.take(stream, queries, i, &points),
