@@ -22,6 +22,9 @@ pub struct MediaInfo {
     pub duration: f64,
     /// Frames per second (0: a still picture).
     pub fps: f64,
+    /// The decoder to read it with, when ffmpeg's own wouldn't keep its
+    /// transparency (VP8/VP9 in WebM: only libvpx reads the alpha).
+    pub decoder: Option<&'static str>,
 }
 
 impl MediaInfo {
@@ -77,13 +80,17 @@ fn rate(s: &str) -> Option<f64> {
     }
 }
 
-/// Codecs that are pictures, not clips (one frame).
-const STILLS: &[&str] = &["png", "mjpeg", "jpegls", "bmp", "tiff", "webp", "targa", "ppm", "pgm", "qoi", "jpeg2000", "dpx", "exr"];
+/// Containers that hold one picture (ffmpeg's image readers): what's read
+/// through them is a still. (Not by codec: PNG and Motion-JPEG are clips
+/// in a MOV or AVI.)
+fn is_picture_format(format: &str) -> bool {
+    format.split(',').any(|f| f == "image2" || f.ends_with("_pipe"))
+}
 
 /// What `path` is (ffprobe).
 pub fn probe(path: &Path) -> Result<MediaInfo> {
     let mut cmd = quiet(Command::new(crate::ffmpeg::tool("ffprobe", "FFPROBE")));
-    cmd.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration", "-of", "default=nw=1"]).arg(path);
+    cmd.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration,format_name", "-of", "default=nw=1"]).arg(path);
     let out = cmd.output().context("ffprobe didn't start")?;
     if !out.status.success() {
         bail!("ffprobe can't read {}: {}", path.display(), String::from_utf8_lossy(&out.stderr).trim());
@@ -96,8 +103,14 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
     let fps = get("avg_frame_rate").and_then(|v| rate(&v)).filter(|r| *r > 0.0).or_else(|| get("r_frame_rate").and_then(|v| rate(&v))).unwrap_or(0.0);
     let duration = get("duration").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let frames: Option<u64> = get("nb_frames").and_then(|v| v.parse().ok());
-    let still = STILLS.contains(&codec.as_str()) || frames == Some(1) || duration <= 0.0 || fps <= 0.0;
-    Ok(if still { MediaInfo { width, height, duration: 0.0, fps: 0.0 } } else { MediaInfo { width, height, duration, fps } })
+    let format = get("format_name").unwrap_or_default();
+    let still = is_picture_format(&format) || frames == Some(1) || duration <= 0.0 || fps <= 0.0;
+    let decoder = match codec.as_str() {
+        "vp9" => Some("libvpx-vp9"),
+        "vp8" => Some("libvpx"),
+        _ => None,
+    };
+    Ok(if still { MediaInfo { width, height, duration: 0.0, fps: 0.0, decoder } } else { MediaInfo { width, height, duration, fps, decoder } })
 }
 
 /// The size `info` decodes at: scaled down (never up) so that one frame has
@@ -116,7 +129,11 @@ pub fn fit(info: &MediaInfo, max_side: u32, max_bytes: usize) -> (u32, u32) {
 pub fn decode(path: &Path, info: &MediaInfo, size: (u32, u32)) -> Result<Frames> {
     let (w, h) = size;
     let mut cmd = quiet(Command::new(crate::ffmpeg::tool("ffmpeg", "FFMPEG")));
-    cmd.args(["-v", "error", "-nostdin", "-i"]).arg(path);
+    cmd.args(["-v", "error", "-nostdin"]);
+    if let Some(d) = info.decoder {
+        cmd.args(["-c:v", d]);
+    }
+    cmd.arg("-i").arg(path);
     let filter = format!("scale={w}:{h}:flags=area,format=rgba");
     cmd.args(["-an", "-vf", &filter]);
     if info.still() {
@@ -158,10 +175,10 @@ mod tests {
 
     #[test]
     fn sizes_fit_the_side_and_the_memory() {
-        let pic = MediaInfo { width: 2000, height: 1000, duration: 0.0, fps: 0.0 };
+        let pic = MediaInfo { width: 2000, height: 1000, duration: 0.0, fps: 0.0, decoder: None };
         assert_eq!(fit(&pic, 500, usize::MAX), (500, 250));
         assert_eq!(fit(&pic, 4000, usize::MAX), (2000, 1000), "never up");
-        let clip = MediaInfo { width: 1000, height: 1000, duration: 10.0, fps: 10.0 };
+        let clip = MediaInfo { width: 1000, height: 1000, duration: 10.0, fps: 10.0, decoder: None };
         let (w, h) = fit(&clip, 4000, 100 * 100 * 4 * 100);
         assert_eq!((w, h), (100, 100), "100 frames in the memory of 100 frames of 100 × 100");
     }
@@ -204,6 +221,21 @@ mod tests {
             let f = decode(&mp4, &info, fit(&info, 48, usize::MAX)).expect("decodes the clip");
             assert_eq!((f.width, f.height, f.frames.len()), (48, 32, 20));
             assert_eq!(f.index_at(0.39), 9);
+        }
+        // PNG in a MOV (an overlay with alpha): a clip, not a picture.
+        let mov = dir.join("a.mov");
+        if Command::new(&ffmpeg).args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=10:duration=0.5", "-c:v", "png"]).arg(&mov).status().is_ok_and(|s| s.success()) {
+            let info = probe(&mov).expect("probes PNG in MOV");
+            assert!(!info.still(), "PNG frames in a MOV are a clip: {info:?}");
+        }
+        // WebM with alpha: read through libvpx, its transparency kept.
+        let webm = dir.join("a.webm");
+        if Command::new(&ffmpeg).args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red@0.5:size=32x32:rate=10:duration=0.5,format=yuva420p", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]).arg(&webm).status().is_ok_and(|s| s.success()) {
+            let info = probe(&webm).expect("probes the WebM");
+            assert_eq!(info.decoder, Some("libvpx-vp9"));
+            let f = decode(&webm, &info, (32, 32)).expect("decodes the WebM");
+            let a = f.frames[0][3];
+            assert!((100..160).contains(&a), "half transparent: {a}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

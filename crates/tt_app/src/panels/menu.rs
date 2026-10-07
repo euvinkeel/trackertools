@@ -53,6 +53,18 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             crate::panels::layer_export::open(world);
             ui.close();
         }
+        if let Some(l) = layer {
+            ui.horizontal(|ui| {
+                if ui.button("Bring to front").clicked() {
+                    tt_core::layer::restack(world, l, tt_core::layer::Restack::Front);
+                    ui.close();
+                }
+                if ui.button("Send to back").clicked() {
+                    tt_core::layer::restack(world, l, tt_core::layer::Restack::Back);
+                    ui.close();
+                }
+            });
+        }
         if let Some(e) = layer.or(followable) {
             if ui.button("Copy as After Effects keyframes").on_hover_text("Its position (and turn, size and opacity for a layer), one key a frame from the in point: select a layer in After Effects and paste").clicked() {
                 crate::panels::layer_export::copy_ae_keyframes(ui.ctx(), world, e);
