@@ -123,6 +123,27 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
                 }
             }
         }
+        // Manual dots with one other tracker: merge the dots into it.
+        let (dots, into): (Vec<Entity>, Vec<Entity>) = trackers.iter().partition(|t| tt_track::human::is_manual(world, **t));
+        let target = match into.as_slice() {
+            [one] => Some(*one),
+            // Only dots: into the one right-clicked (the primary).
+            [] if dots.len() > 1 => primary.filter(|p| dots.contains(p)),
+            _ => None,
+        };
+        if let Some(t) = target {
+            let dots: Vec<Entity> = dots.into_iter().filter(|d| *d != t).collect();
+            let name = world.get::<Name>(t).map_or("the tracker".to_string(), |n| n.to_string());
+            if !dots.is_empty()
+                && ui
+                    .button(format!("Merge {} into {name}", if dots.len() == 1 { "the dot".to_string() } else { format!("{} dots", dots.len()) }))
+                    .on_hover_text("What the dots drew overrides its tracking on those frames, and the dots go (or drag a dot onto a tracker's lane in the timeline)")
+                    .clicked()
+            {
+                tt_track::human::merge_dots(world, &dots, t);
+                ui.close();
+            }
+        }
         // What was drawn by hand on them, on this frame.
         let here = world.resource::<tt_core::transport::Transport>().frame();
         let drawn: Vec<Entity> = trackers.iter().copied().filter(|t| tt_track::human::drawn_at(world, *t, here).is_some()).collect();

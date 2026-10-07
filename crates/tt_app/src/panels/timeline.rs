@@ -14,6 +14,10 @@
 //!   toggles, Shift adds), a drag draws a box that selects what it touches
 //!   (past the top or bottom it scrolls the lanes; Esc drops it), a
 //!   double-click enters that sketch's view, a right-click opens the menu.
+//! - Drag a manual dot (its name or its frames) onto a tracker's lane to
+//!   merge it in: what it drew overrides the tracker's automatic results on
+//!   those frames, and the dot goes (one undo step;
+//!   `tt_track::human::merge_dots`). Selected dots go together.
 //! - A stroke that starts scrolls its lane into view.
 //! - In and out points (I / O; Alt+X clears; `tt_core::marks`): what an
 //!   export covers, shaded outside it on the ruler and the lanes. Drag a
@@ -174,7 +178,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             fit = ui.button("Fit").on_hover_text("Show the whole clip").clicked();
             ui.label(
-                egui::RichText::new("wheel on the ruler or Ctrl+wheel: zoom · Shift+wheel: pan · wheel on lanes: scroll · middle-drag: pan both · drag lanes: box select · right-click: menu")
+                egui::RichText::new("wheel on the ruler or Ctrl+wheel: zoom · Shift+wheel: pan · wheel on lanes: scroll · middle-drag: pan both · drag lanes: box select · drag a manual dot onto a tracker: merge · right-click: menu")
                     .weak()
                     .small(),
             );
@@ -324,6 +328,12 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                 ui_state.edge = Some((e, edge));
                 tt_core::span::begin_drag(world, e);
             }
+            // On a manual dot's name or frames: carry it (and the other selected dots) to a tracker.
+            None if let Some(d) = hits.grab_at(o).filter(|e| tt_track::human::is_manual(world, *e)) => {
+                let sel = world.resource::<Selection>();
+                let dots: Vec<Entity> = if sel.is_selected(d) { sel.entities.iter().copied().filter(|e| tt_track::human::is_manual(world, *e)).collect() } else { vec![d] };
+                ui_state.carry = Some(dots);
+            }
             // Kept in content coordinates, so it stays on its lane while the lanes scroll.
             None => ui_state.marquee = Some(Pos2::new(o.x, o.y + lane_scroll)),
         }
@@ -351,6 +361,33 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         } else {
             tt_core::span::end_drag(world);
             ui_state.edge = None;
+        }
+    } else if let Some(dots) = ui_state.carry.clone() {
+        // Carrying manual dots: the tracker lane under the pointer takes them on release.
+        let down = ui.input(|i| i.pointer.primary_down());
+        let target = pointer.and_then(|p| hits.at(p)).filter(|t| tt_track::is_tracker(world, *t) && !dots.contains(t));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let name = |e: Entity| world.get::<Name>(e).map_or("the dot".to_string(), |n| n.to_string());
+        let what = match dots.as_slice() {
+            [one] => name(*one),
+            _ => format!("{} dots", dots.len()),
+        };
+        let tip = match target {
+            Some(t) => {
+                if let Some((_, lane, _, _)) = hits.lanes.iter().find(|(e, _, _, _)| *e == t) {
+                    painter.with_clip_rect(rows).rect(*lane, 0.0, style::HAND.gamma_multiply(0.12), Stroke::new(1.5, style::HAND), egui::StrokeKind::Inside);
+                }
+                format!("Release: merge {what} into {} (its drawn frames override the tracking there)", name(t))
+            }
+            None => format!("Drop {what} on a tracker's lane to merge it in"),
+        };
+        response.clone().on_hover_text_at_pointer(tip);
+        // Stopped with the button still down (Esc): nothing merged.
+        if response.drag_stopped() || !down {
+            if !down && let Some(t) = target {
+                tt_track::human::merge_dots(world, &dots, t);
+            }
+            ui_state.carry = None;
         }
     } else if let Some(m) = hits.marquee {
         painter.with_clip_rect(rows).rect(m, 2.0, style::ACCENT.gamma_multiply(0.12), Stroke::new(1.0, style::ACCENT), egui::StrokeKind::Inside);
@@ -613,6 +650,11 @@ impl Hits {
             return Some(*e);
         }
         self.lanes.iter().find(|(_, lane, _, _)| lane.contains(p)).map(|(e, _, _, _)| *e)
+    }
+
+    /// The lane whose name or frames are under `p` (what a drag can pick up).
+    fn grab_at(&self, p: Pos2) -> Option<Entity> {
+        self.lanes.iter().find(|(_, lane, label, bars)| lane.contains(p) && (label.contains(p) || bars.iter().any(|b| b.expand2(Vec2::new(2.0, 3.0)).contains(p)))).map(|(e, _, _, _)| *e)
     }
 
     /// The end of a lifetime under `p` (the nearer one if both are close).
@@ -999,6 +1041,8 @@ pub struct TimelineUi {
     /// The end of a lifetime being dragged, and the one under the pointer.
     edge: Option<(Entity, Edge)>,
     hover_edge: Option<(Entity, Edge)>,
+    /// Manual dots being carried to a tracker's lane.
+    carry: Option<Vec<Entity>>,
     /// The in or out point being dragged, and the one under the pointer.
     mark: Option<MarkEnd>,
     hover_mark: Option<MarkEnd>,
@@ -1159,5 +1203,59 @@ mod tests {
         undo(&mut world);
         assert_eq!(world.get::<Span>(sketch), None, "one undo takes the whole drag back");
         assert!(!world.resource::<History>().can_undo());
+    }
+
+    /// Dragging a manual dot's frames onto a tracker's lane merges it in:
+    /// its drawn frames go to the tracker, the dot goes, one undo step.
+    #[test]
+    fn dragging_a_manual_dot_onto_a_tracker_merges_it() {
+        let (mut world, _) = setup();
+        let (out, auto) = {
+            let mut store = world.resource_mut::<SignalStore>();
+            (store.create(tt_track::TRACK_CHANNELS), store.create(tt_track::TRACK_CHANNELS))
+        };
+        world.resource_mut::<SignalStore>().get_mut(auto).expect("signal").write(0, &[1.0; tt_track::TRACK_CHANNELS * 600]);
+        let tracker = world
+            .spawn((
+                Name::new("Tracker 1"),
+                Operator { kind: "track".into() },
+                tt_core::op::Inputs(Vec::new()),
+                Output(out),
+                tt_track::human::AutoOutput(auto),
+                tt_track::Tracker::at(0),
+                tt_track::runner::TrackBook::default(),
+                tt_track::TrackRun::Paused,
+            ))
+            .id();
+        let mut dot = None;
+        tt_core::history::edit(&mut world, "Draw", |tx| {
+            let d = tt_track::human::spawn_manual_dot(tx, "Dot 1".into(), 200);
+            tt_track::human::write_drawn(tx, d, &(200..260).map(|f| (f, Some([5.0, 5.0]))).collect::<Vec<_>>());
+            dot = Some(d);
+        });
+        let dot = dot.expect("a dot");
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut world, Vec::new());
+        frame(&ctx, &mut world, Vec::new());
+        let lanes = world.resource::<TimelineUi>().lanes_area.expect("lanes drawn");
+        let order = lane_list(&mut world);
+        let row = |e: Entity| order.iter().position(|(l, _, _)| *l == e).expect("a lane") as f32;
+        let x = lanes.min.x + (230.0 / 600.0) * lanes.width();
+        let (from, to) = (Pos2::new(x, lanes.min.y + row(dot) * LANE_H + LANE_H / 2.0), Pos2::new(x, lanes.min.y + row(tracker) * LANE_H + LANE_H / 2.0));
+        frame(&ctx, &mut world, vec![Event::PointerMoved(from)]);
+        frame(&ctx, &mut world, vec![button(from, true)]);
+        for i in 1..=8 {
+            frame(&ctx, &mut world, vec![Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))]);
+        }
+        frame(&ctx, &mut world, vec![button(to, false)]);
+        frame(&ctx, &mut world, Vec::new());
+        assert_eq!(tt_track::human::drawn_at(&world, tracker, 230), Some([5.0, 5.0]), "the dot's frames are the tracker's now");
+        assert_eq!(tt_track::human::drawn_frames(&world, tracker).0, 60);
+        assert!(world.get::<bevy_ecs::entity_disabling::Disabled>(dot).is_some(), "the dot went");
+        assert_eq!(world.resource::<Selection>().entities, vec![tracker], "no box selection; the tracker is selected");
+        assert_eq!(world.resource::<History>().undo_label(), Some("Merge Dot 1 into Tracker 1"));
+        undo(&mut world);
+        assert!(world.get::<bevy_ecs::entity_disabling::Disabled>(dot).is_none(), "undo brings the dot back");
+        assert_eq!(tt_track::human::drawn_frames(&world, tracker).0, 0);
     }
 }

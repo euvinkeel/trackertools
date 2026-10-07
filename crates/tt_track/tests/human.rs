@@ -164,6 +164,56 @@ fn tab_follows_a_tracker_like_a_sketch() {
     assert_eq!(core.world.resource::<ActiveView>().0, None, "the viewport is back on the source");
 }
 
+/// Merging manual dots into a tracker: their drawn frames override its
+/// automatic results there (a later dot over an earlier one), the dots go,
+/// a subject they were members of keeps the tracker once; one undo step.
+#[test]
+fn manual_dots_merge_into_a_tracker_as_drawn_frames() {
+    use tt_core::subject::{make_subject, members_of};
+    use tt_track::human::{drawn_frames, merge_dots, spawn_manual_dot};
+    let mut core = core(50);
+    let op = tracker_with_results(&mut core);
+    let w = &mut core.world;
+    let mut dots = Vec::new();
+    edit(w, "Draw", |tx| {
+        for (name, frames, at) in [("Dot 1", 10..20, [500.0, 400.0]), ("Dot 2", 15..25, [600.0, 400.0])] {
+            let d = spawn_manual_dot(tx, name.into(), frames.start);
+            write_drawn(tx, d, &frames.map(|f| (f, Some(at))).collect::<Vec<_>>());
+            dots.push(d);
+        }
+    });
+    // Dot 1 is trimmed to frames 10–17: what is outside its lifetime stays out.
+    set_span(w, dots[0], Span { first: None, last: Some(17) });
+    let subject = make_subject(w, &[op, dots[0]], 12).expect("a subject");
+    for _ in 0..2 {
+        core.run_pre_ui();
+    }
+    let w = &mut core.world;
+    let undo_depth = |w: &World| w.resource::<History>().undo_label().map(str::to_string);
+    let before = undo_depth(w);
+    assert_eq!(merge_dots(w, &dots, op), Some(18), "8 frames of Dot 1, 10 of Dot 2");
+    for _ in 0..2 {
+        core.run_pre_ui();
+    }
+    let w = &mut core.world;
+    let x = |w: &World, f: i64| value(w, op, f).map(|(v, _)| v[0]);
+    assert_eq!(x(w, 12), Some(500.0), "Dot 1 overrides the tracking");
+    assert_eq!(x(w, 16), Some(600.0), "Dot 2, merged later, over Dot 1");
+    assert_eq!(x(w, 30), Some(130.0), "elsewhere the automatic result");
+    assert_eq!(drawn_frames(w, op).0, 15, "frames 10–24");
+    assert!(dots.iter().all(|d| w.get::<bevy_ecs::entity_disabling::Disabled>(*d).is_some()), "the dots went");
+    assert_eq!(members_of(w, subject), vec![op], "the subject keeps the tracker once");
+    assert_eq!(w.resource::<Selection>().primary(), Some(op));
+    assert_eq!(undo_depth(w).as_deref(), Some("Merge 2 dots into the tracker"));
+    undo(w);
+    assert_eq!(undo_depth(w), before, "one undo step");
+    assert_eq!(drawn_frames(w, op).0, 0);
+    assert!(dots.iter().all(|d| w.get::<bevy_ecs::entity_disabling::Disabled>(*d).is_none()), "undo brings the dots back");
+    assert_eq!(members_of(w, subject), vec![op, dots[0]]);
+    // A tracker isn't a dot: nothing to merge.
+    assert_eq!(merge_dots(w, &[op], op), None);
+}
+
 fn pointer(core: &mut Core, t: f64, at: [f64; 2], pressed: bool, down: bool, released: bool) {
     *core.world.resource_mut::<PointerFrame>() = PointerFrame {
         samples: if released { Vec::new() } else { vec![[t, at[0], at[1]]] },
