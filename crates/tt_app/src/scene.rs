@@ -38,6 +38,8 @@ pub struct Scene {
     pub inject: Vec<egui::Event>,
     /// Where the Settings tab is (points).
     pub tab: Option<egui::Pos2>,
+    /// `=layer-render`: its export started.
+    rendering: bool,
 }
 
 impl Scene {
@@ -45,11 +47,20 @@ impl Scene {
         let mode = std::env::var("TT_SCENE_DEMO").ok()?;
         // (The Settings tab in the default layout of a 1600 × 950 window; TT_SCENE_TAB=x,y for another.)
         let tab = std::env::var("TT_SCENE_TAB").ok().and_then(|s| s.split_once(',').and_then(|(x, y)| Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))));
-        Some(Self { sketch: None, subject: None, mode, after: None, opened: None, dragged: 0, inject: Vec::new(), tab: tab.or(Some(egui::pos2(1427.0, 35.0))) })
+        Some(Self { sketch: None, subject: None, mode, after: None, opened: None, dragged: 0, inject: Vec::new(), tab: tab.or(Some(egui::pos2(1427.0, 35.0))), rendering: false })
     }
 
     /// One app frame (the video is open). True: done.
     pub fn drive(&mut self, world: &mut World) -> bool {
+        // `=layer-render`: the export starts once the layers are worked out.
+        if self.mode == "layer-render"
+            && self.after.is_some()
+            && !self.rendering
+            && let Ok(out) = std::env::var("TT_SCENE_OUT")
+        {
+            self.rendering = crate::panels::layer_export::start_now(world, std::env::var_os("TT_SCENE_ALPHA").is_some(), out.into());
+            return false;
+        }
         if let Some(n) = self.after.as_mut() {
             // The export waits for the subject's frames (its members tracking).
             if self.mode.starts_with("export")
@@ -125,6 +136,30 @@ impl Scene {
                         tt_core::focus::focus_on(world, f, 600, t);
                         tt_core::focus::set_focus(world, f, "slower", |p| p.move_time = 1.5);
                         world.resource_mut::<tt_core::selection::Selection>().select_only(f);
+                    }
+                    // `=layer`: the files in TT_SCENE_MEDIA (`;` between them) attached, the
+                    // first to the subject, the next to the tracker selected; the first selected.
+                    if self.mode.starts_with("layer") {
+                        let loose = world.resource::<tt_core::selection::Selection>().primary();
+                        let media = std::env::var("TT_SCENE_MEDIA").unwrap_or_default();
+                        let targets = [self.subject, loose];
+                        let mut first = None;
+                        for (path, target) in media.split(';').filter(|p| !p.is_empty()).zip(targets) {
+                            if let Some(t) = target {
+                                let l = crate::layers::attach_file(world, t, std::path::Path::new(path));
+                                first = first.or(l);
+                            }
+                        }
+                        if let Some(l) = first {
+                            world.resource_mut::<tt_core::selection::Selection>().select_only(l);
+                        }
+                        // `=layer-export`: and the Export layers window; `=layer-render`: and
+                        // its export started (frames 560–620, to TT_SCENE_OUT; with
+                        // TT_SCENE_ALPHA, alone on transparency).
+                        if self.mode == "layer-export" || self.mode == "layer-render" {
+                            crate::panels::layer_export::open(world);
+                        }
+
                     }
                     // `=sketch`: a second sketch (its own colour), the first selected (its moving
                     // outline); `=view`: then inside the first's view (outside it dimmed).

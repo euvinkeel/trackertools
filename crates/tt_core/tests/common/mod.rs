@@ -24,11 +24,12 @@ pub struct Input {
     pub down: bool,
     pub shift: bool,
     pub ctrl: bool,
+    pub alt: bool,
     pub wheel: f32,
     pub action: Option<Action>,
 }
 
-pub const HOLD: Input = Input { press: false, down: true, shift: false, ctrl: false, wheel: 0.0, action: None };
+pub const HOLD: Input = Input { press: false, down: true, shift: false, ctrl: false, alt: false, wheel: 0.0, action: None };
 pub const PRESS: Input = Input { press: true, ..HOLD };
 pub const UP: Input = Input { down: false, ..HOLD };
 
@@ -68,7 +69,7 @@ impl Driver {
             scale: 1.0,
             ..PointerFrame::default()
         };
-        *w.resource_mut::<KeysHeld>() = KeysHeld { keys: Vec::new(), mods: Mods { shift: input.shift, ctrl: input.ctrl, ..Mods::NONE } };
+        *w.resource_mut::<KeysHeld>() = KeysHeld { keys: Vec::new(), mods: Mods { shift: input.shift, ctrl: input.ctrl, alt: input.alt } };
         if let Some(a) = input.action {
             w.resource_mut::<PendingActions>().push(a);
         }

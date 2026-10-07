@@ -5,6 +5,8 @@ mod brush;
 pub mod export;
 mod focus_inspector;
 mod inspector;
+mod layer_inspector;
+pub mod layer_export;
 pub mod look_editor;
 mod menu;
 pub mod outliner;
@@ -37,6 +39,7 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
     });
     export::ui(ui.ctx(), world);
     crate::update::prompt(ui.ctx(), world);
+    layer_export::ui(ui.ctx(), world);
     crate::setup::window(ui.ctx(), &mut world.resource_mut::<crate::setup::Doctor>());
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;

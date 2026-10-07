@@ -216,7 +216,9 @@ fn span_changed(
     let frames = 0..t.frame_count;
     for e in changed.iter().chain(removed.read()) {
         inv.output_changed(e, frames.clone());
-        if ops.get(e).ok().and_then(|o| registry.get(&o.kind)).is_some_and(|k| k.job()) {
+        // A job (a tracker) plans again; a layer times its clip and sizes itself from its own first frame.
+        let op = ops.get(e).ok();
+        if op.and_then(|o| registry.get(&o.kind)).is_some_and(|k| k.job()) || op.is_some_and(|o| o.kind == "layer") {
             inv.recompute(e, frames.clone());
         }
     }
