@@ -10,6 +10,11 @@
 //!   whose guide box or view map differs. A guide edit on frames 700..760
 //!   re-tracks from ~700 on, even though a sketch reports its whole extent as
 //!   changed; a recompute that changes nothing re-tracks nothing.
+//! - A look (a pattern, a reset point, a paint) that changed, came or went
+//!   re-tracks only from the look before it to the look after it, on its
+//!   side of the anchor ([`Plan::touched`]); a paint tracker from the paint
+//!   before it on, resuming there from its state ([`PaintStates`]). Jobs
+//!   track one such stretch each: results past it hold.
 //! - Each side of the anchor with frames left to do gets a job, resuming from
 //!   the result just before them, if the tracker is asked to track that way
 //!   ([`crate::TrackRun`]: forward, backward, both, or paused). Pausing or
@@ -94,6 +99,12 @@ pub struct TrackBook {
 }
 
 /// What a tracker is doing, for panels.
+/// A paint tracker's states on its paints' frames (`job::paint::PaintState`):
+/// where a job tracking again resumes. Only those on frames whose results
+/// still hold are kept (`replan`); not saved.
+#[derive(Component, Debug, Clone, Default)]
+pub struct PaintStates(pub std::collections::BTreeMap<FrameIndex, Arc<crate::job::paint::PaintState>>);
+
 /// A paint tracker's points on each frame tracked (`job::paint`), for the
 /// app to draw: worked out with the results, not saved (tracking again
 /// makes them).
@@ -347,11 +358,15 @@ impl Plan {
         Some((self.guide.get(i)?, self.maps.get(i)?))
     }
 
-    /// Frames whose results from `old` still hold for this plan: with the
-    /// same seed and settings, a frame depends on the inputs from the anchor
-    /// out to it, so results hold out to the first frame whose inputs differ
-    /// on each side.
-    fn kept(&self, old: &Plan) -> Range<FrameIndex> {
+    /// Frames whose results from `old` still hold for this plan (on request:
+    /// "limit recomputation from when paints/reset points have actually
+    /// changed, and their immediate neighbors only"). With the same settings,
+    /// a frame depends on the inputs from the anchor out to it, so results
+    /// hold out to the first frame whose guide or view differs on each side;
+    /// and a look (a pattern, a reset point, a paint) that changed, came or
+    /// went re-tracks only from the look before it to the look after it
+    /// ([`Plan::touched`]).
+    fn kept(&self, old: &Plan) -> RangeSet {
         let (p, q) = (&self.params, &old.params);
         let same_seed = self.anchor == old.anchor
             && close(self.scale, old.scale)
@@ -359,15 +374,13 @@ impl Plan {
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && p.matching == q.matching
             && p.method == q.method
-            && self.root == old.root
-            && self.looks == old.looks
-            && self.seed == old.seed;
+            && self.root == old.root;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
             (Some((g, m)), Some((h, n))) => g.iter().zip(h).all(|(a, b)| close(*a, *b)) && close(m.a, n.a) && close(m.b[0], n.b[0]) && close(m.b[1], n.b[1]),
             _ => false,
         };
         if !same_seed || !same(self.anchor) {
-            return self.anchor..self.anchor;
+            return RangeSet::new();
         }
         let mut end = self.anchor + 1;
         while end <= self.hi && same(end) {
@@ -377,7 +390,46 @@ impl Plan {
         while start > self.lo && same(start - 1) {
             start -= 1;
         }
-        start..end
+        let mut kept = RangeSet::from_range(start..end);
+        for r in self.touched(old) {
+            kept.remove(r);
+        }
+        kept
+    }
+
+    /// The frames the looks that differ from `old`'s re-track: for each
+    /// frame whose looks changed (or came, or went), from the nearest look
+    /// before it to the nearest after it (either plan's), on each side of
+    /// the anchor; up to the side's end where there is none. A paint
+    /// tracker's motion builds on the stretches before, so from a changed
+    /// paint's previous paint to the end of that side. (A template
+    /// tracker's looks are also matched on every frame: limited to their
+    /// neighbours all the same, as asked.)
+    fn touched(&self, old: &Plan) -> Vec<Range<FrameIndex>> {
+        let at = |looks: &[LookSpec], f: FrameIndex| -> Vec<LookSpec> { looks.iter().filter(|l| l.frame == f).cloned().collect() };
+        let mut frames: Vec<FrameIndex> = self.looks.iter().chain(old.looks.iter()).map(|l| l.frame).collect();
+        frames.sort_unstable();
+        frames.dedup();
+        let changed: Vec<FrameIndex> = frames.iter().copied().filter(|f| at(&self.looks, *f) != at(&old.looks, *f)).collect();
+        let paint = self.params.method == Method::Paint;
+        let (lo, hi) = (self.lo.min(old.lo), self.hi.max(old.hi) + 1);
+        let mut out = Vec::new();
+        for c in changed {
+            let before = frames.iter().copied().filter(|f| *f < c).max();
+            let after = frames.iter().copied().filter(|f| *f > c).min();
+            // (Toward the anchor stops at the anchor: the other side doesn't depend on it;
+            // the anchor's own look seeds both.)
+            // (A paint tracker resumes on the paint before, whose frame and state hold: from just after it.)
+            if c >= self.anchor {
+                let from = if paint { before.map_or(self.anchor, |b| b + 1) } else { before.unwrap_or(self.anchor) }.max(self.anchor);
+                out.push(from..if paint { hi } else { after.map_or(hi, |a| a + 1) });
+            }
+            if c <= self.anchor {
+                let to = if paint { after.map_or(self.anchor + 1, |a| a) } else { after.unwrap_or(self.anchor) + 1 }.min(self.anchor + 1);
+                out.push(if paint { lo } else { before.unwrap_or(lo) }..to);
+            }
+        }
+        out
     }
 }
 
@@ -557,6 +609,16 @@ fn drain(world: &mut World, op: Entity) {
                     points.0.insert(f, shifted);
                 }
             }
+            Msg::PaintStates(states) => {
+                let mut e = world.entity_mut(op);
+                if e.get::<PaintStates>().is_none() {
+                    e.insert(PaintStates::default());
+                }
+                let mut kept = e.get_mut::<PaintStates>().expect("inserted");
+                for s in states {
+                    kept.0.insert(s.frame, Arc::new(s));
+                }
+            }
             Msg::Finished => {
                 world.resource_mut::<TrackJobs>().running.remove(&(op, side));
             }
@@ -634,9 +696,9 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
         }
         set
     };
-    let kept = old.as_ref().map_or(plan.anchor..plan.anchor, |b| plan.kept(&b.plan));
+    let kept = old.as_ref().map_or_else(RangeSet::new, |b| plan.kept(&b.plan));
     let done = match &old {
-        Some(b) => intersection(&b.done.intersect(&kept), &present),
+        Some(b) => intersection(&intersection(&b.done, &kept), &present),
         None if world.get::<TrackBook>(op).is_some_and(|b| b.stamp == plan.stamp) && present.intersect(&produced).len() == produced.end - produced.start => present.intersect(&produced),
         None => RangeSet::new(),
     };
@@ -650,7 +712,7 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
         for side in [Side::Forward, Side::Backward] {
             let todo = difference(&RangeSet::from_range(plan.wanted(side, run)), &done);
             let stays = jobs.running.get(&(op, side)).is_some_and(|job| {
-                job.owned == todo && job.owned.hull().is_none_or(|h| kept.start <= h.start && h.end <= kept.end)
+                job.owned == todo && job.owned.ranges().iter().all(|r| intersection(&kept, &RangeSet::from_range(r.clone())).len() == r.end - r.start)
             });
             if !stays {
                 jobs.running.remove(&(op, side));
@@ -674,6 +736,10 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     let reach = tt_core::span::Reach(reachable.start, reachable.end - 1);
     if world.get::<tt_core::span::Reach>(op) != Some(&reach) {
         world.entity_mut(op).insert(reach);
+    }
+    // A paint tracker's states hold where its results do.
+    if let Some(mut states) = world.get_mut::<PaintStates>(op) {
+        states.0.retain(|f, _| done.contains(*f));
     }
     world.resource_mut::<TrackJobs>().basis.insert(op, Basis { plan, done, failed: false, unsettled: true });
 }
@@ -739,18 +805,42 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> Waiting {
             Side::Forward => (hull.start, hull.start - 1),
             Side::Backward => (hull.end - 1, hull.end),
         };
-        // (A paint tracker starts from its first paint again: its motion is built from there.)
+        // A paint tracker resumes on the last paint before what's left that it has a
+        // state on (its motion and cohort there), else from its first paint again.
+        let paint_resume = (plan.params.method == Method::Paint)
+            .then(|| {
+                let states = world.get::<PaintStates>(op)?;
+                let ok = |f: FrameIndex| match side {
+                    Side::Forward => f > plan.anchor && f <= from,
+                    Side::Backward => f < plan.anchor && f >= from,
+                };
+                let pick = |(f, s): (&FrameIndex, &Arc<crate::job::paint::PaintState>)| ok(*f).then(|| s.clone());
+                match side {
+                    Side::Forward => states.0.iter().rev().find_map(pick),
+                    Side::Backward => states.0.iter().find_map(pick),
+                }
+            })
+            .flatten();
         let resume = (range.contains(&before) && plan.params.method != Method::Paint).then(|| world.resource::<SignalStore>().get(out)?.get_valid(before).map(|v| ([(v[0] - offset[0]) as f64, (v[1] - offset[1]) as f64], v[6]))).flatten();
         let from = match (resume, side) {
+            _ if let Some(p) = &paint_resume => p.frame,
             (Some(_), _) => from,
             (None, Side::Forward) => plan.anchor,
             (None, Side::Backward) => plan.anchor - 1,
         };
-        let to = if side == Side::Forward { want.end - 1 } else { want.start };
+        // To the end of the stretch it redoes: results past it (to the side's end) hold.
+        let first = match side {
+            Side::Forward => todo.ranges().first().cloned(),
+            Side::Backward => todo.ranges().last().cloned(),
+        }
+        .unwrap_or(hull.clone());
+        let to = if side == Side::Forward { first.end - 1 } else { first.start };
         let limit = catch_up_limit(world, op, side);
         let now = if side == Side::Forward { from < limit } else { from >= limit };
         let label = world.get::<Name>(op).map_or_else(|| format!("tracker {op}"), |n| format!("{n} ({op})"));
-        specs.push((now, job_spec(&plan, side, from, to, resume, footage, label)));
+        let mut spec = job_spec(&plan, side, from, to, resume, footage, label);
+        spec.paint_resume = paint_resume;
+        specs.push((now, spec));
     }
     specs.sort_by_key(|(now, _)| !*now);
     for (now, spec) in specs {
@@ -784,6 +874,7 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
         from,
         to,
         resume,
+        paint_resume: None,
         lo: plan.lo,
         guide: plan.guide.clone(),
         maps: plan.maps.clone(),

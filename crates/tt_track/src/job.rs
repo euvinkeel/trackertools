@@ -115,6 +115,9 @@ pub struct JobSpec {
     /// job's direction, and its score there: resume there instead of
     /// starting at the anchor.
     pub resume: Option<([f64; 2], f32)>,
+    /// A paint tracker resuming on a paint's frame (`paint::PaintState`): the
+    /// job starts there (`from`), its cohort as it was.
+    pub paint_resume: Option<Arc<paint::PaintState>>,
     /// The tracked range starts here; `guide` and `maps` cover it frame by frame.
     pub lo: FrameIndex,
     /// The guide's boxes `[x, y, left, top, right, bottom]`, source px, gaps filled.
@@ -222,6 +225,8 @@ pub enum Msg {
     Frames(Vec<(FrameIndex, [f32; TRACK_CHANNELS])>),
     /// A paint tracker's points on these frames (`paint`).
     Points(Vec<(FrameIndex, Vec<PointMark>)>),
+    /// A paint tracker's states on its paints' frames (`paint::PaintState`).
+    PaintStates(Vec<paint::PaintState>),
     Finished,
     Failed(String),
 }
@@ -275,6 +280,7 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                     tx: out,
                     out: Vec::new(),
                     marks: Vec::new(),
+                    states: Vec::new(),
                     flushed: Instant::now(),
                     half: [TEMPLATE_R as f64; 2],
                     margin: TEMPLATE_R as f64 + 2.0,
@@ -312,8 +318,9 @@ struct Worker {
     shared: Arc<Shared>,
     tx: Sender<Msg>,
     out: Vec<(FrameIndex, [f32; TRACK_CHANNELS])>,
-    /// A paint tracker's points, sent with the frames.
+    /// A paint tracker's points, sent with the frames, and its states on its paints.
     marks: Vec<(FrameIndex, Vec<PointMark>)>,
+    states: Vec<paint::PaintState>,
     flushed: Instant,
     /// The output box's half-size, and the patch margin the templates need (patch px).
     half: [f64; 2],
@@ -596,6 +603,9 @@ impl Worker {
         }
         if !self.marks.is_empty() {
             let _ = self.tx.send(Msg::Points(std::mem::take(&mut self.marks)));
+        }
+        if !self.states.is_empty() {
+            let _ = self.tx.send(Msg::PaintStates(std::mem::take(&mut self.states)));
         }
         self.flushed = Instant::now();
     }

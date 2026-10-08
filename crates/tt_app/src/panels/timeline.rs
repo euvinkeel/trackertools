@@ -965,6 +965,25 @@ fn lanes(
                     }
                 }
                 flush(&mut line);
+                // Stale frames (to be tracked again, or being): stripes that move, so what is
+                // recomputed shows (on request: "show in the timeline an animating bar so I know which
+                // regions are being recomputed/treated as stale").
+                let lo = (scale.start.floor() as FrameIndex).max(span.range().start);
+                let hi = ((scale.start + scale.span).ceil() as FrameIndex + 1).min(span.range().end);
+                let stale: Vec<Range<FrameIndex>> = sig.runs(lo..hi).into_iter().filter(|(_, s)| *s == FrameState::Stale).map(|(r, _)| r).collect();
+                for r in stale {
+                    let Some(band) = bar(y + 13.0, y + 17.0, r.start, r.end) else { continue };
+                    let painter = painter.with_clip_rect(band);
+                    painter.rect_filled(band, 0.0, tracks::TRACK.gamma_multiply(0.18));
+                    // (12 points a second, to the right: the way tracking goes.)
+                    let shift = ((time * 12.0) % 8.0) as f32;
+                    let mut x = band.left() - 8.0 + shift;
+                    while x < band.right() + 8.0 {
+                        painter.line_segment([Pos2::new(x, band.bottom()), Pos2::new(x + 4.0, band.top())], Stroke::new(1.5, tracks::TRACK.gamma_multiply(0.85)));
+                        x += 8.0;
+                    }
+                    hits.moving = true;
+                }
             }
             // Where it is switched off: hatched over its lane.
             if let Some(o) = world.get::<tt_track::off::TrackerOff>(e).filter(|o| o.any_off()) {

@@ -297,6 +297,7 @@ fn a_job_that_panics_reports_a_failure() {
         from: 600,
         to: 610,
         resume: None,
+        paint_resume: None,
         lo: 0,
         // (No guide boxes: reading the anchor's panics.)
         guide: Arc::new(Vec::new()),
@@ -322,7 +323,7 @@ fn a_job_that_panics_reports_a_failure() {
     match last {
         Some(Msg::Failed(e)) => assert!(e.starts_with("the tracker stopped on an error: "), "{e}"),
         Some(Msg::Finished) => panic!("finished"),
-        Some(Msg::Frames(_) | Msg::Points(_)) | None => panic!("no last word"),
+        Some(Msg::Frames(_) | Msg::Points(_) | Msg::PaintStates(_)) | None => panic!("no last word"),
     }
     assert_eq!((threads.load(Ordering::Relaxed), workers.load(Ordering::Relaxed)), (0, 0));
 }
@@ -536,3 +537,91 @@ fn a_paint_tracker_follows_its_paints() {
     quiet(&mut core);
 }
 
+
+/// A reset point added between two others re-tracks only from the one
+/// before it to the one after it (on request: "limit recomputation from
+/// when paints/reset points have actually changed, and their immediate
+/// neighbors only"): the rest stays valid, and no job runs on the other side.
+#[test]
+fn a_new_reset_point_retracks_only_between_its_neighbours() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    let op = add(&mut core, guide);
+    set_span(&mut core.world, op, Span::new(570, 680));
+    for f in [620, 660] {
+        tt_track::set_reset_point(&mut core.world, op, Look::new(f, truth(f), [6.0, 6.0]));
+    }
+    run(&mut core, &[op], |_| {});
+    assert_eq!(coverage(&core.world, op), Some(570..681));
+    tt_track::set_reset_point(&mut core.world, op, Look::new(640, truth(640), [6.0, 6.0]));
+    let mut sides = Vec::new();
+    run(&mut core, &[op], |w| {
+        let s = status(w, op);
+        if let Some(f) = s.forward {
+            sides.push((f.from, f.to));
+        }
+        assert!(s.backward.is_none(), "nothing to redo before the anchor");
+        // Outside 620–660 the results stay valid while it re-tracks.
+        let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+        for f in [575, 600, 619, 661, 680] {
+            assert_eq!(sig.state(f), tt_core::signal::FrameState::Valid, "frame {f} kept");
+        }
+    });
+    sides.dedup();
+    assert_eq!(sides, vec![(620, 660)], "one job, from the reset point before to the one after");
+    assert_eq!(coverage(&core.world, op), Some(570..681));
+    quiet(&mut core);
+}
+
+/// A paint changed: the paint tracker resumes on the paint before it (its
+/// cohort and motion there), not from its first paint; the frames before
+/// that stay; and it ends where a fresh tracker with the same paints does.
+#[test]
+fn a_changed_paint_resumes_on_the_paint_before() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    core.world.resource_mut::<NewTrackers>().method = Method::Paint;
+    let paint = |f: i64, at: [f64; 2]| {
+        let (c, h, mask) = tt_track::tool::paint_look(&[at, [at[0] + 12.0, at[1] + 4.0]], 9.0);
+        let mut look = Look::new(f, c, h);
+        look.mask = mask;
+        look
+    };
+    let make = |core: &mut Core, last: [f64; 2]| {
+        let op = tt_track::add_tracker_with_look(&mut core.world, guide, paint(600, truth(600))).expect("tracker");
+        set_span(&mut core.world, op, Span::new(570, 640));
+        tt_track::add_look(&mut core.world, op, paint(612, truth(612))).expect("paint");
+        let l = tt_track::add_look(&mut core.world, op, paint(622, last)).expect("paint");
+        (op, l)
+    };
+    let (op, last) = make(&mut core, [truth(622)[0] + 40.0, truth(622)[1]]);
+    run(&mut core, &[op], |_| {});
+    assert_eq!(coverage(&core.world, op), Some(570..641));
+    // The paint on 622 moved onto the sprite.
+    let moved = paint(622, truth(622));
+    tt_core::history::edit(&mut core.world, "move", |tx| tx.modify::<Look>(last, |l| *l = moved.clone()));
+    let mut froms = Vec::new();
+    run(&mut core, &[op], |w| {
+        let s = status(w, op);
+        if let Some(f) = s.forward {
+            froms.push(f.from);
+        }
+        assert!(s.backward.is_none(), "nothing to redo before the anchor");
+        let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+        for f in [575, 600, 612] {
+            assert_eq!(sig.state(f), tt_core::signal::FrameState::Valid, "frame {f} kept");
+        }
+    });
+    froms.dedup();
+    assert_eq!(froms, vec![612], "resumed on the paint before the changed one");
+    // A fresh tracker with the same paints, tracked from its first paint.
+    let (fresh, _) = make(&mut core, truth(622));
+    run(&mut core, &[fresh], |_| {});
+    let w = &core.world;
+    let at = |e: Entity, f: i64| w.resource::<SignalStore>().get(w.get::<Output>(e).expect("output").0).and_then(|s| s.get(f).map(|v| [v[0] as f64, v[1] as f64, tt_track::flags(v) as f64])).expect("a value");
+    for f in 570..641 {
+        let (a, b) = (at(op, f), at(fresh, f));
+        assert!((a[0] - b[0]).hypot(a[1] - b[1]) < 0.5 && a[2] == b[2], "frame {f}: resumed {a:?} vs fresh {b:?}");
+    }
+    quiet(&mut core);
+}

@@ -46,7 +46,9 @@ pub const POINTS_PER_PAINT: usize = 48;
 const PAINTED: u8 = 96;
 
 /// A point and where it went.
-type Pair = ([f64; 2], [f64; 2]);
+pub type Pair = ([f64; 2], [f64; 2]);
+/// A cohort point on a paint's frame: its query, its place in the reference, where it is (view px).
+type Held = (usize, [f64; 2], [f64; 2]);
 
 /// A similarity: `p' = [a·x − b·y + tx, b·x + a·y + ty]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -192,6 +194,21 @@ pub fn on(look: &LookSpec, p: [f64; 2]) -> bool {
     }))
 }
 
+/// A paint job's state on a paint's frame, after it (its cohort, and the
+/// motion there): where a job tracking again from that paint resumes
+/// (`PaintFit::resume`), so a changed paint re-tracks from the paint before
+/// it, not from the first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintState {
+    pub frame: FrameIndex,
+    pub motion: Similarity,
+    /// The tracked point in the reference (view px), and the box's half-size at scale 1.
+    pub target: [f64; 2],
+    pub half: [f64; 2],
+    /// The cohort: each point's place in the reference (view px), and where it is on `frame` (source px).
+    pub points: Vec<([f64; 2], [f64; 2])>,
+}
+
 /// One query of a paint job: the stream frame it starts on (its paint's).
 #[derive(Clone, Debug)]
 pub struct PaintQuery {
@@ -251,15 +268,38 @@ pub struct PaintFit {
     held: Vec<(usize, FrameIndex, Points)>,
     min_score: f64,
     slack: f64,
+    /// The states on the paints' frames passed (for the runner to keep), as
+    /// (frame, the cohort's queries): `take_states` makes them whole.
+    states: Vec<(FrameIndex, Similarity, Vec<Held>)>,
+    /// Resumed: the stream's first frame comes out too (it may be one to redo).
+    resumed: bool,
 }
 
 impl PaintFit {
+    /// A job resuming from `state` (its first frame, stream index 0): its
+    /// cohort's points are the first queries (`state.points.len()` of them,
+    /// on frame 0, placed already), then the paints after it.
+    pub fn resume(state: &PaintState, mut queries: Vec<PaintQuery>, paints: Vec<(usize, LookSpec)>, min_score: f64, slack: f64) -> Self {
+        for (q, (r, _)) in queries.iter_mut().zip(&state.points) {
+            q.reference = Some(*r);
+        }
+        let mut fit = Self::new(queries, paints, state.target, state.half, min_score, slack);
+        fit.motion = state.motion;
+        fit.resumed = true;
+        fit
+    }
+
+    /// The states on the paints passed since the last call: (frame, motion,
+    /// the cohort as (reference, view px)).
+    pub fn take_states(&mut self) -> Vec<(FrameIndex, Similarity, Vec<Pair>)> {
+        std::mem::take(&mut self.states).into_iter().map(|(f, m, pts)| (f, m, pts.into_iter().map(|(_, r, p)| (r, p)).collect())).collect()
+    }
     /// `paints`: (stream index, paint) on the stream; the queries, each with its
     /// paint's stream index; `min_score`; outliers' least distance (view px).
     pub fn new(queries: Vec<PaintQuery>, mut paints: Vec<(usize, LookSpec)>, target: [f64; 2], half: [f64; 2], min_score: f64, slack: f64) -> Self {
         paints.sort_by_key(|(i, _)| *i);
         let alive = vec![false; queries.len()];
-        Self { queries, paints, motion: Similarity::IDENTITY, target, half, alive, next: None, held: Vec::new(), min_score, slack }
+        Self { queries, paints, motion: Similarity::IDENTITY, target, half, alive, next: None, held: Vec::new(), min_score, slack, states: Vec::new(), resumed: false }
     }
 
     fn next_paint_after(&self, i: usize) -> Option<usize> {
@@ -275,8 +315,11 @@ impl PaintFit {
             // The first paint: its points are the cohort, where they are.
             for (k, q) in self.queries.iter_mut().enumerate() {
                 if q.i == 0 {
-                    q.reference = points.get(k).copied().flatten().map(|(p, _)| p);
-                    self.alive[k] = q.reference.is_some();
+                    // (Resumed: placed already, in the reference of the job they came from.)
+                    if q.reference.is_none() {
+                        q.reference = points.get(k).copied().flatten().map(|(p, _)| p);
+                    }
+                    self.alive[k] = q.reference.is_some() && points.get(k).copied().flatten().is_some();
                 }
             }
             self.next = self.next_paint_after(0);
@@ -312,6 +355,12 @@ impl PaintFit {
                 }
                 self.alive = (0..self.queries.len()).map(|k| made[k] || (self.queries[k].i == i && self.queries[k].reference.is_some())).collect();
                 self.next = self.next_paint_after(i);
+                // The state here, for a job that tracks again from this paint.
+                let cohort: Vec<(usize, [f64; 2], [f64; 2])> =
+                    (0..self.queries.len()).filter(|k| self.alive[*k]).filter_map(|k| Some((k, self.queries[k].reference?, at_end.get(k).copied().flatten()?.0))).collect();
+                if let Some(o) = out.last() {
+                    self.states.push((o.f, self.motion, cohort));
+                }
                 out
             }
             Some(_) => Vec::new(),
@@ -353,7 +402,7 @@ impl PaintFit {
             .filter(|k| self.queries[*k].i <= i && (members[*k] || (!open && self.alive[*k])))
             .filter_map(|k| pts.get(k).copied().flatten().map(|(p, s)| Mark { id: k as u32, at: p, seen: s >= self.min_score, kept: members[k] }))
             .collect();
-        let given = i == 0;
+        let given = i == 0 && !self.resumed;
         FrameOut { i, f, at: self.motion.apply(self.target), score: if given { 1.0 } else { score as f32 }, lost: inliers == 0 && !given, scale: self.motion.scale(), marks }
     }
 }
