@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn dragging_a_paint_onto_another_tracker_moves_it() {
         let (mut world, _) = setup();
-        let mut tracker = |world: &mut World, name: &str| {
+        let tracker = |world: &mut World, name: &str| {
             let (out, auto) = {
                 let mut store = world.resource_mut::<SignalStore>();
                 (store.create(tt_track::TRACK_CHANNELS), store.create(tt_track::TRACK_CHANNELS))
