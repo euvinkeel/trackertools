@@ -115,3 +115,37 @@ fn a_layer_rendered_over_the_video_and_alone() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A stabilized render with the layer on it (the export window's): the
+/// layer is drawn on the source frame, then moved with the picture. The map
+/// follows the square, so it stays at the same place in the output on every frame.
+#[test]
+fn a_layer_moves_with_the_stabilized_picture() {
+    let d = dir("warped");
+    let Some(clip) = grey(&d) else {
+        eprintln!("no ffmpeg: skipped");
+        return;
+    };
+    let index = VideoIndex::open(&clip).expect("indexes the clip");
+    let (frames, at) = red();
+    let overlays = [Overlay { frames, size: [10.0, 10.0], placed: &at, blend: tt_core::layer::BlendMode::Normal }];
+    let (progress, cancel) = (AtomicUsize::new(0), AtomicBool::new(false));
+    // Output x 80 is source x 40 + 4g: where the square is on frame g.
+    let map = |g: FrameIndex| [1.0, 0.0, 4.0 * g as f64 - 40.0, 0.0, 1.0, 0.0];
+    let out = d.join("stabilized.mp4");
+    tt_media::render::render_warped_with(&index, &out, Codec::H264, 0..FRAMES as FrameIndex, &map, &overlays, &progress, &cancel).expect("renders");
+    let got = rgba(&out);
+    assert_eq!(got.len(), FRAMES);
+    for (g, f) in got.iter().enumerate() {
+        let inside = px(f, 80, 48);
+        assert!(inside[0] > 220 && inside[1] < 40 && inside[2] < 40, "frame {g}: the square holds still at (80, 48): {inside:?}");
+        let beside = px(f, 110, 48);
+        assert!(beside.iter().take(3).all(|c| c.abs_diff(128) <= 4), "frame {g}: the grey beside it: {beside:?}");
+        // (Output x 4 is source x 4g - 36: outside the picture until frame 9.)
+        if g < 9 {
+            let left = px(f, 4, 48);
+            assert!(left.iter().take(3).all(|c| *c < 24), "frame {g}: black where the picture moved away: {left:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

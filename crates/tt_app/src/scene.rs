@@ -139,7 +139,8 @@ impl Scene {
                     }
                     // `=layer`: the files in TT_SCENE_MEDIA (`;` between them) attached, the
                     // first to the subject, the next to the tracker selected; the first selected.
-                    if self.mode.starts_with("layer") {
+                    // (`=export…` with TT_SCENE_MEDIA too: the export draws them.)
+                    if self.mode.starts_with("layer") || (self.mode.starts_with("export") && std::env::var_os("TT_SCENE_MEDIA").is_some()) {
                         let loose = world.resource::<tt_core::selection::Selection>().primary();
                         let media = std::env::var("TT_SCENE_MEDIA").unwrap_or_default();
                         let targets = [self.subject, loose];

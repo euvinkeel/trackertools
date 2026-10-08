@@ -79,7 +79,7 @@ impl LayerMedia {
     }
 
     /// The texture of `path`'s frame showing at `t` seconds.
-    fn texture(&mut self, ctx: &egui::Context, path: &str, t: f64) -> Result<Option<TextureHandle>, String> {
+    pub(crate) fn texture(&mut self, ctx: &egui::Context, path: &str, t: f64) -> Result<Option<TextureHandle>, String> {
         let Some(frames) = self.get(path)? else { return Ok(None) };
         let i = frames.index_at(t);
         let entry = self.files.get_mut(path).expect("loaded");

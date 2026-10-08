@@ -331,11 +331,29 @@ pub fn render_warped(
     progress: &AtomicUsize,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    render_warped_with(index, out, codec, frames, map, &[], progress, cancel)
+}
+
+/// [`render_warped`] with layers (crate::layers) drawn on each source frame
+/// before it is warped: they move with the picture, as on the video.
+#[allow(clippy::too_many_arguments)]
+pub fn render_warped_with(
+    index: &VideoIndex,
+    out: &Path,
+    codec: Codec,
+    frames: Range<FrameIndex>,
+    map: &(dyn Fn(FrameIndex) -> Affine + Sync),
+    overlays: &[crate::layers::Overlay],
+    progress: &AtomicUsize,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let frames = within(index, frames)?;
     let info = probe_stream(&index.path);
     let (w, h) = (index.width as usize, index.height as usize);
     let (pix, bytes) = if info.deep { ("yuv444p16le", 2) } else { ("yuv444p", 1) };
     let plane = w * h * bytes;
+    let colorspace = info.tags.iter().find(|(k, _)| k == "-colorspace").map(|(_, v)| v.as_str());
+    let conv = crate::layers::ToYuv::new(colorspace, index.height, info.full_range, info.deep);
     // Decoding starts exactly at the first frame asked for.
     let first = index.presented_at(frames.start);
     let (before, after) = crate::ffmpeg::seek_args(index, first);
@@ -362,6 +380,8 @@ pub fn render_warped(
     };
     let mut src = vec![0u8; plane * 3];
     let mut dst = vec![0u8; plane * 3];
+    // The source frame with the layers on it (the decoded one is kept as it is: a repeated frame starts from it).
+    let mut drawn = if overlays.is_empty() { Vec::new() } else { vec![0u8; plane * 3] };
     // The presented frame last read.
     let mut have: Option<usize> = None;
     let result = (|| -> Result<()> {
@@ -379,8 +399,15 @@ pub fn render_warped(
                 }
             }
             let m = map(g);
+            let from = if overlays.is_empty() {
+                &src
+            } else {
+                drawn.copy_from_slice(&src);
+                crate::layers::composite_frame(&mut drawn, w, h, bytes, overlays, g, &conv);
+                &drawn
+            };
             for (k, fill) in [black, mid, mid].into_iter().enumerate() {
-                let (s, d) = (&src[k * plane..(k + 1) * plane], &mut dst[k * plane..(k + 1) * plane]);
+                let (s, d) = (&from[k * plane..(k + 1) * plane], &mut dst[k * plane..(k + 1) * plane]);
                 if bytes == 2 { warp::<2>(s, d, w, h, &m, fill) } else { warp::<1>(s, d, w, h, &m, fill) }
             }
             encoder.write(&dst)?;

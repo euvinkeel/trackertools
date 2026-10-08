@@ -180,7 +180,7 @@ fn cover(ov: &Overlay, pl: &Placed, frame: &[u8], w: usize, rows: Range<usize>, 
 }
 
 /// The overlays on grid frame `g`, each with the media frame it shows.
-fn on_frame<'o, 'a>(overlays: &'o [Overlay<'a>], g: FrameIndex) -> Vec<(&'o Overlay<'a>, Placed, &'o [u8])> {
+pub(crate) fn on_frame<'o, 'a>(overlays: &'o [Overlay<'a>], g: FrameIndex) -> Vec<(&'o Overlay<'a>, Placed, &'o [u8])> {
     overlays.iter().filter_map(|ov| (ov.placed)(g).filter(|p| p.opacity > 0.0).and_then(|p| Some((ov, p, ov.frames.at(p.clip_time)?)))).collect()
 }
 
@@ -205,6 +205,13 @@ fn blend<const B: usize>(plane: &mut [u8], i: usize, v: f64, a: f64) {
         let old = plane[i] as f64;
         plane[i] = (old + (v - old) * a).round().clamp(0.0, 255.0) as u8;
     }
+}
+
+/// The layers on grid frame `g` over a decoded 4:4:4 frame `buf` (`w` × `h`,
+/// `bytes` a sample: 1 or 2), in the source's own colours (`conv`).
+pub(crate) fn composite_frame(buf: &mut [u8], w: usize, h: usize, bytes: usize, overlays: &[Overlay], g: FrameIndex, conv: &ToYuv) {
+    let on = on_frame(overlays, g);
+    if bytes == 2 { composite::<2>(buf, w, h, &on, conv) } else { composite::<1>(buf, w, h, &on, conv) }
 }
 
 /// The layers over 4:4:4 planes `buf` (`w` × `h`, `B` bytes a sample), a band of rows per thread.
@@ -288,8 +295,7 @@ pub fn render_over(index: &VideoIndex, out: &Path, codec: Codec, frames: Range<F
             }
             // (A repeated frame — VFR — must start from the frame as decoded, not as drawn on.)
             out_frame.copy_from_slice(&buf);
-            let on = on_frame(overlays, g);
-            if bytes == 2 { composite::<2>(&mut out_frame, w, h, &on, &conv) } else { composite::<1>(&mut out_frame, w, h, &on, &conv) }
+            composite_frame(&mut out_frame, w, h, bytes, overlays, g, &conv);
             encoder.write(&out_frame)?;
             progress.store(k + 1, Ordering::Relaxed);
         }
