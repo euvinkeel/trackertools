@@ -18,6 +18,12 @@
 //!   merge it in: what it drew overrides the tracker's automatic results on
 //!   those frames, and the dot goes (one undo step;
 //!   `tt_track::human::merge_dots`). Selected dots go together.
+//! - A tracker's looks (paints, reset points, patterns) are marks on its
+//!   lane: a click selects one, a box selects those it touches. Drag them
+//!   onto another tracker's lane to move them there (on request: "box select
+//!   the paint keyframes and then drag them onto another tracker"): one undo
+//!   step; a tracker left with none goes (`tt_track::move_looks`). Only to a
+//!   tracker of the same kind (a paint to a paint tracker, and so on).
 //! - A stroke that starts scrolls its lane into view.
 //! - In and out points (I / O; Alt+X clears; `tt_core::marks`): what an
 //!   export covers, shaded outside it on the ruler and the lanes. Drag a
@@ -328,11 +334,17 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                 ui_state.edge = Some((e, edge));
                 tt_core::span::begin_drag(world, e);
             }
+            // On a look's mark: carry it (and the other selected looks) to another tracker.
+            None if let Some(l) = hits.ticks.iter().find(|(e, r)| r.expand(1.0).contains(o) && world.get::<tt_track::look::Look>(*e).is_some()).map(|(e, _)| *e) => {
+                let sel = world.resource::<Selection>();
+                let looks: Vec<Entity> = if sel.is_selected(l) { sel.entities.iter().copied().filter(|e| world.get::<tt_track::look::Look>(*e).is_some()).collect() } else { vec![l] };
+                ui_state.carry = Some(Carry::Looks(looks));
+            }
             // On a manual dot's name or frames: carry it (and the other selected dots) to a tracker.
             None if let Some(d) = hits.grab_at(o).filter(|e| tt_track::human::is_manual(world, *e)) => {
                 let sel = world.resource::<Selection>();
                 let dots: Vec<Entity> = if sel.is_selected(d) { sel.entities.iter().copied().filter(|e| tt_track::human::is_manual(world, *e)).collect() } else { vec![d] };
-                ui_state.carry = Some(dots);
+                ui_state.carry = Some(Carry::Dots(dots));
             }
             // Kept in content coordinates, so it stays on its lane while the lanes scroll.
             None => ui_state.marquee = Some(Pos2::new(o.x, o.y + lane_scroll)),
@@ -362,7 +374,39 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             tt_core::span::end_drag(world);
             ui_state.edge = None;
         }
-    } else if let Some(dots) = ui_state.carry.clone() {
+    } else if let Some(Carry::Looks(looks)) = ui_state.carry.clone() {
+        // Carrying looks: the tracker lane under the pointer takes them on release (if they fit it).
+        let down = ui.input(|i| i.pointer.primary_down());
+        let under = pointer.filter(|p| rows.contains(*p)).and_then(|p| hits.lanes.iter().find(|(_, lane, _, _)| lane.contains(p)).map(|(e, _, _, _)| *e)).filter(|t| tt_track::is_tracker(world, *t));
+        let plan = under.map(|t| (t, tt_track::looks_to_move(world, &looks, t)));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let name = |e: Entity| world.get::<Name>(e).map_or("the tracker".to_string(), |n| n.to_string());
+        let word = |n: usize| if n == 1 { "1 look".to_string() } else { format!("{n} looks") };
+        let tip = match &plan {
+            Some((t, (moving, emptied))) if !moving.is_empty() => {
+                if let Some((_, lane, _, _)) = hits.lanes.iter().find(|(e, _, _, _)| e == t) {
+                    painter.with_clip_rect(rows).rect(*lane, 0.0, style::PIN.gamma_multiply(0.12), Stroke::new(1.5, style::PIN), egui::StrokeKind::Inside);
+                }
+                let gone = match emptied.as_slice() {
+                    [] => String::new(),
+                    [one] => format!("; {} goes (nothing left in it)", name(*one)),
+                    many => format!("; {} trackers go (nothing left in them)", many.len()),
+                };
+                format!("Release: move {} to {}{gone}", word(moving.len()), name(*t))
+            }
+            Some((t, _)) => format!("{} can't take these (another kind of tracker, or they are its own)", name(*t)),
+            None => format!("Drop {} on another tracker's lane to move them there", word(looks.len())),
+        };
+        response.clone().on_hover_text_at_pointer(tip);
+        // Stopped with the button still down (Esc): nothing moved.
+        if response.drag_stopped() || !down {
+            if !down && let Some((t, _)) = plan {
+                tt_track::move_looks(world, &looks, t);
+                world.resource_mut::<Selection>().entities = looks.clone();
+            }
+            ui_state.carry = None;
+        }
+    } else if let Some(Carry::Dots(dots)) = ui_state.carry.clone() {
         // Carrying manual dots: the tracker lane under the pointer takes them on release.
         let down = ui.input(|i| i.pointer.primary_down());
         let target = pointer.and_then(|p| hits.at(p)).filter(|t| tt_track::is_tracker(world, *t) && !dots.contains(t));
@@ -958,6 +1002,10 @@ fn lanes(
                     continue;
                 }
                 let c = Pos2::new(scale.x(look.frame as f64 + 0.5), y + 9.0);
+                // (A mark to click, box or drag, where the lane shows it.)
+                if rows.contains(c) {
+                    hits.ticks.push((l, Rect::from_center_size(c, Vec2::splat(9.0))));
+                }
                 let lit = selection.is_selected(l);
                 let pin = style::PIN.gamma_multiply(if lit || selected { 1.0 } else { 0.6 });
                 if method.is_some_and(tt_track::Method::point) {
@@ -1089,6 +1137,15 @@ fn lanes(
 
 /// Timeline pointer state (a box being dragged over the lanes, an end of a
 /// lifetime or a mark being dragged) and what the lanes cache.
+/// What a drag carries to a tracker's lane.
+#[derive(Clone, Debug)]
+enum Carry {
+    /// Manual dots, to merge in.
+    Dots(Vec<Entity>),
+    /// Looks (paints, reset points, patterns), to move there.
+    Looks(Vec<Entity>),
+}
+
 #[derive(Resource, Debug, Default)]
 pub struct TimelineUi {
     /// The box's anchor, in content coordinates (screen y + lane scroll).
@@ -1097,7 +1154,7 @@ pub struct TimelineUi {
     edge: Option<(Entity, Edge)>,
     hover_edge: Option<(Entity, Edge)>,
     /// Manual dots being carried to a tracker's lane.
-    carry: Option<Vec<Entity>>,
+    carry: Option<Carry>,
     /// The in or out point being dragged, and the one under the pointer.
     mark: Option<MarkEnd>,
     hover_mark: Option<MarkEnd>,
@@ -1312,5 +1369,59 @@ mod tests {
         undo(&mut world);
         assert!(world.get::<bevy_ecs::entity_disabling::Disabled>(dot).is_none(), "undo brings the dot back");
         assert_eq!(tt_track::human::drawn_frames(&world, tracker).0, 0);
+    }
+
+    /// Two paint trackers; the second, made by mistake, has a paint on 230.
+    /// Dragging that paint's mark onto the first tracker's lane moves it
+    /// there, and the second tracker (nothing left) goes; one undo step.
+    #[test]
+    fn dragging_a_paint_onto_another_tracker_moves_it() {
+        let (mut world, _) = setup();
+        let tracker = |world: &mut World, name: &str| {
+            let (out, auto) = {
+                let mut store = world.resource_mut::<SignalStore>();
+                (store.create(tt_track::TRACK_CHANNELS), store.create(tt_track::TRACK_CHANNELS))
+            };
+            world.resource_mut::<SignalStore>().get_mut(auto).expect("signal").write(0, &[1.0; tt_track::TRACK_CHANNELS * 600]);
+            world
+                .spawn((
+                    Name::new(name.to_string()),
+                    Operator { kind: "track".into() },
+                    tt_core::op::Inputs(Vec::new()),
+                    Output(out),
+                    tt_track::human::AutoOutput(auto),
+                    tt_track::Tracker { method: tt_track::Method::Paint, ..tt_track::Tracker::at(100) },
+                    tt_track::runner::TrackBook::default(),
+                    tt_track::TrackRun::Paused,
+                ))
+                .id()
+        };
+        let keep = tracker(&mut world, "Tracker 1");
+        let mistake = tracker(&mut world, "Tracker 2");
+        tt_track::add_look(&mut world, keep, tt_track::look::Look::new(100, [5.0, 5.0], [4.0, 4.0])).expect("its paint");
+        let paint = tt_track::add_look(&mut world, mistake, tt_track::look::Look::new(230, [9.0, 9.0], [4.0, 4.0])).expect("the paint made by mistake");
+        world.resource_mut::<Selection>().entities = vec![mistake];
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut world, Vec::new());
+        frame(&ctx, &mut world, Vec::new());
+        let lanes = world.resource::<TimelineUi>().lanes_area.expect("lanes drawn");
+        let order = lane_list(&mut world);
+        let row = |e: Entity| order.iter().position(|(l, _, _)| *l == e).expect("a lane") as f32;
+        let x = lanes.min.x + (230.5 / 600.0) * lanes.width();
+        let (from, to) = (Pos2::new(x, lanes.min.y + row(mistake) * LANE_H + 9.0), Pos2::new(x, lanes.min.y + row(keep) * LANE_H + LANE_H / 2.0));
+        frame(&ctx, &mut world, vec![Event::PointerMoved(from)]);
+        frame(&ctx, &mut world, vec![button(from, true)]);
+        for i in 1..=8 {
+            frame(&ctx, &mut world, vec![Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))]);
+        }
+        frame(&ctx, &mut world, vec![button(to, false)]);
+        frame(&ctx, &mut world, Vec::new());
+        assert_eq!(tt_track::look::owner_of(&world, paint), Some(keep), "the paint is Tracker 1's now");
+        assert_eq!(tt_track::look::looks_of(&world, keep).len(), 2);
+        assert!(world.get::<bevy_ecs::entity_disabling::Disabled>(mistake).is_some(), "the tracker made by mistake went");
+        assert_eq!(world.resource::<History>().undo_label(), Some("Move paint to Tracker 1"));
+        undo(&mut world);
+        assert_eq!(tt_track::look::owner_of(&world, paint), Some(mistake), "undone");
+        assert!(world.get::<bevy_ecs::entity_disabling::Disabled>(mistake).is_none());
     }
 }
