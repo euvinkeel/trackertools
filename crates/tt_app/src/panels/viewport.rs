@@ -144,11 +144,13 @@ pub struct PointerView {
     pub ants: bool,
     /// In a view, outside the box it follows is dimmed and hatched.
     pub dim_outside: bool,
+    /// Paint trackers' points get their paths too (their dots always show).
+    pub paint_paths: bool,
 }
 
 impl Default for PointerView {
     fn default() -> Self {
-        Self { hide_pointer: true, clear_radius: 24.0, ants: true, dim_outside: true }
+        Self { hide_pointer: true, clear_radius: 24.0, ants: true, dim_outside: true, paint_paths: false }
     }
 }
 

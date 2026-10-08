@@ -322,7 +322,7 @@ fn a_job_that_panics_reports_a_failure() {
     match last {
         Some(Msg::Failed(e)) => assert!(e.starts_with("the tracker stopped on an error: "), "{e}"),
         Some(Msg::Finished) => panic!("finished"),
-        Some(Msg::Frames(_)) | None => panic!("no last word"),
+        Some(Msg::Frames(_) | Msg::Points(_)) | None => panic!("no last word"),
     }
     assert_eq!((threads.load(Ordering::Relaxed), workers.load(Ordering::Relaxed)), (0, 0));
 }
@@ -488,9 +488,11 @@ fn an_engine_that_cannot_start_says_why() {
 
 /// A paint tracker end to end. The fake answers each point where it was
 /// asked in the crop, and the crop follows the guide (the sprite), so the
-/// points move with the sprite: the tracker follows it from its first
-/// paint's centre; a reset paint where none of its points are starts it
-/// again from there, and it follows the sprite from that.
+/// points move with the sprite. Painted on 600 and again on 612 on the
+/// sprite: the points make it, and it follows the sprite. A third paint on
+/// 622, 40 px off the sprite: none of the points get there, so 612–622 is
+/// lost, and from 622 it follows the sprite from that paint. Its points
+/// come out for the app to draw.
 #[test]
 fn a_paint_tracker_follows_its_paints() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
@@ -505,24 +507,32 @@ fn a_paint_tracker_follows_its_paints() {
     let first = truth(600);
     let op = tt_track::add_tracker_with_look(&mut core.world, guide, paint(600, first)).expect("tracker");
     set_span(&mut core.world, op, Span::new(570, 630));
-    // On frame 615 the subject is painted 40 px to the right: none of the points are there.
-    let moved = [truth(615)[0] + 40.0, truth(615)[1]];
-    tt_track::add_look(&mut core.world, op, paint(615, moved)).expect("a reset paint");
+    tt_track::add_look(&mut core.world, op, paint(612, truth(612))).expect("a reset paint");
+    let off = [truth(622)[0] + 40.0, truth(622)[1]];
+    tt_track::add_look(&mut core.world, op, paint(622, off)).expect("a paint off the sprite");
     run(&mut core, &[op], |_| {});
     let w = &core.world;
     assert!(w.get::<OpError>(op).is_none(), "{:?}", w.get::<OpError>(op));
     assert_eq!(coverage(w, op), Some(570..631), "both ways over its span");
-    let at = |f: i64| w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).and_then(|s| s.get(f).map(|v| [v[0] as f64, v[1] as f64])).expect("a result");
+    let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+    let at = |f: i64| sig.get(f).map(|v| ([v[0] as f64, v[1] as f64], tt_track::flags(v) != 0)).expect("a result");
     // A paint's centre, moved as the sprite moved since frame `from`.
     let centre = |c: [f64; 2], from: i64, f: i64| [c[0] + 6.0 + truth(f)[0] - truth(from)[0], c[1] + 2.0 + truth(f)[1] - truth(from)[1]];
     let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 1.5;
-    for f in [570, 585, 600, 610, 614] {
+    for f in [570, 585, 600, 606, 612] {
         let want = centre(first, 600, f);
-        assert!(near(at(f), want), "frame {f}: the first paint's centre, with the sprite: {:?} vs {want:?}", at(f));
+        assert!(near(at(f).0, want) && !at(f).1, "frame {f}: with the sprite: {:?} vs {want:?}", at(f));
     }
-    for f in [615, 620, 630] {
-        let want = centre(moved, 615, f);
-        assert!(near(at(f), want), "frame {f}: the reset paint's centre, with the sprite: {:?} vs {want:?}", at(f));
+    assert!((613..622).all(|f| at(f).1), "613–621: no point reaches the paint on 622: lost");
+    for f in [622, 626, 630] {
+        let want = centre(off, 622, f);
+        assert!(near(at(f).0, want), "frame {f}: from the paint on 622, with the sprite: {:?} vs {want:?}", at(f));
     }
+    // Its points, for the app: on 606 the cohort of the first stretch, all kept.
+    let points = w.get::<tt_track::runner::PaintPoints>(op).expect("its points");
+    let marks = points.0.get(&606).expect("points on 606");
+    assert!(!marks.is_empty() && marks.iter().all(|m| m.kept), "{marks:?}");
+    assert!(points.0.get(&616).expect("points on 616").iter().all(|m| !m.kept), "613–621: none of them make it");
     quiet(&mut core);
 }
+

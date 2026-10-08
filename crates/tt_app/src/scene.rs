@@ -310,6 +310,9 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
     }
     if painted.is_some() {
         world.resource_mut::<tt_core::tool::ActiveTool>().0 = tt_core::tool::Tool::Track;
+        // (Before the reset paint, with the points' paths: who makes it and who doesn't.)
+        world.resource_mut::<tt_core::transport::Transport>().seek(610);
+        world.resource_mut::<crate::panels::viewport::PointerView>().paint_paths = true;
     }
     subject
 }

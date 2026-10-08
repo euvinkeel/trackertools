@@ -118,6 +118,34 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         // Only within its lifetime (its span on the timeline).
         let span = tt_core::span::span_of(world, e);
         let screen = |f: FrameIndex, x: f32, y: f32| map.to_screen(space(f).from_source([x as f64, y as f64]));
+        // A paint tracker's points: dots on this frame (its colour: in the cohort; faded red: they
+        // don't make it to the next paint), and with the setting, their paths.
+        if let Some(points) = world.get::<tt_track::runner::PaintPoints>(e).filter(|_| method == Method::Paint) {
+            let lost = style::LOST.gamma_multiply(0.75 * fade);
+            if lit && world.resource::<crate::panels::viewport::PointerView>().paint_paths {
+                let mut paths: std::collections::BTreeMap<u32, Vec<(Pos2, bool)>> = Default::default();
+                for (f, marks) in points.0.range(frame - reach..=frame + reach) {
+                    for m in marks {
+                        paths.entry(m.id).or_default().push((screen(*f, m.at[0], m.at[1]), m.kept));
+                    }
+                }
+                for run in paths.values() {
+                    for w in run.windows(2) {
+                        let c = if w[1].1 { found.gamma_multiply(0.45 * fade) } else { lost.gamma_multiply(0.6) };
+                        painter.line_segment([w[0].0, w[1].0], Stroke::new(1.0, c));
+                    }
+                }
+            }
+            for m in points.0.get(&frame).into_iter().flatten() {
+                let p = screen(frame, m.at[0], m.at[1]);
+                let c = if m.kept { found.gamma_multiply(fade) } else { lost };
+                if m.seen {
+                    painter.circle_filled(p, if lit { 2.5 } else { 1.8 }, c);
+                } else {
+                    painter.circle_stroke(p, if lit { 2.5 } else { 1.8 }, Stroke::new(1.0, c));
+                }
+            }
+        }
         let at = |f: FrameIndex| {
             sig.get(f).filter(|_| span.contains(f)).map(|v| {
                 let mark = if human.is_some_and(|h| h.get(f).is_some()) {
@@ -348,15 +376,14 @@ pub fn draw_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, wo
 
 /// A paint's painted cells, filled, over its rectangle `r` on screen.
 fn paint_cells(painter: &Painter, r: Rect, look: &Look, colour: Color32) {
-    use tt_track::look::MASK_N;
-    let Some(mask) = look.painted() else {
+    let Some(n) = tt_track::job::paint::mask_side(&look.mask).filter(|_| look.mask.iter().any(|c| *c > 0)) else {
         painter.rect_filled(r, 0.0, colour);
         return;
     };
-    let cell = Vec2::new(r.width() / MASK_N as f32, r.height() / MASK_N as f32);
-    for (i, m) in mask.iter().enumerate() {
+    let cell = Vec2::new(r.width() / n as f32, r.height() / n as f32);
+    for (i, m) in look.mask.iter().enumerate() {
         if *m >= 96 {
-            let at = r.min + Vec2::new((i % MASK_N) as f32 * cell.x, (i / MASK_N) as f32 * cell.y);
+            let at = r.min + Vec2::new((i % n) as f32 * cell.x, (i / n) as f32 * cell.y);
             painter.rect_filled(Rect::from_min_size(at, cell + Vec2::splat(0.5)), 0.0, colour);
         }
     }

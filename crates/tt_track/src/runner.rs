@@ -66,7 +66,7 @@ use tt_core::view::{SpaceMap, home_of, map_at};
 use tt_media::{DecodeOptions, VideoIndex};
 
 use crate::human::{AutoOutput, ensure_auto, is_manual};
-use crate::job::{JobSpec, LookSpec, Msg, Phase, Shared, Side, spawn};
+use crate::job::{JobSpec, LookSpec, Msg, Phase, PointMark, Shared, Side, spawn};
 use crate::look::Look;
 use crate::template::{LOOK_PX, Settings, TEMPLATE_R};
 use crate::{Direction, Method, Rendition, TRACK_CHANNELS, TrackRun, Tracker, guide_of, run_of};
@@ -94,6 +94,12 @@ pub struct TrackBook {
 }
 
 /// What a tracker is doing, for panels.
+/// A paint tracker's points on each frame tracked (`job::paint`), for the
+/// app to draw: worked out with the results, not saved (tracking again
+/// makes them).
+#[derive(Component, Debug, Clone, Default)]
+pub struct PaintPoints(pub std::collections::BTreeMap<FrameIndex, Vec<PointMark>>);
+
 #[derive(Component, Clone, Debug, Default)]
 pub struct TrackStatus {
     pub forward: Option<SideStatus>,
@@ -538,6 +544,17 @@ fn drain(world: &mut World, op: Entity) {
                 if jobs.results_touched.is_none_or(|t| now - t >= RESULTS_SAVED_EVERY || now < t) {
                     jobs.results_touched = Some(now);
                     world.resource_mut::<History>().touch();
+                }
+            }
+            Msg::Points(frames) => {
+                let mut e = world.entity_mut(op);
+                if e.get::<PaintPoints>().is_none() {
+                    e.insert(PaintPoints::default());
+                }
+                let mut points = e.get_mut::<PaintPoints>().expect("inserted");
+                for (f, marks) in frames {
+                    let shifted = marks.into_iter().map(|m| PointMark { at: [m.at[0] + ox, m.at[1] + oy], ..m }).collect();
+                    points.0.insert(f, shifted);
                 }
             }
             Msg::Finished => {

@@ -220,8 +220,21 @@ impl Shared {
 
 pub enum Msg {
     Frames(Vec<(FrameIndex, [f32; TRACK_CHANNELS])>),
+    /// A paint tracker's points on these frames (`paint`).
+    Points(Vec<(FrameIndex, Vec<PointMark>)>),
     Finished,
     Failed(String),
+}
+
+/// One of a paint tracker's points on a frame (`paint::Mark`, in source px).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointMark {
+    pub id: u32,
+    pub at: [f32; 2],
+    /// The model saw it there.
+    pub seen: bool,
+    /// It makes it to the next paint (in the cohort).
+    pub kept: bool,
 }
 
 /// Counted in each of its counters until the thread exits (cancelled jobs
@@ -261,6 +274,7 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                     shared,
                     tx: out,
                     out: Vec::new(),
+                    marks: Vec::new(),
                     flushed: Instant::now(),
                     half: [TEMPLATE_R as f64; 2],
                     margin: TEMPLATE_R as f64 + 2.0,
@@ -298,6 +312,8 @@ struct Worker {
     shared: Arc<Shared>,
     tx: Sender<Msg>,
     out: Vec<(FrameIndex, [f32; TRACK_CHANNELS])>,
+    /// A paint tracker's points, sent with the frames.
+    marks: Vec<(FrameIndex, Vec<PointMark>)>,
     flushed: Instant,
     /// The output box's half-size, and the patch margin the templates need (patch px).
     half: [f64; 2],
@@ -577,6 +593,9 @@ impl Worker {
     fn flush(&mut self) {
         if !self.out.is_empty() {
             let _ = self.tx.send(Msg::Frames(std::mem::take(&mut self.out)));
+        }
+        if !self.marks.is_empty() {
+            let _ = self.tx.send(Msg::Points(std::mem::take(&mut self.marks)));
         }
         self.flushed = Instant::now();
     }

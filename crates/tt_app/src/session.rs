@@ -74,6 +74,8 @@ struct SettingsFile {
     /// The selected box's moving outline; in a view, outside its box dimmed.
     marching_ants: bool,
     dim_outside_view: bool,
+    /// Paint trackers' points' paths on the video.
+    paint_paths: bool,
     /// Anticipatory speed: on/off and its knobs.
     auto_speed: AutoSpeed,
     /// New tracker looks get their mask painted automatically.
@@ -115,6 +117,7 @@ impl Default for SettingsFile {
             clear_radius: p.clear_radius,
             marching_ants: p.ants,
             dim_outside_view: p.dim_outside,
+            paint_paths: p.paint_paths,
             auto_speed: AutoSpeed::default(),
             auto_mask_looks: LookDefaults::default().auto_mask,
             stabilize_smooth_position: st.smooth_position,
@@ -148,6 +151,7 @@ impl SettingsFile {
             clear_radius: p.clear_radius,
             marching_ants: p.ants,
             dim_outside_view: p.dim_outside,
+            paint_paths: p.paint_paths,
             auto_speed: a.clone(),
             auto_mask_looks: l.auto_mask,
             stabilize_smooth_position: st.smooth_position,
@@ -190,6 +194,7 @@ impl SettingsFile {
             clear_radius: self.clear_radius.clamp(0.0, 200.0),
             ants: self.marching_ants,
             dim_outside: self.dim_outside_view,
+            paint_paths: self.paint_paths,
         };
         // Version 3 turned anticipatory speed on by default.
         *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };
