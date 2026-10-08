@@ -448,6 +448,7 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
     step(Step::Code);
     let code = dir.join("code");
     write_code(&code).map_err(cannot_write)?;
+    let _ = std::fs::write(code.join("stamp.txt"), code_stamp());
 
     let model = dir.join("scaled_online.pth");
     if !sha256(&model).is_ok_and(|h| h == MODEL_SHA256) {
@@ -624,6 +625,51 @@ pub fn write_code(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The packed code's fingerprint: its files' paths and bytes, hashed.
+fn code_stamp() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (path, bytes) in code::FILES {
+        h.update(path.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The worker's code in `dir` (the doctor's `code\`), written out again when
+/// this program's differs from what is there (a newer or older trackertools
+/// than the one that set CoTracker up: the code it runs must be its own, or
+/// the worker misses what the app asks of it). True: written. A folder the
+/// doctor never wrote is left alone (CoTracker isn't set up).
+pub fn refresh_code_in(dir: &Path) -> std::io::Result<bool> {
+    if !dir.join("editor").join("cotracker_worker.py").is_file() {
+        return Ok(false);
+    }
+    let stamp = code_stamp();
+    let file = dir.join("stamp.txt");
+    if std::fs::read_to_string(&file).is_ok_and(|s| s.trim() == stamp) {
+        return Ok(false);
+    }
+    write_code(dir)?;
+    std::fs::write(&file, &stamp)?;
+    Ok(true)
+}
+
+/// [`refresh_code_in`] for the doctor's folder, at the app's start (before
+/// any worker runs from it).
+pub fn refresh_code() {
+    let dir = tt_track::job::cotracker_dir().join("code");
+    match refresh_code_in(&dir) {
+        Ok(true) => {
+            tracing::info!("CoTracker's code in {} written anew (this trackertools has other code)", dir.display());
+            tt_track::job::forget_cotracker_availability();
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!("CoTracker's code in {}: could not write it anew: {e}", dir.display()),
+    }
+}
+
 /// Start the worker and wait (up to 5 minutes) for it to load the model:
 /// the device it loaded on (`cuda`, `cpu`, `mps`).
 pub fn test_worker(python: &Path, worker: &Path, model: &Path) -> Result<String, Problem> {
@@ -686,6 +732,114 @@ pub fn test_worker(python: &Path, worker: &Path, model: &Path) -> Result<String,
     result
 }
 
+// ------------------------------------------------------------------ TAPNext
+
+/// TAPNext++'s model (Google DeepMind, Apache-2.0): DeepMind's training
+/// checkpoint, from which the setup keeps only the weights, as fp16
+/// (`editor/tapnext/trim_checkpoint.py`): 2.5 GB downloaded, 389 MB kept.
+pub const TAPNEXT: &str = "https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt";
+pub const TAPNEXT_SHA256: &str = "cb96a43444ccb4fbdb25d800b88c7ba196179a526e78f01b021a16b1c1eff6da";
+pub const TAPNEXT_BYTES: u64 = 2_532_282_370;
+
+/// Where a TAPNext setup is.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum TapnextStep {
+    #[default]
+    Idle,
+    Download { got: u64 },
+    Trim,
+    Done,
+    Failed(Problem),
+}
+
+impl TapnextStep {
+    pub fn busy(&self) -> bool {
+        matches!(self, TapnextStep::Download { .. } | TapnextStep::Trim)
+    }
+
+    /// In a sentence, for the person.
+    pub fn text(&self) -> String {
+        match self {
+            TapnextStep::Idle => String::new(),
+            TapnextStep::Download { got } => format!("trackertools downloads the TAPNext model: {:.2} GB of {:.2} GB.", *got as f64 / 1e9, TAPNEXT_BYTES as f64 / 1e9),
+            TapnextStep::Trim => "trackertools makes the TAPNext model smaller (389 MB). This can take 1 minute.".into(),
+            TapnextStep::Done => "TAPNext is ready.".into(),
+            TapnextStep::Failed(p) => p.what.clone(),
+        }
+    }
+}
+
+/// Setting TAPNext up, in the background (it needs CoTracker's Python).
+#[derive(Clone, Default)]
+pub struct TapnextSetup {
+    step: Arc<Mutex<TapnextStep>>,
+}
+
+impl TapnextSetup {
+    pub fn step(&self) -> TapnextStep {
+        self.step.lock().expect("step").clone()
+    }
+
+    /// Download TAPNext's model, keep its weights as fp16 next to CoTracker's.
+    pub fn start(&self) {
+        if self.step().busy() {
+            return;
+        }
+        *self.step.lock().expect("step") = TapnextStep::Download { got: 0 };
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let step = |s: TapnextStep| *me.step.lock().expect("step") = s;
+            let done = install_tapnext(&step);
+            if let Err(p) = &done {
+                tracing::warn!("TAPNext setup: {} ({})", p.what, p.details);
+            }
+            step(match done {
+                Ok(()) => TapnextStep::Done,
+                Err(p) => TapnextStep::Failed(p),
+            });
+        });
+    }
+}
+
+fn install_tapnext(step: &dyn Fn(TapnextStep)) -> Result<(), Problem> {
+    const AGAIN_T: &str = "Then click Set up TAPNext again.";
+    let cannot_write = |e: std::io::Error| Problem::new(&format!("trackertools cannot write to its folder. Make sure that the disk has approximately 3 GB free. {AGAIN_T}"), e);
+    let dir = tt_track::job::cotracker_dir();
+    let out = tt_track::job::tapnext_weights();
+    let (python, worker) = tt_track::job::worker_command();
+    std::fs::create_dir_all(&dir).map_err(cannot_write)?;
+    // The code (the trimming script and the model's code with it), as this program has it.
+    if worker.starts_with(&dir) {
+        write_code(&dir.join("code")).map_err(cannot_write)?;
+    }
+    let script = worker.parent().map(|p| p.join("tapnext").join("trim_checkpoint.py")).filter(|p| p.is_file());
+    let Some(script) = script else {
+        return Err(Problem::new(&format!("trackertools cannot find the TAPNext code. {ASK}"), format!("no tapnext/trim_checkpoint.py next to {}", worker.display())));
+    };
+    let part = dir.join("tapnextpp_ckpt.pt.part");
+    tracing::info!("TAPNext setup: downloading {TAPNEXT} to {}", part.display());
+    download(TAPNEXT, &part, &|got| step(TapnextStep::Download { got }))
+        .map_err(|p| Problem::new(&format!("The download of the TAPNext model stopped. Make sure that the computer is connected to the internet and that the disk has approximately 3 GB free. {AGAIN_T}"), p.details))?;
+    let got = sha256(&part).map_err(cannot_write)?;
+    if got != TAPNEXT_SHA256 {
+        let _ = std::fs::remove_file(&part);
+        return Err(Problem::new(&format!("The TAPNext model download is not correct. {AGAIN_T}"), format!("SHA-256 {got}, expected {TAPNEXT_SHA256}")));
+    }
+    step(TapnextStep::Trim);
+    let tmp = out.with_extension("pt.part");
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script).arg(&part).arg(&tmp).args(["--fp16", "--resolution", "256"]).stdin(Stdio::null());
+    let trimmed = run(&mut cmd, None);
+    let _ = std::fs::remove_file(&part);
+    trimmed.map_err(|d| Problem::new(&format!("trackertools cannot make the TAPNext model smaller. {ASK}"), d))?;
+    let _ = std::fs::remove_file(&out);
+    std::fs::rename(&tmp, &out).map_err(cannot_write)?;
+    tracing::info!("TAPNext is set up: {}", out.display());
+    // The worker running now was started without it: the next one has it.
+    tt_track::job::close_cotracker_worker();
+    Ok(())
+}
+
 // ------------------------------------------------------------ started early
 
 /// CoTracker's engine started as soon as a video is open (on request: "auto
@@ -710,12 +864,14 @@ pub struct EarlyStart {
     told: Option<String>,
     /// This run started after the graphics card stopped.
     after_gpu_loss: bool,
+    /// The doctor's copy of the worker's code was checked against this program's.
+    refreshed: bool,
 }
 
 impl Default for EarlyStart {
     fn default() -> Self {
         let after_gpu_loss = matches!(crate::recover::recovered(), Some(crate::recover::Why::Gpu | crate::recover::Why::GpuUnsaved));
-        Self { enabled: true, tried: false, available: false, notice: None, told: None, after_gpu_loss }
+        Self { enabled: true, tried: false, available: false, notice: None, told: None, after_gpu_loss, refreshed: false }
     }
 }
 
@@ -725,6 +881,11 @@ const NOTICE_FOR: Duration = Duration::from_secs(20);
 /// Every frame: start the engine when it should, and show its notice.
 /// True: the person asked for the doctor.
 pub fn early_start(ctx: &egui::Context, world: &mut World) -> bool {
+    // (Once, before any worker runs: the code it runs is this program's.)
+    if !world.resource::<EarlyStart>().refreshed {
+        world.resource_mut::<EarlyStart>().refreshed = true;
+        refresh_code();
+    }
     let video = world.get_resource::<crate::media::Media>().is_some();
     let available = tt_track::job::cotracker_availability().is_ok();
     let mut e = world.resource_mut::<EarlyStart>();
@@ -923,5 +1084,23 @@ mod tests {
         eprintln!("CoTracker loaded on {device}");
         assert!(["cuda", "cpu", "mps"].contains(&device.as_str()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The doctor's copy of the code is written anew when it differs from
+    /// this program's, once; a folder the doctor never wrote is left alone.
+    #[test]
+    fn the_code_is_written_anew_when_it_differs() {
+        let dir = std::env::temp_dir().join(format!("tt-code-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!refresh_code_in(&dir).expect("ok"), "not set up: left alone");
+        assert!(!dir.exists());
+        // An older program's code, without a stamp.
+        std::fs::create_dir_all(dir.join("editor")).unwrap();
+        std::fs::write(dir.join("editor").join("cotracker_worker.py"), "old").unwrap();
+        assert!(refresh_code_in(&dir).expect("ok"), "written anew");
+        let worker = std::fs::read(dir.join("editor").join("cotracker_worker.py")).unwrap();
+        assert_eq!(worker, code::FILES.iter().find(|(p, _)| *p == "editor/cotracker_worker.py").expect("packed").1, "this program's worker");
+        assert!(!refresh_code_in(&dir).expect("ok"), "the same: not written again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

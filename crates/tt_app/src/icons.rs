@@ -45,7 +45,7 @@ impl Glyph {
         }
         if world.get::<tt_track::look::Look>(e).is_some() {
             let method = tt_track::look::owner_of(world, e).and_then(|t| world.get::<tt_track::Tracker>(t)).map(|t| t.method);
-            return if method == Some(Method::CoTracker) { Glyph::ResetPoint } else { Glyph::Look };
+            return if method.is_some_and(Method::point) { Glyph::ResetPoint } else { Glyph::Look };
         }
         Glyph::Other
     }
@@ -53,7 +53,7 @@ impl Glyph {
     pub fn tracker(method: Method) -> Glyph {
         match method {
             Method::Template => Glyph::Template,
-            Method::CoTracker | Method::Paint => Glyph::CoTracker,
+            Method::CoTracker | Method::Paint | Method::TapNext => Glyph::CoTracker,
             Method::Manual => Glyph::Manual,
         }
     }

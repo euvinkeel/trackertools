@@ -29,6 +29,10 @@ fn main() {
     let mut files: Vec<PathBuf> = ["editor/cotracker_worker.py", "editor/engine.py", "editor/frames.py", "LICENSE.md"].iter().map(|f| repo.join(f)).collect();
     println!("cargo:rerun-if-changed={}", repo.join("cotracker").display());
     python_files(&repo.join("cotracker"), &mut files);
+    // TAPNext++ (vendored, Apache-2.0: its license and notice go with it).
+    println!("cargo:rerun-if-changed={}", repo.join("editor/tapnext").display());
+    python_files(&repo.join("editor/tapnext"), &mut files);
+    files.extend(["editor/tapnext/LICENSE", "editor/tapnext/NOTICE"].iter().map(|f| repo.join(f)));
     let mut code = String::from("/// The CoTracker worker's code: (path under the code folder, its bytes).\npub const FILES: &[(&str, &[u8])] = &[\n");
     for f in files.iter().filter(|f| f.is_file()) {
         println!("cargo:rerun-if-changed={}", f.display());

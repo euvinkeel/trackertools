@@ -48,7 +48,7 @@ pub use learned::{
     installed_weights as cotracker_weights, installed_worker as cotracker_worker, weights as cotracker_model,
 };
 
-pub use learned::worker_command;
+pub use learned::{tapnext_availability, tapnext_weights, worker_command};
 pub use learned::{
     Engine as CoTrackerEngine, close_worker as close_cotracker_worker, engine as cotracker_engine, keep_warm as keep_cotracker_warm, processes_started as cotracker_processes_started,
     warm_up as warm_up_cotracker,
@@ -272,7 +272,7 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                 };
                 let result = match worker.spec.method {
                     Method::Template => worker.run(),
-                    Method::CoTracker | Method::Paint => worker.run_learned(),
+                    Method::CoTracker | Method::Paint | Method::TapNext => worker.run_learned(),
                     // (A manual dot is never planned: nothing to track.)
                     Method::Manual => Ok(()),
                 };

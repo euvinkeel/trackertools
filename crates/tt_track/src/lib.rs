@@ -92,12 +92,21 @@ pub enum Method {
     /// made from them (`job::paint`): its looks are paints, the first where
     /// it starts, later ones its reset paints.
     Paint,
+    /// TAPNext++ (Google DeepMind's online point tracker, Apache-2.0): one
+    /// pixel followed, as a CoTracker, from its reset points; each frame's
+    /// result as soon as that frame is in. Run by the same worker.
+    TapNext,
 }
 
 impl Method {
     /// It runs on CoTracker's model (a stream through the shared worker).
     pub fn learned(self) -> bool {
-        matches!(self, Method::CoTracker | Method::Paint)
+        matches!(self, Method::CoTracker | Method::Paint | Method::TapNext)
+    }
+
+    /// It follows one pixel (its looks are reset points: a click places one).
+    pub fn point(self) -> bool {
+        matches!(self, Method::CoTracker | Method::TapNext)
     }
 
     /// What its looks are called: a template tracker's are patterns it
@@ -105,7 +114,7 @@ impl Method {
     /// ("reset point").
     pub fn look_word(self) -> &'static str {
         match self {
-            Method::CoTracker => "reset point",
+            Method::CoTracker | Method::TapNext => "reset point",
             Method::Paint => "paint",
             _ => "look",
         }

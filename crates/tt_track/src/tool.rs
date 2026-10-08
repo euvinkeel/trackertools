@@ -161,7 +161,7 @@ pub fn track_tool(world: &mut World) {
         tool.stroke.clear();
         let end = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover).unwrap_or(start);
         // CoTracker follows a pixel: the point where the press is let go.
-        let point = method_for(world, shift) == Method::CoTracker;
+        let point = method_for(world, shift).point();
         let (c, h) = if point { (end, [tool.brush as f64 / p.scale.max(1e-9); 2]) } else { tool.pattern(start, end, p.scale) };
         // The pointer is in the shown space's pixels; looks live in source pixels.
         let map = map_at(world, world.resource::<ActiveView>().0, f);
@@ -189,10 +189,10 @@ fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Re
     if let (Some(t), false) = (tracker, new) {
         match world.get::<Tracker>(t).map_or(Method::Template, |p| p.method) {
             Method::Manual => return Err("A manual dot has no automatic tracking: draw it with the Draw tool (M), or Shift+drag for a new tracker".into()),
-            Method::CoTracker if reseed == Some(t) => {
+            Method::CoTracker | Method::TapNext if reseed == Some(t) => {
                 reseed_with_look(world, t, look);
             }
-            Method::CoTracker => {
+            Method::CoTracker | Method::TapNext => {
                 set_reset_point(world, t, look);
             }
             Method::Template if reseed == Some(t) => {
