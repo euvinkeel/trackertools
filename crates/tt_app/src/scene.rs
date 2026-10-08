@@ -305,6 +305,15 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         _ => None,
     };
     world.resource_mut::<tt_core::transport::Transport>().seek(625);
+    // `=off`: the guided tracker switched off on 610–639.
+    if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "off")
+        && let Some(g) = guided
+    {
+        tt_track::off::switch_from(world, &[g], 610, true);
+        tt_track::off::switch_from(world, &[g], 640, false);
+        world.resource_mut::<tt_core::selection::Selection>().select_only(g);
+        return subject;
+    }
     if let Some(t) = painted.or(loose) {
         world.resource_mut::<tt_core::selection::Selection>().select_only(t);
     }

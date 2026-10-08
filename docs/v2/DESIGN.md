@@ -290,6 +290,10 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 
 Also: guide-seeded trackers (*Track its centre* on a sketch, `T`) keep re-centring on the guide. *Re-seed here* (`T` on a tracker) starts it again from its look on the playhead's frame (a painted one first), which moves first. With no look there, it switches to the Track tool and the next drag is that look. *(Fixed after hands-on use: re-seeding used to make a look wherever the tracker was on that frame. Where the tracker had drifted onto dark foliage, that look was foliage, and it became the seed, so the tracker followed foliage at 0.97.)* Deleting or restoring a look re-tracks (any input without an output of its own recomputes its readers when it is deleted or restored).
 
+**Switching a tracker off** (§6.5; `tt_track::off`) *(on request: "enable or disable a tracker easily … marked as disabled if they go off the rails and then can come back again when you know they're good, and at that point other trackers would contribute/take over if they are enabled. hotkeys for that too? visual indication in timeline as well")*: a tracker's off keys (saved, undone) say from which frames on it is off, and on again. Where it is off its output carries the `OFF` flag (`human::compose`, over its tracked and drawn frames alike), so what reads flags leaves it out as it does lost frames: a subject goes on with its other members, exports and stabilizers without its points. Its results stay; switched on, they count again. `H` / `Shift+H`, the Inspector (*Switch off from here*, *Switch on from here*, and where it is off), and the right-click menu switch it; the timeline hatches its lane where it is off (and doesn't count those frames as lost), and on the video it is grey, labelled *off*. Measured (`tests/off.rs`): a subject of a slow and a fast dot moves with the slow one alone while the fast one is off, and with both again after; the fast one's point is where it was; undo.
+
+**The right-click menu's trackers** *(on request: "if I have a tracker (or multiple) selected I can right click on the timeline and it has options to Track (N) trackers forward, back or both from the time cursor … or if any are tracking say Pause (N) running trackers")*: at the top of the entity menu (timeline, outliner, viewport): *Track N trackers forward / backward / both ways from frame F* (`track_from`: one with a look, reset point or paint on F starts again there, as *Re-seed here*, one undo step; the others go on from their anchor and results), *Pause N running* (the selected ones running, or with no tracker selected, every running one), and switching them off or on.
+
 **On real footage** (the user's 1080p60 gameplay, their Tracker 1: 5 painted looks, frames 37619–40235, replayed headless by `tests/real_footage.rs`; "on the cursor" = at least 12 near-white pixels within 14 px of the point):
 
 | | on the cursor | longest miss | speed |
@@ -733,6 +737,7 @@ Adopted from Rerun's proven design.
   - `←/→` step, `Shift+←/→` jump to start/end;
   - `I` / `O` mark the in / out point at the playhead, `Alt+X` clears them, `Shift+I` / `Shift+O` go to them (as in Resolve);
   - `T` the Track tool, `M` the Draw tool (a tracker's point by hand, or a manual dot; §6.4); a click selects the tracker whose point is under it too;
+  - `H` switches the selected trackers off from the playhead on (or on again there), `Shift+H` off everywhere (or on everywhere) (§6.5);
   - `G` / `S` grab / scale selected;
   - `X` delete;
   - `Ctrl+Z` / `Ctrl+Shift+Z` undo / redo;

@@ -17,6 +17,63 @@ pub fn right_clicked(world: &mut World, e: Entity) {
     }
 }
 
+/// Trackers running now: asked to track and with a job or queued for one.
+fn running(world: &World, t: Entity) -> bool {
+    world.get::<tt_track::TrackStatus>(t).is_some_and(|s| s.busy() || s.queued || s.waits_for_cotracker || s.waits_at_playhead)
+}
+
+/// The selected trackers' commands (on request: "right click on the timeline
+/// … Track (N) trackers forward, back, or both from the time cursor … or if
+/// any are tracking, Pause (N) running trackers"); with none selected, Pause
+/// for every running tracker. Then switching them off and on.
+fn trackers_menu(ui: &mut egui::Ui, world: &mut World, selection: &[Entity], chord: &dyn Fn(Action) -> String) {
+    use tt_track::TrackRun;
+    let trackers: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e) && !tt_track::human::is_manual(world, *e)).collect();
+    let all: Vec<Entity> = crate::panels::tracks::list(world).into_iter().map(|(e, _)| e).filter(|e| running(world, *e)).collect();
+    let running_now: Vec<Entity> = if trackers.is_empty() { all } else { trackers.iter().copied().filter(|e| running(world, *e)).collect() };
+    let switchable: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e)).collect();
+    if trackers.is_empty() && running_now.is_empty() && switchable.is_empty() {
+        return;
+    }
+    let f = world.resource::<tt_core::transport::Transport>().frame();
+    let n = |k: usize| if k == 1 { "1 tracker".to_string() } else { format!("{k} trackers") };
+    if !trackers.is_empty() {
+        for (run, way) in [(TrackRun::Forward, "forward"), (TrackRun::Backward, "backward"), (TrackRun::Both, "both ways")] {
+            if ui
+                .button(format!("Track {} {way} from frame {f}", n(trackers.len())))
+                .on_hover_text("Each starts again here from its look, reset point or paint on this frame, if it has one; the others go on from where they are")
+                .clicked()
+            {
+                tt_track::track_from(world, &trackers, f, run);
+                ui.close();
+            }
+        }
+    }
+    if !running_now.is_empty() && ui.button(format!("Pause {} running", n(running_now.len()))).on_hover_text("They stop; what they tracked stays. Track them again to go on.").clicked() {
+        tt_track::track_from(world, &running_now, f, TrackRun::Paused);
+        ui.close();
+    }
+    if !switchable.is_empty() {
+        let off_here = switchable.iter().any(|t| !tt_track::off::is_off(world, *t, f));
+        let any_off = switchable.iter().any(|t| world.get::<tt_track::off::TrackerOff>(*t).is_some_and(tt_track::off::TrackerOff::any_off));
+        let here = if off_here { format!("Switch {} off from frame {f}", n(switchable.len())) } else { format!("Switch {} on again from frame {f}", n(switchable.len())) };
+        if ui
+            .button(format!("{here}{}", chord(Action::SwitchTracker)))
+            .on_hover_text("Where a tracker is off, subjects and exports go on with the others (as where it is lost). Its results stay: switch it on again and they count again.")
+            .clicked()
+        {
+            tt_track::off::switch_from(world, &switchable, f, off_here);
+            ui.close();
+        }
+        let every = if any_off { "on everywhere" } else { "off everywhere" };
+        if ui.button(format!("Switch {} {every}{}", n(switchable.len()), chord(Action::SwitchTrackerEverywhere))).clicked() {
+            tt_track::off::switch_everywhere(world, &switchable, !any_off);
+            ui.close();
+        }
+    }
+    ui.separator();
+}
+
 /// The menu's contents (inside `Response::context_menu`).
 pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     let selection = world.resource::<Selection>().entities.clone();
@@ -29,6 +86,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
     let followable = primary.and_then(|e| tt_core::view::followable(world, e));
     let mut push: Option<Action> = None;
 
+    trackers_menu(ui, world, &selection, &chord);
     if selection.is_empty() {
         ui.label(egui::RichText::new("Nothing selected").weak());
     } else {

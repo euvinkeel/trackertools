@@ -229,3 +229,28 @@ fn a_tracker_saved_before_fuse_and_matching_still_loads() {
     assert!(t.fuse);
     assert_eq!(t.matching, Matching::default());
 }
+
+/// The timeline menu's "Track N trackers … from frame F": a tracker with a
+/// look on F starts again there; one without goes on from where it is; both
+/// are asked to track; Pause stops them. One undo step for the re-seed.
+#[test]
+fn track_from_reseeds_where_a_look_is_and_runs_them() {
+    let mut app = AppBuilder::new();
+    app.add_module(CoreModules).add_module(TrackModule);
+    let mut core = app.build();
+    core.world.resource_mut::<Transport>().frame_count = 200;
+    let s = sketch(&mut core, "Sketch 1", 0..200);
+    let a = tt_track::add_tracker_with_look(&mut core.world, s, Look::new(50, [100.0, 100.0], [8.0, 8.0])).expect("a");
+    let b = tt_track::add_tracker_with_look(&mut core.world, s, Look::new(50, [100.0, 100.0], [8.0, 8.0])).expect("b");
+    add_look(&mut core.world, a, Look::new(120, [104.0, 100.0], [8.0, 8.0])).expect("a look on 120");
+    let (asked, reseeded) = tt_track::track_from(&mut core.world, &[a, b, s], 120, tt_track::TrackRun::Forward);
+    assert_eq!((asked, reseeded), (2, 1), "the sketch isn't a tracker; only a has a look on 120");
+    assert_eq!(core.world.get::<Tracker>(a).map(|t| t.anchor), Some(120), "a starts again on 120");
+    assert_eq!(core.world.get::<Tracker>(b).map(|t| t.anchor), Some(50), "b goes on from its anchor");
+    assert!([a, b].iter().all(|t| tt_track::run_of(&core.world, *t) == tt_track::TrackRun::Forward));
+    tt_track::track_from(&mut core.world, &[a, b], 120, tt_track::TrackRun::Paused);
+    assert!([a, b].iter().all(|t| tt_track::run_of(&core.world, *t) == tt_track::TrackRun::Paused));
+    assert_eq!(core.world.resource::<History>().undo_label(), Some("Re-seed trackers"));
+    undo(&mut core.world);
+    assert_eq!(core.world.get::<Tracker>(a).map(|t| t.anchor), Some(50), "undone");
+}
