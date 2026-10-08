@@ -18,3 +18,11 @@ The TAPNext++ weights (tapnextpp_ckpt.pt, tapnextpp_512.ckpt; Apache-2.0,
 from DeepMind's storage) are not part of this repository.
 
 Paper: TAPNext++ (arXiv 2604.10582); TAPNext (arXiv 2504.05579).
+
+vit_block.py is torchvision's EncoderBlock (torchvision 0.29,
+torchvision/models/vision_transformer.py), copied so TAPNext needs no
+torchvision. torchvision: BSD 3-Clause License, Copyright (c) Soumith
+Chintala 2016, all rights reserved. Redistribution and use in source and
+binary forms, with or without modification, are permitted provided that the
+copyright notice, this list of conditions and the disclaimer are retained;
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

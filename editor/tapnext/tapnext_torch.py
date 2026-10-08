@@ -27,7 +27,7 @@ from . import tapnext_lru_modules
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torchvision.models import vision_transformer
+from . import vit_block as vision_transformer  # (torchvision's EncoderBlock, copied: no torchvision needed)
 
 
 def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=np.float32):
