@@ -30,9 +30,21 @@ a tag and the stream's number (u32):
 - `F` + id + a frame; `E` + id: its frames end; `X` + id: drop it (its job
   was cancelled: nothing more is sent about it).
 On stdout the same messages as above, each with `"s": id` (but `ready`,
-once, for all). The streams' windows run in turn, one window each round, so
+once, for all). The streams' windows run in rounds, one window each round, so
 they all move on together; a stream that fails says so (`error` with its
 `s`) and the others go on. stdin closing ends the worker.
+
+**Batched** (shared mode; `TT_COTRACKER_BATCH=0` turns it off): the streams
+with a window ready in the same round run as one batch: one call of the CNN
+encoder for all their new frames (it works frame by frame: instance norm, no
+batch statistics), and, off CUDA graphs, one pass of the transformer with
+every stream a batch row (point counts padded, the padding masked out of the
+space attention). Every stream's state (its tracks, the rolling cache) stays
+its own; results are the same as one stream at a time within float noise
+(editor/tests/test_shared_batch.py). For rounds to find several streams
+ready, the input is read ahead on a thread ([`Inbox`]): the jobs keep
+sending while a round runs. A batch that fails is run again stream by
+stream, so one stream's failure stays its own.
 
 Arguments: `--weights PATH` (CoTracker3 `scaled_online.pth`; default: the
 `TT_COTRACKER_WEIGHTS` environment variable, else torch hub's cache, where v1
@@ -47,13 +59,19 @@ what makes a graphics card reset:
   by one, slower).
 - `TT_COTRACKER_BENCHMARK=0`: cuDNN does not try out its algorithms on the
   first window (`torch.backends.cudnn.benchmark` off).
+And for finding out where the time goes: `TT_COTRACKER_PROFILE=1` logs each
+window (each round, batched) to stderr: the time in the encoder, in sampling
+the joining tracks' features, in the transformer, and in all.
 """
 
 import argparse
 import json
 import math
 import os
+import queue
 import sys
+import threading
+import time
 from typing import Optional
 
 # Ops MPS lacks run on the CPU instead of failing (must be set before torch loads).
@@ -104,6 +122,101 @@ class Engine(v1.TrackingEngine):
         self.graphed = v1.GraphedWindow(self) if device == "cuda" and graphs else None
         if not (graphs and benchmark):
             print(f"CUDA graphs {'on' if graphs else 'off'}, cuDNN benchmark {'on' if benchmark else 'off'}", file=sys.stderr)
+
+    def encode_many(self, groups):
+        """[`encode`] of several streams' new frames (a list of frame lists) as
+        one batch, split back into one pyramid each. In chunks of up to
+        ENCODE_BATCH × ENCODE_CHUNK frames: a few fixed sizes, each tuned once
+        by cuDNN; the largest that pads the least (a padded frame costs as
+        much as a real one)."""
+        frames = [f for g in groups for f in g]
+        n = len(frames)
+        sizes = [k * v1.ENCODE_CHUNK for k in range(ENCODE_BATCH, 0, -1)]
+        chunk = min(sizes, key=lambda c: -(-n // c) * c)
+        pyramid = self.encode(frames, chunk)
+        out, at = [], 0
+        for g in groups:
+            out.append([p[:, at:at + len(g)] for p in pyramid])
+            at += len(g)
+        return out
+
+    def run_windows(self, jobs):
+        """[`run_window`] of several streams' windows (`(pyramid, tracks, ind)`
+        each) as one pass of the transformer, a batch row each: point counts
+        padded to the largest and the padding masked out of the space
+        attention (as the CUDA graphs pad theirs), so no row sees another's
+        points. On CUDA graphs (captured for one row) they run one by one."""
+        if len(jobs) == 1 or self.graphed is not None:
+            return [self.run_window(*job) for job in jobs]
+        ns = [len(tracks) for _, tracks, _ in jobs]
+        n_pad, mask = max(ns), None
+        if min(ns) < n_pad:
+            # The cross attention tells its mask's orientation by its width:
+            # it must not equal the virtual tracks' count (GraphedWindow.bucket).
+            n_pad += n_pad == self.model.updateformer.num_virtual_tracks
+            mask = torch.zeros(len(jobs), self.S, n_pad, dtype=torch.bool, device=self.device)
+            for b, n in enumerate(ns):
+                mask[b, :, :n] = True
+            mask = mask.view(-1, n_pad)  # (B S, N), as the space attention's tokens
+
+        def pad(x, dim, value):
+            extra = n_pad - x.shape[dim]
+            if not extra:
+                return x
+            shape = list(x.shape)
+            shape[dim] = extra
+            return torch.cat([x, x.new_full(shape, value)], dim)
+
+        ins = [self.window_inputs(tracks, ind) for _, tracks, ind in jobs]
+        coords = torch.cat([pad(i[0], 2, 1.0) for i in ins])
+        vis = torch.cat([pad(i[1], 2, 0.0) for i in ins])
+        conf = torch.cat([pad(i[2], 2, 0.0) for i in ins])
+        support = [torch.cat([pad(i[3][lvl], 3, 0.0) for i in ins]) for lvl in range(self.levels)]
+        pyramid = [torch.cat(level) for level in zip(*(job[0] for job in jobs))]
+        c, v, k = v1.forward_window_safe(self.model, pyramid, coords, support, vis, conf, self.iters, mask)
+        return [(c[b, :, :n], v[b, :, :n], k[b, :, :n]) for b, n in enumerate(ns)]
+
+
+# Batching (module docs): on unless TT_COTRACKER_BATCH=0; the encoder's
+# largest batch, in chunks of v1.ENCODE_CHUNK frames.
+BATCH = os.environ.get("TT_COTRACKER_BATCH") != "0"
+ENCODE_BATCH = 4
+
+PROFILE = os.environ.get("TT_COTRACKER_PROFILE") == "1"
+PROFILE_LOG = []  # what TT_COTRACKER_PROFILE logs, kept (editor/bench_shared.py reads it)
+
+
+class Clock:
+    """Where a window's (a round's) time goes, for `TT_COTRACKER_PROFILE=1`:
+    waits for the graphics card at each lap (so only when profiling: it
+    stalls the queue). A no-op otherwise."""
+
+    def __init__(self, eng: Engine, what: str, **info):
+        self.eng, self.what, self.info, self.parts = eng, what, info, {}
+        if PROFILE:
+            self.start = self.t = self.now()
+
+    def now(self) -> float:
+        if self.eng.device == "cuda":
+            torch.cuda.synchronize()
+        elif self.eng.device == "mps":
+            torch.mps.synchronize()
+        return time.perf_counter()
+
+    def lap(self, part: str):
+        if PROFILE:
+            t = self.now()
+            self.parts[part] = self.parts.get(part, 0.0) + t - self.t
+            self.t = t
+
+    def done(self, **info):
+        if not PROFILE:
+            return
+        entry = {"what": self.what, **self.info, **info, **self.parts, "total": self.now() - self.start}
+        PROFILE_LOG.append(entry)
+        times = ", ".join(f"{k} {entry[k] * 1000:.1f} ms" for k in ("encode", "sample", "run", "total") if k in entry)
+        about = " ".join(f"{k}={v}" for k, v in {**self.info, **info}.items())
+        print(f"profile: {self.what} {about}: {times}", file=sys.stderr, flush=True)
 
 
 def pick_engine(weights: str, asked: Optional[str]) -> "Engine":
@@ -170,6 +283,8 @@ class Stream:
         self.support_q = None
         self.ind, self.first, self.cache, self.tail = 0, True, None, None
         self.over = False
+        # The window under way (between [`begin`] and [`finish`]).
+        self.n_new, self.ended, self.pyramid = 0, False, None
 
     def need(self) -> int:
         """Frames its next window takes."""
@@ -190,23 +305,43 @@ class Stream:
 
     def window(self, new, ended: bool):
         """Track one window with `new` frames (up to [`need`]); `ended`: no
-        frames come after them. Sets `over` when the stream is finished."""
-        eng = self.eng
-        S, step, overlap = eng.S, eng.step, eng.overlap
-        need, n_new = self.need(), len(new)
-        if n_new == 0:
-            # The stream ended at the previous window's overlap: its tail is final.
+        frames come after them. Sets `over` when the stream is finished.
+        (A batched round runs the same steps, [`run_round`].)"""
+        clock = Clock(self.eng, "window", frames=len(new), tracks=len(self.active))
+        if self.begin(new, ended):
+            pyr_new = self.eng.encode(new)
+            clock.lap("encode")
+            self.place(pyr_new)
+            clock.lap("sample")
+            out = self.eng.run_window(self.pyramid, self.active, self.ind)
+            clock.lap("run")
+            self.finish(*out)
+        clock.done()
+
+    def begin(self, new, ended: bool) -> bool:
+        """A window's first step: takes its `new` frames; false when there is
+        nothing to run (the stream ended at the previous window's overlap:
+        its tail is final, and emitted)."""
+        if not new:
             if self.tail is not None:
                 live, coords, probs = self.tail
-                for k in range(overlap):
+                for k in range(self.eng.overlap):
                     if self.ind + k >= self.emitted:
                         self.emit(self.ind + k, coords, probs, k, live)
                         self.emitted = self.ind + k + 1
             self.over = True
-            return
+            return False
+        self.n_new, self.ended = len(new), ended
+        return True
+
+    def place(self, pyr_new):
+        """The window's pyramid: the new frames' features (`pyr_new`, from
+        the encoder) after the cached overlap; the features of the support
+        points and queries that join in it."""
+        eng = self.eng
+        S, step, overlap = eng.S, eng.step, eng.overlap
         ind, first = self.ind, self.first
-        valid = n_new if first else overlap + n_new
-        pyr_new = eng.encode(new)
+        valid = self.n_new if first else overlap + self.n_new
         pyramid = pyr_new if first else [torch.cat([c, n], dim=1) for c, n in zip(self.cache, pyr_new)]
         T = pyramid[0].shape[1]
         if T < S:
@@ -226,9 +361,19 @@ class Stream:
         if joining:
             eng.sample_feats(pyramid, joining, ind)
             self.active.extend(joining)
-        last = ended or n_new < need
+        self.pyramid = pyramid
+
+    def finish(self, coords, vis, conf):
+        """A window's last step, with the transformer's answer for
+        `self.active` (from [`Engine.run_window`]): emits its final frames,
+        carries the tracks on, caches the overlap's features."""
+        eng = self.eng
+        S, step, overlap = eng.S, eng.step, eng.overlap
+        ind, pyramid = self.ind, self.pyramid
+        valid = self.n_new if self.first else overlap + self.n_new
+        last = self.ended or self.n_new < self.need()
         n_emit = valid if last else min(step, valid)
-        coords, vis, conf = eng.run_window(pyramid, self.active, ind)
+        self.pyramid = None
         probs = torch.sigmoid(vis) * torch.sigmoid(conf)
         coords_cpu, probs_cpu = coords.float().cpu().numpy(), probs.float().cpu().numpy()
         for k in range(n_emit):
@@ -263,66 +408,214 @@ def read_exact(stdin, n: int) -> bytes:
     return data
 
 
-def run_shared(eng: Engine, stdin):
-    """Many streams, one model (the shared protocol, module docs): read a
-    message; then, while any stream has a window's worth of frames (or its
-    last ones), run one window of each such stream in turn."""
+def read_message(stdin):
+    """One message of the shared protocol, `(tag, stream, payload)` (the
+    header line for `O`, the frame for `F`), or None at the end of the input.
+    Every stream's crops are the model's size (a stream with another fails
+    when it opens, and its frames are read and dropped)."""
+    tag = stdin.read(1)
+    if not tag:
+        return None
+    sid = int.from_bytes(read_exact(stdin, 4), "little")
+    if tag == b"O":
+        return tag, sid, stdin.readline()
+    if tag == b"F":
+        data = read_exact(stdin, v1.MODEL_W * v1.MODEL_H * 3)
+        return tag, sid, np.frombuffer(data, np.uint8).reshape(v1.MODEL_H, v1.MODEL_W, 3)
+    if tag in (b"E", b"X"):
+        return tag, sid, None
+    raise ValueError(f"unknown message {tag!r}")
+
+
+# Frames of one stream the read-ahead holds at most: two first windows.
+READ_AHEAD = 32
+
+
+class Inbox:
+    """The shared worker's input, read ahead on a thread: the jobs keep
+    sending while a round of windows runs, so the next round finds every
+    stream whose frames came meanwhile and runs them as one batch (read
+    message by message, each stream's window ran as soon as its own frames
+    were in: one at a time). It holds at most READ_AHEAD frames of a stream,
+    then waits (the jobs wait on the pipe, as before): a stream holding that
+    many has a window ready, so the worker always frees some."""
+
+    def __init__(self, stdin):
+        self.messages = queue.Queue()
+        self.held = {}  # stream -> frames read and not yet taken by a window
+        self.room = threading.Condition()
+        threading.Thread(target=self._read, args=(stdin,), daemon=True, name="inbox").start()
+
+    def _read(self, stdin):
+        try:
+            while True:
+                with self.room:
+                    self.room.wait_for(lambda: max(self.held.values(), default=0) < READ_AHEAD)
+                msg = read_message(stdin)
+                if msg is not None and msg[0] == b"F":
+                    with self.room:
+                        self.held[msg[1]] = self.held.get(msg[1], 0) + 1
+                self.messages.put(msg)
+                if msg is None:
+                    return
+        except Exception as exc:  # the worker fails with it, as reading in turn did
+            self.messages.put(exc)
+
+    def get(self, wait: bool = True) -> list:
+        """The messages come so far (`wait`: for the first)."""
+        out = []
+        if wait:
+            out.append(self.messages.get())
+        while True:
+            try:
+                out.append(self.messages.get_nowait())
+            except queue.Empty:
+                return out
+
+    def free(self, sid: int, n: int):
+        """`n` of the stream's frames are taken (or dropped)."""
+        with self.room:
+            left = self.held.get(sid, 0) - n
+            if left > 0:
+                self.held[sid] = left
+            else:
+                self.held.pop(sid, None)
+            self.room.notify()
+
+
+def run_round(eng: Engine, ready) -> list:
+    """One window of each ready stream (`(sid, stream, frames, ended)`) as a
+    batch (module docs): their encodes as one call, their transformer passes
+    as one, every other step each stream's own. Returns each stream's
+    failure, or None. A batched step that fails runs again stream by stream
+    (it changes no stream's state), so a failure stays the stream's own."""
+    import traceback
+
+    errors = [None] * len(ready)
+    clock = Clock(eng, "round", streams=len(ready), frames=sum(len(r[2]) for r in ready))
+
+    def each(idx, fn):
+        for i in idx:
+            try:
+                fn(i)
+            except Exception as exc:
+                errors[i] = exc
+        return [i for i in idx if errors[i] is None]
+
+    def batched(what, idx, together, alone):
+        try:
+            return dict(zip(idx, together(idx))) if idx else {}
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            print(f"the batched {what} failed; running it stream by stream", file=sys.stderr)
+            out = {}
+            each(idx, lambda i: out.__setitem__(i, alone(i)))
+            return out
+
+    began = []
+    each(range(len(ready)), lambda i: ready[i][1].begin(ready[i][2], ready[i][3]) and began.append(i))
+    pyramids = batched("encode", began, lambda idx: eng.encode_many([ready[i][2] for i in idx]), lambda i: eng.encode(ready[i][2]))
+    clock.lap("encode")
+    placed = each(list(pyramids), lambda i: ready[i][1].place(pyramids[i]))
+    clock.lap("sample")
+    jobs = {i: (ready[i][1].pyramid, ready[i][1].active, ready[i][1].ind) for i in placed}
+    outs = batched("window", placed, lambda idx: eng.run_windows([jobs[i] for i in idx]), lambda i: eng.run_window(*jobs[i]))
+    clock.lap("run")
+    each(list(outs), lambda i: ready[i][1].finish(*outs[i]))
+    clock.done(tracks=sum(len(jobs[i][1]) for i in placed))
+    return errors
+
+
+def run_shared(eng: Engine, stdin, batch: Optional[bool] = None):
+    """Many streams, one model (the shared protocol, module docs): take the
+    messages come so far; then, while any stream has a window's worth of
+    frames (or its last ones), run a round: one window of each such stream,
+    as one batch ([`run_round`]), or (`batch` off: `TT_COTRACKER_BATCH=0`)
+    in turn, reading message by message."""
+    import traceback
+
+    batch = BATCH if batch is None else batch
+    inbox = Inbox(stdin) if batch else None
     streams = {}  # id -> [Stream, frames waiting, ended]
 
     def sender(sid):
         return lambda msg: send({"s": sid, **msg})
 
-    def fail(sid, exc):
-        import traceback
+    def free(sid, n):
+        if inbox is not None and n:
+            inbox.free(sid, n)
 
-        traceback.print_exc(file=sys.stderr)
+    def drop(sid):
+        entry = streams.pop(sid, None)
+        if entry:
+            free(sid, len(entry[1]))
+
+    def fail(sid, exc):
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         send({"s": sid, "error": f"{type(exc).__name__}: {exc}"})
-        streams.pop(sid, None)
+        drop(sid)
+
+    def alone(r):
+        try:
+            r[1].window(r[2], r[3])
+        except Exception as exc:
+            return exc
+        return None
+
+    def take(msgs):
+        """Applies the messages; the input's end (true, or the exception
+        reading it raised) if they reach it, else False."""
+        for msg in msgs:
+            if msg is None or isinstance(msg, Exception):
+                return msg or True
+            tag, sid, data = msg
+            if tag == b"O":
+                try:
+                    streams[sid] = [Stream(eng, json.loads(data), sender(sid)), [], False]
+                except Exception as exc:  # this stream fails, the others go on
+                    fail(sid, exc)
+            elif tag == b"F":
+                if sid in streams:
+                    streams[sid][1].append(data)
+                else:  # (a frame for a stream that failed is dropped)
+                    free(sid, 1)
+            elif tag == b"E":
+                if sid in streams:
+                    streams[sid][2] = True
+            elif tag == b"X":
+                drop(sid)
+        return False
 
     while True:
-        tag = stdin.read(1)
-        if not tag:
-            return
-        sid = int.from_bytes(read_exact(stdin, 4), "little")
-        if tag == b"O":
-            header = json.loads(stdin.readline())
-            try:
-                streams[sid] = [Stream(eng, header, sender(sid)), [], False]
-            except Exception as exc:  # this stream fails, the others go on
-                fail(sid, exc)
-        elif tag == b"F":
-            entry = streams.get(sid)
-            # (A frame for a stream that failed is read and dropped.)
-            size = entry[0].w * entry[0].h * 3 if entry else v1.MODEL_W * v1.MODEL_H * 3
-            data = read_exact(stdin, size)
-            if entry:
-                entry[1].append(np.frombuffer(data, np.uint8).reshape(entry[0].h, entry[0].w, 3))
-        elif tag == b"E":
-            if sid in streams:
-                streams[sid][2] = True
-        elif tag == b"X":
-            streams.pop(sid, None)
-        else:
-            raise ValueError(f"unknown message {tag!r}")
-        # Windows that can run now, one per stream a round, until none can.
-        progress = True
-        while progress:
-            progress = False
+        end = take(inbox.get() if inbox is not None else [read_message(stdin)])
+        # Rounds of the windows that can run now, one per stream a round, until none can.
+        while True:
+            ready = []
             for sid in list(streams):
                 stream, frames, ended = streams[sid]
                 need = stream.need()
                 if len(frames) < need and not ended:
                     continue
-                take, streams[sid][1] = frames[:need], frames[need:]
-                try:
-                    stream.window(take, ended and len(frames) <= need)
-                except Exception as exc:
+                new, streams[sid][1] = frames[:need], frames[need:]
+                free(sid, len(new))
+                ready.append((sid, stream, new, ended and len(frames) <= need))
+            if not ready:
+                break
+            # (In turn, each stream's window runs as the loop gets to it.)
+            outcomes = zip(ready, run_round(eng, ready)) if batch and len(ready) > 1 else ((r, alone(r)) for r in ready)
+            for (sid, stream, _, _), exc in outcomes:
+                if exc is not None:
                     fail(sid, exc)
-                    continue
-                progress = True
-                if stream.over:
+                elif stream.over:
                     send({"s": sid, "done": True})
-                    streams.pop(sid, None)
+                    drop(sid)
+            # What came while the round ran: the next round's.
+            if inbox is not None and not end:
+                end = take(inbox.get(wait=False))
+        if isinstance(end, Exception):
+            raise end
+        if end:
+            return
 
 
 def practice(eng: Engine):
@@ -338,6 +631,10 @@ def practice(eng: Engine):
     s.window([blank] * s.need(), True)
     if not s.over:
         s.window([], True)
+    # And the batched encoder's other chunk sizes (each tuned on its first run).
+    if BATCH and eng.device != "cpu":
+        for k in range(2, ENCODE_BATCH + 1):
+            eng.encode([blank] * (k * v1.ENCODE_CHUNK), k * v1.ENCODE_CHUNK)
 
 
 def main():

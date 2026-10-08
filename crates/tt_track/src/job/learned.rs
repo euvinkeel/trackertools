@@ -29,8 +29,9 @@
 //!   one Python process (`--shared`), so the model is on the graphics card
 //!   once, in one context, its windows running one at a time: several jobs
 //!   in their own processes at once made the card reset (2026-10-04). The
-//!   worker runs the streams' windows in turn, so several trackers move on
-//!   together (`runner::cotracker_jobs` of them), and only the first job
+//!   worker runs the streams' windows in rounds, so several trackers move on
+//!   together (`runner::cotracker_jobs` of them), each round's windows as
+//!   one batch on the card (the worker's docs), and only the first job
 //!   waits for the model to load. It closes once no stream has used it for
 //!   [`IDLE`]. The anchor alone (the forward side of a tracker asked only
 //!   backward) needs no stream: it is the seed.
