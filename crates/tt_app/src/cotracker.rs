@@ -448,6 +448,7 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
     step(Step::Code);
     let code = dir.join("code");
     write_code(&code).map_err(cannot_write)?;
+    let _ = std::fs::write(code.join("stamp.txt"), code_stamp());
 
     let model = dir.join("scaled_online.pth");
     if !sha256(&model).is_ok_and(|h| h == MODEL_SHA256) {
@@ -622,6 +623,51 @@ pub fn write_code(dir: &Path) -> std::io::Result<()> {
         std::fs::write(to, bytes)?;
     }
     Ok(())
+}
+
+/// The packed code's fingerprint: its files' paths and bytes, hashed.
+fn code_stamp() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (path, bytes) in code::FILES {
+        h.update(path.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The worker's code in `dir` (the doctor's `code\`), written out again when
+/// this program's differs from what is there (a newer or older trackertools
+/// than the one that set CoTracker up: the code it runs must be its own, or
+/// the worker misses what the app asks of it). True: written. A folder the
+/// doctor never wrote is left alone (CoTracker isn't set up).
+pub fn refresh_code_in(dir: &Path) -> std::io::Result<bool> {
+    if !dir.join("editor").join("cotracker_worker.py").is_file() {
+        return Ok(false);
+    }
+    let stamp = code_stamp();
+    let file = dir.join("stamp.txt");
+    if std::fs::read_to_string(&file).is_ok_and(|s| s.trim() == stamp) {
+        return Ok(false);
+    }
+    write_code(dir)?;
+    std::fs::write(&file, &stamp)?;
+    Ok(true)
+}
+
+/// [`refresh_code_in`] for the doctor's folder, at the app's start (before
+/// any worker runs from it).
+pub fn refresh_code() {
+    let dir = tt_track::job::cotracker_dir().join("code");
+    match refresh_code_in(&dir) {
+        Ok(true) => {
+            tracing::info!("CoTracker's code in {} written anew (this trackertools has other code)", dir.display());
+            tt_track::job::forget_cotracker_availability();
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!("CoTracker's code in {}: could not write it anew: {e}", dir.display()),
+    }
 }
 
 /// Start the worker and wait (up to 5 minutes) for it to load the model:
@@ -818,12 +864,14 @@ pub struct EarlyStart {
     told: Option<String>,
     /// This run started after the graphics card stopped.
     after_gpu_loss: bool,
+    /// The doctor's copy of the worker's code was checked against this program's.
+    refreshed: bool,
 }
 
 impl Default for EarlyStart {
     fn default() -> Self {
         let after_gpu_loss = matches!(crate::recover::recovered(), Some(crate::recover::Why::Gpu | crate::recover::Why::GpuUnsaved));
-        Self { enabled: true, tried: false, available: false, notice: None, told: None, after_gpu_loss }
+        Self { enabled: true, tried: false, available: false, notice: None, told: None, after_gpu_loss, refreshed: false }
     }
 }
 
@@ -833,6 +881,11 @@ const NOTICE_FOR: Duration = Duration::from_secs(20);
 /// Every frame: start the engine when it should, and show its notice.
 /// True: the person asked for the doctor.
 pub fn early_start(ctx: &egui::Context, world: &mut World) -> bool {
+    // (Once, before any worker runs: the code it runs is this program's.)
+    if !world.resource::<EarlyStart>().refreshed {
+        world.resource_mut::<EarlyStart>().refreshed = true;
+        refresh_code();
+    }
     let video = world.get_resource::<crate::media::Media>().is_some();
     let available = tt_track::job::cotracker_availability().is_ok();
     let mut e = world.resource_mut::<EarlyStart>();
@@ -1031,5 +1084,23 @@ mod tests {
         eprintln!("CoTracker loaded on {device}");
         assert!(["cuda", "cpu", "mps"].contains(&device.as_str()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The doctor's copy of the code is written anew when it differs from
+    /// this program's, once; a folder the doctor never wrote is left alone.
+    #[test]
+    fn the_code_is_written_anew_when_it_differs() {
+        let dir = std::env::temp_dir().join(format!("tt-code-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!refresh_code_in(&dir).expect("ok"), "not set up: left alone");
+        assert!(!dir.exists());
+        // An older program's code, without a stamp.
+        std::fs::create_dir_all(dir.join("editor")).unwrap();
+        std::fs::write(dir.join("editor").join("cotracker_worker.py"), "old").unwrap();
+        assert!(refresh_code_in(&dir).expect("ok"), "written anew");
+        let worker = std::fs::read(dir.join("editor").join("cotracker_worker.py")).unwrap();
+        assert_eq!(worker, code::FILES.iter().find(|(p, _)| *p == "editor/cotracker_worker.py").expect("packed").1, "this program's worker");
+        assert!(!refresh_code_in(&dir).expect("ok"), "the same: not written again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
