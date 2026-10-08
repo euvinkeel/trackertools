@@ -241,7 +241,7 @@ impl Check {
 pub struct Checked {
     pub checks: Vec<Check>,
     pub ready: bool,
-    /// The NVIDIA graphics card (CoTracker's), if there is one.
+    /// The graphics CoTracker can use (an NVIDIA card, or a Mac's Apple silicon), if there is one.
     pub gpu: Option<crate::cotracker::Gpu>,
     /// Windows' Visual C++ runtime, for CoTracker's PyTorch (looked at with an NVIDIA card, on Windows).
     pub runtime: Option<crate::cotracker::Runtime>,
@@ -302,12 +302,13 @@ pub fn run_checks(graphics: Option<&str>) -> Checked {
             Check::new(Warn, "Updates cannot download, because curl or tar is not on this computer.")
         });
     }
-    let gpu = if cfg!(windows) { crate::cotracker::nvidia_gpu() } else { None };
+    let gpu = crate::cotracker::gpu();
     checks.push(match &gpu {
+        Some(g) if g.apple => Check::new(Pass, format!("Apple silicon: {} ({}). CoTracker can use its graphics.", g.name, g.driver)),
         Some(g) => Check::new(Pass, format!("NVIDIA graphics card: {} (CUDA capability {}.{}, driver {}).", g.name, g.compute.0, g.compute.1, g.driver)),
-        None => Check::new(Info, "There is no NVIDIA graphics card. CoTracker cannot run on this computer."),
+        None => Check::new(Info, format!("There is no {}. CoTracker cannot run on this computer.", needs())),
     });
-    let runtime = gpu.as_ref().map(|_| crate::cotracker::vc_runtime());
+    let runtime = gpu.as_ref().filter(|_| cfg!(windows)).map(|_| crate::cotracker::vc_runtime());
     if let Some(r) = &runtime {
         use crate::cotracker::Runtime;
         checks.push(match r {
@@ -363,7 +364,23 @@ fn report_from(checked: &Checked, graphics: Option<&str>, logs: &Path, when: Str
     r
 }
 
+/// What CoTracker needs on this kind of computer, for people.
+fn needs() -> &'static str {
+    if cfg!(target_os = "macos") { "Apple silicon (an M1 or later chip)" } else { "NVIDIA graphics card" }
+}
+
+/// `ffmpeg.exe and ffprobe.exe` on Windows, `ffmpeg and ffprobe` elsewhere.
+fn ffmpeg_files() -> String {
+    let x = std::env::consts::EXE_SUFFIX;
+    format!("ffmpeg{x} and ffprobe{x}")
+}
+
 fn os_version() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let out = quiet(PathBuf::from("/usr/bin/sw_vers")).arg("-productVersion").output().ok()?;
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return (!v.is_empty()).then(|| format!("macOS {v}"));
+    }
     if !cfg!(windows) {
         return None;
     }
@@ -621,7 +638,7 @@ struct Everything {
     /// When everything was ready: the app starts `delay` seconds after.
     ready_at: Option<Instant>,
     delay: f64,
-    /// It started the CoTracker setup (an NVIDIA card; it goes on after the app starts).
+    /// It started the CoTracker setup (an NVIDIA card or Apple silicon; it goes on after the app starts).
     cotracker: bool,
 }
 
@@ -720,7 +737,7 @@ impl Doctor {
                 }
                 Err(e) => self.note = Some((format!("{CANNOT_WRITE} ({e})"), true)),
             },
-            None => self.note = Some(("This folder does not contain ffmpeg.exe and ffprobe.exe. Select a different folder.".into(), true)),
+            None => self.note = Some((format!("This folder does not contain {}. Select a different folder.", ffmpeg_files()), true)),
         }
     }
 }
@@ -798,13 +815,13 @@ fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
         doctor.start_install();
         e.installing = true;
     }
-    // CoTracker, on an NVIDIA card that can run it: set up in the background once FFmpeg works (the app doesn't wait).
+    // CoTracker, on graphics that can run it: set up in the background once FFmpeg works (the app doesn't wait).
     let gpu = checked.as_ref().and_then(|c| c.gpu.clone());
     let co_ready = tt_track::job::cotracker_availability().is_ok();
     if ready
         && !co_ready
         && !e.cotracker
-        && can_install
+        && crate::cotracker::CAN_SET_UP
         && let Some(g) = gpu.as_ref().filter(|g| crate::cotracker::plan(g).is_ok())
     {
         doctor.co.start(g.clone());
@@ -859,8 +876,8 @@ fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
     let co = doctor.co.step();
     lines.push(match &gpu {
         _ if co_ready => (Mark::Done, "5. CoTracker is ready.".into()),
-        None if checked.is_some() => (Mark::Later, "5. CoTracker needs an NVIDIA graphics card. This computer does not have one. trackertools does not set up CoTracker.".into()),
-        None => (Mark::Later, "5. trackertools looks for an NVIDIA graphics card for CoTracker.".into()),
+        None if checked.is_some() => (Mark::Later, format!("5. CoTracker needs {}. This computer does not have it. trackertools does not set up CoTracker.", needs())),
+        None => (Mark::Later, "5. trackertools looks for graphics for CoTracker.".into()),
         Some(g) => match crate::cotracker::plan(g) {
             Err(why) => (Mark::Problem, format!("5. {why}")),
             Ok(_) => match &co {
@@ -934,7 +951,11 @@ fn cotracker_part(ui: &mut egui::Ui, doctor: &mut Doctor, checked: Option<&Check
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new("CoTracker").strong());
-    ui.label("CoTracker is a second kind of tracker. It uses the NVIDIA graphics card.");
+    ui.label(if cfg!(target_os = "macos") {
+        "CoTracker is a second kind of tracker. It uses the graphics of Apple silicon."
+    } else {
+        "CoTracker is a second kind of tracker. It uses the NVIDIA graphics card."
+    });
     let step = doctor.co.step();
     if step.busy() {
         ui.horizontal(|ui| {
@@ -967,7 +988,7 @@ fn cotracker_part(ui: &mut egui::Ui, doctor: &mut Doctor, checked: Option<&Check
         return;
     };
     let Some(gpu) = &c.gpu else {
-        line(ui, "\u{2013}", style::MUTED, "This computer does not have an NVIDIA graphics card. CoTracker cannot run without one.");
+        line(ui, "\u{2013}", style::MUTED, &format!("This computer does not have {}. CoTracker cannot run without it.", needs()));
         return;
     };
     match crate::cotracker::plan(gpu) {
@@ -975,15 +996,15 @@ fn cotracker_part(ui: &mut egui::Ui, doctor: &mut Doctor, checked: Option<&Check
         Ok(plan) => {
             ui.label(format!("This computer has an {}. CoTracker can use it.", gpu.name));
             ui.label(format!(
-                "To set up CoTracker, trackertools downloads Python, PyTorch for CUDA {} and the CoTracker model. The download is approximately 2.5 GB.",
-                plan.cuda
+                "To set up CoTracker, trackertools downloads Python, PyTorch for {} and the CoTracker model. The download is approximately {}.",
+                plan.label, plan.total_size
             ));
             ui.label("Make sure that the disk has approximately 6 GB free. The setup can take 5 to 30 minutes.");
             if c.runtime.as_ref().is_some_and(|r| !matches!(r, crate::cotracker::Runtime::Ready(_))) {
                 ui.label("trackertools also installs the Microsoft Visual C++ runtime from Microsoft. Windows asks for permission. Click Yes.");
             }
             ui.label("The CoTracker model is for non-commercial use only (license: CC BY-NC 4.0).");
-            if cfg!(all(windows, target_arch = "x86_64")) {
+            if crate::cotracker::CAN_SET_UP {
                 let label = if matches!(step, Step::Failed(_)) { "Set up CoTracker again" } else { "Set up CoTracker" };
                 if ui.button(egui::RichText::new(label).strong()).clicked() {
                     doctor.co.start(gpu.clone());
@@ -1081,7 +1102,7 @@ fn body(ui: &mut egui::Ui, doctor: &mut Doctor, first_run: bool) -> bool {
     }
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        ui.label("If you have FFmpeg, click Find FFmpeg. Then select the folder that contains ffmpeg.exe and ffprobe.exe.");
+        ui.label(format!("If you have FFmpeg, click Find FFmpeg. Then select the folder that contains {}.", ffmpeg_files()));
         if ui.add_enabled(!install.busy(), egui::Button::new("Find FFmpeg\u{2026}")).clicked()
             && let Some(dir) = rfd::FileDialog::new().pick_folder()
         {

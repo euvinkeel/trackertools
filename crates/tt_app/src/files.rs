@@ -67,7 +67,8 @@ fn explorer(line: &str) -> std::io::Result<()> {
     }
 }
 
-#[cfg(test)]
+/// (Windows paths: elsewhere `C:\…` isn't absolute.)
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

@@ -213,7 +213,7 @@ fn build_from_code(ui: &mut egui::Ui, world: &mut World) {
     if let Some(b) = switch_to {
         rb.switch(&b);
     }
-    let exe = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("trackertools.exe")));
+    let exe = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join(crate::rebuild::program_file())));
     let tip = format!(
         "Builds branch {} and puts it at {}. Then trackertools saves your work, closes and starts the new build. The first build takes several minutes; later ones are faster.",
         co.branch,

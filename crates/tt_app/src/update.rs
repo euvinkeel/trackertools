@@ -3,8 +3,8 @@
 //!
 //! The repository is the source of truth. Pushing a tag `vX.Y.Z` makes the
 //! release workflow (`.github/workflows/release.yml`) build
-//! `trackertools-windows-x64.zip` and publish it with the changes since the
-//! last tag as its notes. A copy that workflow built knows its version (the
+//! `trackertools-windows-x64.zip` and `trackertools-macos-arm64.zip` (Apple
+//! silicon) and publish them with the changes since the last tag as its notes. A copy that workflow built knows its version (the
 //! tag, `TT_VERSION` at build time) and can replace itself; a copy built from
 //! source says so and leaves updating to git.
 //!
@@ -217,6 +217,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 
 /// A console tool run without a window of its own (the app has no console).
 pub(crate) fn quiet(program: PathBuf) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))] // (only Windows sets a flag)
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
