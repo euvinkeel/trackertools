@@ -41,3 +41,14 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Input",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# (Already in the tree.) Recovery waits for the old process to exit.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# (Already in the tree through winit.) The pointer service: AppKit's mouse events.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSGeometry", "NSProcessInfo"] }
