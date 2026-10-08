@@ -1,6 +1,6 @@
 ## Not released yet
 - Settings > Updates shows what changed in each version, and what is not released yet.
-- Settings > Build from your code shows the newest branch on GitHub. Click Switch to it, then Build and restart, to try the latest changes.
+- Settings > Build from your code shows the changes ready to try (the try branch) and what they add. Click Switch to try, then Build and restart. It also shows the newest branch on GitHub.
 
 ## 0.4.0
 - Paint trackers: brush over the thing to follow. CoTracker follows many points on it. Paint again on other frames: only the points that stay on the paint from one paint to the next count. Alt+brush erases. Dots on the video show which points count.

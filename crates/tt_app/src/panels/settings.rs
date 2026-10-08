@@ -262,7 +262,8 @@ fn build_from_code(ui: &mut egui::Ui, world: &mut World) {
         }
         ui.add_space(4.0);
     }
-    if let Some(n) = &co.newest {
+    // (The try branch is shown above: not again as the newest.)
+    if let Some(n) = co.newest.as_ref().filter(|n| n.branch != crate::rebuild::TRY) {
         let here = n.branch == co.branch;
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Newest on GitHub:").strong());
