@@ -107,7 +107,7 @@ pub fn open(world: &mut World) {
 
 /// Whether any of `layers` (or what it follows) still has frames to work
 /// out: an export now would miss them, so it waits (a frame or two).
-fn pending(world: &World, layers: &[Entity]) -> bool {
+pub(crate) fn pending(world: &World, layers: &[Entity]) -> bool {
     let dirty = |e: Entity| world.get::<tt_core::op::Dirty>(e).is_some_and(|d| !d.0.is_empty());
     layers.iter().any(|l| dirty(*l) || target_of(world, *l).is_some_and(dirty))
 }
@@ -288,9 +288,39 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
 type Placements = Vec<Option<Placed>>;
 
 /// Each chosen layer's media path, its own size, its blend mode, and its placement on each of `frames`.
-type Gathered = Vec<(String, [f32; 2], tt_core::layer::BlendMode, Placements)>;
+pub(crate) type Gathered = Vec<(String, [f32; 2], tt_core::layer::BlendMode, Placements)>;
 
-fn gather(world: &World, layers: &[Entity], frames: &Range<FrameIndex>) -> Gathered {
+/// The gathered layers with their media read: what a render draws.
+pub(crate) type Loaded = Vec<(Arc<tt_media::overlay::Frames>, [f32; 2], tt_core::layer::BlendMode, Placements)>;
+
+/// Read the layers' media at their own size, up to a memory limit (1.5 GB
+/// for all of them, shared out). On the render's thread: it takes a while.
+pub(crate) fn load(gathered: Gathered) -> Result<Loaded, String> {
+    let budget = (1536usize << 20) / gathered.len().max(1);
+    let mut media: Loaded = Vec::new();
+    for (path, size, blend, placed) in gathered {
+        let p = Path::new(&path);
+        let info = tt_media::overlay::probe(p).map_err(|e| format!("{path}: {e:#}"))?;
+        let frames = tt_media::overlay::decode(p, &info, tt_media::overlay::fit(&info, 8192, budget)).map_err(|e| format!("{path}: {e:#}"))?;
+        media.push((Arc::new(frames), size, blend, placed));
+    }
+    Ok(media)
+}
+
+/// `f` with the loaded layers as the renderers take them, `first` being the first frame gathered.
+pub(crate) fn with_overlays<R>(media: &Loaded, first: FrameIndex, f: impl FnOnce(&[Overlay]) -> R) -> R {
+    let places: Vec<Box<dyn Fn(FrameIndex) -> Option<Placed> + Sync>> = media
+        .iter()
+        .map(|(_, _, _, placed)| {
+            let placed = placed.clone();
+            Box::new(move |g: FrameIndex| usize::try_from(g - first).ok().and_then(|i| placed.get(i).copied().flatten())) as Box<dyn Fn(FrameIndex) -> Option<Placed> + Sync>
+        })
+        .collect();
+    let overlays: Vec<Overlay> = media.iter().zip(&places).map(|((f, size, blend, _), at)| Overlay { frames: f.clone(), size: *size, placed: at.as_ref(), blend: *blend }).collect();
+    f(&overlays)
+}
+
+pub(crate) fn gather(world: &World, layers: &[Entity], frames: &Range<FrameIndex>) -> Gathered {
     layers
         .iter()
         // (Deleted since the window opened: not exported.)
@@ -310,29 +340,12 @@ fn start(world: &World, layers: &[Entity], what: What, codec: Codec, alpha: Alph
     let (progress, cancel, reading) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)));
     let (done, stop, read) = (progress.clone(), cancel.clone(), reading.clone());
     let handle = std::thread::spawn(move || {
-        // 1.5 GB for all the layers' frames, shared out.
-        let budget = (1536usize << 20) / gathered.len().max(1);
-        let mut media: Vec<(Arc<tt_media::overlay::Frames>, [f32; 2], tt_core::layer::BlendMode, Placements)> = Vec::new();
-        for (path, size, blend, placed) in gathered {
-            let p = Path::new(&path);
-            let info = tt_media::overlay::probe(p).map_err(|e| format!("{e:#}"))?;
-            let frames = tt_media::overlay::decode(p, &info, tt_media::overlay::fit(&info, 8192, budget)).map_err(|e| format!("{e:#}"))?;
-            media.push((Arc::new(frames), size, blend, placed));
-        }
+        let media = load(gathered)?;
         read.store(false, Ordering::Relaxed);
-        let first = frames.start;
-        let places: Vec<Box<dyn Fn(FrameIndex) -> Option<Placed> + Sync>> = media
-            .iter()
-            .map(|(_, _, _, placed)| {
-                let placed = placed.clone();
-                Box::new(move |g: FrameIndex| placed.get((g - first) as usize).copied().flatten()) as Box<dyn Fn(FrameIndex) -> Option<Placed> + Sync>
-            })
-            .collect();
-        let overlays: Vec<Overlay> = media.iter().zip(&places).map(|((f, size, blend, _), at)| Overlay { frames: f.clone(), size: *size, placed: at.as_ref(), blend: *blend }).collect();
-        let made = match what {
-            What::Over => tt_media::layers::render_over(&index, &out, codec, frames, &overlays, &done, &stop),
-            _ => tt_media::layers::render_alpha(&index, &out, alpha, frames, &overlays, &done, &stop),
-        };
+        let made = with_overlays(&media, frames.start, |overlays| match what {
+            What::Over => tt_media::layers::render_over(&index, &out, codec, frames, overlays, &done, &stop),
+            _ => tt_media::layers::render_alpha(&index, &out, alpha, frames, overlays, &done, &stop),
+        });
         made.map(|()| out).map_err(|e| format!("{e:#}"))
     });
     Some(Job { progress, total, cancel, handle: Some(handle), reading })

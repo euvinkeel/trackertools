@@ -10,6 +10,11 @@
 //! (`tt_track::export::Framing`), and a small preview shows the playhead's
 //! frame as the export renders it: the decoded frame drawn on the CPU
 //! through the export's own map (`rendered_map`), with guidelines over it.
+//!
+//! The layers (tt_core::layer) come along by default: drawn on each source
+//! frame before it is stabilized, so they move with what they are attached
+//! to, as on the video (`render_warped_with`). The preview draws them with
+//! their preview pictures (as the viewport does: blend modes as Normal).
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -22,7 +27,7 @@ use bevy_ecs::prelude::*;
 use egui::{Color32, Stroke, Vec2};
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::FrameIndex;
-use tt_media::render::{Codec, invert, nv12_preview, render_marker, render_warped};
+use tt_media::render::{Codec, invert, nv12_preview, render_marker, render_warped_with};
 use tt_track::export::{Framing, Smoothing, StabilizerDefaults, Steady, follow, follow_path, follower_at, good_points, hides_the_edges, rendered_map, stabilize, stabilize_path, subject_path, zoom_to_fill};
 
 use crate::media::{Media, StatusLine, Which};
@@ -51,6 +56,8 @@ pub enum Source {
 pub struct ExportWindow {
     request: Option<Request>,
     job: Option<Job>,
+    /// Export asked for, waiting for the layers to be worked out (a frame or two).
+    start_when_ready: bool,
     done: Option<Result<PathBuf, String>>,
     preview: Preview,
 }
@@ -115,6 +122,15 @@ struct Request {
     path: PathBuf,
     /// The path is the default one (a change of format changes its extension).
     default_path: bool,
+    /// The layers are drawn on it (stabilized only).
+    layers: bool,
+}
+
+/// A layer in the preview: its picture, its corners (output pixels) and its opacity.
+struct LayerQuad {
+    texture: egui::TextureHandle,
+    corners: [[f64; 2]; 4],
+    opacity: f32,
 }
 
 /// The least zoom that hides the black edges (up to [`MAX_ZOOM`]), for the
@@ -258,6 +274,7 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
         zoom: None,
         path,
         default_path: true,
+        layers: true,
     });
 }
 
@@ -274,9 +291,11 @@ fn default_path(source: &Path, kind: Kind, name: &str, codec: Codec) -> PathBuf 
         .expect("a free name")
 }
 
-/// Render `frames` of the source as `r` says, framed by `framing` (stabilized), on a thread of its own.
-fn start(world: &World, r: &Request, frames: Range<FrameIndex>, framing: Framing) -> Option<Job> {
+/// Render `frames` of the source as `r` says, framed by `framing` (stabilized), on a thread of its own;
+/// with `layers` drawn on it (stabilized, if asked for).
+fn start(world: &World, r: &Request, frames: Range<FrameIndex>, framing: Framing, layers: &[Entity]) -> Option<Job> {
     let index = world.get_resource::<Media>()?.original.index.clone();
+    let gathered = if r.kind == Kind::Stabilized && r.layers { crate::panels::layer_export::gather(world, layers, &frames) } else { Vec::new() };
     let total = (frames.end - frames.start).max(0) as usize;
     let size = [index.width as f64, index.height as f64];
     let (progress, cancel) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
@@ -286,7 +305,12 @@ fn start(world: &World, r: &Request, frames: Range<FrameIndex>, framing: Framing
     let half = (size[0].min(size[1]) / 24.0).clamp(16.0, 120.0);
     let handle = std::thread::spawn(move || {
         let made = match kind {
-            Kind::Stabilized => render_warped(&index, &out, codec, frames, &|g| rendered_map(&keys, size, framing, g), &done, &stop),
+            Kind::Stabilized => {
+                let media = crate::panels::layer_export::load(gathered)?;
+                crate::panels::layer_export::with_overlays(&media, frames.start, |overlays| {
+                    render_warped_with(&index, &out, codec, frames.clone(), &|g| rendered_map(&keys, size, framing, g), overlays, &done, &stop)
+                })
+            }
             Kind::Target => render_marker(&index, &out, codec, frames, &|g| follower_at(&keys, size, g), half, &done, &stop),
         };
         made.map(|()| out).map_err(|e| format!("{e:#}"))
@@ -339,10 +363,11 @@ fn refresh_preview(ctx: &egui::Context, world: &World, p: &mut Preview, r: &Requ
 
 /// The preview (`display` points) and what is over it. Returns where it is,
 /// and how far it was dragged this frame (a part of its width and height).
-fn preview_ui(ui: &mut egui::Ui, p: &Preview, r: &Request, size: [f64; 2], display: Vec2) -> (egui::Rect, Option<Vec2>) {
+fn preview_ui(ui: &mut egui::Ui, p: &Preview, r: &Request, size: [f64; 2], display: Vec2, layers: &[LayerQuad]) -> (egui::Rect, Option<Vec2>) {
     let (rect, response) = ui.allocate_exact_size(display, egui::Sense::drag());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::BLACK);
+    let at = |c: [f64; 2]| rect.min + Vec2::new((c[0] / size[0]) as f32 * rect.width(), (c[1] / size[1]) as f32 * rect.height());
     match &p.texture {
         Some(t) => {
             painter.image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
@@ -350,6 +375,16 @@ fn preview_ui(ui: &mut egui::Ui, p: &Preview, r: &Request, size: [f64; 2], displ
         None => {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Decoding\u{2026}", egui::FontId::proportional(13.0), style::MUTED);
         }
+    }
+    // The layers, bottom first, where the export puts them.
+    for l in layers {
+        let tint = Color32::from_white_alpha((l.opacity.clamp(0.0, 1.0) * 255.0).round() as u8);
+        let mut mesh = egui::Mesh::with_texture(l.texture.id());
+        for (c, uv) in l.corners.iter().zip([egui::pos2(0.0, 0.0), egui::pos2(1.0, 0.0), egui::pos2(1.0, 1.0), egui::pos2(0.0, 1.0)]) {
+            mesh.vertices.push(egui::epaint::Vertex { pos: at(*c), uv, color: tint });
+        }
+        mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(mesh));
     }
     if p.guides {
         let faint = Stroke::new(1.0, Color32::from_white_alpha(70));
@@ -441,6 +476,36 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
     }
     let playhead = world.resource::<tt_core::transport::Transport>().frame();
     let display = preview_size(size);
+    // The layers: all of them, as the video shows them; in the preview on its frame, through the export's map.
+    let layer_list = tt_core::layer::layers(world);
+    let mut quads = Vec::new();
+    if let Some(r) = state.request.as_ref().filter(|r| r.kind == Kind::Stabilized && r.layers)
+        && let Some(shown) = state.preview.shows
+        && let Some(back) = invert(&rendered_map(&r.keys, size, shown.framing, shown.grid))
+    {
+        for e in &layer_list {
+            let (Some(params), Some(pl)) = (world.get::<tt_core::layer::LayerParams>(*e).cloned(), tt_core::layer::placed_at(world, *e, shown.grid)) else { continue };
+            match world.resource_mut::<crate::layers::LayerMedia>().texture(ctx, &params.media, pl.clip_time) {
+                Ok(Some(texture)) => {
+                    let corners = pl.corners(params.media_size).map(|s| [back[0] * s[0] + back[1] * s[1] + back[2], back[3] * s[0] + back[4] * s[1] + back[5]]);
+                    quads.push(LayerQuad { texture, corners, opacity: pl.opacity as f32 });
+                }
+                // Still being read: drawn when it is.
+                Ok(None) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+                Err(_) => {}
+            }
+        }
+    }
+    // An export asked for while the layers were being worked out: now, if they are.
+    if state.start_when_ready && state.job.is_none() && !crate::panels::layer_export::pending(world, &layer_list) {
+        state.start_when_ready = false;
+        if let Some(r) = state.request.as_mut() {
+            let framing = r.framing(size, &frames, true);
+            state.job = start(world, r, frames.clone(), framing, &layer_list);
+        }
+    } else if state.start_when_ready {
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
     let mut open = true;
     let mut go = false;
     let mut options_changed: Option<StabilizerDefaults> = None;
@@ -571,9 +636,19 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                             });
                         });
                         ui.end_row();
+                        if !layer_list.is_empty() {
+                            ui.label("Layers");
+                            let n = layer_list.len();
+                            let text = if n == 1 { "Include the layer".to_string() } else { format!("Include the {n} layers") };
+                            ui.checkbox(&mut r.layers, text).on_hover_text(
+                                "The pictures, GIFs and clips attached to what you tracked, drawn on the video before it is stabilized, so they move with what they are attached to. \
+                                 Off: the video alone.",
+                            );
+                            ui.end_row();
+                        }
                         ui.label("Preview");
                         ui.vertical(|ui| {
-                            let (at, dragged) = preview_ui(ui, &state.preview, r, size, display);
+                            let (at, dragged) = preview_ui(ui, &state.preview, r, size, display, &quads);
                             state.preview.rect = Some(at);
                             if let Some(d) = dragged {
                                 o.offset = [(o.offset[0] + d.x).clamp(-MAX_OFFSET, MAX_OFFSET), (o.offset[1] + d.y).clamp(-MAX_OFFSET, MAX_OFFSET)];
@@ -681,14 +756,21 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
     }
     if go && let Some(r) = state.request.as_mut() {
         state.done = None;
-        let framing = r.framing(size, &frames, true);
-        state.job = start(world, r, frames, framing);
+        if r.kind == Kind::Stabilized && r.layers && crate::panels::layer_export::pending(world, &layer_list) {
+            // (Their frames are still being worked out: it starts when they are.)
+            state.start_when_ready = true;
+            ctx.request_repaint();
+        } else {
+            let framing = r.framing(size, &frames, true);
+            state.job = start(world, r, frames, framing, &layer_list);
+        }
     }
     if !open {
         if let Some(job) = &state.job {
             job.cancel.store(true, Ordering::Relaxed);
         }
         state.request = None;
+        state.start_when_ready = false;
         (state.preview.texture, state.preview.shows) = (None, None);
     }
     *world.resource_mut::<ExportWindow>() = state;
