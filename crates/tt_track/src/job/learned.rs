@@ -93,7 +93,12 @@ impl JobSpec {
     /// starts (the anchor, or the frame before `from` when resuming), and how many.
     fn stream(&self) -> (FrameIndex, usize) {
         let dir: FrameIndex = if self.side == Side::Forward { 1 } else { -1 };
-        let start = if self.resume.is_some() { self.from - dir } else { self.anchor };
+        let start = match (&self.paint_resume, self.resume) {
+            // (A paint tracker resumes on a paint's frame: its state there.)
+            (Some(p), _) => p.frame,
+            (None, Some(_)) => self.from - dir,
+            (None, None) => self.anchor,
+        };
         (start, ((self.to - start) * dir + 1).max(1) as usize)
     }
 
@@ -733,7 +738,7 @@ impl Worker {
         // Where the stream starts: the frame before `from` when resuming, else the anchor.
         let (start, n) = s.stream();
         // The anchor alone is the seed: no worker for it.
-        if n == 1 && s.resume.is_none() {
+        if n == 1 && s.resume.is_none() && s.paint_resume.is_none() {
             if s.side == Side::Forward && self.wait_for(anchor, || {}) {
                 self.emit(anchor, seed, 1.0, false);
             }
@@ -774,8 +779,19 @@ impl Worker {
             // Many points over each paint on the stream's frames (`paint`).
             let mut pq = Vec::new();
             let mut paints: Vec<(usize, LookSpec)> = Vec::new();
+            // Resuming: the cohort as it was on the paint's frame, first (`PaintFit::resume`).
+            if let Some(state) = &s.paint_resume {
+                for (_, at) in &state.points {
+                    queries.push((0, crop_point(start, self.map(start).from_source(*at))));
+                    pq.push(super::paint::PaintQuery { i: 0, reference: None });
+                }
+            }
             for i in 0..n {
                 let f = stream.frame(i);
+                // (Resuming: the paint on the first frame is in the cohort already.)
+                if i == 0 && s.paint_resume.is_some() {
+                    continue;
+                }
                 for l in s.looks.iter().filter(|l| l.frame == f) {
                     paints.push((i, l.clone()));
                     for p in super::paint::sample(l, super::paint::POINTS_PER_PAINT) {
@@ -793,7 +809,10 @@ impl Worker {
             let a = self.map(anchor).a;
             let half = first_paint.as_ref().map_or(self.half, |l| l.half.map(|h| (h / a * s.scale).max(2.0)));
             // (Outliers: further than 1.5 crop px from where the motion puts them, at least.)
-            self.paint = Some(super::paint::PaintFit::new(pq, paints, seed, half, s.settings.min_score as f64, 1.5 / scale));
+            self.paint = Some(match &s.paint_resume {
+                Some(state) => super::paint::PaintFit::resume(state, pq, paints, s.settings.min_score as f64, 1.5 / scale),
+                None => super::paint::PaintFit::new(pq, paints, seed, half, s.settings.min_score as f64, 1.5 / scale),
+            });
         } else {
             queries.push((0usize, crop_point(start, first_seed)));
             for i in 1..n {
@@ -807,7 +826,7 @@ impl Worker {
         worker.send(b'O', format!("{header}\n").as_bytes())?;
 
         // The anchor itself is the seed (when not resuming, on the forward side).
-        if s.resume.is_none() && s.side == Side::Forward && self.wait_for(anchor, || {}) {
+        if s.resume.is_none() && s.paint_resume.is_none() && s.side == Side::Forward && self.wait_for(anchor, || {}) {
             self.emit(anchor, seed, 1.0, false);
         }
         let queries: Vec<usize> = queries.iter().map(|(i, _)| *i).collect();
@@ -925,8 +944,9 @@ impl Worker {
         let base = self.half;
         for o in out {
             self.half = half.map(|h| h * o.scale);
-            // (The stream's first frame is the anchor's: emitted already as the paint's centre.)
-            if o.i > 0 {
+            // (The stream's first frame is the anchor's, emitted already as the paint's centre;
+            // resumed, it may be one to redo.)
+            if o.i > 0 || self.spec.paint_resume.is_some() {
                 self.emit(o.f, o.at, o.score, o.lost);
             }
             let map = *self.map(o.f);
@@ -949,7 +969,13 @@ impl Worker {
             let pts: super::paint::Points =
                 points.iter().map(|p| p.filter(|[x, y, _]| x.is_finite() && y.is_finite()).map(|[x, y, s]| (grid.to_view([x, y]), s.clamp(0.0, 1.0)))).collect();
             let out = fit.frame(i, f, self.map(f), pts);
-            let half = fit.half;
+            let (half, target) = (fit.half, fit.target);
+            // Its states on the paints passed: for a job tracking again from one of them.
+            for (g, motion, cohort) in fit.take_states() {
+                let map = *self.map(g);
+                let points = cohort.into_iter().map(|(r, p)| (r, map.to_source(p))).collect();
+                self.states.push(super::paint::PaintState { frame: g, motion, target, half, points });
+            }
             self.paint = Some(fit);
             self.paint_out(out, half);
             return;
