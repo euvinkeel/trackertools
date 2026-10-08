@@ -11,10 +11,15 @@ Run: .venv\\Scripts\\python.exe editor\\bench_shared.py [--frames 48]
 """
 
 import os
+import sys
 
 # The CPU only, and the worker's profile on (both before torch loads).
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["TT_COTRACKER_DEVICE"] = "cpu"
+# The CPU unless `--device mps|cuda` is given (on a Mac: mps). Never the
+# graphics card by default: a card another app is using may reset.
+DEVICE = sys.argv[sys.argv.index("--device") + 1] if "--device" in sys.argv else "cpu"
+if DEVICE == "cpu":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["TT_COTRACKER_DEVICE"] = DEVICE
 os.environ["TT_COTRACKER_PROFILE"] = "1"
 
 import argparse  # noqa: E402
@@ -111,6 +116,7 @@ def main():
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--streams", default="1,3,6")
     ap.add_argument("--video", default=VIDEO)
+    ap.add_argument("--device", default="cpu", help="cpu (default), mps or cuda (read before torch loads)")
     args = ap.parse_args()
     frames = decode(args.video, args.frames)
     eng = load()

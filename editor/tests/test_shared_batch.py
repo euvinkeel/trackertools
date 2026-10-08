@@ -13,8 +13,12 @@ Run: .venv\\Scripts\\python.exe editor\\tests\\test_shared_batch.py [--video PAT
 import os
 import sys
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["TT_COTRACKER_DEVICE"] = "cpu"
+# The CPU unless `--device mps|cuda` is given (on a Mac: mps). Never the
+# graphics card by default: a card another app is using may reset.
+DEVICE = sys.argv[sys.argv.index("--device") + 1] if "--device" in sys.argv else "cpu"
+if DEVICE == "cpu":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["TT_COTRACKER_DEVICE"] = DEVICE
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
