@@ -43,6 +43,32 @@ pub fn version() -> String {
     }
 }
 
+/// What changed, version by version (`CHANGES.md`, packed into the
+/// program): `(title, lines)`, newest first. The first title is "Not
+/// released yet" while there are changes no release has.
+pub fn changelog() -> Vec<(String, Vec<String>)> {
+    parse_changelog(include_str!("../CHANGES.md"))
+}
+
+/// A `CHANGES.md` as `(title, lines)` sections (another branch's too).
+pub fn parse_changelog(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in text.lines() {
+        if let Some(title) = line.strip_prefix("## ") {
+            out.push((title.trim().to_string(), Vec::new()));
+        } else if let (Some(item), Some(last)) = (line.strip_prefix("- "), out.last_mut()) {
+            last.1.push(item.trim().to_string());
+        }
+    }
+    out.retain(|(_, lines)| !lines.is_empty());
+    out
+}
+
+/// The changelog's lines for `version` (without its `v`), if it has some.
+pub fn changes_in(version: &str) -> Option<Vec<String>> {
+    changelog().into_iter().find(|(t, _)| t == version.trim_start_matches('v')).map(|(_, l)| l)
+}
+
 /// Built by the release workflow: it can replace itself.
 pub fn installable() -> bool {
     option_env!("TT_VERSION").is_some()
@@ -694,5 +720,16 @@ mod tests {
     fn release_notes_read_as_plain_lines() {
         let notes = "## What's Changed\n* Several projects on one video by @euvinkeel in https://github.com/x/y/pull/17\n* Sketch colours\n\n**Full Changelog**: https://github.com/x/y/compare/v0.2.0...v0.2.1";
         assert_eq!(plain_notes(notes), "\u{2022} Several projects on one video\n\u{2022} Sketch colours");
+    }
+
+    /// The changelog reads: sections newest first, each with its lines; the released ones by version.
+    #[test]
+    fn the_changelog_reads() {
+        let log = changelog();
+        assert!(!log.is_empty());
+        assert!(log.iter().all(|(t, lines)| !t.is_empty() && !lines.is_empty()));
+        assert!(changes_in("0.4.0").is_some_and(|l| l.iter().any(|x| x.contains("Paint"))));
+        assert!(changes_in("v0.3.0").is_some());
+        assert!(changes_in("9.9.9").is_none());
     }
 }

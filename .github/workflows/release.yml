@@ -86,7 +86,18 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --clobber
           } else {
-            gh release create $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --title "trackertools $env:TAG" --generate-notes
+            # Its notes: the version's section of the changelog (crates/tt_app/CHANGES.md), else GitHub's list of pull requests.
+            $ver = $env:TAG.TrimStart('v'); $in = $false; $notes = @()
+            foreach ($l in Get-Content crates/tt_app/CHANGES.md) {
+              if ($l.StartsWith('## ')) { $in = ($l.Substring(3).Trim() -eq $ver); continue }
+              if ($in -and $l.Trim()) { $notes += $l }
+            }
+            if ($notes.Count -gt 0) {
+              $notes -join "`n" | Out-File -Encoding utf8 notes.md
+              gh release create $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --title "trackertools $env:TAG" --notes-file notes.md
+            } else {
+              gh release create $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --title "trackertools $env:TAG" --generate-notes
+            }
           }
 
   macos:
