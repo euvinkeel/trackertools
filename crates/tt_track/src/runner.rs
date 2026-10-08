@@ -722,7 +722,8 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> Waiting {
             Side::Forward => (hull.start, hull.start - 1),
             Side::Backward => (hull.end - 1, hull.end),
         };
-        let resume = range.contains(&before).then(|| world.resource::<SignalStore>().get(out)?.get_valid(before).map(|v| ([(v[0] - offset[0]) as f64, (v[1] - offset[1]) as f64], v[6]))).flatten();
+        // (A paint tracker starts from its first paint again: its motion is built from there.)
+        let resume = (range.contains(&before) && plan.params.method != Method::Paint).then(|| world.resource::<SignalStore>().get(out)?.get_valid(before).map(|v| ([(v[0] - offset[0]) as f64, (v[1] - offset[1]) as f64], v[6]))).flatten();
         let from = match (resume, side) {
             (Some(_), _) => from,
             (None, Side::Forward) => plan.anchor,

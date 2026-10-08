@@ -273,6 +273,24 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         }
         world.resource_mut::<NewTrackers>().method = Method::Template;
     }
+    // `=paint`: a paint tracker, painted on frame 600 and again (a reset paint) on 625, selected.
+    let mut painted = None;
+    if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "paint") && tt_track::job::cotracker_availability().is_ok() {
+        world.resource_mut::<NewTrackers>().method = Method::Paint;
+        let paint = |f: FrameIndex| {
+            let c = at(f, [0.0, 0.0]);
+            let (centre, half, mask) = tt_track::tool::paint_look(&[[c[0] - 10.0, c[1] - 4.0], [c[0] + 4.0, c[1] + 6.0], [c[0] + 12.0, c[1] - 2.0]], 9.0);
+            let mut l = Look::new(f, centre, half);
+            l.mask = mask;
+            l
+        };
+        painted = tt_track::add_unguided_tracker(world, paint(600));
+        if let Some(t) = painted {
+            tt_track::add_look(world, t, paint(625));
+            tt_core::span::set_span(world, t, tt_core::span::Span::new(570, 680));
+        }
+        world.resource_mut::<NewTrackers>().method = Method::Template;
+    }
     // A manual dot: a path drawn by hand.
     let mut dot = None;
     edit(world, "Scene: a manual dot", |tx| {
@@ -287,8 +305,11 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         _ => None,
     };
     world.resource_mut::<tt_core::transport::Transport>().seek(625);
-    if let Some(t) = loose {
+    if let Some(t) = painted.or(loose) {
         world.resource_mut::<tt_core::selection::Selection>().select_only(t);
+    }
+    if painted.is_some() {
+        world.resource_mut::<tt_core::tool::ActiveTool>().0 = tt_core::tool::Tool::Track;
     }
     subject
 }

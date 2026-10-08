@@ -41,6 +41,7 @@ use crate::template::{Estimate, LookTemplate, Settings, TEMPLATE_R, TemplateTrac
 use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
 
 mod learned;
+pub mod paint;
 
 pub use learned::{
     availability as cotracker_availability, forget_availability as forget_cotracker_availability, installed_dir as cotracker_dir, installed_python as cotracker_python,
@@ -267,10 +268,11 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                     stretch: Vec::new(),
                     stretch_bytes: Some(0),
                     near: None,
+                    paint: None,
                 };
                 let result = match worker.spec.method {
                     Method::Template => worker.run(),
-                    Method::CoTracker => worker.run_learned(),
+                    Method::CoTracker | Method::Paint => worker.run_learned(),
                     // (A manual dot is never planned: nothing to track.)
                     Method::Manual => Ok(()),
                 };
@@ -310,6 +312,8 @@ struct Worker {
     /// With no guide: where the next patch is centred (view px), where the
     /// tracker was going.
     near: Option<[f64; 2]>,
+    /// A paint tracker's points and motion (`paint`).
+    paint: Option<paint::PaintFit>,
 }
 
 impl Worker {

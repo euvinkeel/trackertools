@@ -60,6 +60,7 @@ pub fn kind_name(method: Method) -> &'static str {
         Method::Template => "template tracker",
         Method::CoTracker => "CoTracker",
         Method::Manual => "manual dot",
+        Method::Paint => "paint tracker",
     }
 }
 
@@ -176,6 +177,12 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
                         painter.text(p + Vec2::new(10.0, 6.0), Align2::LEFT_TOP, name, FontId::proportional(10.0), pin);
                     }
                     (Method::CoTracker, false) => icons::diamond(painter, p, 3.5, Stroke::new(1.0, pin), Some(pin.gamma_multiply(0.5))),
+                    (Method::Paint, true) => {
+                        let b = space(frame).box_from_source(look.rect());
+                        let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
+                        paint_cells(painter, r, look, pin.gamma_multiply(if chosen { 0.5 } else { 0.32 }));
+                        painter.text(r.left_bottom() + Vec2::new(0.0, 2.0), Align2::LEFT_TOP, name, FontId::proportional(10.0), pin);
+                    }
                     (_, true) => {
                         let b = space(frame).box_from_source(look.rect());
                         let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
@@ -325,10 +332,54 @@ pub fn draw_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, wo
     }
 }
 
+/// A paint's painted cells, filled, over its rectangle `r` on screen.
+fn paint_cells(painter: &Painter, r: Rect, look: &Look, colour: Color32) {
+    use tt_track::look::MASK_N;
+    let Some(mask) = look.painted() else {
+        painter.rect_filled(r, 0.0, colour);
+        return;
+    };
+    let cell = Vec2::new(r.width() / MASK_N as f32, r.height() / MASK_N as f32);
+    for (i, m) in mask.iter().enumerate() {
+        if *m >= 96 {
+            let at = r.min + Vec2::new((i % MASK_N) as f32 * cell.x, (i / MASK_N) as f32 * cell.y);
+            painter.rect_filled(Rect::from_min_size(at, cell + Vec2::splat(0.5)), 0.0, colour);
+        }
+    }
+}
+
 fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: &mut World, map: &ViewportMapping) {
     let tool = world.resource::<TrackTool>().clone();
     let shift = ui.input(|i| i.modifiers.shift);
     let point = tt_track::tool::method_for(world, shift) == Method::CoTracker;
+    // A paint tracker: the brush, and the stroke so far.
+    if tt_track::tool::method_for(world, tool.drag.map_or(shift, |d| d.2)) == Method::Paint {
+        let brush = TRACK.gamma_multiply(0.35);
+        if tool.drag.is_some() && !tool.stroke.is_empty() {
+            let pts: Vec<Pos2> = tool.stroke.iter().map(|p| map.to_screen(*p)).collect();
+            for p in &pts {
+                painter.circle_filled(*p, tool.brush, brush);
+            }
+            if pts.len() > 1 {
+                painter.add(Shape::line(pts, Stroke::new(2.0 * tool.brush, brush)));
+            }
+        }
+        if let Some(pos) = response.hover_pos() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            painter.circle_stroke(pos, tool.brush, Stroke::new(1.5, TRACK));
+        }
+        let world_ref: &World = world;
+        let selected = world_ref.resource::<Selection>().primary().filter(|e| is_tracker(world_ref, *e)).filter(|e| world_ref.get::<Tracker>(*e).is_some_and(|t| t.method == Method::Paint));
+        let text = match selected.filter(|_| !shift) {
+            Some(e) => {
+                let name = world_ref.get::<Name>(e).map_or("the tracker".to_string(), |n| n.to_string());
+                format!("PAINT \u{b7} brush over {name}'s subject on this frame: a reset paint (points not on it are left out from here) \u{b7} Ctrl+wheel: brush size \u{b7} Shift: a new tracker \u{b7} T/Esc exits")
+            }
+            None => "NEW PAINT TRACKER \u{b7} hold and brush over what to follow \u{b7} Ctrl+wheel: brush size \u{b7} T/Esc exits".to_string(),
+        };
+        hint(painter, map, text, TRACK, tool.refused.as_ref());
+        return;
+    }
     let dashed_rect = |r: Rect, c: Color32| {
         let s = Stroke::new(1.0, c);
         for (a, b) in [(r.left_top(), r.right_top()), (r.right_top(), r.right_bottom()), (r.right_bottom(), r.left_bottom()), (r.left_bottom(), r.left_top())] {
@@ -449,6 +500,10 @@ fn legend(ui: &mut egui::Ui, method: Method) {
             mark(ui, &|p, o| icons::crosshair(p, o, 4.0, Stroke::new(1.5, style::LOST)), "lost");
             if method == Method::CoTracker {
                 mark(ui, &|p, o| icons::diamond(p, o, 4.5, Stroke::new(1.5, style::PIN), None), "reset point");
+            } else if method == Method::Paint {
+                mark(ui, &|p, o| {
+                    p.rect_filled(Rect::from_center_size(o, Vec2::splat(8.0)), 2.0, style::PIN.gamma_multiply(0.5));
+                }, "paint");
             } else {
                 mark(ui, &|p, o| {
                     p.rect_stroke(Rect::from_center_size(o, Vec2::splat(8.0)), 0.0, Stroke::new(1.5, style::PIN), StrokeKind::Middle);
@@ -493,6 +548,7 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         for (method, text, tip) in [
             (Method::Template, "Template tracker", "Drag a rectangle around what to follow in this sketch (or click a point): a tracker matching that pattern on every frame (fast, sub-pixel). It searches inside this sketch's box, in its view."),
             (Method::CoTracker, "CoTracker", "Click the pixel to follow in this sketch: Meta's CoTracker3, a learned point tracker, run in Python. It searches inside this sketch's box, in its view."),
+            (Method::Paint, "Paint tracker", "Brush over what to follow in this sketch: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them. It searches inside this sketch's box, in its view."),
         ] {
             let usable = method == Method::Template || cotracker.is_ok();
             let r = ui.button(text).on_hover_text(if usable { tip } else { "CoTracker is not set up on this computer. Click CoTracker. The doctor shows what CoTracker needs and sets it up." });
@@ -526,6 +582,8 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             let r#where = guide.map_or("searching the whole frame".to_string(), |g| format!("searching inside {g}"));
             let fix = if method == Method::CoTracker {
                 "where it loses the pixel: Track tool, click where it really is (a reset point)"
+            } else if method == Method::Paint {
+                "where it slips: Track tool, brush over the subject on that frame (a reset paint: points not on it are left out from there)"
             } else {
                 "where it misses: Track tool, drag around the subject (a new look, pinned there)"
             };
@@ -609,12 +667,18 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     let looks = looks_of(world, e);
     let mut remove = None;
     ui.horizontal_wrapped(|ui| {
-        ui.label(if method == Method::CoTracker { "Reset points:" } else { "Looks:" });
+        ui.label(match method {
+            Method::CoTracker => "Reset points:",
+            Method::Paint => "Paints:",
+            _ => "Looks:",
+        });
         for l in &looks {
             let Some(look) = world.get::<Look>(*l) else { continue };
             let f = look.frame;
             let label = if method == Method::CoTracker {
                 format!("frame {} \u{b7} {:.0}, {:.0}", look.frame, look.x, look.y)
+            } else if method == Method::Paint {
+                format!("frame {} \u{b7} {:.0}\u{d7}{:.0}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h)
             } else {
                 let painted = if look.painted().is_some() { " \u{b7} masked" } else { " \u{b7} unpainted" };
                 format!("frame {} \u{b7} {:.0}\u{d7}{:.0}{painted}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h)

@@ -16,6 +16,11 @@
 //!   point* on this frame: the pixel it follows from here on, moved if it
 //!   already has one here).
 //!
+//! - **Paint** trackers: hold and brush over the subject (the brush is the
+//!   click's size: Ctrl+wheel). Let go: the area brushed is a paint (a look
+//!   with that mask): a new paint tracker, or with one selected another
+//!   paint on this frame, its reset paint ([`crate::job::paint`]).
+//!
 //! New template looks get their mask painted automatically ([`crate::look::LookDefaults`]).
 //!
 //! The guide (search region and motion prior) is the selected sketch (or
@@ -46,12 +51,52 @@ pub struct TrackTool {
     /// *Re-seed here* found no look on its frame: the next drag makes the
     /// look this tracker starts again from.
     pub reseed: Option<Entity>,
+    /// A paint stroke in progress: the pointer's path (shown space's pixels).
+    pub stroke: Vec<[f64; 2]>,
 }
 
 impl Default for TrackTool {
     fn default() -> Self {
-        Self { brush: 14.0, drag: None, refused: None, reseed: None }
+        Self { brush: 14.0, drag: None, refused: None, reseed: None, stroke: Vec::new() }
     }
+}
+
+/// The paint a brush stroke makes: the stroke `path` with radius `r` (both in
+/// one space's pixels), as `(centre, half-size, mask)` of a look there.
+pub fn paint_look(path: &[[f64; 2]], r: f64) -> ([f64; 2], [f64; 2], Vec<u8>) {
+    use crate::look::MASK_N;
+    let r = r.max(0.5);
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for p in path {
+        for k in 0..2 {
+            lo[k] = lo[k].min(p[k] - r);
+            hi[k] = hi[k].max(p[k] + r);
+        }
+    }
+    let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+    let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0];
+    // Distance from a point to the stroke (a dot: its first point).
+    let near = |q: [f64; 2]| -> f64 {
+        let mut best = (q[0] - path[0][0]).hypot(q[1] - path[0][1]);
+        for w in path.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let len2 = d[0] * d[0] + d[1] * d[1];
+            let t = if len2 > 0.0 { (((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            best = best.min((q[0] - a[0] - t * d[0]).hypot(q[1] - a[1] - t * d[1]));
+        }
+        best
+    };
+    let mut mask = vec![0u8; MASK_N * MASK_N];
+    for y in 0..MASK_N {
+        for x in 0..MASK_N {
+            let q = [lo[0] + (x as f64 + 0.5) / MASK_N as f64 * 2.0 * half[0], lo[1] + (y as f64 + 0.5) / MASK_N as f64 * 2.0 * half[1]];
+            if near(q) <= r {
+                mask[y * MASK_N + x] = 255;
+            }
+        }
+    }
+    (centre, half, mask)
 }
 
 impl TrackTool {
@@ -95,9 +140,25 @@ pub fn track_tool(world: &mut World) {
     {
         tool.drag = Some((at, frame, shift));
         tool.refused = None;
+        tool.stroke = vec![at];
+    }
+    // A paint tracker's press brushes: the path, kept until it is let go.
+    let painting = tool.drag.is_some_and(|(_, _, shift)| method_for(world, shift) == Method::Paint);
+    if painting {
+        let since = p.pressed.unwrap_or(f64::NEG_INFINITY);
+        tool.stroke.extend(p.samples.iter().filter(|s| s[0] >= since).map(|s| [s[1], s[2]]));
     }
     let ended = p.released.is_some() || !p.down;
+    if ended && painting && let Some((start, f, shift)) = tool.drag.take() {
+        let path = if tool.stroke.is_empty() { vec![start] } else { std::mem::take(&mut tool.stroke) };
+        let (c, h, mask) = paint_look(&path, tool.brush as f64 / p.scale.max(1e-9));
+        let map = map_at(world, world.resource::<ActiveView>().0, f);
+        let mut look = Look::new(f, map.to_source(c), [h[0] * map.a, h[1] * map.a]);
+        look.mask = mask;
+        tool.refused = place(world, look, shift, tool.reseed.take()).err();
+    }
     if ended && let Some((start, f, shift)) = tool.drag.take() {
+        tool.stroke.clear();
         let end = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover).unwrap_or(start);
         // CoTracker follows a pixel: the point where the press is let go.
         let point = method_for(world, shift) == Method::CoTracker;
@@ -139,6 +200,10 @@ fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Re
             }
             Method::Template => {
                 add_look(world, t, auto_masked(world, look));
+            }
+            // Another paint (on a frame with one already: both count).
+            Method::Paint => {
+                add_look(world, t, look);
             }
         }
         return Ok(());

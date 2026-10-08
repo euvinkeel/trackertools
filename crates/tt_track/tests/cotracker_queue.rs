@@ -485,3 +485,44 @@ fn an_engine_that_cannot_start_says_why() {
     tt_track::job::keep_cotracker_warm(false);
     tt_track::job::close_cotracker_worker();
 }
+
+/// A paint tracker end to end. The fake answers each point where it was
+/// asked in the crop, and the crop follows the guide (the sprite), so the
+/// points move with the sprite: the tracker follows it from its first
+/// paint's centre; a reset paint where none of its points are starts it
+/// again from there, and it follows the sprite from that.
+#[test]
+fn a_paint_tracker_follows_its_paints() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    core.world.resource_mut::<NewTrackers>().method = Method::Paint;
+    let paint = |f: i64, at: [f64; 2]| {
+        let (c, h, mask) = tt_track::tool::paint_look(&[at, [at[0] + 12.0, at[1] + 4.0]], 9.0);
+        let mut look = Look::new(f, c, h);
+        look.mask = mask;
+        look
+    };
+    let first = truth(600);
+    let op = tt_track::add_tracker_with_look(&mut core.world, guide, paint(600, first)).expect("tracker");
+    set_span(&mut core.world, op, Span::new(570, 630));
+    // On frame 615 the subject is painted 40 px to the right: none of the points are there.
+    let moved = [truth(615)[0] + 40.0, truth(615)[1]];
+    tt_track::add_look(&mut core.world, op, paint(615, moved)).expect("a reset paint");
+    run(&mut core, &[op], |_| {});
+    let w = &core.world;
+    assert!(w.get::<OpError>(op).is_none(), "{:?}", w.get::<OpError>(op));
+    assert_eq!(coverage(w, op), Some(570..631), "both ways over its span");
+    let at = |f: i64| w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).and_then(|s| s.get(f).map(|v| [v[0] as f64, v[1] as f64])).expect("a result");
+    // A paint's centre, moved as the sprite moved since frame `from`.
+    let centre = |c: [f64; 2], from: i64, f: i64| [c[0] + 6.0 + truth(f)[0] - truth(from)[0], c[1] + 2.0 + truth(f)[1] - truth(from)[1]];
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 1.5;
+    for f in [570, 585, 600, 610, 614] {
+        let want = centre(first, 600, f);
+        assert!(near(at(f), want), "frame {f}: the first paint's centre, with the sprite: {:?} vs {want:?}", at(f));
+    }
+    for f in [615, 620, 630] {
+        let want = centre(moved, 615, f);
+        assert!(near(at(f), want), "frame {f}: the reset paint's centre, with the sprite: {:?} vs {want:?}", at(f));
+    }
+    quiet(&mut core);
+}
