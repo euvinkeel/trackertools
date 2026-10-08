@@ -739,7 +739,7 @@ impl Worker {
         let mut stream = Stream { start, dir, grids: Vec::with_capacity(n) };
 
         self.shared.set_phase(super::Phase::Loading);
-        let what = format!("{}, {:?}, {n} frames", s.label, s.side);
+        let what = format!("{}, {:?}, {:?}, {n} frames", s.label, s.method, s.side);
         let mut worker = Process::start(self.shared.clone(), &what)?;
         // (No time limit: loading takes long the first time. A cancel ends it.)
         loop {
