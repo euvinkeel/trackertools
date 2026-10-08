@@ -2,8 +2,10 @@
 //! FFmpeg (`ffmpeg` and `ffprobe`), which doesn't come with it. When they
 //! can't be found, a small setup window comes before the app: it installs
 //! FFmpeg in a folder the person chooses (gyan.dev's Windows "essentials"
-//! build, checked against its SHA-256, unpacked with Windows' own curl and
-//! tar), or takes the folder of one they have; then the app starts.
+//! build; on a Mac, Martin Riedl's Apple silicon builds, which ffmpeg.org
+//! lists, signed by their developer; each checked against its SHA-256 and
+//! unpacked with the system's own curl and tar), or takes the folder of one
+//! they have; then the app starts.
 //!
 //! The doctor (Settings) shows the same checks, and makes a report to send
 //! to whoever helps: the checks, this computer, and the end of this run's
@@ -21,7 +23,8 @@
 //!
 //! Dev: `TT_SETUP_AUTO=<seconds>` presses that button by itself once the
 //! checks are done, its countdown to the start that many seconds (scripted
-//! checks of the setup; `TT_FFMPEG_URL` points it at a local zip).
+//! checks of the setup; `TT_FFMPEG_URL` points it at local zips, separated
+//! by spaces).
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -37,10 +40,21 @@ use tt_core::{AppBuilder, Class, Module};
 use crate::style;
 use crate::update::{Problem, quiet, system_tool};
 
-/// FFmpeg for Windows: the latest release's "essentials" build from
-/// gyan.dev (where ffmpeg.org points Windows users), its SHA-256 at the
-/// same address + `.sha256`. `TT_FFMPEG_URL` replaces it (tests).
-pub const FFMPEG_ZIP: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+/// FFmpeg's downloads, each with its SHA-256 at the same address +
+/// `.sha256` (after redirects). Windows: the latest release's "essentials"
+/// build from gyan.dev (where ffmpeg.org points Windows users), one zip with
+/// both programs. A Mac with Apple silicon: the latest release from Martin
+/// Riedl (where ffmpeg.org points Mac users), a zip for each program.
+/// `TT_FFMPEG_URL` replaces them (tests).
+pub const FFMPEG_DOWNLOADS: &[&str] = if cfg!(target_os = "macos") {
+    &["https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip", "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip"]
+} else {
+    &["https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"]
+};
+/// Setup can install FFmpeg on this computer: Windows on x64, macOS on Apple silicon.
+pub const CAN_INSTALL_FFMPEG: bool = cfg!(any(all(windows, target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")));
+/// FFmpeg's download, for people.
+const FFMPEG_SIZE: &str = if cfg!(target_os = "macos") { "60 MB" } else { "120 MB" };
 
 const LOG: &str = "trackertools.log";
 const PREVIOUS_LOG: &str = "trackertools-previous.log";
@@ -294,8 +308,9 @@ pub fn run_checks(graphics: Option<&str>) -> Checked {
     } else {
         Check::new(Fail, format!("trackertools cannot save its files in {}. Make sure that the folder is not read-only.", data.display()))
     });
-    if cfg!(windows) {
-        let have = |n: &str| system_tool(n).is_file();
+    if cfg!(any(windows, target_os = "macos")) {
+        // (Windows' own in System32; macOS's in /usr/bin.)
+        let have = |n: &str| system_tool(n).is_file() || (cfg!(target_os = "macos") && Path::new("/usr/bin").join(n).is_file());
         checks.push(if have("curl") && have("tar") {
             Check::new(Pass, "Updates can download and install.")
         } else {
@@ -445,9 +460,17 @@ impl Install {
     }
 }
 
-/// Install FFmpeg from `url` into `dir` and see that it starts: its version.
-pub fn install(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<String, Problem> {
-    fetch_and_place(url, dir, step)?;
+/// FFmpeg's downloads for this computer, or `TT_FFMPEG_URL`'s.
+fn ffmpeg_downloads() -> Vec<String> {
+    match std::env::var("TT_FFMPEG_URL") {
+        Ok(urls) => urls.split_whitespace().map(str::to_string).collect(),
+        Err(_) => FFMPEG_DOWNLOADS.iter().map(|u| u.to_string()).collect(),
+    }
+}
+
+/// Install FFmpeg from `urls` into `dir` and see that it starts: its version.
+pub fn install(urls: &[String], dir: &Path, step: &dyn Fn(Install)) -> Result<String, Problem> {
+    fetch_and_place(urls, dir, step)?;
     step(Install::Test);
     let out = quiet(dir.join(exe("ffmpeg"))).args(["-hide_banner", "-version"]).output().map_err(|e| Problem::new(DOES_NOT_START, e))?;
     let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or_default().to_string();
@@ -457,10 +480,10 @@ pub fn install(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<String, 
     Ok(version_of(&first))
 }
 
-/// Download the zip at `url`, check it against the SHA-256 at `url` +
-/// `.sha256`, unpack it in a temporary folder, and put its ffmpeg and
-/// ffprobe (and FFmpeg's license) in `dir`.
-fn fetch_and_place(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<(), Problem> {
+/// Download the zip at each of `urls`, check it against the SHA-256 at its
+/// address + `.sha256`, unpack them in a temporary folder, and put their
+/// ffmpeg and ffprobe (and FFmpeg's license) in `dir`.
+fn fetch_and_place(urls: &[String], dir: &Path, step: &dyn Fn(Install)) -> Result<(), Problem> {
     if !writable(dir) {
         return Err(Problem::new(CANNOT_WRITE, dir.display()));
     }
@@ -468,27 +491,31 @@ fn fetch_and_place(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<(), 
     let work = std::env::temp_dir().join(format!("trackertools-ffmpeg-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&work).map_err(|e| Problem::new("trackertools cannot write to the temporary folder.", e))?;
     let done = (|| {
-        let zip = work.join("ffmpeg.zip");
-        // Where the address leads now (the latest release's file): the zip and its checksum both come from there.
-        let (total, url) = head(url);
-        step(Install::Download { got: 0, total });
-        download(&url, &zip, &|got| step(Install::Download { got, total }))?;
-        step(Install::Verify);
-        let expected = fetch_text(&format!("{url}.sha256")).map_err(|e| Problem::new(CANNOT_CHECK, e))?;
-        let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
-        let got = sha256(&zip).map_err(|e| Problem::new(CANNOT_CHECK, e))?;
-        if expected.len() != 64 || got != expected {
-            return Err(Problem::new("The download is not correct. Click Install FFmpeg again.", format!("SHA-256 {got}, expected {expected}")));
-        }
-        step(Install::Extract);
         let files = work.join("files");
         std::fs::create_dir_all(&files).map_err(|e| Problem::new("trackertools cannot write to the temporary folder.", e))?;
-        let out = quiet(system_tool("tar")).arg("-xf").arg(&zip).arg("-C").arg(&files).output().map_err(|e| Problem::new("trackertools cannot extract the files. Click Install FFmpeg again.", e))?;
-        if !out.status.success() {
-            return Err(Problem::new("trackertools cannot extract the files. Click Install FFmpeg again.", String::from_utf8_lossy(&out.stderr)));
+        for (i, url) in urls.iter().enumerate() {
+            let zip = work.join(format!("ffmpeg-{i}.zip"));
+            // Where the address leads now (the latest release's file): the zip and its checksum both come from there.
+            let (total, url) = head(url);
+            step(Install::Download { got: 0, total });
+            download(&url, &zip, &|got| step(Install::Download { got, total }))?;
+            step(Install::Verify);
+            let expected = fetch_text(&format!("{url}.sha256")).map_err(|e| Problem::new(CANNOT_CHECK, e))?;
+            let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+            let got = sha256(&zip).map_err(|e| Problem::new(CANNOT_CHECK, e))?;
+            if expected.len() != 64 || got != expected {
+                return Err(Problem::new("The download is not correct. Click Install FFmpeg again.", format!("SHA-256 {got}, expected {expected}")));
+            }
+            step(Install::Extract);
+            let into = files.join(i.to_string());
+            std::fs::create_dir_all(&into).map_err(|e| Problem::new("trackertools cannot write to the temporary folder.", e))?;
+            let out = quiet(system_tool("tar")).arg("-xf").arg(&zip).arg("-C").arg(&into).output().map_err(|e| Problem::new("trackertools cannot extract the files. Click Install FFmpeg again.", e))?;
+            if !out.status.success() {
+                return Err(Problem::new("trackertools cannot extract the files. Click Install FFmpeg again.", String::from_utf8_lossy(&out.stderr)));
+            }
         }
         let (Some(ffmpeg), Some(ffprobe)) = (find(&files, &exe("ffmpeg")), find(&files, &exe("ffprobe"))) else {
-            return Err(Problem::new("The download does not contain FFmpeg. Click Install FFmpeg again.", &url));
+            return Err(Problem::new("The download does not contain FFmpeg. Click Install FFmpeg again.", urls.join(" ")));
         };
         for (from, name) in [(ffmpeg, exe("ffmpeg")), (ffprobe, exe("ffprobe"))] {
             replace(&from, &dir.join(name)).map_err(|e| Problem::new(CANNOT_WRITE, e))?;
@@ -503,10 +530,30 @@ fn fetch_and_place(url: &str, dir: &Path, step: &dyn Fn(Install)) -> Result<(), 
 }
 
 /// The size of what `url` leads to (0: it doesn't say), and where it leads
-/// after redirects (`url` itself if that can't be found out).
+/// after redirects (`url` itself if that can't be found out). A server that
+/// refuses HEAD (Martin Riedl's redirects answer 404) is asked for the
+/// first byte instead: its `Content-Range` has the size.
 fn head(url: &str) -> (u64, String) {
-    let Ok(out) = quiet(system_tool("curl")).args(["-sIL", "--max-time", "20", "-w", "\n%{url_effective}"]).args(https_only(url)).arg(url).output() else { return (0, url.to_string()) };
+    let Ok(out) = quiet(system_tool("curl")).args(["-sIL", "--max-time", "20", "-w", "\n%{http_code}\n%{url_effective}"]).args(https_only(url)).arg(url).output() else { return (0, url.to_string()) };
     let text = String::from_utf8_lossy(&out.stdout);
+    // (An http error only: a file:// address says 000.)
+    let refused = text.lines().rev().nth(1).and_then(|c| c.trim().parse::<u32>().ok()).is_some_and(|c| c >= 400);
+    if refused
+        && let Ok(out) = quiet(system_tool("curl"))
+            .args(["-sSL", "--max-time", "20", "-r", "0-0", "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }, "-D", "-", "-w", "\n%{url_effective}"])
+            .args(https_only(url))
+            .arg(url)
+            .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let size = text
+            .lines()
+            .filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-range")).and_then(|(_, v)| v.rsplit('/').next()?.trim().parse().ok()))
+            .next_back()
+            .unwrap_or(0);
+        let last = text.lines().map(str::trim).rfind(|l| !l.is_empty()).filter(|l| l.contains("://")).unwrap_or(url);
+        return (size, last.to_string());
+    }
     let size = text
         .lines()
         .filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse().ok()))
@@ -708,9 +755,9 @@ impl Doctor {
         let (state, dir) = (self.install.clone(), self.install_dir.clone());
         *state.lock().expect("install") = Install::Download { got: 0, total: 0 };
         std::thread::spawn(move || {
-            let url = std::env::var("TT_FFMPEG_URL").unwrap_or_else(|_| FFMPEG_ZIP.to_string());
+            let urls = ffmpeg_downloads();
             let step = |s: Install| *state.lock().expect("install") = s;
-            let done = install(&url, &dir, &step).and_then(|v| remember(&dir).map(|()| v).map_err(|e| Problem::new(CANNOT_WRITE, e)));
+            let done = install(&urls, &dir, &step).and_then(|v| remember(&dir).map(|()| v).map_err(|e| Problem::new(CANNOT_WRITE, e)));
             match &done {
                 Ok(v) => tracing::info!("FFmpeg {v} installed in {}", dir.display()),
                 Err(p) => tracing::warn!("FFmpeg setup: {} ({})", p.what, p.details),
@@ -788,7 +835,7 @@ fn everything(ui: &mut egui::Ui, doctor: &mut Doctor) -> bool {
     let checked = doctor.checked();
     let install = doctor.install_state();
     let ready = checked.as_ref().is_some_and(|c| c.ready);
-    let can_install = cfg!(all(windows, target_arch = "x86_64"));
+    let can_install = CAN_INSTALL_FFMPEG;
     // A check that fails besides FFmpeg (a read-only data folder): it doesn't start.
     let failing = checked.as_ref().filter(|c| c.ready).is_some_and(|c| c.checks.iter().any(|k| k.level == Level::Fail));
     let warnings = checked.as_ref().map_or(0, |c| c.checks.iter().filter(|k| k.level == Level::Warn).count());
@@ -1108,8 +1155,8 @@ fn body(ui: &mut egui::Ui, doctor: &mut Doctor, first_run: bool) -> bool {
         }
         ui.add(egui::Label::new(egui::RichText::new(doctor.install_dir.display().to_string()).monospace()).wrap());
     });
-    if cfg!(all(windows, target_arch = "x86_64")) {
-        step(ui, if first_run { "2. Click Install FFmpeg. The download is approximately 120 MB." } else { "Install FFmpeg in this folder. The download is approximately 120 MB." });
+    if CAN_INSTALL_FFMPEG {
+        step(ui, &if first_run { format!("2. Click Install FFmpeg. The download is approximately {FFMPEG_SIZE}.") } else { format!("Install FFmpeg in this folder. The download is approximately {FFMPEG_SIZE}.") });
         ui.horizontal(|ui| {
             let label = if ready && !first_run { "Install FFmpeg again" } else { "Install FFmpeg" };
             if ui.add_enabled(!install.busy(), egui::Button::new(egui::RichText::new(label).strong())).clicked() {
@@ -1282,7 +1329,7 @@ mod tests {
         let url = fake_build(&d, true);
         let dest = d.join("chosen folder");
         let steps = Mutex::new(Vec::new());
-        fetch_and_place(&url, &dest, &|s| steps.lock().unwrap().push(s)).expect("installs");
+        fetch_and_place(std::slice::from_ref(&url), &dest, &|s| steps.lock().unwrap().push(s)).expect("installs");
         assert_eq!(std::fs::read(dest.join(exe("ffmpeg"))).unwrap(), b"ffmpeg");
         assert_eq!(std::fs::read(dest.join(exe("ffprobe"))).unwrap(), b"ffprobe");
         assert!(dest.join("FFMPEG-LICENSE.txt").is_file());
@@ -1295,7 +1342,7 @@ mod tests {
         assert_eq!(ffmpeg_folder(&unpacked), Some(unpacked.join("bin")), "an unpacked build: its bin");
         assert_eq!(ffmpeg_folder(&d), None);
         // Installed again over itself (a program in use is renamed away instead).
-        fetch_and_place(&url, &dest, &|_| {}).expect("again");
+        fetch_and_place(std::slice::from_ref(&url), &dest, &|_| {}).expect("again");
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -1304,15 +1351,64 @@ mod tests {
         let d = scratch("bad");
         let url = fake_build(&d, true);
         std::fs::write(d.join("ffmpeg-test.zip.sha256"), format!("{}\n", "0".repeat(64))).unwrap();
-        let err = fetch_and_place(&url, &d.join("dest"), &|_| {}).expect_err("refused");
+        let err = fetch_and_place(std::slice::from_ref(&url), &d.join("dest"), &|_| {}).expect_err("refused");
         assert_eq!(err.what, "The download is not correct. Click Install FFmpeg again.");
         assert!(!d.join("dest").join(exe("ffmpeg")).exists());
         // And one without FFmpeg in it.
         let e = scratch("empty");
         let url = fake_build(&e, false);
-        assert_eq!(fetch_and_place(&url, &e.join("dest"), &|_| {}).expect_err("refused").what, "The download does not contain FFmpeg. Click Install FFmpeg again.");
+        assert_eq!(fetch_and_place(std::slice::from_ref(&url), &e.join("dest"), &|_| {}).expect_err("refused").what, "The download does not contain FFmpeg. Click Install FFmpeg again.");
         let _ = std::fs::remove_dir_all(d);
         let _ = std::fs::remove_dir_all(e);
+    }
+
+    /// A zip with one program at its top and its `.sha256`, as Martin Riedl's Mac builds are.
+    fn one_program_zip(dir: &Path, name: &str) -> String {
+        let src = dir.join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(exe(name)), name.as_bytes()).unwrap();
+        let zip = dir.join(format!("{name}.zip"));
+        let made = quiet(system_tool("tar")).arg("-a").arg("-cf").arg(&zip).arg("-C").arg(&src).arg(".").status().unwrap();
+        assert!(made.success());
+        std::fs::write(dir.join(format!("{name}.zip.sha256")), format!("{}  {name}.zip\n", sha256(&zip).unwrap())).unwrap();
+        format!("file:///{}", zip.display().to_string().replace('\\', "/"))
+    }
+
+    #[test]
+    fn ffmpeg_and_ffprobe_from_a_zip_each() {
+        let d = scratch("two");
+        let urls = [one_program_zip(&d, "ffmpeg"), one_program_zip(&d, "ffprobe")];
+        let dest = d.join("dest");
+        fetch_and_place(&urls, &dest, &|_| {}).expect("installs");
+        assert_eq!(std::fs::read(dest.join(exe("ffmpeg"))).unwrap(), b"ffmpeg");
+        assert_eq!(std::fs::read(dest.join(exe("ffprobe"))).unwrap(), b"ffprobe");
+        // Only one of them: refused.
+        let e = d.join("dest2");
+        assert_eq!(fetch_and_place(&urls[..1], &e, &|_| {}).expect_err("refused").what, "The download does not contain FFmpeg. Click Install FFmpeg again.");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The real download for this computer, into `TT_FFMPEG_SETUP_TEST` (a
+    /// scratch folder): FFmpeg starts and says its version. About 60 MB (a
+    /// Mac) or 120 MB (Windows), so only when asked:
+    /// `cargo test -p tt_app real_ffmpeg -- --ignored`
+    #[test]
+    #[ignore]
+    fn real_ffmpeg_download_installs_and_starts() {
+        let dir = PathBuf::from(std::env::var("TT_FFMPEG_SETUP_TEST").expect("TT_FFMPEG_SETUP_TEST: a scratch folder"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let steps = Mutex::new(Vec::new());
+        let urls: Vec<String> = FFMPEG_DOWNLOADS.iter().map(|u| u.to_string()).collect();
+        let version = install(&urls, &dir, &|s| steps.lock().unwrap().push(s)).unwrap_or_else(|p| panic!("{}\n{}", p.what, p.details));
+        eprintln!("FFmpeg {version} in {}", dir.display());
+        let steps = steps.into_inner().unwrap();
+        assert!(steps.iter().any(|s| matches!(s, Install::Download { total, .. } if *total > 0)), "the size is known: {steps:?}");
+        assert!(dir.join(exe("ffprobe")).is_file());
+    }
+
+    #[test]
+    fn martin_riedls_version_line() {
+        assert_eq!(version_of("ffmpeg version 9.0.2-https://www.martin-riedl.de Copyright (c) 2000-2026 the FFmpeg developers"), "9.0.2");
     }
 
     #[test]

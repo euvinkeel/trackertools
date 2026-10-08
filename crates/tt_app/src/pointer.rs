@@ -2,6 +2,13 @@
 //! raw input on a dedicated thread, stamped with QueryPerformanceCounter and
 //! the absolute cursor position at that moment (~1 kHz while moving).
 //!
+//! On macOS: an AppKit local event monitor (the app's own events, so no
+//! permission is asked) with mouse-event coalescing off, so every report the
+//! mouse or trackpad makes arrives, each with the event's own time (seconds
+//! since the system started: the clock `Instant` uses there, so one offset
+//! maps them too) and its position in the window. Elsewhere: egui's latest
+//! position once a frame.
+//!
 //! - Times are converted to the app's wall clock (`WallClock`, seconds since
 //!   the shell's epoch): Rust's `Instant` is QPC-based on Windows, so one
 //!   offset measured at startup maps them exactly.
@@ -25,10 +32,12 @@ use crate::panels::viewport::ViewportMapping;
 pub struct PointerSample {
     /// Wall-clock seconds (same epoch as `WallClock::now`).
     pub t: f64,
-    /// Absolute cursor position, physical screen pixels.
+    /// Cursor position: physical screen pixels on Windows; window points
+    /// from the client area's top-left on macOS ([`window_pos`] maps both).
     pub x: f64,
     pub y: f64,
-    /// Raw device motion (counts; unaccelerated). 0, 0 for button-only reports.
+    /// Raw device motion (counts; unaccelerated; on macOS the event's delta,
+    /// in points). 0, 0 for button-only reports.
     pub dx: i32,
     pub dy: i32,
     /// Button transitions in this report (`RI_MOUSE_*` flags; physical buttons).
@@ -57,7 +66,9 @@ impl PointerService {
             let sink = samples.clone();
             std::thread::Builder::new().name("pointer".into()).spawn(move || win::run(sink, epoch)).is_ok()
         };
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let running = mac::run(samples.clone(), epoch);
+        #[cfg(not(any(windows, target_os = "macos")))]
         let running = {
             let _ = epoch;
             false
@@ -110,8 +121,8 @@ pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now:
         Some(inner) => {
             for s in service.since(*read) {
                 *read = s.t;
-                // Screen pixels → window points (the client origin is `inner.min`) → source pixels.
-                samples.push(map.to_canvas_at(s.t, egui::pos2(s.x as f32 / ppp - inner.min.x, s.y as f32 / ppp - inner.min.y)));
+                // Window points → source pixels.
+                samples.push(map.to_canvas_at(s.t, window_pos(&s, ppp, inner)));
             }
         }
         None => {
@@ -135,6 +146,16 @@ pub fn frame(ctx: &egui::Context, service: &PointerService, read: &mut f64, now:
         wheel: if over { wheel } else { 0.0 },
         scale: map.points_per_canvas(),
         ..PointerFrame::default()
+    }
+}
+
+/// A sample's position in window points (egui's). Windows' are physical
+/// screen pixels (the client origin is `inner.min`); macOS's are window points already.
+pub fn window_pos(s: &PointerSample, ppp: f32, inner: egui::Rect) -> egui::Pos2 {
+    if cfg!(target_os = "macos") {
+        egui::pos2(s.x as f32, s.y as f32)
+    } else {
+        egui::pos2(s.x as f32 / ppp - inner.min.x, s.y as f32 / ppp - inner.min.y)
     }
 }
 
@@ -244,5 +265,77 @@ mod win {
                 DispatchMessageW(&msg);
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::collections::VecDeque;
+    use std::ptr::NonNull;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use block2::RcBlock;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSEventMask, NSEventType};
+    use objc2_foundation::NSProcessInfo;
+
+    use super::{KEEP, LEFT_DOWN, LEFT_UP, PointerSample};
+
+    /// Watch the app's mouse events with coalescing off. True if it runs
+    /// (it must start on the main thread, as the shell does).
+    pub fn run(sink: Arc<Mutex<VecDeque<PointerSample>>>, epoch: Instant) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            tracing::warn!("pointer service: not started on the main thread");
+            return false;
+        };
+        // Event times → wall-clock seconds: measure both "now"s together.
+        let offset = NSProcessInfo::processInfo().systemUptime() - epoch.elapsed().as_secs_f64();
+        NSEvent::setMouseCoalescingEnabled(false);
+        let mask = NSEventMask::MouseMoved
+            | NSEventMask::LeftMouseDragged
+            | NSEventMask::RightMouseDragged
+            | NSEventMask::OtherMouseDragged
+            | NSEventMask::LeftMouseDown
+            | NSEventMask::LeftMouseUp;
+        let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            // SAFETY: AppKit hands the monitor a valid event for the call.
+            if let Some(sample) = sample(unsafe { event.as_ref() }, mtm, offset) {
+                let mut q = sink.lock().unwrap();
+                q.push_back(sample);
+                if q.len() > KEEP {
+                    q.pop_front();
+                }
+            }
+            // Passed on unchanged: winit (and egui) get every event as before.
+            event.as_ptr()
+        });
+        // SAFETY: the handler returns the event it was given; the monitor lives as long as the app.
+        match unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) } {
+            Some(monitor) => {
+                std::mem::forget(monitor);
+                tracing::info!("pointer service: AppKit mouse events, coalescing off");
+                true
+            }
+            None => {
+                tracing::warn!("pointer service: AppKit did not add the event monitor");
+                false
+            }
+        }
+    }
+
+    /// The event as a sample: its time, and where it is in its window's
+    /// content (points from the top-left, as egui has them).
+    fn sample(e: &NSEvent, mtm: MainThreadMarker, offset: f64) -> Option<PointerSample> {
+        let view = e.window(mtm)?.contentView()?;
+        let p = view.convertPoint_fromView(e.locationInWindow(), None);
+        let y = if view.isFlipped() { p.y } else { view.bounds().size.height - p.y };
+        let buttons = match e.r#type() {
+            NSEventType::LeftMouseDown => LEFT_DOWN,
+            NSEventType::LeftMouseUp => LEFT_UP,
+            _ => 0,
+        };
+        let (dx, dy) = if buttons == 0 { (e.deltaX().round() as i32, e.deltaY().round() as i32) } else { (0, 0) };
+        Some(PointerSample { t: e.timestamp() - offset, x: p.x, y, dx, dy, buttons })
     }
 }

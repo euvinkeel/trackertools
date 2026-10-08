@@ -290,7 +290,7 @@ impl eframe::App for Shell {
             let ppp = ctx.pixels_per_point();
             let mapping = ctx.input(|i| i.viewport().inner_rect.zip(i.pointer.latest_pos())).and_then(|(inner, egui_pos)| {
                 let s = *self.pointer.recent(0.0).last()?;
-                Some(egui::pos2(s.x as f32 / ppp - inner.min.x, s.y as f32 / ppp - inner.min.y) - egui_pos)
+                Some(crate::pointer::window_pos(&s, ppp, inner) - egui_pos)
             });
             probe.frame(now, moves as u32, &self.pointer, mapping);
             ctx.request_repaint();

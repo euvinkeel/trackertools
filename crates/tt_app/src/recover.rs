@@ -118,7 +118,16 @@ fn wait_for_exit(pid: u32, timeout: Duration) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn wait_for_exit(pid: u32, timeout: Duration) {
+    let end = Instant::now() + timeout;
+    // SAFETY: signal 0 sends nothing; it only asks whether the process is still there.
+    while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 fn wait_for_exit(_pid: u32, timeout: Duration) {
     std::thread::sleep(timeout.min(Duration::from_secs(1)));
 }
@@ -383,6 +392,24 @@ pub fn notice(ctx: &egui::Context, world: &mut World) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// It waits until the process is gone, and no longer.
+    #[cfg(unix)]
+    #[test]
+    fn it_waits_for_the_old_process_to_exit() {
+        let mut child = Command::new("sleep").arg("0.3").spawn().expect("sleep");
+        let pid = child.id();
+        // (Reaped as it exits, as the old app is: else it stays a zombie that kill still finds.)
+        let reaper = std::thread::spawn(move || child.wait());
+        let t = Instant::now();
+        wait_for_exit(pid, Duration::from_secs(5));
+        let waited = t.elapsed();
+        assert!(waited >= Duration::from_millis(250) && waited < Duration::from_secs(2), "{waited:?}");
+        reaper.join().unwrap().unwrap();
+        let t = Instant::now();
+        wait_for_exit(pid, Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_millis(100), "gone: no wait");
+    }
 
     #[test]
     fn the_reason_goes_through_the_variable_and_back() {
