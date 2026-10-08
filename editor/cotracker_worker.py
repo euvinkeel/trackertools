@@ -46,6 +46,25 @@ ready, the input is read ahead on a thread ([`Inbox`]): the jobs keep
 sending while a round runs. A batch that fails is run again stream by
 stream, so one stream's failure stays its own.
 
+**TAPNext++** (the "precision" method, editor/tapnext/): a stream whose
+header has `"method": "tapnext"` runs through TAPNext++ instead (absent or
+`"cotracker"`: CoTracker3, as above). Same messages, with these differences:
+- the model loads the first time such a stream opens (seconds), on the
+  worker's device; if it can't, that stream fails with the reason and the
+  others go on (the next TAPNext stream tries again);
+- each frame's points are sent as soon as that frame is in (online: no
+  window, nothing waits for later frames);
+- `p` is the model's visibility (sigmoid of its logit; it has no
+  confidence); its crop (the model's size, as every stream's) is squashed to the model's
+  square input, tapnext/tracker.py);
+- optional `"support": n` (default 64; 0: none): n helper points on a grid
+  around each query (±16 × ±12 crop px), tracked with it and not sent (at
+  most 256 in all): one point alone can lose its target from a cold start.
+Its weights: `--tapnext-weights PATH`, default the `TT_TAPNEXT_WEIGHTS`
+environment variable (DeepMind's `tapnextpp_ckpt.pt` / `tapnextpp_512.ckpt`,
+or one trimmed by tapnext/trim_checkpoint.py). Apache-2.0, not in this
+repository. `TT_TAPNEXT_DEVICE` runs it on another device than CoTracker.
+
 Arguments: `--weights PATH` (CoTracker3 `scaled_online.pth`; default: the
 `TT_COTRACKER_WEIGHTS` environment variable, else torch hub's cache, where v1
 downloaded it) and `--device cpu|cuda|mps` (default: CUDA when available,
@@ -398,9 +417,42 @@ class Stream:
         self.first = False
 
 
-def run(eng: Engine, stdin, header: dict):
+class Tapnext:
+    """TAPNext++, loaded the first time a stream asks for it (most runs
+    never do): its weights' path, and the model once loaded. A failed load
+    isn't kept: the next stream tries again (the weights may be there now)."""
+
+    def __init__(self, weights: Optional[str], device: str):
+        self.weights, self.device, self.model = weights, device, None
+
+    def get(self):
+        if self.model is None:
+            if not self.weights:
+                raise FileNotFoundError("TAPNext++ weights not set (--tapnext-weights or TT_TAPNEXT_WEIGHTS)")
+            if not os.path.exists(self.weights):
+                raise FileNotFoundError(f"TAPNext++ weights not found at {self.weights}")
+            from tapnext.tracker import Model
+
+            self.model = Model(self.weights, self.device)
+            print(f"TAPNext++ loaded on {self.device} ({self.model.resolution} px input)", file=sys.stderr)
+        return self.model
+
+
+def open_stream(eng: Engine, tapnext: Tapnext, header: dict, send):
+    """A stream through the model its header asks for (`method`)."""
+    method = header.get("method", "cotracker")
+    if method == "cotracker":
+        return Stream(eng, header, send)
+    if method == "tapnext":
+        from tapnext.tracker import Stream as TapnextStream
+
+        return TapnextStream(tapnext.get(), header, send)
+    raise ValueError(f"unknown method {method!r}")
+
+
+def run(eng: Engine, tapnext: Tapnext, stdin, header: dict):
     """One stream, the whole worker's (the plain protocol)."""
-    stream = Stream(eng, header, send)
+    stream = open_stream(eng, tapnext, header, send)
     while not stream.over:
         new, ended = read_frames(stdin, stream.need(), stream.w, stream.h)
         stream.window(new, ended)
@@ -535,7 +587,7 @@ def run_round(eng: Engine, ready) -> list:
     return errors
 
 
-def run_shared(eng: Engine, stdin, batch: Optional[bool] = None):
+def run_shared(eng: Engine, stdin, batch: Optional[bool] = None, tapnext: Optional[Tapnext] = None):
     """Many streams, one model (the shared protocol, module docs): take the
     messages come so far; then, while any stream has a window's worth of
     frames (or its last ones), run a round: one window of each such stream,
@@ -544,6 +596,7 @@ def run_shared(eng: Engine, stdin, batch: Optional[bool] = None):
     import traceback
 
     batch = BATCH if batch is None else batch
+    tapnext = tapnext or Tapnext(None, eng.device)
     inbox = Inbox(stdin) if batch else None
     streams = {}  # id -> [Stream, frames waiting, ended]
 
@@ -580,7 +633,7 @@ def run_shared(eng: Engine, stdin, batch: Optional[bool] = None):
             tag, sid, data = msg
             if tag == b"O":
                 try:
-                    streams[sid] = [Stream(eng, json.loads(data), sender(sid)), [], False]
+                    streams[sid] = [open_stream(eng, tapnext, json.loads(data), sender(sid)), [], False]
                 except Exception as exc:  # this stream fails, the others go on
                     fail(sid, exc)
             elif tag == b"F":
@@ -611,7 +664,11 @@ def run_shared(eng: Engine, stdin, batch: Optional[bool] = None):
             if not ready:
                 break
             # (In turn, each stream's window runs as the loop gets to it.)
-            outcomes = zip(ready, run_round(eng, ready)) if batch and len(ready) > 1 else ((r, alone(r)) for r in ready)
+            # (CoTracker's windows as one batch; a TAPNext stream's, one frame, on its own.)
+            co = [r for r in ready if isinstance(r[1], Stream)]
+            others = [(r, alone(r)) for r in ready if not isinstance(r[1], Stream)]
+            outcomes = list(zip(co, run_round(eng, co))) if batch and len(co) > 1 else [(r, alone(r)) for r in co]
+            outcomes += others
             for (sid, stream, _, _), exc in outcomes:
                 if exc is not None:
                     fail(sid, exc)
@@ -651,6 +708,7 @@ def main():
     ap.add_argument("--weights", default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--shared", action="store_true", help="many streams, one model (module docs)")
+    ap.add_argument("--tapnext-weights", default=None, help="TAPNext++ weights (default: TT_TAPNEXT_WEIGHTS)")
     args = ap.parse_args()
     try:
         weights = args.weights or default_weights()
@@ -661,14 +719,15 @@ def main():
         if args.shared:
             with torch.inference_mode():
                 practice(eng)
+        tapnext = Tapnext(args.tapnext_weights or os.environ.get("TT_TAPNEXT_WEIGHTS"), os.environ.get("TT_TAPNEXT_DEVICE") or eng.device)
         send({"ready": {"device": eng.device, "window": eng.S}})
         stdin = sys.stdin.buffer
         with torch.inference_mode():
             if args.shared:
-                run_shared(eng, stdin)
+                run_shared(eng, stdin, tapnext=tapnext)
             else:
                 header = json.loads(stdin.readline())
-                run(eng, stdin, header)
+                run(eng, tapnext, stdin, header)
                 send({"done": True})
     except Exception as exc:  # the job (every stream, shared) shows it
         import traceback

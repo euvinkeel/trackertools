@@ -29,3 +29,25 @@ editable package:
 ```powershell
 .venv\Scripts\python.exe -m pip install -e . --no-build-isolation --no-deps
 ```
+
+## TAPNext++ (PyTorch TAPNext)
+
+`editor/tapnext/tapnext_torch.py`, `tapnext_lru_modules.py` and `pscan.py`
+are from [google-deepmind/tapnet](https://github.com/google-deepmind/tapnet)
+(`tapnet/tapnext/`) at commit `148b2c4090eb2e34551c46cf079be258ea41d175`
+("Support variable resolutions and add VOTSp2026 submission files"), with
+package-relative imports and einops replaced by plain reshapes (no einops
+dependency); `editor/tapnext/NOTICE` lists the changes, `LICENSE` is the
+upstream one. `tracker.py` and `trim_checkpoint.py` there are ours.
+
+### License
+
+Code and the TAPNext++ weights are **Apache-2.0**. The weights are not in
+this repository: `tapnextpp_ckpt.pt` (256² input) and `tapnextpp_512.ckpt`
+(512² input), 2.5 GB each as published (training checkpoints); trim them
+with `editor/tapnext/trim_checkpoint.py`.
+
+### Updating the vendored copy
+
+Download the three files from a newer tapnet commit and reapply the
+changes listed in `editor/tapnext/NOTICE`; run `editor/tests/test_tapnext.py`.
