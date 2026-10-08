@@ -42,6 +42,8 @@ use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bevy_ecs::prelude::*;
+
 use crate::setup::{download, fetch_text, find, sha256};
 use crate::update::{Problem, quiet, system_tool};
 
@@ -682,6 +684,99 @@ pub fn test_worker(python: &Path, worker: &Path, model: &Path) -> Result<String,
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+// ------------------------------------------------------------ started early
+
+/// CoTracker's engine started as soon as a video is open (on request: "auto
+/// start up cotracker engine so we don't have to warm it up the moment we
+/// place a cotracker point (but warn the user via quick popup/notif if that
+/// fails, try not to make it crash the app)"): tt_track's shared worker,
+/// loaded and warmed up in its own process while the person works, and kept
+/// loaded. It is tried once a run (and again after the doctor sets
+/// CoTracker up); a failure shows a notice with the reason, and is not tried
+/// again by itself. Not after the graphics card stopped and the app started
+/// again: the card is left alone for that run.
+#[derive(Resource, Debug)]
+pub struct EarlyStart {
+    /// The setting (Settings > CoTracker): start it when a video opens.
+    pub enabled: bool,
+    tried: bool,
+    /// CoTracker was set up when last looked (set up anew: tried again).
+    available: bool,
+    /// The notice shown: the reason, and since when.
+    notice: Option<(String, Instant)>,
+    /// The failure already shown (not shown twice).
+    told: Option<String>,
+    /// This run started after the graphics card stopped.
+    after_gpu_loss: bool,
+}
+
+impl Default for EarlyStart {
+    fn default() -> Self {
+        let after_gpu_loss = matches!(crate::recover::recovered(), Some(crate::recover::Why::Gpu | crate::recover::Why::GpuUnsaved));
+        Self { enabled: true, tried: false, available: false, notice: None, told: None, after_gpu_loss }
+    }
+}
+
+/// How long the notice stays (it has an OK button too).
+const NOTICE_FOR: Duration = Duration::from_secs(20);
+
+/// Every frame: start the engine when it should, and show its notice.
+/// True: the person asked for the doctor.
+pub fn early_start(ctx: &egui::Context, world: &mut World) -> bool {
+    let video = world.get_resource::<crate::media::Media>().is_some();
+    let available = tt_track::job::cotracker_availability().is_ok();
+    let mut e = world.resource_mut::<EarlyStart>();
+    if available && !e.available {
+        // Set up (anew): one more try.
+        e.tried = false;
+    }
+    e.available = available;
+    tt_track::job::keep_cotracker_warm(e.enabled);
+    if e.enabled && video && available && !e.tried && !e.after_gpu_loss {
+        e.tried = true;
+        tracing::info!("starting CoTracker's engine early (a video is open)");
+        // (An error is kept by the engine: shown below.)
+        let _ = tt_track::job::warm_up_cotracker();
+    }
+    if let tt_track::job::CoTrackerEngine::Failed(why) = tt_track::job::cotracker_engine()
+        && e.tried
+        && e.told.as_ref() != Some(&why)
+    {
+        e.told = Some(why.clone());
+        e.notice = Some((why, Instant::now()));
+    }
+    let Some((why, since)) = e.notice.clone() else { return false };
+    if since.elapsed() >= NOTICE_FOR {
+        e.notice = None;
+        return false;
+    }
+    ctx.request_repaint_after(Duration::from_millis(500));
+    let (mut close, mut doctor) = (false, false);
+    egui::Area::new(egui::Id::new("cotracker-notice")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -48.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+        egui::Frame::popup(ui.style()).show(ui, |ui| {
+            ui.set_max_width(380.0);
+            ui.label(egui::RichText::new("\u{26a0} CoTracker could not start").strong().color(egui::Color32::from_rgb(0xfb, 0xbf, 0x24)));
+            ui.label("You can use template trackers. CoTracker trackers start CoTracker again when they track.");
+            let short: String = why.chars().take(240).collect();
+            ui.label(egui::RichText::new(short).small().weak()).on_hover_text(why.as_str());
+            ui.horizontal(|ui| {
+                doctor = ui.button("Open the doctor").clicked();
+                close = ui.button("OK").clicked();
+            });
+        });
+    });
+    if close || doctor {
+        world.resource_mut::<EarlyStart>().notice = None;
+    }
+    doctor
+}
+
+/// The top bar's word while the engine starts early: Some while it loads.
+pub fn early_start_label(world: &World) -> Option<&'static str> {
+    let e = world.get_resource::<EarlyStart>()?;
+    (e.enabled && e.tried && tt_track::job::cotracker_engine() == tt_track::job::CoTrackerEngine::Starting).then_some("\u{23f3} CoTracker is starting")
 }
 
 #[cfg(test)]

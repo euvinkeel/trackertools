@@ -24,6 +24,29 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         }
 
         ui.separator();
+        ui.heading("CoTracker");
+        {
+            let mut e = world.resource_mut::<crate::cotracker::EarlyStart>();
+            ui.checkbox(&mut e.enabled, "Start CoTracker when a video opens").on_hover_text(
+                "CoTracker loads its model in the background and keeps it loaded, so CoTracker trackers start at once. \
+                 It uses some memory on the graphics card while trackertools is open. \
+                 Off: CoTracker starts when a CoTracker tracker tracks, and stops 30 seconds after the last one.",
+            );
+        }
+        let state = match tt_track::job::cotracker_engine() {
+            tt_track::job::CoTrackerEngine::Off => "CoTracker is not running.".to_string(),
+            tt_track::job::CoTrackerEngine::Starting => "CoTracker is starting.".to_string(),
+            tt_track::job::CoTrackerEngine::Ready(device) => format!("CoTracker is ready ({}).", match device.as_str() {
+                "cuda" => "on the NVIDIA graphics card",
+                "mps" => "on the Apple graphics",
+                "cpu" => "on the processor: slow",
+                _ => "loaded",
+            }),
+            tt_track::job::CoTrackerEngine::Failed(why) => format!("CoTracker could not start: {why}"),
+        };
+        ui.label(egui::RichText::new(state).color(style::MUTED).small());
+
+        ui.separator();
         ui.heading("Sketching");
         ui.label(egui::RichText::new("The next stroke's size, falloff, the wheel and the box are in the Brush tab.").color(style::MUTED).small());
         ui.add_space(6.0);

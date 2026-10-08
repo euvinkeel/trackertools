@@ -325,6 +325,21 @@ def run_shared(eng: Engine, stdin):
                     streams.pop(sid, None)
 
 
+def practice(eng: Engine):
+    """One practice stream on blank frames, results dropped, before the
+    shared worker says it is ready: the first windows on a card are slow
+    (cuDNN picks its algorithms, the CUDA graphs are captured), so the
+    first real tracker doesn't wait for that. `TT_COTRACKER_WARM=0`: none."""
+    if os.environ.get("TT_COTRACKER_WARM") == "0":
+        return
+    s = Stream(eng, {"width": v1.MODEL_W, "height": v1.MODEL_H, "queries": [[0, v1.MODEL_W / 2, v1.MODEL_H / 2]]}, lambda msg: None)
+    blank = np.zeros((v1.MODEL_H, v1.MODEL_W, 3), np.uint8)
+    s.window([blank] * s.need(), False)
+    s.window([blank] * s.need(), True)
+    if not s.over:
+        s.window([], True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default=None)
@@ -337,6 +352,9 @@ def main():
             raise FileNotFoundError(f"CoTracker3 weights not found at {weights} (set TT_COTRACKER_WEIGHTS)")
         torch.set_grad_enabled(False)
         eng = pick_engine(weights, args.device or os.environ.get("TT_COTRACKER_DEVICE"))
+        if args.shared:
+            with torch.inference_mode():
+                practice(eng)
         send({"ready": {"device": eng.device, "window": eng.S}})
         stdin = sys.stdin.buffer
         with torch.inference_mode():

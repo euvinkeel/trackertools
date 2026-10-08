@@ -48,7 +48,10 @@ pub use learned::{
 };
 
 pub use learned::worker_command;
-pub use learned::{close_worker as close_cotracker_worker, processes_started as cotracker_processes_started};
+pub use learned::{
+    Engine as CoTrackerEngine, close_worker as close_cotracker_worker, engine as cotracker_engine, keep_warm as keep_cotracker_warm, processes_started as cotracker_processes_started,
+    warm_up as warm_up_cotracker,
+};
 
 /// A look, as a job reads it: a frame, a rectangle there (source px), a mask.
 #[derive(Clone, Debug, PartialEq)]
