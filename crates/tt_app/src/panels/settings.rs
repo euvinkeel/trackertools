@@ -123,6 +123,33 @@ fn updates(ui: &mut egui::Ui, world: &mut World) {
     let up = world.resource::<Updater>().clone();
     ui.heading("Updates");
     ui.label(format!("You have trackertools {}.", version()));
+    // What changed (the changelog packed into this program).
+    let log = crate::update::changelog();
+    let mine = version();
+    let released = mine.split('-').next().unwrap_or_default().to_string();
+    if let Some(lines) = crate::update::changes_in(&released).filter(|_| !mine.ends_with("-dev")) {
+        egui::CollapsingHeader::new(format!("What's new in {released}")).id_salt("changes-this").default_open(false).show(ui, |ui| {
+            for l in &lines {
+                ui.label(format!("\u{2022} {l}"));
+            }
+        });
+    }
+    if let Some((_, lines)) = log.first().filter(|(t, _)| t == "Not released yet") {
+        egui::CollapsingHeader::new("Not released yet (in this build)").id_salt("changes-next").show(ui, |ui| {
+            for l in lines {
+                ui.label(format!("\u{2022} {l}"));
+            }
+            ui.label(egui::RichText::new("These are in this build of the code. A release will have them.").small().color(style::MUTED));
+        });
+    }
+    egui::CollapsingHeader::new("Earlier versions").id_salt("changes-earlier").show(ui, |ui| {
+        for (title, lines) in log.iter().filter(|(t, _)| t != "Not released yet" && *t != released) {
+            ui.label(egui::RichText::new(title).strong());
+            for l in lines {
+                ui.label(format!("\u{2022} {l}"));
+            }
+        }
+    });
     match up.state() {
         State::Idle => {}
         State::Checking => {
@@ -209,6 +236,49 @@ fn build_from_code(ui: &mut egui::Ui, world: &mut World) {
     ui.label(egui::RichText::new(dir.display().to_string()).monospace().small().color(style::MUTED));
     ui.label(format!("Branch {} \u{b7} {}", co.branch, co.commit)).on_hover_text("What the next build is made from");
     let mut switch_to = None;
+    // The newest branch on GitHub (fetched once by itself): where the latest changes are.
+    let fetched = egui::Id::new("rebuild-fetched-once");
+    if !ui.data(|d| d.get_temp::<bool>(fetched).unwrap_or(false)) && !rb.busy() {
+        ui.data_mut(|d| d.insert_temp(fetched, true));
+        rb.fetch();
+    }
+    // The changes ready to try (the try branch), first: what it adds, and one click to switch.
+    if let Some((t, changes)) = &co.try_branch {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Ready to try").strong().color(style::ACCENT));
+        ui.label(egui::RichText::new(format!("Branch {} \u{b7} {} \u{b7} {}", t.branch, t.subject, t.when)).small().color(style::MUTED));
+        for c in changes {
+            ui.label(format!("\u{2022} {c}"));
+        }
+        if co.branch == t.branch {
+            ui.label(egui::RichText::new("\u{2714} You are on it. Click Build and restart to try it. (If it changed on GitHub since, click Switch to try again after Fetch.)").small().color(style::ACCENT));
+        }
+        if ui
+            .add_enabled(!rb.busy() && co.dirty == 0, egui::Button::new(if co.branch == t.branch { "Switch to try again (newest)" } else { "Switch to try" }))
+            .on_hover_text("Switches the code to the try branch: the changes ready to try, together. Then click Build and restart.")
+            .clicked()
+        {
+            switch_to = Some(t.branch.clone());
+        }
+        ui.add_space(4.0);
+    }
+    if let Some(n) = &co.newest {
+        let here = n.branch == co.branch;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Newest on GitHub:").strong());
+            ui.label(egui::RichText::new(&n.branch).monospace().color(style::ACCENT));
+            ui.label(egui::RichText::new(format!("\u{b7} {} \u{b7} {}", n.subject, n.when)).small().color(style::MUTED));
+        });
+        if here {
+            ui.label(egui::RichText::new("\u{2714} You are on it. Click Build and restart to try it (Fetch first to get its newest commits).").small().color(style::ACCENT));
+        } else if ui
+            .add_enabled(!rb.busy() && co.dirty == 0, egui::Button::new(format!("Switch to {}", n.branch)))
+            .on_hover_text("Switches the code to that branch (the latest changes). Then click Build and restart.")
+            .clicked()
+        {
+            switch_to = Some(n.branch.clone());
+        }
+    }
     ui.horizontal(|ui| {
         ui.add_enabled_ui(!rb.busy() && co.dirty == 0, |ui| {
             egui::ComboBox::from_id_salt("rebuild-branch").selected_text("Switch to\u{2026}").show_ui(ui, |ui| {

@@ -71,6 +71,23 @@ pub struct Checkout {
     pub local: Vec<String>,
     /// GitHub's branches (`origin/…`) not checked out here yet.
     pub remote: Vec<String>,
+    /// GitHub's branch with the newest commit (as last fetched): where the latest changes are.
+    pub newest: Option<Newest>,
+    /// GitHub's `try` branch, if there is one: the changes ready to try (every
+    /// open pull request together, kept up to date by whoever makes them), and
+    /// what it has that isn't released (its changelog's "Not released yet").
+    pub try_branch: Option<(Newest, Vec<String>)>,
+}
+
+/// The branch that holds the changes ready to try (see [`Checkout::try_branch`]).
+pub const TRY: &str = "try";
+
+/// A branch's name (without `origin/`), its last commit's subject, and how long ago.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Newest {
+    pub branch: String,
+    pub subject: String,
+    pub when: String,
 }
 
 #[derive(Resource, Clone)]
@@ -123,6 +140,12 @@ impl Rebuild {
         let Some(dir) = self.dir.clone() else { return };
         let name = branch.strip_prefix("origin/").unwrap_or(branch).to_string();
         self.run(format!("Switching to {name}\u{2026}"), move |me| {
+            // The try branch moves on GitHub (it is made again): take it as it is there.
+            if name == TRY {
+                let out = git(&dir, &["checkout", "-B", TRY, &format!("origin/{TRY}")]).map_err(|e| format!("git checkout {TRY} failed: {e}"))?;
+                me.push(&out);
+                return Ok(());
+            }
             let out = git(&dir, &["checkout", &name]).map_err(|e| format!("git checkout {name} failed: {e}"))?;
             me.push(&out);
             // A branch that follows GitHub's: bring it up to date (fast-forward only: never a merge).
@@ -212,11 +235,29 @@ fn read_checkout(dir: &Path) -> Checkout {
     let commit = lines(&["log", "-1", "--format=%h %s"]).into_iter().next().unwrap_or_default();
     let dirty = lines(&["status", "--porcelain", "--untracked-files=no"]).len();
     let local = lines(&["branch", "--format=%(refname:short)"]);
-    let remote = lines(&["branch", "-r", "--format=%(refname:short)"])
+    let remote: Vec<String> = lines(&["branch", "-r", "--format=%(refname:short)"])
         .into_iter()
         .filter(|r| r.starts_with("origin/") && r != "origin/HEAD" && r != "origin" && !local.iter().any(|l| Some(l.as_str()) == r.strip_prefix("origin/")))
         .collect();
-    Checkout { branch, commit, dirty, local, remote }
+    let newest = lines(&["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)\t%(subject)\t%(committerdate:relative)", "refs/remotes/origin"])
+        .into_iter()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, '\t');
+            let (name, subject, when) = (parts.next()?, parts.next()?, parts.next()?);
+            let branch = name.strip_prefix("origin/")?.to_string();
+            (branch != "HEAD" && !branch.is_empty()).then(|| Newest { branch, subject: subject.to_string(), when: when.to_string() })
+        })
+        .next();
+    let try_branch = lines(&["log", "-1", "--format=%s\t%cr", &format!("origin/{TRY}")]).into_iter().next().and_then(|l| {
+        let (subject, when) = l.split_once('\t')?;
+        let changes = git(dir, &["show", &format!("origin/{TRY}:crates/tt_app/CHANGES.md")])
+            .ok()
+            .and_then(|t| crate::update::parse_changelog(&t).into_iter().find(|(title, _)| title == "Not released yet").map(|(_, l)| l))
+            .unwrap_or_default();
+        Some((Newest { branch: TRY.to_string(), subject: subject.to_string(), when: when.to_string() }, changes))
+    });
+    let remote = remote.into_iter().filter(|r| r != &format!("origin/{TRY}")).collect();
+    Checkout { branch, commit, dirty, local, remote, newest, try_branch }
 }
 
 /// Every app frame: a finished build restarts trackertools with it.
