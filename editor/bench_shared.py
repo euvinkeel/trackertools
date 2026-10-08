@@ -102,7 +102,7 @@ def run(eng, data: bytes, batch: bool):
     return got, time.perf_counter() - t0, list(cw.PROFILE_LOG)
 
 
-def load(device: str = "cpu"):
+def load(device: str = DEVICE):
     torch.set_grad_enabled(False)
     eng = cw.Engine(cw.default_weights(), device)
     with torch.inference_mode(), contextlib.redirect_stderr(io.StringIO()):
@@ -120,7 +120,7 @@ def main():
     args = ap.parse_args()
     frames = decode(args.video, args.frames)
     eng = load()
-    print(f"CPU, {torch.get_num_threads()} threads; {len(frames)} frames a stream, windows of {eng.S}")
+    print(f"{eng.device} ({torch.get_num_threads()} CPU threads); {len(frames)} frames a stream, windows of {eng.S}")
     print(f"{'streams':>7} {'batch':>5} {'wall s':>7} {'encode':>7} {'sample':>7} {'run':>7} {'other':>7} {'windows':>7} {'rounds':>6}  ms/frame/stream")
     for n in [int(s) for s in args.streams.split(",")]:
         data = shared_input(frames, n)
