@@ -34,6 +34,7 @@ pub mod image;
 pub mod job;
 pub mod look;
 pub mod ncc;
+pub mod off;
 pub mod runner;
 pub mod template;
 pub mod tool;
@@ -61,6 +62,8 @@ pub const TRACK_CHANNELS: usize = 8;
 pub const LOST: u32 = 1;
 /// Flag: the point left the guide's box (the rough pass says the subject isn't there).
 pub const OUTSIDE: u32 = 2;
+/// Flag: the tracker is switched off on this frame (`off`): left out, as a lost frame is.
+pub const OFF: u32 = 4;
 
 /// A tracker frame's flags (0 = trustworthy); frames of older 7-channel outputs have none.
 pub fn flags(v: &[f32]) -> u32 {
@@ -594,6 +597,44 @@ fn apply_track_actions(world: &mut World) {
     }
 }
 
+/// Track `trackers` one way, both or pause them (`run`), from frame `f`:
+/// a tracker with a look (a reset point, a paint) on `f` starts again from
+/// it there (as *Re-seed here*), one undo step for them all; the others go
+/// on from where they are (their anchor and results). Manual dots are left
+/// alone. Returns how many were asked, and how many started again at `f`.
+pub fn track_from(world: &mut World, trackers: &[Entity], f: FrameIndex, run: TrackRun) -> (usize, usize) {
+    let trackers: Vec<Entity> = trackers.iter().copied().filter(|e| is_tracker(world, *e) && method_of(world, *e) != Method::Manual).collect();
+    let mut reseed: Vec<(Entity, Entity)> = Vec::new();
+    if run != TrackRun::Paused {
+        for t in &trackers {
+            let here: Vec<Entity> = look::looks_of(world, *t).into_iter().filter(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == f)).collect();
+            let Some(l) = here.iter().find(|l| world.get::<Look>(**l).is_some_and(|l| l.painted().is_some() || !l.mask.is_empty())).or(here.first()).copied() else { continue };
+            // (Already its anchor and first look: nothing to start again.)
+            if world.get::<Tracker>(*t).is_some_and(|p| p.anchor == f) && look::looks_of(world, *t).first() == Some(&l) {
+                continue;
+            }
+            reseed.push((*t, l));
+        }
+    }
+    if !reseed.is_empty() {
+        edit(world, "Re-seed trackers", |tx| {
+            for (e, l) in &reseed {
+                tx.modify::<Tracker>(*e, |t| t.anchor = f);
+                tx.modify::<Inputs>(*e, |i| {
+                    let Some(from) = i.0.iter().position(|(s, p)| s == "look" && p == l) else { return };
+                    let item = i.0.remove(from);
+                    let at = i.0.iter().position(|(s, _)| s == "look").unwrap_or(i.0.len());
+                    i.0.insert(at, item);
+                });
+            }
+        });
+    }
+    for t in &trackers {
+        set_run(world, *t, run);
+    }
+    (trackers.len(), reseed.len())
+}
+
 /// A look edited (moved, resized, its mask painted): its trackers re-track.
 fn look_changed(changed: Query<Entity, Changed<Look>>, mut inv: ResMut<tt_core::op::Invalidations>, t: Res<Transport>) {
     for e in &changed {
@@ -612,6 +653,8 @@ impl Module for TrackModule {
             .component::<TrackRun>(Class::Document)
             .component::<human::AutoOutput>(Class::Document)
             .component::<human::HumanLayer>(Class::Document)
+            .component::<off::TrackerOff>(Class::Document)
+            .declare::<runner::PaintPoints>(Class::Derived)
             .declare::<human::Composed>(Class::Derived)
             .declare::<PausedOnOpen>(Class::Derived)
             .declare::<human::DrawTool>(Class::Derived)
@@ -634,7 +677,7 @@ impl Module for TrackModule {
             .declare::<runner::TrackJobs>(Class::Derived)
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
-            .add_systems((apply_track_actions, look_changed).in_set(Set::Intents))
+            .add_systems((apply_track_actions, look_changed, off::switch_actions).in_set(Set::Intents))
             .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
     }

@@ -77,6 +77,8 @@ enum Mark {
     Auto,
     Lost,
     Drawn,
+    /// Switched off here (`tt_track::off`).
+    Off,
 }
 
 impl Mark {
@@ -86,6 +88,7 @@ impl Mark {
             Mark::Auto => found,
             Mark::Lost => style::LOST,
             Mark::Drawn => style::HAND,
+            Mark::Off => style::MUTED,
         }
     }
 }
@@ -148,7 +151,9 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         }
         let at = |f: FrameIndex| {
             sig.get(f).filter(|_| span.contains(f)).map(|v| {
-                let mark = if human.is_some_and(|h| h.get(f).is_some()) {
+                let mark = if tt_track::flags(v) & tt_track::OFF != 0 {
+                    Mark::Off
+                } else if human.is_some_and(|h| h.get(f).is_some()) {
                     Mark::Drawn
                 } else if tt_track::flags(v) != 0 {
                     Mark::Lost
@@ -265,13 +270,14 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             None => {
                 let b = space(frame).box_from_source(std::array::from_fn(|c| v[c] as f64));
                 let flags = tt_track::flags(v);
-                let c = if flags != 0 { style::LOST } else { found }.gamma_multiply(fade * if stale { 0.5 } else { 1.0 });
+                let c = if flags & tt_track::OFF != 0 { style::MUTED } else if flags != 0 { style::LOST } else { found }.gamma_multiply(fade * if stale { 0.5 } else { 1.0 });
                 let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
                 let stroke = Stroke::new(if lit { 1.5 } else { 1.0 }, c);
                 painter.rect_stroke(r, 2.0, stroke, StrokeKind::Middle);
                 icons::crosshair(painter, map.to_screen([b[0], b[1]]), 3.0, stroke);
                 let text = match flags {
                     0 => format!("{name} \u{b7} {:.2}", v[6]),
+                    f if f & tt_track::OFF != 0 => format!("{name} \u{b7} off"),
                     f if f & LOST_FLAG != 0 => format!("{name} \u{b7} lost ({:.2})", v[6]),
                     _ => format!("{name} \u{b7} outside the sketch ({:.2})", v[6]),
                 };
@@ -514,7 +520,8 @@ fn counts(ui: &egui::Ui, world: &World, e: Entity) -> (usize, usize) {
         return c;
     }
     let n = world.resource::<Transport>().frame_count;
-    let c = (0..n).filter_map(|f| sig.get(f)).fold((0, 0), |(c, l), v| (c + 1, l + (tt_track::flags(v) != 0) as usize));
+    // (Switched off isn't flagged by the tracker: not counted.)
+    let c = (0..n).filter_map(|f| sig.get(f)).fold((0, 0), |(c, l), v| (c + 1, l + (tt_track::flags(v) & !tt_track::OFF != 0) as usize));
     ui.data_mut(|d| d.insert_temp(id, (key, c)));
     c
 }
@@ -747,9 +754,34 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     } else {
         "Start it again from the playhead, from your look on this frame (with none here, drag around the subject first)"
     };
-    if ui.button("Re-seed here").on_hover_text(reseed_tip).clicked() {
-        world.resource_mut::<PendingActions>().push(Action::Track);
-    }
+    ui.horizontal(|ui| {
+        if ui.button("Re-seed here").on_hover_text(reseed_tip).clicked() {
+            world.resource_mut::<PendingActions>().push(Action::Track);
+        }
+        // Switched off from here on (or on again): subjects and exports use the others there.
+        let here = world.resource::<Transport>().frame();
+        let off = tt_track::off::is_off(world, e, here);
+        let chord = |a: Action| world.resource::<tt_core::input::Keymap>().chord_for(a).map(|c| format!(" ({c})")).unwrap_or_default();
+        let (text, tip) = if off {
+            ("Switch on from here", "It counts again from this frame on (in subjects and exports).")
+        } else {
+            ("Switch off from here", "From this frame on it doesn't count: subjects and exports go on with the others, as where it is lost. Its results stay. Switch it on again where it is good.")
+        };
+        let key = chord(Action::SwitchTracker);
+        if ui.button(text).on_hover_text(format!("{tip}{key}")).clicked() {
+            tt_track::off::switch_from(world, &[e], here, !off);
+        }
+        if let Some(o) = world.get::<tt_track::off::TrackerOff>(e).filter(|o| o.any_off()) {
+            let stretches = o.off_ranges(FrameIndex::MIN, FrameIndex::MAX);
+            let words: Vec<String> = stretches.iter().map(|r| match (r.start == FrameIndex::MIN, r.end == FrameIndex::MAX) {
+                (true, true) => "everywhere".to_string(),
+                (true, false) => format!("before {}", r.end),
+                (false, true) => format!("from {}", r.start),
+                (false, false) => format!("{}\u{2013}{}", r.start, r.end - 1),
+            }).collect();
+            ui.label(egui::RichText::new(format!("off: {}", words.join(", "))).color(style::MUTED).small());
+        }
+    });
     for (s, forward) in [(status.forward, true), (status.backward, false)] {
         let Some(s) = s else { continue };
         // (The anchor as tracked: moved into the guide's frames.)

@@ -57,6 +57,10 @@ pub enum Action {
     Rename,
     /// Track the selected sketches from the playhead (re-seed selected trackers there).
     Track,
+    /// Switch the selected trackers off from the playhead on (or on again there).
+    SwitchTracker,
+    /// Switch the selected trackers off everywhere (or on everywhere).
+    SwitchTrackerEverywhere,
     /// Scrubbing snaps the playhead to the edges of timeline objects, or stops snapping.
     ToggleSnap,
     /// Mark the in point (an export's first frame) at the playhead (`crate::marks`).
@@ -155,6 +159,8 @@ impl Default for Keymap {
                 (b(Key::Letter('a'), Mods::NONE, false), SelectAll),
                 (b(Key::F2, Mods::NONE, false), Rename),
                 (b(Key::Letter('t'), Mods::NONE, false), Tool(crate::tool::Tool::Track)),
+                (b(Key::Letter('h'), Mods::NONE, false), SwitchTracker),
+                (b(Key::Letter('h'), Mods::SHIFT, false), SwitchTrackerEverywhere),
                 // M: draw a tracker's point by hand (a manual dot, or over a tracker's results).
                 (b(Key::Letter('m'), Mods::NONE, false), Tool(crate::tool::Tool::Draw)),
                 (b(Key::Letter('n'), Mods::NONE, false), ToggleSnap),

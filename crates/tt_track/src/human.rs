@@ -71,6 +71,8 @@ pub struct Composed {
     human: Option<Signal>,
     output: u64,
     manual: bool,
+    /// Where it was switched off (`off`).
+    off: Option<crate::off::TrackerOff>,
 }
 
 /// Whether `tracker` is a manual dot (no algorithm: only what is drawn).
@@ -128,7 +130,16 @@ fn default_half(world: &World, tracker: Entity) -> [f32; 2] {
 
 /// One frame of the output from the layers: the drawn point (valid), else
 /// the automatic result as it is, else nothing.
-fn composed(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2]) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
+fn composed(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2], off: Option<&crate::off::TrackerOff>) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
+    let (mut v, state) = layered(f, auto, human, half)?;
+    // Switched off here: flagged, so what reads it leaves it out.
+    if off.is_some_and(|o| o.is_off(f)) {
+        v[7] = (crate::flags(&v) | crate::OFF) as f32;
+    }
+    Some((v, state))
+}
+
+fn layered(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2]) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
     let a = auto.and_then(|a| a.get(f)).filter(|v| v.len() == TRACK_CHANNELS);
     if let Some(p) = human.and_then(|h| h.get(f)) {
         let (x, y) = (p[0], p[1]);
@@ -157,6 +168,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
     let (Some(out), Some(auto)) = (world.get::<Output>(tracker).map(|o| o.0), world.get::<AutoOutput>(tracker).map(|a| a.0)) else { return };
     let manual = is_manual(world, tracker);
     let half = default_half(world, tracker);
+    let off = world.get::<crate::off::TrackerOff>(tracker).cloned().filter(|o| !o.0.is_empty());
     let (a, h) = {
         let store = world.resource::<SignalStore>();
         (if manual { None } else { store.get(auto).cloned() }, world.get::<HumanLayer>(tracker).and_then(|id| store.get(id.0)).cloned())
@@ -165,12 +177,12 @@ pub fn compose(world: &mut World, tracker: Entity) {
     let mut todo = RangeSet::new();
     let mut revalidate = false;
     match world.get::<Composed>(tracker) {
-        Some(p) if p.manual == manual => {
+        Some(p) if p.manual == manual && p.off == off => {
             todo.union(&changed(a.as_ref(), p.auto.as_ref()));
             todo.union(&changed(h.as_ref(), p.human.as_ref()));
             revalidate = p.output != version;
         }
-        // The first time (or a manual dot turned automatic, or back): everything.
+        // The first time (or a manual dot turned automatic, or back, or switched off or on somewhere): everything.
         _ => {
             let store = world.resource::<SignalStore>();
             let hulls = [a.as_ref(), h.as_ref(), store.get(out)].into_iter().flatten().filter_map(Signal::present_hull);
@@ -192,7 +204,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
         }
     }
     // Nothing changed: nothing to do (not even a new snapshot).
-    if todo.is_empty() && world.get::<Composed>(tracker).is_some_and(|p| p.output == version && p.manual == manual) {
+    if todo.is_empty() && world.get::<Composed>(tracker).is_some_and(|p| p.output == version && p.manual == manual && p.off == off) {
         return;
     }
     let mut written = RangeSet::new();
@@ -202,7 +214,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
         let mut clear: Vec<std::ops::Range<FrameIndex>> = Vec::new();
         for r in todo.ranges() {
             for f in r.clone() {
-                match composed(f, a.as_ref(), h.as_ref(), half) {
+                match composed(f, a.as_ref(), h.as_ref(), half, off.as_ref()) {
                     Some((v, state)) => {
                         let same = sig.get(f).is_some_and(|w| w == v) && sig.state(f) == state;
                         if !same {
@@ -227,7 +239,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
         }
     }
     let version = world.resource::<SignalStore>().get(out).map_or(0, Signal::version);
-    world.entity_mut(tracker).insert(Composed { auto: a, human: h, output: version, manual });
+    world.entity_mut(tracker).insert(Composed { auto: a, human: h, output: version, manual, off });
     if !written.is_empty() {
         let mut inv = world.resource_mut::<Invalidations>();
         for r in written.ranges() {
@@ -519,13 +531,13 @@ mod tests {
         human.set(6, &[50.0, 60.0]);
         human.set(9, &[70.0, 80.0]);
         let half = [DOT_HALF; 2];
-        assert_eq!(composed(5, Some(&auto), Some(&human), half), Some(([10.0, 20.0, 6.0, 16.0, 14.0, 24.0, 0.8, 0.0], FrameState::Valid)));
+        assert_eq!(composed(5, Some(&auto), Some(&human), half, None), Some(([10.0, 20.0, 6.0, 16.0, 14.0, 24.0, 0.8, 0.0], FrameState::Valid)));
         // Drawn over a lost, stale result: the drawn point, its box's size, trusted.
-        assert_eq!(composed(6, Some(&auto), Some(&human), half), Some(([50.0, 60.0, 46.0, 56.0, 54.0, 64.0, 1.0, 0.0], FrameState::Valid)));
+        assert_eq!(composed(6, Some(&auto), Some(&human), half, None), Some(([50.0, 60.0, 46.0, 56.0, 54.0, 64.0, 1.0, 0.0], FrameState::Valid)));
         // Drawn where nothing was tracked: a dot's box.
-        assert_eq!(composed(9, Some(&auto), Some(&human), half), Some(([70.0, 80.0, 62.0, 72.0, 78.0, 88.0, 1.0, 0.0], FrameState::Valid)));
-        assert_eq!(composed(7, Some(&auto), Some(&human), half), None);
+        assert_eq!(composed(9, Some(&auto), Some(&human), half, None), Some(([70.0, 80.0, 62.0, 72.0, 78.0, 88.0, 1.0, 0.0], FrameState::Valid)));
+        assert_eq!(composed(7, Some(&auto), Some(&human), half, None), None);
         // A manual dot: its drawing alone.
-        assert_eq!(composed(5, None, Some(&human), half), None);
+        assert_eq!(composed(5, None, Some(&human), half, None), None);
     }
 }
