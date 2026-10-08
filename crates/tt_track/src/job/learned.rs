@@ -175,6 +175,22 @@ fn on_path(program: &std::path::Path) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&exe).is_file()))
 }
 
+/// TAPNext++'s weights (trimmed, fp16): `TT_TAPNEXT_WEIGHTS`, else where the
+/// doctor puts them (tt_app::cotracker::TapnextSetup).
+pub fn tapnext_weights() -> PathBuf {
+    std::env::var_os("TT_TAPNEXT_WEIGHTS").map(PathBuf::from).unwrap_or_else(|| installed_dir().join("tapnextpp_256_fp16.pt"))
+}
+
+/// Whether TAPNext trackers can run: CoTracker's worker (it runs them too)
+/// and TAPNext's weights. Err: what's missing, for the person.
+pub fn tapnext_availability() -> Result<(), String> {
+    availability().map_err(|_| "TAPNext needs CoTracker: CoTracker is not set up on this computer.".to_string())?;
+    if !tapnext_weights().is_file() {
+        return Err("TAPNext is not set up on this computer.".into());
+    }
+    Ok(())
+}
+
 /// Where the weights are: `TT_COTRACKER_WEIGHTS`, else the doctor's
 /// download, else torch hub's cache (`torch.hub.get_dir()`, as v1
 /// downloaded them). The worker is told (`--weights`).
@@ -343,6 +359,11 @@ impl Proc {
         cmd.arg(&script).arg("--shared").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(w) = weights().filter(|w| w.is_file()) {
             cmd.arg("--weights").arg(w);
+        }
+        // (TAPNext loads only when a TAPNext tracker asks.)
+        let tapnext = tapnext_weights();
+        if tapnext.is_file() {
+            cmd.arg("--tapnext-weights").arg(tapnext);
         }
         #[cfg(windows)]
         {
@@ -769,7 +790,8 @@ impl Worker {
                 }
             }
         }
-        let header = serde_json::json!({ "width": CROP_W, "height": CROP_H, "queries": queries.iter().map(|(i, p)| [*i as f64, p[0], p[1]]).collect::<Vec<_>>() });
+        let method = if s.method == Method::TapNext { "tapnext" } else { "cotracker" };
+        let header = serde_json::json!({ "width": CROP_W, "height": CROP_H, "method": method, "queries": queries.iter().map(|(i, p)| [*i as f64, p[0], p[1]]).collect::<Vec<_>>() });
         worker.send(b'O', format!("{header}\n").as_bytes())?;
 
         // The anchor itself is the seed (when not resuming, on the forward side).

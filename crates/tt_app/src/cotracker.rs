@@ -686,6 +686,114 @@ pub fn test_worker(python: &Path, worker: &Path, model: &Path) -> Result<String,
     result
 }
 
+// ------------------------------------------------------------------ TAPNext
+
+/// TAPNext++'s model (Google DeepMind, Apache-2.0): DeepMind's training
+/// checkpoint, from which the setup keeps only the weights, as fp16
+/// (`editor/tapnext/trim_checkpoint.py`): 2.5 GB downloaded, 389 MB kept.
+pub const TAPNEXT: &str = "https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt";
+pub const TAPNEXT_SHA256: &str = "cb96a43444ccb4fbdb25d800b88c7ba196179a526e78f01b021a16b1c1eff6da";
+pub const TAPNEXT_BYTES: u64 = 2_532_282_370;
+
+/// Where a TAPNext setup is.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum TapnextStep {
+    #[default]
+    Idle,
+    Download { got: u64 },
+    Trim,
+    Done,
+    Failed(Problem),
+}
+
+impl TapnextStep {
+    pub fn busy(&self) -> bool {
+        matches!(self, TapnextStep::Download { .. } | TapnextStep::Trim)
+    }
+
+    /// In a sentence, for the person.
+    pub fn text(&self) -> String {
+        match self {
+            TapnextStep::Idle => String::new(),
+            TapnextStep::Download { got } => format!("trackertools downloads the TAPNext model: {:.2} GB of {:.2} GB.", *got as f64 / 1e9, TAPNEXT_BYTES as f64 / 1e9),
+            TapnextStep::Trim => "trackertools makes the TAPNext model smaller (389 MB). This can take 1 minute.".into(),
+            TapnextStep::Done => "TAPNext is ready.".into(),
+            TapnextStep::Failed(p) => p.what.clone(),
+        }
+    }
+}
+
+/// Setting TAPNext up, in the background (it needs CoTracker's Python).
+#[derive(Clone, Default)]
+pub struct TapnextSetup {
+    step: Arc<Mutex<TapnextStep>>,
+}
+
+impl TapnextSetup {
+    pub fn step(&self) -> TapnextStep {
+        self.step.lock().expect("step").clone()
+    }
+
+    /// Download TAPNext's model, keep its weights as fp16 next to CoTracker's.
+    pub fn start(&self) {
+        if self.step().busy() {
+            return;
+        }
+        *self.step.lock().expect("step") = TapnextStep::Download { got: 0 };
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let step = |s: TapnextStep| *me.step.lock().expect("step") = s;
+            let done = install_tapnext(&step);
+            if let Err(p) = &done {
+                tracing::warn!("TAPNext setup: {} ({})", p.what, p.details);
+            }
+            step(match done {
+                Ok(()) => TapnextStep::Done,
+                Err(p) => TapnextStep::Failed(p),
+            });
+        });
+    }
+}
+
+fn install_tapnext(step: &dyn Fn(TapnextStep)) -> Result<(), Problem> {
+    const AGAIN_T: &str = "Then click Set up TAPNext again.";
+    let cannot_write = |e: std::io::Error| Problem::new(&format!("trackertools cannot write to its folder. Make sure that the disk has approximately 3 GB free. {AGAIN_T}"), e);
+    let dir = tt_track::job::cotracker_dir();
+    let out = tt_track::job::tapnext_weights();
+    let (python, worker) = tt_track::job::worker_command();
+    std::fs::create_dir_all(&dir).map_err(cannot_write)?;
+    // The code (the trimming script and the model's code with it), as this program has it.
+    if worker.starts_with(&dir) {
+        write_code(&dir.join("code")).map_err(cannot_write)?;
+    }
+    let script = worker.parent().map(|p| p.join("tapnext").join("trim_checkpoint.py")).filter(|p| p.is_file());
+    let Some(script) = script else {
+        return Err(Problem::new(&format!("trackertools cannot find the TAPNext code. {ASK}"), format!("no tapnext/trim_checkpoint.py next to {}", worker.display())));
+    };
+    let part = dir.join("tapnextpp_ckpt.pt.part");
+    tracing::info!("TAPNext setup: downloading {TAPNEXT} to {}", part.display());
+    download(TAPNEXT, &part, &|got| step(TapnextStep::Download { got }))
+        .map_err(|p| Problem::new(&format!("The download of the TAPNext model stopped. Make sure that the computer is connected to the internet and that the disk has approximately 3 GB free. {AGAIN_T}"), p.details))?;
+    let got = sha256(&part).map_err(cannot_write)?;
+    if got != TAPNEXT_SHA256 {
+        let _ = std::fs::remove_file(&part);
+        return Err(Problem::new(&format!("The TAPNext model download is not correct. {AGAIN_T}"), format!("SHA-256 {got}, expected {TAPNEXT_SHA256}")));
+    }
+    step(TapnextStep::Trim);
+    let tmp = out.with_extension("pt.part");
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script).arg(&part).arg(&tmp).args(["--fp16", "--resolution", "256"]).stdin(Stdio::null());
+    let trimmed = run(&mut cmd, None);
+    let _ = std::fs::remove_file(&part);
+    trimmed.map_err(|d| Problem::new(&format!("trackertools cannot make the TAPNext model smaller. {ASK}"), d))?;
+    let _ = std::fs::remove_file(&out);
+    std::fs::rename(&tmp, &out).map_err(cannot_write)?;
+    tracing::info!("TAPNext is set up: {}", out.display());
+    // The worker running now was started without it: the next one has it.
+    tt_track::job::close_cotracker_worker();
+    Ok(())
+}
+
 // ------------------------------------------------------------ started early
 
 /// CoTracker's engine started as soon as a video is open (on request: "auto

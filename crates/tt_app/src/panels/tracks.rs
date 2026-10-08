@@ -59,6 +59,7 @@ pub fn kind_name(method: Method) -> &'static str {
     match method {
         Method::Template => "template tracker",
         Method::CoTracker => "CoTracker",
+        Method::TapNext => "TAPNext tracker",
         Method::Manual => "manual dot",
         Method::Paint => "paint tracker",
     }
@@ -172,11 +173,11 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
                 let pin = style::PIN.gamma_multiply(if look.frame == frame { 0.95 } else { 0.55 });
                 let name = world.get::<Name>(l).map_or_else(|| method.look_word().to_string(), |n| n.to_string());
                 match (method, look.frame == frame) {
-                    (Method::CoTracker, true) => {
+                    (m, true) if m.point() => {
                         icons::diamond(painter, p, if chosen { 9.0 } else { 7.5 }, Stroke::new(if chosen { 2.0 } else { 1.5 }, pin), None);
                         painter.text(p + Vec2::new(10.0, 6.0), Align2::LEFT_TOP, name, FontId::proportional(10.0), pin);
                     }
-                    (Method::CoTracker, false) => icons::diamond(painter, p, 3.5, Stroke::new(1.0, pin), Some(pin.gamma_multiply(0.5))),
+                    (m, false) if m.point() => icons::diamond(painter, p, 3.5, Stroke::new(1.0, pin), Some(pin.gamma_multiply(0.5))),
                     (Method::Paint, true) => {
                         let b = space(frame).box_from_source(look.rect());
                         let r = Rect::from_min_max(map.to_screen([b[2], b[3]]), map.to_screen([b[4], b[5]]));
@@ -351,7 +352,7 @@ fn paint_cells(painter: &Painter, r: Rect, look: &Look, colour: Color32) {
 fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: &mut World, map: &ViewportMapping) {
     let tool = world.resource::<TrackTool>().clone();
     let shift = ui.input(|i| i.modifiers.shift);
-    let point = tt_track::tool::method_for(world, shift) == Method::CoTracker;
+    let point = tt_track::tool::method_for(world, shift).point();
     // A paint tracker: the brush, and the stroke so far.
     if tt_track::tool::method_for(world, tool.drag.map_or(shift, |d| d.2)) == Method::Paint {
         let brush = TRACK.gamma_multiply(0.35);
@@ -407,10 +408,10 @@ fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world
     let method = selected.and_then(|e| world_ref.get::<Tracker>(e)).map(|t| t.method);
     let kind = kind_name(world_ref.resource::<NewTrackers>().method).to_uppercase();
     let text = match (selected, tool.reseed, method) {
-        (Some(t), Some(r), Some(Method::CoTracker)) if t == r => format!("TRACK \u{b7} click the pixel to follow on this frame: {name} starts again from it \u{b7} T/Esc exits"),
+        (Some(t), Some(r), Some(m)) if t == r && m.point() => format!("TRACK \u{b7} click the pixel to follow on this frame: {name} starts again from it \u{b7} T/Esc exits"),
         (Some(t), Some(r), _) if t == r => format!("TRACK \u{b7} drag around the subject on this frame: {name} starts again from it \u{b7} T/Esc exits"),
         (Some(_), _, Some(Method::Manual)) => format!("TRACK \u{b7} {name} is a manual dot: draw it with the Draw tool (M) \u{b7} Shift+drag: a new tracker \u{b7} T/Esc exits"),
-        (Some(_), _, Some(Method::CoTracker)) => {
+        (Some(_), _, Some(m)) if m.point() => {
             format!("TRACK \u{b7} click where {name}'s pixel really is: its reset point on this frame (it follows that pixel from here) \u{b7} Shift+click: a new tracker \u{b7} T/Esc exits")
         }
         (Some(t), _, _) if run_of(world_ref, t) == TrackRun::Paused => {
@@ -498,7 +499,7 @@ fn legend(ui: &mut egui::Ui, method: Method) {
         if method != Method::Manual {
             mark(ui, &|p, o| icons::crosshair(p, o, 4.0, Stroke::new(1.5, style::AUTO)), "automatic");
             mark(ui, &|p, o| icons::crosshair(p, o, 4.0, Stroke::new(1.5, style::LOST)), "lost");
-            if method == Method::CoTracker {
+            if method.point() {
                 mark(ui, &|p, o| icons::diamond(p, o, 4.5, Stroke::new(1.5, style::PIN), None), "reset point");
             } else if method == Method::Paint {
                 mark(ui, &|p, o| {
@@ -518,7 +519,7 @@ fn legend(ui: &mut egui::Ui, method: Method) {
 pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if world.get::<Look>(e).is_some() {
         let owner = tt_track::look::owner_of(world, e);
-        if owner.and_then(|t| world.get::<Tracker>(t)).is_some_and(|t| t.method == Method::CoTracker) {
+        if owner.and_then(|t| world.get::<Tracker>(t)).is_some_and(|t| t.method.point()) {
             let frame = world.get::<Look>(e).map_or(0, |l| l.frame);
             ui.label(
                 egui::RichText::new(format!(
@@ -549,9 +550,14 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             (Method::Template, "Template tracker", "Drag a rectangle around what to follow in this sketch (or click a point): a tracker matching that pattern on every frame (fast, sub-pixel). It searches inside this sketch's box, in its view."),
             (Method::CoTracker, "CoTracker", "Click the pixel to follow in this sketch: Meta's CoTracker3, a learned point tracker, run in Python. It searches inside this sketch's box, in its view."),
             (Method::Paint, "Paint tracker", "Brush over what to follow in this sketch: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them. It searches inside this sketch's box, in its view."),
+            (Method::TapNext, "TAPNext", "Experimental. Click the pixel to follow in this sketch: Google DeepMind's TAPNext++, a point tracker that gives each frame's result at once. It searches inside this sketch's box, in its view."),
         ] {
-            let usable = method == Method::Template || cotracker.is_ok();
-            let r = ui.button(text).on_hover_text(if usable { tip } else { "CoTracker is not set up on this computer. Click CoTracker. The doctor shows what CoTracker needs and sets it up." });
+            let usable = match method {
+                Method::Template => true,
+                Method::TapNext => tt_track::job::tapnext_availability().is_ok(),
+                _ => cotracker.is_ok(),
+            };
+            let r = ui.button(text).on_hover_text(if usable { tip } else { "It is not set up on this computer. Click it. The doctor shows what it needs and sets it up." });
             if r.clicked() && !usable {
                 world.resource_mut::<crate::setup::Doctor>().show();
             } else if r.clicked() {
@@ -580,7 +586,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         _ => {
             let guide = guide_of(world, e).and_then(|g| world.get::<Name>(g)).map(|n| n.to_string());
             let r#where = guide.map_or("searching the whole frame".to_string(), |g| format!("searching inside {g}"));
-            let fix = if method == Method::CoTracker {
+            let fix = if method.point() {
                 "where it loses the pixel: Track tool, click where it really is (a reset point)"
             } else if method == Method::Paint {
                 "where it slips: Track tool, brush over the subject on that frame (a reset paint: points not on it are left out from there)"
@@ -668,14 +674,14 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     let mut remove = None;
     ui.horizontal_wrapped(|ui| {
         ui.label(match method {
-            Method::CoTracker => "Reset points:",
+            Method::CoTracker | Method::TapNext => "Reset points:",
             Method::Paint => "Paints:",
             _ => "Looks:",
         });
         for l in &looks {
             let Some(look) = world.get::<Look>(*l) else { continue };
             let f = look.frame;
-            let label = if method == Method::CoTracker {
+            let label = if method.point() {
                 format!("frame {} \u{b7} {:.0}, {:.0}", look.frame, look.x, look.y)
             } else if method == Method::Paint {
                 format!("frame {} \u{b7} {:.0}\u{d7}{:.0}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h)
@@ -683,7 +689,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                 let painted = if look.painted().is_some() { " \u{b7} masked" } else { " \u{b7} unpainted" };
                 format!("frame {} \u{b7} {:.0}\u{d7}{:.0}{painted}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h)
             };
-            let tip = if method == Method::CoTracker { "Go to its frame (to move it: Track tool, click there)" } else { "Select it to see and paint which pixels are the subject; the playhead goes to its frame" };
+            let tip = if method.point() { "Go to its frame (to move it: Track tool, click there)" } else { "Select it to see and paint which pixels are the subject; the playhead goes to its frame" };
             if ui.button(label).on_hover_text(tip).clicked() {
                 world.resource_mut::<Selection>().select_only(*l);
                 world.resource_mut::<PendingActions>().push(Action::Seek(f));
@@ -696,7 +702,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if let Some(l) = remove {
         tt_core::commands::delete(world, &[l]);
     }
-    let reseed_tip = if method == Method::CoTracker {
+    let reseed_tip = if method.point() {
         "Start it again from the playhead, from its reset point on this frame (with none here, click the pixel first)"
     } else {
         "Start it again from the playhead, from your look on this frame (with none here, drag around the subject first)"

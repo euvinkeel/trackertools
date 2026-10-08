@@ -617,6 +617,8 @@ pub struct Doctor {
     install_dir: PathBuf,
     /// Set up CoTracker (crate::cotracker), running in the background.
     co: crate::cotracker::Setup,
+    /// Set up TAPNext (crate::cotracker::TapnextSetup), the same.
+    tap: crate::cotracker::TapnextSetup,
     /// The install whose result the checks have seen.
     seen_done: bool,
     /// A sentence under the buttons (copied, saved, a folder without FFmpeg): (text, is it a problem).
@@ -653,6 +655,7 @@ impl Default for Doctor {
             install: Arc::default(),
             install_dir: chosen_dir(),
             co: crate::cotracker::Setup::default(),
+            tap: crate::cotracker::TapnextSetup::default(),
             seen_done: false,
             note: None,
             everything: None,
@@ -976,6 +979,7 @@ fn cotracker_part(ui: &mut egui::Ui, doctor: &mut Doctor, checked: Option<&Check
     let available = tt_track::job::cotracker_availability().is_ok();
     if available {
         line(ui, "\u{2714}", style::ACCENT, &if let Step::Done(_) = step { step.text() } else { "CoTracker is ready.".into() });
+        tapnext(ui, doctor);
         return;
     }
     if let Step::Failed(p) = &step {
@@ -1014,6 +1018,40 @@ fn cotracker_part(ui: &mut egui::Ui, doctor: &mut Doctor, checked: Option<&Check
                 ui.label("trackertools cannot set up CoTracker on this computer.");
             }
         }
+    }
+}
+
+/// TAPNext, once CoTracker is ready (it runs in CoTracker's worker).
+fn tapnext(ui: &mut egui::Ui, doctor: &mut Doctor) {
+    use crate::cotracker::TapnextStep;
+    let red = egui::Color32::from_rgb(0xf4, 0x3f, 0x5e);
+    let line = |ui: &mut egui::Ui, mark: &str, color: egui::Color32, text: &str| {
+        ui.horizontal(|ui| {
+            ui.colored_label(color, mark);
+            ui.add(egui::Label::new(egui::RichText::new(text).color(if color == red { red } else { style::TEXT })).wrap());
+        });
+    };
+    let step = doctor.tap.step();
+    if step.busy() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(step.text());
+        });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        return;
+    }
+    if tt_track::job::tapnext_availability().is_ok() {
+        line(ui, "\u{2714}", style::ACCENT, "TAPNext is ready (an experimental point tracker: Track tool, TAPNext).");
+        return;
+    }
+    if let TapnextStep::Failed(p) = &step {
+        line(ui, "\u{2716}", red, &p.what);
+    }
+    ui.label("TAPNext is an experimental point tracker from Google DeepMind (license: Apache 2.0). It gives each frame's result at once.");
+    ui.label("To set it up, trackertools downloads its model (2.5 GB) and keeps a smaller copy (389 MB).");
+    let label = if matches!(step, TapnextStep::Failed(_)) { "Set up TAPNext again" } else { "Set up TAPNext" };
+    if ui.button(label).clicked() {
+        doctor.tap.start();
     }
 }
 

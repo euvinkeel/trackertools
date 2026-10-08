@@ -142,3 +142,18 @@ fn a_paint_tracker_follows_the_sprite_both_ways() {
     assert!(e[e.len() / 2] < 1.5, "median {:.2} px", e[e.len() / 2]);
     assert!(e[e.len() - 1] < 4.0, "max {:.2} px", e[e.len() - 1]);
 }
+
+/// A TAPNext tracker on the same sprite (TAPNext++'s weights:
+/// `TT_TAPNEXT_WEIGHTS`, or where the doctor puts them; skipped without).
+#[test]
+fn a_tapnext_tracker_follows_the_sprite_both_ways() {
+    if !tt_track::job::tapnext_weights().is_file() {
+        eprintln!("skipped: no TAPNext++ weights (TT_TAPNEXT_WEIGHTS)");
+        return;
+    }
+    let Some((e, secs, flagged, at600)) = track_sprite(Method::TapNext, Look::new(600, truth(600), [10.5, 10.5])) else { return };
+    eprintln!("TAPNext++: 61 frames in {secs:.1} s; error median {:.2} px, p95 {:.2}, max {:.2}; {flagged} flagged", e[e.len() / 2], e[e.len() * 95 / 100], e[e.len() - 1]);
+    assert!(e[e.len() / 2] < 1.5, "median {:.2} px", e[e.len() / 2]);
+    assert!(e[e.len() - 1] < 4.0, "max {:.2} px", e[e.len() - 1]);
+    assert!(at600 < 1e-3, "the reset point's frame is pinned");
+}

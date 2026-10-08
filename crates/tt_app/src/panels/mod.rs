@@ -291,11 +291,16 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             (tt_track::Method::Template, "⌖ Template tracker", "matches the pattern you show it on every frame: fast, sub-pixel, built in"),
             (tt_track::Method::CoTracker, "⌖ CoTracker", "Meta's CoTracker3, a learned point tracker, run in Python (PyTorch and its weights)"),
             (tt_track::Method::Paint, "⌖ Paint", "brush over the subject: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them (robust to some points getting lost or hidden)"),
+            (tt_track::Method::TapNext, "⌖ TAPNext", "experimental: Google DeepMind's TAPNext++, a point tracker that gives each frame's result at once (click the pixel to follow, as CoTracker)"),
         ] {
-            let usable = method == tt_track::Method::Template || cotracker.is_ok();
+            let usable = match method {
+                tt_track::Method::Template => Ok(()),
+                tt_track::Method::TapNext => tt_track::job::tapnext_availability(),
+                _ => cotracker.clone(),
+            };
             let r = ui.selectable_label(tracking_tool && kind == method, text);
-            if !usable {
-                open_doctor |= r.on_hover_text("CoTracker is not set up on this computer. Click CoTracker. The doctor shows what CoTracker needs and sets it up.").clicked();
+            if let Err(why) = usable {
+                open_doctor |= r.on_hover_text(format!("{why} Click {}. The doctor shows what it needs and sets it up.", text.trim_start_matches("⌖ "))).clicked();
                 continue;
             }
             let r = r
