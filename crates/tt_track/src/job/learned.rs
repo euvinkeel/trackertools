@@ -751,7 +751,10 @@ impl Worker {
                 Ok(_) | Err(RecvTimeoutError::Disconnected) => bail!("the CoTracker worker didn't start: {}", worker.last_words(3, " | ")),
             }
         }
-        self.shared.set_phase(super::Phase::Tracking);
+        // (TAPNext loads its own model when its stream opens: loading until its first result.)
+        if s.method != Method::TapNext {
+            self.shared.set_phase(super::Phase::Tracking);
+        }
         // Seeds, in crop pixels on their frames: the start, and each look's aligned point further on.
         let crop_point = |f: FrameIndex, p: [f64; 2]| {
             let g = self.guide_point(f);
@@ -907,6 +910,9 @@ impl Worker {
     fn take(&mut self, stream: &Stream, queries: &[usize], i: usize, points: &[Option<[f64; 3]>]) {
         let Some(grid) = stream.grids.get(i).copied() else { return };
         let f = stream.frame(i);
+        if self.shared.phase() != super::Phase::Tracking {
+            self.shared.set_phase(super::Phase::Tracking);
+        }
         if let Some(mut fit) = self.paint.take() {
             // A paint tracker: one motion from all its points (`paint`).
             let pts: Vec<Option<([f64; 2], f64)>> =
