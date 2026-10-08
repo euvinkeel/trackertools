@@ -1,0 +1,18 @@
+TAPNext (PyTorch implementation)
+Copyright 2026 Google LLC
+Licensed under the Apache License, Version 2.0 (see LICENSE in this folder).
+
+tapnext_torch.py, tapnext_lru_modules.py and pscan.py are from
+https://github.com/google-deepmind/tapnet, directory tapnet/tapnext/,
+at commit 148b2c4090eb2e34551c46cf079be258ea41d175 (2026-07-09, "Support
+variable resolutions and add VOTSp2026 submission files").
+
+Changes for trackertools: package-relative imports instead of
+`tapnet.tapnext`, and the einops rearranges replaced by the equivalent
+torch reshape/permute calls (tapnext_torch.py, tapnext_lru_modules.py; each
+file says so in its header). pscan.py is unchanged.
+
+The TAPNext++ weights (tapnextpp_ckpt.pt, tapnextpp_512.ckpt; Apache-2.0,
+from DeepMind's storage) are not part of this repository.
+
+Paper: TAPNext++ (arXiv 2604.10582); TAPNext (arXiv 2504.05579).
