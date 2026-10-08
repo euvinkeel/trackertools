@@ -10,6 +10,11 @@
 //!   whose guide box or view map differs. A guide edit on frames 700..760
 //!   re-tracks from ~700 on, even though a sketch reports its whole extent as
 //!   changed; a recompute that changes nothing re-tracks nothing.
+//! - A look (a pattern, a reset point, a paint) that changed, came or went
+//!   re-tracks only from the look before it to the look after it, on its
+//!   side of the anchor ([`Plan::touched`]); a paint tracker from the paint
+//!   before it on, resuming there from its state ([`PaintStates`]). Jobs
+//!   track one such stretch each: results past it hold.
 //! - Each side of the anchor with frames left to do gets a job, resuming from
 //!   the result just before them, if the tracker is asked to track that way
 //!   ([`crate::TrackRun`]: forward, backward, both, or paused). Pausing or
