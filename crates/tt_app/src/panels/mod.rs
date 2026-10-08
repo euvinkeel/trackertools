@@ -290,6 +290,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         for (method, text, what) in [
             (tt_track::Method::Template, "⌖ Template tracker", "matches the pattern you show it on every frame: fast, sub-pixel, built in"),
             (tt_track::Method::CoTracker, "⌖ CoTracker", "Meta's CoTracker3, a learned point tracker, run in Python (PyTorch and its weights)"),
+            (tt_track::Method::Paint, "⌖ Paint", "brush over the subject: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them (robust to some points getting lost or hidden)"),
         ] {
             let usable = method == tt_track::Method::Template || cotracker.is_ok();
             let r = ui.selectable_label(tracking_tool && kind == method, text);

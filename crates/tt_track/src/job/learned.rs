@@ -99,7 +99,7 @@ impl JobSpec {
     /// Whether the job starts a CoTracker worker (a Python process with the
     /// model on the graphics card): not for the anchor alone.
     pub fn starts_worker(&self) -> bool {
-        self.method == Method::CoTracker && self.stream().1 > 1
+        self.method.learned() && self.stream().1 > 1
     }
 }
 
@@ -693,7 +693,12 @@ impl Worker {
             let a = self.map(l.frame).a;
             self.half = l.half.map(|h| (h / a * s.scale).max(2.0));
         }
-        let seed = s.seed.map_or_else(|| self.guide_point(anchor), |p| self.map(anchor).from_source(p));
+        let paint = s.method == Method::Paint;
+        let first_paint = if paint { s.looks.iter().filter(|l| l.frame == anchor).find(|l| l.mask.is_some()).or_else(|| s.looks.iter().find(|l| l.frame == anchor)).cloned() } else { None };
+        let seed = match &first_paint {
+            Some(l) => self.map(anchor).from_source(super::paint::centre(l)),
+            None => s.seed.map_or_else(|| self.guide_point(anchor), |p| self.map(anchor).from_source(p)),
+        };
         // Where the stream starts: the frame before `from` when resuming, else the anchor.
         let (start, n) = s.stream();
         // The anchor alone is the seed: no worker for it.
@@ -730,10 +735,37 @@ impl Worker {
             let g = self.guide_point(f);
             [(p[0] - g[0]) * scale + CROP_W as f64 / 2.0, (p[1] - g[1]) * scale + CROP_H as f64 / 2.0]
         };
-        let mut queries = vec![(0usize, crop_point(start, first_seed))];
-        for i in 1..n {
-            if let Some(p) = self.pin(stream.frame(i)) {
-                queries.push((i, crop_point(stream.frame(i), p)));
+        let mut queries = Vec::new();
+        if paint {
+            // Many points over each paint on the stream's frames (`paint`).
+            let mut pq = Vec::new();
+            let mut paints = Vec::new();
+            for i in 0..n {
+                let f = stream.frame(i);
+                for l in s.looks.iter().filter(|l| l.frame == f) {
+                    let k = paints.len();
+                    paints.push((f, l.clone()));
+                    for p in super::paint::sample(l, super::paint::POINTS_PER_PAINT) {
+                        let c = crop_point(f, self.map(f).from_source(p));
+                        if (0.0..CROP_W as f64).contains(&c[0]) && (0.0..CROP_H as f64).contains(&c[1]) {
+                            queries.push((i, c));
+                            pq.push(super::paint::PaintQuery { i, paint: k, reference: None, dropped: false });
+                        }
+                    }
+                }
+            }
+            if queries.is_empty() {
+                bail!("the paint is outside the area this tracker searches");
+            }
+            let a = self.map(anchor).a;
+            let half = first_paint.as_ref().map_or(self.half, |l| l.half.map(|h| (h / a * s.scale).max(2.0)));
+            self.paint = Some(super::paint::PaintFit::new(pq, paints, seed, half));
+        } else {
+            queries.push((0usize, crop_point(start, first_seed)));
+            for i in 1..n {
+                if let Some(p) = self.pin(stream.frame(i)) {
+                    queries.push((i, crop_point(stream.frame(i), p)));
+                }
             }
         }
         let header = serde_json::json!({ "width": CROP_W, "height": CROP_H, "queries": queries.iter().map(|(i, p)| [*i as f64, p[0], p[1]]).collect::<Vec<_>>() });
@@ -852,6 +884,22 @@ impl Worker {
     fn take(&mut self, stream: &Stream, queries: &[usize], i: usize, points: &[Option<[f64; 3]>]) {
         let Some(grid) = stream.grids.get(i).copied() else { return };
         let f = stream.frame(i);
+        if let Some(mut fit) = self.paint.take() {
+            // A paint tracker: one motion from all its points (`paint`).
+            let pts: Vec<Option<([f64; 2], f64)>> =
+                points.iter().map(|p| p.filter(|[x, y, _]| x.is_finite() && y.is_finite()).map(|[x, y, s]| (grid.to_view([x, y]), s.clamp(0.0, 1.0)))).collect();
+            // (Outliers: further than 1.5 crop px from where the motion puts them, at least.)
+            let r = fit.frame(i, f, self.map(f), &pts, self.spec.settings.min_score as f64, 1.5 / grid.scale);
+            let base = self.half;
+            self.half = fit.half.map(|h| h * r.scale);
+            // The stream's first frame is the anchor's (emitted already as the paint's centre).
+            if i > 0 {
+                self.emit(f, r.at, r.score, r.lost);
+            }
+            self.half = base;
+            self.paint = Some(fit);
+            return;
+        }
         // The stream's first frame is the anchor (emitted already) or the resume point (tracked before).
         if i == 0 {
             return;

@@ -52,15 +52,17 @@ fn truth(f: i64) -> [f64; 2] {
     p.map(|v| 2.0 * (v.floor() / 2.0).floor() + 10.5)
 }
 
-#[test]
-fn cotracker_follows_the_sprite_both_ways_through_the_view() {
+/// Track the sprite with `method` from `look` (frame 600) through a rough
+/// guide alive on frames 590–650; the error per frame against the truth
+/// (sorted), the seconds it took, frames flagged. None: skipped.
+fn track_sprite(method: Method, look: Look) -> Option<(Vec<f64>, f64, usize, f32)> {
     let Some(fixture) = fixture() else {
         eprintln!("skipped: sprite_1080p60.mp4 not found (cargo xtask fixtures)");
-        return;
+        return None;
     };
     if let Err(why) = worker_ready() {
         eprintln!("skipped: {why}");
-        return;
+        return None;
     }
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
@@ -89,8 +91,8 @@ fn cotracker_follows_the_sprite_both_ways_through_the_view() {
     }
     let guide = w.spawn((Name::new("Guide"), Output(sig))).id();
     set_span(w, guide, Span::new(590, 650));
-    let op = tt_track::add_tracker_with_look(w, guide, Look::new(600, truth(600), [10.5, 10.5])).expect("tracker");
-    let params = Tracker { method: Method::CoTracker, ..w.get::<Tracker>(op).expect("tracker").clone() };
+    let op = tt_track::add_tracker_with_look(w, guide, look).expect("tracker");
+    let params = Tracker { method, ..w.get::<Tracker>(op).expect("tracker").clone() };
     w.entity_mut(op).insert(params);
 
     let start = Instant::now();
@@ -115,8 +117,28 @@ fn cotracker_follows_the_sprite_both_ways_through_the_view() {
     let flagged = (590..651).filter(|f| out.get(*f).is_some_and(|v| tt_track::flags(v) != 0)).count();
     assert!((590..651).all(|f| out.state(f) == FrameState::Valid));
     e.sort_by(f64::total_cmp);
+    let at600 = out.get(600).map_or(f32::INFINITY, |v| (v[0] as f64 - truth(600)[0]).abs() as f32);
+    Some((e, secs, flagged, at600))
+}
+
+#[test]
+fn cotracker_follows_the_sprite_both_ways_through_the_view() {
+    let Some((e, secs, flagged, at600)) = track_sprite(Method::CoTracker, Look::new(600, truth(600), [10.5, 10.5])) else { return };
     eprintln!("CoTracker3: 61 frames in {secs:.1} s; error median {:.2} px, p95 {:.2}, max {:.2}; {flagged} flagged", e[e.len() / 2], e[e.len() * 95 / 100], e[e.len() - 1]);
     assert!(e[e.len() / 2] < 1.5, "median {:.2} px", e[e.len() / 2]);
     assert!(e[e.len() - 1] < 4.0, "max {:.2} px", e[e.len() - 1]);
-    assert!(out.get(600).is_some_and(|v| (v[0] as f64 - truth(600)[0]).abs() < 1e-3), "the look's frame is pinned");
+    assert!(at600 < 1e-3, "the look's frame is pinned");
+}
+
+/// A paint tracker on the same sprite: a dab of paint over it on frame 600
+/// (many points), one motion from them.
+#[test]
+fn a_paint_tracker_follows_the_sprite_both_ways() {
+    let (c, h, mask) = tt_track::tool::paint_look(&[truth(600)], 8.0);
+    let mut look = Look::new(600, c, h);
+    look.mask = mask;
+    let Some((e, secs, flagged, _)) = track_sprite(Method::Paint, look) else { return };
+    eprintln!("Paint tracker: 61 frames in {secs:.1} s; error median {:.2} px, p95 {:.2}, max {:.2}; {flagged} flagged", e[e.len() / 2], e[e.len() * 95 / 100], e[e.len() - 1]);
+    assert!(e[e.len() / 2] < 1.5, "median {:.2} px", e[e.len() / 2]);
+    assert!(e[e.len() - 1] < 4.0, "max {:.2} px", e[e.len() - 1]);
 }

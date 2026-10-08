@@ -88,15 +88,25 @@ pub enum Method {
     CoTracker,
     /// No algorithm: only what a person draws (a manual dot, [`human`]).
     Manual,
+    /// CoTracker3 on many points painted over the subject, and one motion
+    /// made from them (`job::paint`): its looks are paints, the first where
+    /// it starts, later ones its reset paints.
+    Paint,
 }
 
 impl Method {
+    /// It runs on CoTracker's model (a stream through the shared worker).
+    pub fn learned(self) -> bool {
+        matches!(self, Method::CoTracker | Method::Paint)
+    }
+
     /// What its looks are called: a template tracker's are patterns it
     /// matches ("look"), CoTracker's the pixel it follows from there on
     /// ("reset point").
     pub fn look_word(self) -> &'static str {
         match self {
             Method::CoTracker => "reset point",
+            Method::Paint => "paint",
             _ => "look",
         }
     }
@@ -184,7 +194,7 @@ pub fn pause_cotrackers_on_open(world: &mut World) -> Vec<Entity> {
     let mut q = world.query::<(Entity, &Tracker, Option<&TrackRun>)>();
     let mut asked: Vec<Entity> = q
         .iter(world)
-        .filter(|(_, t, run)| t.method == Method::CoTracker && run.copied().unwrap_or(TrackRun::Both) != TrackRun::Paused)
+        .filter(|(_, t, run)| t.method.learned() && run.copied().unwrap_or(TrackRun::Both) != TrackRun::Paused)
         .map(|(e, _, _)| e)
         .collect();
     tt_core::meta::creation_order(world, &mut asked);
