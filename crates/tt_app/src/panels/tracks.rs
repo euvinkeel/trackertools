@@ -267,12 +267,20 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
     }
 }
 
-fn side_line(s: &SideStatus, forward: bool) -> String {
+/// The model a learned tracker loads (a paint tracker runs on CoTracker's).
+fn model_name(method: Option<Method>) -> &'static str {
+    match method {
+        Some(Method::TapNext) => "TAPNext",
+        _ => "CoTracker",
+    }
+}
+
+fn side_line(s: &SideStatus, forward: bool, method: Option<Method>) -> String {
     let arrow = if forward { "forward" } else { "backward" };
     let state = if s.waiting {
         " \u{b7} waiting for the playhead".to_string()
     } else if s.phase == tt_track::job::Phase::Loading {
-        " \u{b7} loading CoTracker's model".to_string()
+        format!(" \u{b7} loading {}'s model", model_name(method))
     } else if s.fps > 0.0 {
         format!(" \u{b7} {:.0} fps", s.fps)
     } else {
@@ -292,7 +300,11 @@ pub fn summary(world: &mut World) -> Option<(String, String)> {
     let waiting = busy.iter().flat_map(|(_, s)| [s.forward, s.backward]).flatten().all(|s| s.waiting);
     let loading = busy.iter().filter(|(_, s)| s.starting() == Some(true)).count();
     let text = if loading > 0 {
-        "loading CoTracker\u{2026}".to_string()
+        // (The models the loading ones wait for: CoTracker, TAPNext, or both.)
+        let mut models: Vec<&str> = busy.iter().filter(|(_, s)| s.starting() == Some(true)).map(|(e, _)| model_name(world.get::<Tracker>(*e).map(|t| t.method))).collect();
+        models.sort();
+        models.dedup();
+        format!("loading {}\u{2026}", models.join(" and "))
     } else if waiting {
         format!("{} waiting for the playhead", busy.len())
     } else {
@@ -302,7 +314,8 @@ pub fn summary(world: &mut World) -> Option<(String, String)> {
         .iter()
         .map(|(e, s)| {
             let name = world.get::<Name>(*e).map_or("Tracker".to_string(), |n| n.to_string());
-            let sides: Vec<String> = [s.forward.map(|f| side_line(&f, true)), s.backward.map(|b| side_line(&b, false))].into_iter().flatten().collect();
+            let method = world.get::<Tracker>(*e).map(|t| t.method);
+            let sides: Vec<String> = [s.forward.map(|f| side_line(&f, true, method)), s.backward.map(|b| side_line(&b, false, method))].into_iter().flatten().collect();
             format!("{name} ({}): {}", s.rendition, sides.join(", "))
         })
         .collect();
@@ -715,7 +728,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         // (The anchor as tracked: moved into the guide's frames.)
         let total = (s.to - status.anchor).abs().max(1) as f32;
         let done = (s.at - status.anchor).abs() as f32 / total;
-        ui.add(egui::ProgressBar::new(done.clamp(0.0, 1.0)).text(side_line(&s, forward)));
+        ui.add(egui::ProgressBar::new(done.clamp(0.0, 1.0)).text(side_line(&s, forward, Some(method))));
     }
     let _ = name;
 }
