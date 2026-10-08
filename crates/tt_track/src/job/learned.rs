@@ -34,6 +34,15 @@
 //!   waits for the model to load. It closes once no stream has used it for
 //!   [`IDLE`]. The anchor alone (the forward side of a tracker asked only
 //!   backward) needs no stream: it is the seed.
+//! - **Started early** (on request: "auto start up cotracker engine so we
+//!   don't have to warm it up the moment we place a cotracker point"): the
+//!   app calls [`warm_up`] once a video is open, so the model is loaded (and
+//!   has run a practice window: the worker's `practice`) before the first
+//!   CoTracker tracker needs it, and kept loaded while the app runs
+//!   ([`keep_warm`]). [`engine`] says how it is: starting, ready (on which
+//!   device), or why it could not start ([`Engine::Failed`]), for the app
+//!   to say so; it never retries by itself after a failure (a CoTracker job
+//!   still starts a worker when it needs one).
 //! - **A stuck worker** (the graphics card stopped answering, say) is stopped
 //!   after [`HANG`] with nothing from it while a stream waits on it (to take
 //!   a frame, or for its last results), and the jobs on it fail; the next
@@ -197,6 +206,58 @@ enum Reply {
 /// Worker processes started (tests count them: jobs share one).
 static STARTED: AtomicUsize = AtomicUsize::new(0);
 
+/// Keep the worker while nothing uses it ([`keep_warm`]).
+static KEEP: AtomicBool = AtomicBool::new(false);
+
+/// Why the last worker could not start or stopped (cleared when one is ready).
+static FAILED: Mutex<Option<String>> = Mutex::new(None);
+
+/// How the CoTracker engine (the shared worker) is now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// No worker runs.
+    Off,
+    /// Its Python and model are loading (the first time: a minute or so).
+    Starting,
+    /// Loaded and warmed up, on this device ("cuda", "mps", "cpu").
+    Ready(String),
+    /// The last one could not start, or stopped: why, in its own words.
+    Failed(String),
+}
+
+/// How the engine is now.
+pub fn engine() -> Engine {
+    let shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    match shared.as_ref().filter(|p| !p.dead.load(Ordering::Relaxed)) {
+        Some(p) if p.ready.load(Ordering::Relaxed) => Engine::Ready(p.device.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or_default()),
+        Some(_) => Engine::Starting,
+        None => match FAILED.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+            Some(why) => Engine::Failed(why),
+            None => Engine::Off,
+        },
+    }
+}
+
+/// Start the engine now if it isn't running (in the background: this
+/// returns at once), and keep it loaded while nothing uses it. Err: the
+/// worker could not even start (also kept for [`engine`]).
+pub fn warm_up() -> Result<()> {
+    keep_warm(true);
+    Proc::current().map(|_| ())
+}
+
+/// Keep the worker loaded while no tracker uses it (true), or close it
+/// [`IDLE`] after its last stream as before (false).
+pub fn keep_warm(on: bool) {
+    KEEP.store(on, Ordering::Relaxed);
+}
+
+/// Note why a worker failed (for [`engine`]); its stderr's last line says most.
+fn failed(why: String) {
+    tracing::warn!("CoTracker engine: {why}");
+    *FAILED.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+}
+
 /// How many CoTracker worker processes have started since the app did.
 pub fn processes_started() -> usize {
     STARTED.load(Ordering::Relaxed)
@@ -206,6 +267,7 @@ pub fn processes_started() -> usize {
 /// job starts another. For a worker set up anew (the doctor), and tests
 /// whose fake worker's switches changed.
 pub fn close_worker() {
+    *FAILED.lock().unwrap_or_else(PoisonError::into_inner) = None;
     if let Some(p) = SHARED.lock().unwrap_or_else(PoisonError::into_inner).take() {
         p.dead.store(true, Ordering::Relaxed);
         drop(p.queue.lock().unwrap_or_else(PoisonError::into_inner).take());
@@ -230,6 +292,8 @@ struct Proc {
     next: AtomicU32,
     /// Its model is loaded.
     ready: AtomicBool,
+    /// The device it said it runs on.
+    device: Mutex<Option<String>>,
     /// It is gone or going (failed, hung, idle): the next job starts another.
     dead: AtomicBool,
     /// Its watchdog stopped it: nothing came from it for [`HANG`].
@@ -267,7 +331,7 @@ impl Proc {
         if let Some(p) = shared.as_ref().filter(|p| !p.dead.load(Ordering::Relaxed)) {
             return Ok(p.clone());
         }
-        let p = Proc::spawn()?;
+        let p = Proc::spawn().inspect_err(|e| failed(format!("{e:#}")))?;
         *shared = Some(p.clone());
         Ok(p)
     }
@@ -298,6 +362,7 @@ impl Proc {
             routes: Mutex::new(HashMap::new()),
             next: AtomicU32::new(1),
             ready: AtomicBool::new(false),
+            device: Mutex::new(None),
             dead: AtomicBool::new(false),
             hung: AtomicBool::new(false),
             start: Instant::now(),
@@ -325,8 +390,11 @@ impl Proc {
                 me.hear();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 let routes = me.routes.lock().unwrap_or_else(PoisonError::into_inner);
-                if v.get("ready").is_some() {
+                if let Some(r) = v.get("ready") {
+                    *me.device.lock().unwrap_or_else(PoisonError::into_inner) = r.get("device").and_then(|d| d.as_str()).map(str::to_string);
+                    *FAILED.lock().unwrap_or_else(PoisonError::into_inner) = None;
                     me.ready.store(true, Ordering::Relaxed);
+                    tracing::info!("CoTracker worker {} ready on {}", me.name, r.get("device").and_then(|d| d.as_str()).unwrap_or("?"));
                     for tx in routes.values() {
                         let _ = tx.send(Reply::Ready);
                     }
@@ -335,6 +403,7 @@ impl Proc {
                 let Some(sid) = v.get("s").and_then(|s| s.as_u64()) else {
                     // The worker failed as a whole: every stream hears it.
                     let e = v.get("error").and_then(|e| e.as_str()).unwrap_or("the worker failed").to_string();
+                    failed(e.clone());
                     me.dead.store(true, Ordering::Relaxed);
                     for tx in routes.values() {
                         let _ = tx.send(Reply::Error(e.clone()));
@@ -356,7 +425,13 @@ impl Proc {
                     let _ = tx.send(reply);
                 }
             }
-            // It ended: every stream's replies end (their jobs see it).
+            // It ended: every stream's replies end (their jobs see it). Before it was ready, and not
+            // closed by us: it could not start (Python or PyTorch missing, say).
+            if !me.ready.load(Ordering::Relaxed) && !me.dead.load(Ordering::Relaxed) && FAILED.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+                std::thread::sleep(Duration::from_millis(200)); // (its stderr's last lines come in)
+                let words = me.last_words(1, "");
+                failed(if words.is_empty() { "the CoTracker worker stopped while it loaded".to_string() } else { words });
+            }
             me.dead.store(true, Ordering::Relaxed);
             me.routes.lock().unwrap_or_else(PoisonError::into_inner).clear();
         });
@@ -388,7 +463,7 @@ impl Proc {
             if self.dead.load(Ordering::Relaxed) {
                 break (false, false);
             }
-            if self.open.load(Ordering::Relaxed) == 0 {
+            if self.open.load(Ordering::Relaxed) == 0 && !KEEP.load(Ordering::Relaxed) {
                 if idle.get_or_insert_with(Instant::now).elapsed() >= IDLE {
                     // Nothing uses it: it goes (its model leaves the graphics card).
                     self.dead.store(true, Ordering::Relaxed);
@@ -403,6 +478,7 @@ impl Proc {
             }
             if excused.max(self.last_heard()).elapsed() >= HANG {
                 self.hung.store(true, Ordering::Relaxed);
+                failed(format!("CoTracker stopped answering for {} s, so it was stopped", HANG.as_secs()));
                 self.dead.store(true, Ordering::Relaxed);
                 tracing::warn!("CoTracker worker {}: no answer for {} s; stopping it", self.name, HANG.as_secs());
                 let _ = self.child.lock().unwrap_or_else(PoisonError::into_inner).kill();

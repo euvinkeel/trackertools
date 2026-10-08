@@ -248,6 +248,13 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 ui.separator();
                 open_doctor |= ui.button(egui::RichText::new(text).color(color)).on_hover_text(format!("{} Click to open the doctor.", step.text())).clicked();
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            } else if let Some(text) = crate::cotracker::early_start_label(world) {
+                ui.separator();
+                ui.label(egui::RichText::new(text).color(style::MUTED)).on_hover_text(
+                    "CoTracker loads its model now, while you work, so that CoTracker trackers can start at once. The first time can take a minute. \
+                     To stop this, go to Settings > CoTracker.",
+                );
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
         }
         let history = world.resource::<tt_core::history::History>();

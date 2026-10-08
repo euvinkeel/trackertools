@@ -344,6 +344,11 @@ impl eframe::App for Shell {
             return;
         }
         panels::draw(ui, &mut self.core.world);
+        if crate::cotracker::early_start(ui.ctx(), &mut self.core.world) {
+            let mut doctor = self.core.world.resource_mut::<crate::setup::Doctor>();
+            doctor.open = true;
+            doctor.recheck();
+        }
         if crate::recover::notice(ui.ctx(), &mut self.core.world) {
             let mut doctor = self.core.world.resource_mut::<crate::setup::Doctor>();
             (doctor.open, doctor.last_run_failed) = (true, false);

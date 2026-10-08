@@ -100,7 +100,8 @@ fn setup(run: TrackRun) -> Option<(Core, Entity)> {
     set_env("TT_FAKE_COTRACKER_HANG", None);
     // (Read once, by the first runner pass: the default, three jobs at once.)
     set_env("TT_COTRACKER_JOBS", None);
-    // A worker left from another test had other switches: it goes.
+    // A worker left from another test had other switches: it goes (and none is kept warm).
+    tt_track::job::keep_cotracker_warm(false);
     tt_track::job::close_cotracker_worker();
     let mut app = AppBuilder::new();
     app.add_module(CoreModules).add_module(TrackModule);
@@ -421,4 +422,66 @@ fn running_results_are_saved_now_and_then() {
     assert!(touched.windows(2).all(|t| t[1] - t[0] >= RESULTS_SAVED_EVERY), "at most every {RESULTS_SAVED_EVERY} s: {touched:?}");
     set_env("TT_FAKE_COTRACKER_DELAY", Some("0.005".as_ref()));
     quiet(&mut core);
+}
+
+/// Wait (up to 20 s) until the engine is as `done` says; its last state.
+fn engine_until(what: &str, done: impl Fn(&tt_track::job::CoTrackerEngine) -> bool) -> tt_track::job::CoTrackerEngine {
+    let start = Instant::now();
+    loop {
+        let e = tt_track::job::cotracker_engine();
+        if done(&e) {
+            return e;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "{what}: still {e:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Started early, the engine is ready before the first CoTracker tracker
+/// needs it, and that tracker uses it: no other worker starts, and the job
+/// never waits for a model to load.
+#[test]
+fn the_engine_started_early_is_the_one_trackers_use() {
+    use tt_track::job::CoTrackerEngine;
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    assert_eq!(tt_track::job::cotracker_engine(), CoTrackerEngine::Off);
+    let started = tt_track::job::cotracker_processes_started();
+    tt_track::job::warm_up_cotracker().expect("the worker starts");
+    assert_eq!(engine_until("ready", |e| matches!(e, CoTrackerEngine::Ready(_))), CoTrackerEngine::Ready("fake".into()));
+    let op = add(&mut core, guide);
+    let mut loaded = false;
+    run(&mut core, &[op], |w| loaded |= status(w, op).forward.is_some_and(|s| s.phase == Phase::Loading));
+    assert!(!loaded, "the tracker never waited for the model to load");
+    assert_eq!(coverage(&core.world, op), Some(570..631));
+    assert_eq!(tt_track::job::cotracker_processes_started() - started, 1, "one worker: the one started early");
+    // Kept loaded with nothing using it.
+    assert!(matches!(tt_track::job::cotracker_engine(), CoTrackerEngine::Ready(_)));
+    quiet(&mut core);
+    tt_track::job::keep_cotracker_warm(false);
+    tt_track::job::close_cotracker_worker();
+}
+
+/// An engine that can't start says why (for the app to show), and nothing
+/// panics: a worker that fails as it loads, and a Python that isn't there.
+#[test]
+fn an_engine_that_cannot_start_says_why() {
+    use tt_track::job::CoTrackerEngine;
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_core, _guide)) = setup(TrackRun::Both) else { return };
+    set_env("TT_FAKE_COTRACKER_FAIL", Some("1".as_ref()));
+    tt_track::job::warm_up_cotracker().expect("the process starts");
+    let e = engine_until("failed", |e| matches!(e, CoTrackerEngine::Failed(_)));
+    assert!(matches!(&e, CoTrackerEngine::Failed(why) if why.contains("fake CoTracker failure")), "{e:?}");
+    set_env("TT_FAKE_COTRACKER_FAIL", None);
+    tt_track::job::close_cotracker_worker();
+    assert_eq!(tt_track::job::cotracker_engine(), CoTrackerEngine::Off, "closed anew: no failure kept");
+
+    let python = std::env::var_os("TT_PYTHON");
+    set_env("TT_PYTHON", Some(r"C:\nonexistent\python.exe".as_ref()));
+    assert!(tt_track::job::warm_up_cotracker().is_err());
+    assert!(matches!(tt_track::job::cotracker_engine(), CoTrackerEngine::Failed(why) if why.contains("starting the CoTracker worker")));
+    set_env("TT_PYTHON", python.as_deref());
+    tt_track::job::keep_cotracker_warm(false);
+    tt_track::job::close_cotracker_worker();
 }

@@ -747,6 +747,7 @@ pub struct SetupModule;
 impl Module for SetupModule {
     fn build(&self, app: &mut AppBuilder) {
         app.declare::<Doctor>(Class::Derived).init_resource::<Doctor>();
+        app.declare::<crate::cotracker::EarlyStart>(Class::Derived).init_resource::<crate::cotracker::EarlyStart>();
     }
 }
 

@@ -93,6 +93,8 @@ struct SettingsFile {
     check_for_updates: bool,
     /// A version whose update prompt was answered with Skip.
     skipped_update: Option<String>,
+    /// Start CoTracker's engine when a video opens (`cotracker::EarlyStart`).
+    cotracker_start_early: bool,
 }
 
 impl Default for SettingsFile {
@@ -124,12 +126,14 @@ impl Default for SettingsFile {
             stabilize_offset: st.offset,
             check_for_updates: Updater::default().check_on_start,
             skipped_update: None,
+            cotracker_start_early: true,
         }
     }
 }
 
 impl SettingsFile {
-    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed, l: &LookDefaults, st: &StabilizerDefaults, u: &Updater) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn of(d: &SketchDefaults, v: &ViewDefaults, p: &PointerView, a: &AutoSpeed, l: &LookDefaults, st: &StabilizerDefaults, u: &Updater, early: bool) -> Self {
         Self {
             version: SETTINGS_VERSION,
             wheel: d.wheel,
@@ -155,6 +159,7 @@ impl SettingsFile {
             stabilize_offset: st.offset,
             check_for_updates: u.check_on_start,
             skipped_update: u.skipped.clone(),
+            cotracker_start_early: early,
         }
     }
 
@@ -190,6 +195,9 @@ impl SettingsFile {
         *world.resource_mut::<AutoSpeed>() = AutoSpeed { enabled: self.auto_speed.enabled || self.version < 3, ..self.auto_speed.clone() };
         if let Some(mut l) = world.get_resource_mut::<LookDefaults>() {
             l.auto_mask = self.auto_mask_looks;
+        }
+        if let Some(mut e) = world.get_resource_mut::<crate::cotracker::EarlyStart>() {
+            e.enabled = self.cotracker_start_early;
         }
         if let Some(mut u) = world.get_resource_mut::<Updater>() {
             u.check_on_start = self.check_for_updates;
@@ -308,9 +316,10 @@ fn track_settings(
     looks: Res<LookDefaults>,
     stabilizer: Res<StabilizerDefaults>,
     updater: Res<Updater>,
+    early: Option<Res<crate::cotracker::EarlyStart>>,
     mut session: ResMut<Session>,
 ) {
-    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto, &looks, &stabilizer, &updater);
+    let settings = SettingsFile::of(&defaults, &views, &pointer, &auto, &looks, &stabilizer, &updater, early.is_none_or(|e| e.enabled));
     if session.file.settings != settings && !session.scripted {
         session.file.settings = settings;
     }
@@ -382,7 +391,7 @@ mod tests {
     #[test]
     fn the_preset_new_sketches_use_is_remembered() {
         let chosen = SketchDefaults { params: SketchParams::preset("Loose").unwrap(), ..SketchDefaults::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default(), &LookDefaults::default(), &StabilizerDefaults::default(), &Updater::default())).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&chosen, &ViewDefaults::default(), &PointerView::default(), &AutoSpeed::default(), &LookDefaults::default(), &StabilizerDefaults::default(), &Updater::default(), true)).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();
@@ -395,7 +404,7 @@ mod tests {
     #[test]
     fn auto_speed_and_its_knobs_are_remembered() {
         let knobs = AutoSpeed { enabled: true, comfort: 450.0, look_ahead: 0.0, ..AutoSpeed::default() };
-        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs, &LookDefaults::default(), &StabilizerDefaults::default(), &Updater::default())).unwrap();
+        let text = serde_json::to_string(&SettingsFile::of(&SketchDefaults::default(), &ViewDefaults::default(), &PointerView::default(), &knobs, &LookDefaults::default(), &StabilizerDefaults::default(), &Updater::default(), true)).unwrap();
         let mut world = World::new();
         world.init_resource::<SketchDefaults>();
         world.init_resource::<ViewDefaults>();
@@ -419,6 +428,7 @@ mod tests {
             &LookDefaults::default(),
             &chosen,
             &Updater::default(),
+            true,
         ))
         .unwrap();
         let mut world = World::new();
