@@ -181,6 +181,11 @@ class Engine(v1.TrackingEngine):
 # largest batch, in chunks of v1.ENCODE_CHUNK frames.
 BATCH = os.environ.get("TT_COTRACKER_BATCH") != "0"
 ENCODE_BATCH = 4
+# The encoder batched too: off unless TT_COTRACKER_BATCH_ENCODE=1. Measured, it
+# never paid: no faster on a PC's CPU, 11% slower on a Mac's MPS and twice
+# as slow on a Mac's CPU (2026-10-08), while the transformer's batch saves
+# 6–31%. So each stream's frames are encoded as before (chunks of 8).
+BATCH_ENCODE = os.environ.get("TT_COTRACKER_BATCH_ENCODE") == "1"
 
 PROFILE = os.environ.get("TT_COTRACKER_PROFILE") == "1"
 PROFILE_LOG = []  # what TT_COTRACKER_PROFILE logs, kept (editor/bench_shared.py reads it)
@@ -514,7 +519,11 @@ def run_round(eng: Engine, ready) -> list:
 
     began = []
     each(range(len(ready)), lambda i: ready[i][1].begin(ready[i][2], ready[i][3]) and began.append(i))
-    pyramids = batched("encode", began, lambda idx: eng.encode_many([ready[i][2] for i in idx]), lambda i: eng.encode(ready[i][2]))
+    if BATCH_ENCODE:
+        pyramids = batched("encode", began, lambda idx: eng.encode_many([ready[i][2] for i in idx]), lambda i: eng.encode(ready[i][2]))
+    else:
+        pyramids = {}
+        each(began, lambda i: pyramids.__setitem__(i, eng.encode(ready[i][2])))
     clock.lap("encode")
     placed = each(list(pyramids), lambda i: ready[i][1].place(pyramids[i]))
     clock.lap("sample")
@@ -632,7 +641,7 @@ def practice(eng: Engine):
     if not s.over:
         s.window([], True)
     # And the batched encoder's other chunk sizes (each tuned on its first run).
-    if BATCH and eng.device != "cpu":
+    if BATCH and BATCH_ENCODE and eng.device != "cpu":
         for k in range(2, ENCODE_BATCH + 1):
             eng.encode([blank] * (k * v1.ENCODE_CHUNK), k * v1.ENCODE_CHUNK)
 
