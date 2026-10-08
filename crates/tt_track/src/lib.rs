@@ -483,6 +483,71 @@ pub fn add_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity
     made
 }
 
+/// Whether looks of a `from` tracker can go to a `to` tracker: the same kind
+/// of look (a paint to a paint tracker, a reset point to a point tracker, a
+/// pattern to a template tracker).
+pub fn looks_fit(from: Method, to: Method) -> bool {
+    let kind = |m: Method| match m {
+        Method::Paint => 0,
+        m if m.point() => 1,
+        Method::Template => 2,
+        Method::Manual => 3,
+        _ => 4,
+    };
+    kind(from) == kind(to) && to != Method::Manual
+}
+
+/// What moving `looks` to `tracker` would do: the looks that can go (live,
+/// of another tracker of the same kind), and the trackers they leave with
+/// no looks at all (they go too: a tracker made by mistake).
+pub fn looks_to_move(world: &World, looks: &[Entity], tracker: Entity) -> (Vec<(Entity, Entity)>, Vec<Entity>) {
+    let Some(to) = world.get::<Tracker>(tracker).map(|t| t.method) else { return (Vec::new(), Vec::new()) };
+    let moving: Vec<(Entity, Entity)> = looks
+        .iter()
+        .filter(|l| world.get::<Look>(**l).is_some() && world.get_entity(**l).is_ok_and(|r| !r.contains::<Disabled>()))
+        .filter_map(|l| Some((*l, look::owner_of(world, *l)?)))
+        .filter(|(_, owner)| *owner != tracker && world.get::<Tracker>(*owner).is_some_and(|t| looks_fit(t.method, to)))
+        .collect();
+    let mut emptied: Vec<Entity> = moving.iter().map(|(_, o)| *o).collect();
+    emptied.sort();
+    emptied.dedup();
+    emptied.retain(|o| look::looks_of(world, *o).iter().all(|l| moving.iter().any(|(m, _)| m == l)));
+    (moving, emptied)
+}
+
+/// Move `looks` (paints, reset points, patterns) to `tracker`, one undo step
+/// (on request: "I accidentally make new paintings under a brand new tracker
+/// when I mean to have another tracker use those paints … box select the
+/// paint keyframes and drag them onto another tracker"): they leave their
+/// trackers and become `tracker`'s; a tracker left with no looks goes (with
+/// its view). Returns how many moved and how many trackers went.
+pub fn move_looks(world: &mut World, looks: &[Entity], tracker: Entity) -> (usize, usize) {
+    let (moving, emptied) = looks_to_move(world, looks, tracker);
+    if moving.is_empty() {
+        return (0, 0);
+    }
+    let word = method_of(world, tracker).look_word();
+    let name = world.get::<Name>(tracker).map_or("the tracker".to_string(), |n| n.to_string());
+    let label = match moving.len() {
+        1 => format!("Move {word} to {name}"),
+        n => format!("Move {n} {word}s to {name}"),
+    };
+    let mut doomed = emptied.clone();
+    for t in &emptied {
+        doomed.extend(tt_core::view::view_of(world, *t));
+    }
+    edit(world, &label, |tx| {
+        for (l, owner) in &moving {
+            tx.modify::<Inputs>(*owner, |i| i.0.retain(|(s, p)| !(s == "look" && p == l)));
+            tx.modify::<Inputs>(tracker, |i| i.0.push(("look".to_string(), *l)));
+        }
+        for e in &doomed {
+            tx.delete(*e);
+        }
+    });
+    (moving.len(), emptied.len())
+}
+
 /// A CoTracker's reset point on `look`'s frame (one undo step): it follows
 /// one pixel at a time, so a reset point already on that frame moves there;
 /// else a new one. Returns it.
