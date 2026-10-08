@@ -10,7 +10,9 @@ variable resolutions and add VOTSp2026 submission files").
 Changes for trackertools: package-relative imports instead of
 `tapnet.tapnext`, and the einops rearranges replaced by the equivalent
 torch reshape/permute calls (tapnext_torch.py, tapnext_lru_modules.py; each
-file says so in its header). pscan.py is unchanged.
+file says so in its header); in tapnext_torch.py the torch.export / pytree
+registrations (private torch API, unused here) may fail without stopping the
+import. pscan.py is unchanged.
 
 The TAPNext++ weights (tapnextpp_ckpt.pt, tapnextpp_512.ckpt; Apache-2.0,
 from DeepMind's storage) are not part of this repository.

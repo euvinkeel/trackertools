@@ -13,7 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 # Modified for trackertools (2026): package-relative import; einops calls
-# replaced by the equivalent reshape/permute (no einops dependency).
+# replaced by the equivalent reshape/permute (no einops dependency); the
+# torch.export / pytree registrations may fail without stopping the import.
 
 """TAPNext implementation in torch."""
 
@@ -333,7 +334,13 @@ class TAPNext(nn.Module):
         ),
     )
 
-torch.export.register_dataclass(TAPNextTrackingState)
+# (trackertools: torch.export registration is for exporting the model, which
+# we don't; it uses private torch API, so a torch without it must not stop
+# the import.)
+try:
+  torch.export.register_dataclass(TAPNextTrackingState)
+except Exception:  # pylint: disable=broad-except
+  pass
 
 
 def flatten_tracking_state(state, _):
@@ -344,6 +351,9 @@ def flatten_tracking_state(state, _):
   )
 
 
-torch.fx._pytree.register_pytree_flatten_spec(  # pylint: disable=protected-access
-    TAPNextTrackingState, flatten_tracking_state
-)
+try:
+  torch.fx._pytree.register_pytree_flatten_spec(  # pylint: disable=protected-access
+      TAPNextTrackingState, flatten_tracking_state
+  )
+except Exception:  # pylint: disable=broad-except
+  pass
