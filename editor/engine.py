@@ -336,14 +336,15 @@ class TrackingEngine:
 
     # ---- network pieces -------------------------------------------------
 
-    def encode(self, frames: List[np.ndarray]) -> List[torch.Tensor]:
-        # Always run the encoder on fixed-size chunks so cudnn autotunes once.
+    def encode(self, frames: List[np.ndarray], chunk: int = ENCODE_CHUNK) -> List[torch.Tensor]:
+        # Always run the encoder on fixed-size chunks so cudnn autotunes once
+        # (per chunk size: the shared worker's batches use a few multiples).
         chunks = []
-        for i in range(0, len(frames), ENCODE_CHUNK):
-            part = frames[i:i + ENCODE_CHUNK]
+        for i in range(0, len(frames), chunk):
+            part = frames[i:i + chunk]
             n = len(part)
-            if n < ENCODE_CHUNK:
-                part = part + [part[-1]] * (ENCODE_CHUNK - n)
+            if n < chunk:
+                part = part + [part[-1]] * (chunk - n)
             x = torch.from_numpy(np.stack(part)).to(self.device, non_blocking=True)
             x = x.permute(0, 3, 1, 2).float()
             x = 2 * (x / 255.0) - 1.0
@@ -398,6 +399,23 @@ class TrackingEngine:
         return torch.tensor(rows, device=self.device, dtype=torch.float32) / self.stride
 
     def run_window(self, pyramid, tracks: List[Track], ind: Optional[int] = None):
+        coords, vis, conf, support = self.window_inputs(tracks, ind)
+        if self.graphed is not None:
+            try:
+                return self.graphed.run(pyramid, coords, vis, conf, support, len(tracks))
+            except Exception:
+                import traceback
+
+                traceback.print_exc()
+                print("CUDA graph path failed; falling back to eager execution.")
+                self.graphed = None
+        c, v, k = forward_window_safe(self.model, pyramid, coords, support, vis, conf, self.iters)
+        return c[0], v[0], k[0]  # (S,N,2) px, (S,N), (S,N)
+
+    def window_inputs(self, tracks: List[Track], ind: Optional[int] = None):
+        """The window's starting state for `tracks` (each carried on from its
+        last window, or from its query): coords (1, S, N, 2) in stride units,
+        vis and conf logits (1, S, N, 1), support features per level (1, 1, 49, N, C)."""
         S, overlap = self.S, self.overlap
         coords, vis, conf = [], [], []
         for t in tracks:
@@ -432,17 +450,7 @@ class TrackingEngine:
             torch.stack([t.feats[i] for t in tracks], dim=1)[None, None]
             for i in range(self.levels)
         ]  # (1, 1, 49, N, C)
-        if self.graphed is not None:
-            try:
-                return self.graphed.run(pyramid, coords, vis, conf, support, len(tracks))
-            except Exception:
-                import traceback
-
-                traceback.print_exc()
-                print("CUDA graph path failed; falling back to eager execution.")
-                self.graphed = None
-        c, v, k = forward_window_safe(self.model, pyramid, coords, support, vis, conf, self.iters)
-        return c[0], v[0], k[0]  # (S,N,2) px, (S,N), (S,N)
+        return coords, vis, conf, support
 
     # ---- jobs -------------------------------------------------------------
 
