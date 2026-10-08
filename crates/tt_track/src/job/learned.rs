@@ -66,7 +66,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tt_core::time::FrameIndex;
 use tt_media::FrameStream;
 
-use super::{JobSpec, MAX_PATCHES, SEGMENT, Shared, Side, Worker};
+use super::{JobSpec, LookSpec, MAX_PATCHES, SEGMENT, Shared, Side, Worker};
 use crate::Method;
 use crate::image::{Grid, Luma, chroma_planes, resample_xy, with_colour};
 
@@ -681,7 +681,16 @@ impl Worker {
             hw = hw.max((b[0] - b[2]).max(b[4] - b[0]) * search);
             hh = hh.max((b[1] - b[3]).max(b[5] - b[1]) * search);
         }
-        let w = (k * hw).max(k * hh * CROP_W as f64 / CROP_H as f64);
+        let mut w = (k * hw).max(k * hh * CROP_W as f64 / CROP_H as f64);
+        // A paint tracker's paints fit too (they can be spread over the picture), with a margin.
+        if s.method == Method::Paint {
+            for l in s.looks.iter().filter(|l| (s.lo..s.lo + s.maps.len() as FrameIndex).contains(&l.frame)) {
+                let g = self.guide_point(l.frame);
+                let b = self.map(l.frame).box_from_source([l.center[0], l.center[1], l.center[0] - l.half[0], l.center[1] - l.half[1], l.center[0] + l.half[0], l.center[1] + l.half[1]]);
+                let (dx, dy) = ((b[2] - g[0]).abs().max((b[4] - g[0]).abs()), (b[3] - g[1]).abs().max((b[5] - g[1]).abs()));
+                w = w.max(2.2 * dx).max(2.2 * dy * CROP_W as f64 / CROP_H as f64);
+            }
+        }
         CROP_W as f64 / w
     }
 
@@ -764,17 +773,16 @@ impl Worker {
         if paint {
             // Many points over each paint on the stream's frames (`paint`).
             let mut pq = Vec::new();
-            let mut paints = Vec::new();
+            let mut paints: Vec<(usize, LookSpec)> = Vec::new();
             for i in 0..n {
                 let f = stream.frame(i);
                 for l in s.looks.iter().filter(|l| l.frame == f) {
-                    let k = paints.len();
-                    paints.push((f, l.clone()));
+                    paints.push((i, l.clone()));
                     for p in super::paint::sample(l, super::paint::POINTS_PER_PAINT) {
                         let c = crop_point(f, self.map(f).from_source(p));
                         if (0.0..CROP_W as f64).contains(&c[0]) && (0.0..CROP_H as f64).contains(&c[1]) {
                             queries.push((i, c));
-                            pq.push(super::paint::PaintQuery { i, paint: k, reference: None, dropped: false });
+                            pq.push(super::paint::PaintQuery { i, reference: None });
                         }
                     }
                 }
@@ -784,7 +792,8 @@ impl Worker {
             }
             let a = self.map(anchor).a;
             let half = first_paint.as_ref().map_or(self.half, |l| l.half.map(|h| (h / a * s.scale).max(2.0)));
-            self.paint = Some(super::paint::PaintFit::new(pq, paints, seed, half));
+            // (Outliers: further than 1.5 crop px from where the motion puts them, at least.)
+            self.paint = Some(super::paint::PaintFit::new(pq, paints, seed, half, s.settings.min_score as f64, 1.5 / scale));
         } else {
             queries.push((0usize, crop_point(start, first_seed)));
             for i in 1..n {
@@ -859,6 +868,11 @@ impl Worker {
                 Ok(Reply::Frame(i, points)) => self.take(&stream, &queries, i, &points),
                 Ok(Reply::Done) => {
                     worker.finished = true;
+                    // A paint tracker's frames still waiting for a paint the stream didn't reach.
+                    if let Some(mut fit) = self.paint.take() {
+                        let (out, half) = (fit.finish(), fit.half);
+                        self.paint_out(out, half);
+                    }
                     return Ok(());
                 }
                 Ok(Reply::Error(e)) => bail!("CoTracker: {e}"),
@@ -905,6 +919,23 @@ impl Worker {
         Ok(())
     }
 
+    /// A paint tracker's frames as they come out (`paint`): each its point,
+    /// its box scaled with the motion, and its points.
+    fn paint_out(&mut self, out: Vec<super::paint::FrameOut>, half: [f64; 2]) {
+        let base = self.half;
+        for o in out {
+            self.half = half.map(|h| h * o.scale);
+            // (The stream's first frame is the anchor's: emitted already as the paint's centre.)
+            if o.i > 0 {
+                self.emit(o.f, o.at, o.score, o.lost);
+            }
+            let map = *self.map(o.f);
+            let marks = o.marks.iter().map(|m| super::PointMark { id: m.id, at: map.to_source(m.at).map(|v| v as f32), seen: m.seen, kept: m.kept }).collect();
+            self.marks.push((o.f, marks));
+        }
+        self.half = base;
+    }
+
     /// Stream frame `i`'s result: from the latest seed at or before it; a
     /// look's own frame is pinned where the user put it.
     fn take(&mut self, stream: &Stream, queries: &[usize], i: usize, points: &[Option<[f64; 3]>]) {
@@ -914,19 +945,13 @@ impl Worker {
             self.shared.set_phase(super::Phase::Tracking);
         }
         if let Some(mut fit) = self.paint.take() {
-            // A paint tracker: one motion from all its points (`paint`).
-            let pts: Vec<Option<([f64; 2], f64)>> =
+            // A paint tracker: one motion from the points that stay on the subject (`paint`).
+            let pts: super::paint::Points =
                 points.iter().map(|p| p.filter(|[x, y, _]| x.is_finite() && y.is_finite()).map(|[x, y, s]| (grid.to_view([x, y]), s.clamp(0.0, 1.0)))).collect();
-            // (Outliers: further than 1.5 crop px from where the motion puts them, at least.)
-            let r = fit.frame(i, f, self.map(f), &pts, self.spec.settings.min_score as f64, 1.5 / grid.scale);
-            let base = self.half;
-            self.half = fit.half.map(|h| h * r.scale);
-            // The stream's first frame is the anchor's (emitted already as the paint's centre).
-            if i > 0 {
-                self.emit(f, r.at, r.score, r.lost);
-            }
-            self.half = base;
+            let out = fit.frame(i, f, self.map(f), pts);
+            let half = fit.half;
             self.paint = Some(fit);
+            self.paint_out(out, half);
             return;
         }
         // The stream's first frame is the anchor (emitted already) or the resume point (tracked before).

@@ -18,8 +18,10 @@
 //!
 //! - **Paint** trackers: hold and brush over the subject (the brush is the
 //!   click's size: Ctrl+wheel). Let go: the area brushed is a paint (a look
-//!   with that mask): a new paint tracker, or with one selected another
-//!   paint on this frame, its reset paint ([`crate::job::paint`]).
+//!   with that mask): a new paint tracker, or with one selected, added to
+//!   its paint on this frame (anywhere on the picture: patches with gaps
+//!   between them are one paint), or a new paint on this frame
+//!   ([`crate::job::paint`]). Alt+brush erases from its paint here.
 //!
 //! New template looks get their mask painted automatically ([`crate::look::LookDefaults`]).
 //!
@@ -61,23 +63,36 @@ impl Default for TrackTool {
     }
 }
 
-/// The paint a brush stroke makes: the stroke `path` with radius `r` (both in
-/// one space's pixels), as `(centre, half-size, mask)` of a look there.
-pub fn paint_look(path: &[[f64; 2]], r: f64) -> ([f64; 2], [f64; 2], Vec<u8>) {
-    use crate::look::MASK_N;
+/// What a brush stroke makes of a paint: the stroke `path` with radius `r`
+/// added to `old` (a paint's `(centre, half-size, mask)`, all in one space's
+/// pixels), or with `erase` taken out of it. A paint over a large area gets
+/// finer cells (a mask `n × n`, 32 to 128 a side), so patches far apart stay
+/// as painted. None: nothing is left painted.
+pub fn brush_paint(old: Option<([f64; 2], [f64; 2], &[u8])>, path: &[[f64; 2]], r: f64, erase: bool) -> Option<([f64; 2], [f64; 2], Vec<u8>)> {
     let r = r.max(0.5);
     let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-    for p in path {
+    let mut grow = |p: [f64; 2], h: [f64; 2]| {
         for k in 0..2 {
-            lo[k] = lo[k].min(p[k] - r);
-            hi[k] = hi[k].max(p[k] + r);
+            lo[k] = lo[k].min(p[k] - h[k]);
+            hi[k] = hi[k].max(p[k] + h[k]);
+        }
+    };
+    if let Some((c, h, _)) = old {
+        grow(c, h);
+    }
+    if !erase || old.is_none() {
+        for p in path {
+            grow(*p, [r, r]);
         }
     }
     let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
     let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0];
+    // Cells about a third of the brush's radius, 32 to 128 a side.
+    let n = ((2.0 * half[0].max(half[1]) / (r / 3.0).max(1.0)).ceil() as usize).clamp(crate::look::MASK_N, 128);
     // Distance from a point to the stroke (a dot: its first point).
     let near = |q: [f64; 2]| -> f64 {
-        let mut best = (q[0] - path[0][0]).hypot(q[1] - path[0][1]);
+        let Some(first) = path.first() else { return f64::INFINITY };
+        let mut best = (q[0] - first[0]).hypot(q[1] - first[1]);
         for w in path.windows(2) {
             let (a, b) = (w[0], w[1]);
             let d = [b[0] - a[0], b[1] - a[1]];
@@ -87,16 +102,32 @@ pub fn paint_look(path: &[[f64; 2]], r: f64) -> ([f64; 2], [f64; 2], Vec<u8>) {
         }
         best
     };
-    let mut mask = vec![0u8; MASK_N * MASK_N];
-    for y in 0..MASK_N {
-        for x in 0..MASK_N {
-            let q = [lo[0] + (x as f64 + 0.5) / MASK_N as f64 * 2.0 * half[0], lo[1] + (y as f64 + 0.5) / MASK_N as f64 * 2.0 * half[1]];
-            if near(q) <= r {
-                mask[y * MASK_N + x] = 255;
+    // Whether the old paint covers a point (its nearest cell).
+    let was = |q: [f64; 2]| -> bool {
+        let Some((c, h, mask)) = old else { return false };
+        let Some(m) = crate::job::paint::mask_side(mask) else { return false };
+        let (u, v) = ((q[0] - (c[0] - h[0])) / (2.0 * h[0]) * m as f64, (q[1] - (c[1] - h[1])) / (2.0 * h[1]) * m as f64);
+        let (x, y) = (u.floor() as i64, v.floor() as i64);
+        (0..m as i64).contains(&x) && (0..m as i64).contains(&y) && mask[y as usize * m + x as usize] >= 96
+    };
+    let mut mask = vec![0u8; n * n];
+    let mut any = false;
+    for y in 0..n {
+        for x in 0..n {
+            let q = [lo[0] + (x as f64 + 0.5) / n as f64 * 2.0 * half[0], lo[1] + (y as f64 + 0.5) / n as f64 * 2.0 * half[1]];
+            let on = near(q) <= r;
+            if if erase { was(q) && !on } else { was(q) || on } {
+                mask[y * n + x] = 255;
+                any = true;
             }
         }
     }
-    (centre, half, mask)
+    any.then_some((centre, half, mask))
+}
+
+/// The paint a brush stroke makes on its own (`brush_paint` with nothing before it).
+pub fn paint_look(path: &[[f64; 2]], r: f64) -> ([f64; 2], [f64; 2], Vec<u8>) {
+    brush_paint(None, path, r, false).expect("a stroke paints")
 }
 
 impl TrackTool {
@@ -151,11 +182,12 @@ pub fn track_tool(world: &mut World) {
     let ended = p.released.is_some() || !p.down;
     if ended && painting && let Some((start, f, shift)) = tool.drag.take() {
         let path = if tool.stroke.is_empty() { vec![start] } else { std::mem::take(&mut tool.stroke) };
-        let (c, h, mask) = paint_look(&path, tool.brush as f64 / p.scale.max(1e-9));
+        // In source pixels: a paint lives there (the brush's radius is the shown space's).
         let map = map_at(world, world.resource::<ActiveView>().0, f);
-        let mut look = Look::new(f, map.to_source(c), [h[0] * map.a, h[1] * map.a]);
-        look.mask = mask;
-        tool.refused = place(world, look, shift, tool.reseed.take()).err();
+        let path: Vec<[f64; 2]> = path.iter().map(|p| map.to_source(*p)).collect();
+        let r = tool.brush as f64 / p.scale.max(1e-9) * map.a;
+        let erase = world.resource::<KeysHeld>().mods.alt;
+        tool.refused = brush(world, f, &path, r, shift, erase, tool.reseed.take()).err();
     }
     if ended && let Some((start, f, shift)) = tool.drag.take() {
         tool.stroke.clear();
@@ -169,6 +201,41 @@ pub fn track_tool(world: &mut World) {
         tool.refused = place(world, look, shift, tool.reseed.take()).err();
     }
     *world.resource_mut::<TrackTool>() = tool;
+}
+
+/// A brush stroke (source px, radius `r`) on frame `f`: added to the
+/// selected paint tracker's paint on this frame (or, `erase`, taken out of
+/// it: a paint left empty goes), else a new paint (`place`). Err = why not.
+fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool, erase: bool, reseed: Option<Entity>) -> Result<(), String> {
+    let tracker = world.resource::<Selection>().primary().filter(|e| is_tracker(world, *e)).filter(|_| !new).filter(|e| world.get::<Tracker>(*e).is_some_and(|t| t.method == Method::Paint));
+    let here = tracker.and_then(|t| crate::look::looks_of(world, t).into_iter().find(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == f)));
+    match (here, erase) {
+        (Some(l), _) => {
+            let old = world.get::<Look>(l).cloned().expect("a look");
+            let made = brush_paint(Some((old.center(), old.half(), &old.mask)), path, r, erase);
+            match made {
+                Some((c, h, mask)) => {
+                    tt_core::history::edit(world, if erase { "Erase paint" } else { "Paint" }, |tx| {
+                        tx.modify::<Look>(l, |look| {
+                            (look.x, look.y, look.half_w, look.half_h) = (c[0] as f32, c[1] as f32, h[0] as f32, h[1] as f32);
+                            look.mask = mask;
+                        });
+                    });
+                }
+                None => {
+                    tt_core::commands::delete(world, &[l]);
+                }
+            }
+            Ok(())
+        }
+        (None, true) => Err("Nothing to erase: this tracker has no paint on this frame".into()),
+        (None, false) => {
+            let (c, h, mask) = paint_look(path, r);
+            let mut look = Look::new(f, c, h);
+            look.mask = mask;
+            place(world, look, new, reseed)
+        }
+    }
 }
 
 /// What a press makes: the selected tracker's kind (unless `new`), else the kind chosen for new ones.
@@ -217,5 +284,32 @@ fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Re
         Some(g) => add_tracker_with_look(world, g, look).map(|_| ()).ok_or_else(|| "That sketch has no frames to track in".to_string()),
         // No sketch here: the tracker searches the whole frame.
         None => add_unguided_tracker(world, look).map(|_| ()).ok_or_else(|| "There is no video to track in".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::LookSpec;
+    use crate::job::paint::on;
+
+    fn spec(made: &([f64; 2], [f64; 2], Vec<u8>)) -> LookSpec {
+        LookSpec { frame: 0, center: made.0, half: made.1, mask: Some(made.2.clone()) }
+    }
+
+    /// Strokes far apart are one paint (the gap stays unpainted, with fine
+    /// enough cells), and an erasing stroke takes its part out of it.
+    #[test]
+    fn a_paint_grows_over_gaps_and_erases() {
+        let a = brush_paint(None, &[[100.0, 100.0], [120.0, 100.0]], 8.0, false).expect("painted");
+        let b = brush_paint(Some((a.0, a.1, &a.2)), &[[900.0, 500.0]], 8.0, false).expect("painted");
+        let s = spec(&b);
+        assert!(on(&s, [110.0, 100.0]) && on(&s, [900.0, 500.0]), "both patches");
+        assert!(!on(&s, [500.0, 300.0]) && !on(&s, [160.0, 100.0]), "not the gap between them");
+        assert!(crate::job::paint::mask_side(&b.2).is_some_and(|n| n > crate::look::MASK_N), "finer cells over a large area");
+        let c = brush_paint(Some((b.0, b.1, &b.2)), &[[900.0, 500.0]], 12.0, true).expect("some left");
+        let s = spec(&c);
+        assert!(on(&s, [110.0, 100.0]) && !on(&s, [900.0, 500.0]), "the second patch erased");
+        assert!(brush_paint(Some((c.0, c.1, &c.2)), &[[90.0, 100.0], [130.0, 100.0]], 15.0, true).is_none(), "all erased: none left");
     }
 }

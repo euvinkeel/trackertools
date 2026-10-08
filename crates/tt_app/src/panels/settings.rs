@@ -60,6 +60,8 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         });
         ui.add_space(6.0);
         ui.label("On the video");
+        ui.checkbox(&mut pv.paint_paths, "Paths of paint trackers' points")
+            .on_hover_text("Each point of the selected paint tracker gets its path over the nearby frames: in its colour while it is in the cohort, faded red up to where it leaves. The points' dots on the shown frame always show.");
         ui.checkbox(&mut pv.ants, "Moving outline on the selected box")
             .on_hover_text("A black and white outline that moves around the selected sketch's box and the box being recorded, so you can see it on light and dark pictures.");
         ui.checkbox(&mut pv.dim_outside, "In a view, dim what is outside its box")
