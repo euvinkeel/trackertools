@@ -1,7 +1,8 @@
 //! Setting CoTracker up on a computer that only has the program (the
 //! doctor, `crate::setup`). CoTracker3 runs in a Python worker
-//! (tt_track::job::learned) with PyTorch on an NVIDIA graphics card. All of
-//! it goes into `cotracker\` in the data folder (`tt_track::job::cotracker_dir`):
+//! (tt_track::job::learned) with PyTorch on an NVIDIA graphics card (Windows)
+//! or on Apple silicon's graphics (macOS: PyTorch's MPS). All of it goes into
+//! `cotracker\` in the data folder (`tt_track::job::cotracker_dir`):
 //!
 //! - `uv\`: uv, Astral's single-file Python manager, from its GitHub release
 //!   (checked against its SHA-256). It needs no admin rights and changes
@@ -9,7 +10,8 @@
 //! - `python\`, `env\`: a Python 3.12 of uv's own, and an environment with
 //!   PyTorch 2.14.0 built for the card: CUDA 13.0 for Blackwell (the RTX 50
 //!   cards; the CUDA 12.6 build has no code for them), else CUDA 12.6, what
-//!   the worker was developed with; and the worker's other packages (NumPy,
+//!   the worker was developed with; on a Mac, PyPI's own build, which has
+//!   MPS. And the worker's other packages (NumPy,
 //!   PyAV, OpenCV), at the versions it was developed with. pip installs
 //!   them (from the Python itself, `ensurepip`), not uv: uv unpacks into its
 //!   cache and then renames the folder, which Windows refused ("Access is
@@ -27,7 +29,8 @@
 //! bring it. Microsoft's installer (checked: signed by Microsoft) puts it
 //! there, after Windows asks the person for permission.
 //!
-//! Then the worker starts once, to see that it loads the model on the card.
+//! Then the worker starts once, to see that it loads the model on the card
+//! (on a Mac, on MPS, or on the processor when MPS does not work).
 //! Every step says what it does in a sentence (ASD-STE100, as all of setup).
 //! `TT_COTRACKER_CUDA=cu126|cu130` picks the PyTorch build, and
 //! `TT_VC_RUNTIME=<version>|none` pretends a Visual C++ runtime (tests).
@@ -46,7 +49,14 @@ mod code {
     include!(concat!(env!("OUT_DIR"), "/cotracker_code.rs"));
 }
 
-pub const UV_ZIP: &str = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip";
+/// uv's release download for this computer (a `.sha256` is beside it).
+pub const UV_ARCHIVE: &str = if cfg!(target_os = "macos") {
+    "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz"
+} else {
+    "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+};
+/// trackertools can set CoTracker up on this computer: Windows on x64, macOS on Apple silicon.
+pub const CAN_SET_UP: bool = cfg!(any(all(windows, target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")));
 pub const MODEL: &str = "https://huggingface.co/facebook/cotracker3/resolve/main/scaled_online.pth";
 /// The model's SHA-256, as Hugging Face publishes it (and v1's copy has it).
 pub const MODEL_SHA256: &str = "205d34789f19699d64b22cf93f9b697f15f28d4025240e31532e504109837218";
@@ -65,13 +75,40 @@ const VC_RUNTIME_DLLS: [&str; 4] = ["vcruntime140.dll", "vcruntime140_1.dll", "m
 const AGAIN: &str = "Then click Set up CoTracker again.";
 const ASK: &str = "Click Copy report. Send the report to the person who gave you trackertools.";
 
-/// The NVIDIA graphics card, as its driver's `nvidia-smi` tells.
+/// The graphics CoTracker uses: an NVIDIA card, as its driver's
+/// `nvidia-smi` tells, or a Mac's Apple silicon.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpu {
     pub name: String,
-    /// CUDA compute capability (Blackwell's RTX 50 cards: 12.0).
+    /// CUDA compute capability (Blackwell's RTX 50 cards: 12.0). (0, 0) for Apple silicon.
     pub compute: (u32, u32),
+    /// The NVIDIA driver's version, or macOS's.
     pub driver: String,
+    /// Apple silicon's graphics (PyTorch's MPS), not an NVIDIA card.
+    pub apple: bool,
+}
+
+/// The graphics CoTracker can use on this computer: an NVIDIA card on
+/// Windows, Apple silicon on a Mac.
+pub fn gpu() -> Option<Gpu> {
+    if cfg!(windows) {
+        nvidia_gpu()
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        apple_gpu()
+    } else {
+        None
+    }
+}
+
+/// The Mac's chip (`Apple M3 Pro`) and macOS's version.
+fn apple_gpu() -> Option<Gpu> {
+    let said = |program: &str, args: &[&str]| {
+        let out = quiet(PathBuf::from(program)).args(args).output().ok().filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let name = said("/usr/sbin/sysctl", &["-n", "machdep.cpu.brand_string"]).filter(|n| n.starts_with("Apple"))?;
+    let driver = said("/usr/bin/sw_vers", &["-productVersion"]).map_or_else(|| "macOS".into(), |v| format!("macOS {v}"));
+    Some(Gpu { name, compute: (0, 0), driver, apple: true })
 }
 
 /// The computer's NVIDIA graphics card, if it has one with a driver.
@@ -92,25 +129,34 @@ fn parse_gpu(text: &str) -> Option<Gpu> {
     let line = text.lines().find(|l| !l.trim().is_empty())?;
     let parts: Vec<&str> = line.split(',').map(str::trim).collect();
     let (major, minor) = parts.get(1)?.split_once('.')?;
-    Some(Gpu { name: parts.first()?.to_string(), compute: (major.parse().ok()?, minor.parse().ok()?), driver: parts.get(2)?.to_string() })
+    Some(Gpu { name: parts.first()?.to_string(), compute: (major.parse().ok()?, minor.parse().ok()?), driver: parts.get(2)?.to_string(), apple: false })
 }
 
 /// The PyTorch build a card needs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plan {
-    /// PyTorch's index for it (`cu130`).
-    pub index: &'static str,
-    /// Its CUDA version, for people.
-    pub cuda: &'static str,
+    /// PyTorch's index for it (`cu130`); None: PyPI's own build (a Mac's, with MPS).
+    pub index: Option<&'static str>,
+    /// What it is built for, for people (`CUDA 13.0`).
+    pub label: &'static str,
+    /// The device the worker must load on (`cuda`, `mps`).
+    pub device: &'static str,
     /// The oldest NVIDIA driver that runs it.
     pub min_driver: u32,
+    /// PyTorch's download, for people (`2 GB`), and all of the setup's.
+    pub torch_size: &'static str,
+    pub total_size: &'static str,
 }
 
-const CUDA_13: Plan = Plan { index: "cu130", cuda: "13.0", min_driver: 580 };
-const CUDA_12: Plan = Plan { index: "cu126", cuda: "12.6", min_driver: 528 };
+const CUDA_13: Plan = Plan { index: Some("cu130"), label: "CUDA 13.0", device: "cuda", min_driver: 580, torch_size: "2 GB", total_size: "2.5 GB" };
+const CUDA_12: Plan = Plan { index: Some("cu126"), label: "CUDA 12.6", device: "cuda", min_driver: 528, torch_size: "2 GB", total_size: "2.5 GB" };
+const MPS: Plan = Plan { index: None, label: "Apple silicon", device: "mps", min_driver: 0, torch_size: "130 MB", total_size: "0.3 GB" };
 
 /// The PyTorch build for `gpu`, or why it can't run CoTracker (a sentence for the person).
 pub fn plan(gpu: &Gpu) -> Result<Plan, String> {
+    if gpu.apple {
+        return Ok(MPS);
+    }
     let plan = match std::env::var("TT_COTRACKER_CUDA").as_deref() {
         Ok("cu130") => CUDA_13,
         Ok("cu126") => CUDA_12,
@@ -247,8 +293,8 @@ pub enum Step {
     Runtime,
     Uv,
     Python,
-    /// PyTorch for CUDA `cuda`: bytes of it on the disk so far.
-    Torch { cuda: &'static str, bytes: u64 },
+    /// PyTorch for the plan: bytes of it on the disk so far.
+    Torch { plan: Plan, bytes: u64 },
     Packages,
     Code,
     Model { got: u64, total: u64 },
@@ -271,11 +317,14 @@ impl Step {
             Step::Runtime => "trackertools installs the Microsoft Visual C++ runtime from Microsoft (approximately 20 MB). Windows asks for permission. Click Yes.".into(),
             Step::Uv => "trackertools downloads uv, a Python installer (18 MB).".into(),
             Step::Python => "trackertools installs Python 3.12 for CoTracker.".into(),
-            Step::Torch { cuda, bytes } => format!("trackertools downloads and installs PyTorch for CUDA {cuda} (approximately 2 GB): {:.1} GB on the disk now.", gb(*bytes)),
+            Step::Torch { plan, bytes } => {
+                let now = if *bytes < 1_000_000_000 { format!("{:.0} MB", *bytes as f64 / 1e6) } else { format!("{:.1} GB", gb(*bytes)) };
+                format!("trackertools downloads and installs PyTorch for {} (approximately {}): {now} on the disk now.", plan.label, plan.torch_size)
+            }
             Step::Packages => "trackertools installs NumPy, PyAV and OpenCV.".into(),
             Step::Code => "trackertools copies the CoTracker code.".into(),
             Step::Model { got, total } => format!("trackertools downloads the CoTracker model: {:.0} MB of {:.0} MB.", *got as f64 / 1e6, *total as f64 / 1e6),
-            Step::Test => "trackertools starts CoTracker on the graphics card. This can take 1 minute.".into(),
+            Step::Test => "trackertools starts CoTracker on the graphics. This can take 1 minute.".into(),
             Step::Done(gpu) => format!("CoTracker is ready on the {gpu}."),
             Step::Failed(p) => p.what.clone(),
         }
@@ -381,9 +430,13 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
     let tmp = dir.join("tmp");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(cannot_write)?;
-    let index = format!("https://download.pytorch.org/whl/{}", plan.index);
-    step(Step::Torch { cuda: plan.cuda, bytes: 0 });
-    run(pip(&python, dir).args(["install", "--no-cache-dir", TORCH, "--index-url", &index]), Some((&tmp, &|bytes| step(Step::Torch { cuda: plan.cuda, bytes }))))
+    step(Step::Torch { plan, bytes: 0 });
+    let mut torch = pip(&python, dir);
+    torch.args(["install", "--no-cache-dir", TORCH]);
+    if let Some(index) = plan.index {
+        torch.args(["--index-url", &format!("https://download.pytorch.org/whl/{index}")]);
+    }
+    run(&mut torch, Some((&tmp, &|bytes| step(Step::Torch { plan, bytes }))))
         .map_err(|d| Problem::new(&format!("trackertools cannot install PyTorch. Make sure that the computer is connected to the internet and that the disk has approximately 6 GB free. {AGAIN}"), d))?;
 
     step(Step::Packages);
@@ -414,7 +467,8 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
         true => Problem::new(&format!("Windows must restart to complete the installation of the Microsoft Visual C++ runtime. Restart the computer. {AGAIN}"), p.details),
         false => p,
     })?;
-    if device != "cuda" {
+    // (On a Mac the worker uses the processor when MPS does not work: slower, but it tracks.)
+    if device != plan.device && !(gpu.apple && device == "cpu") {
         return Err(Problem::new(&format!("CoTracker starts, but it cannot use the graphics card. Update the NVIDIA driver. {AGAIN}"), format!("the worker loaded on {device}")));
     }
     // pip's temporary folder and uv's cache (Python's download): the environment has everything it needs.
@@ -425,6 +479,10 @@ pub fn install(dir: &Path, gpu: &Gpu, step: &dyn Fn(Step)) -> Result<String, Pro
 
 /// uv in `dir\uv` (downloaded and checked the first time).
 fn get_uv(dir: &Path) -> Result<PathBuf, Problem> {
+    get_uv_from(dir, UV_ARCHIVE)
+}
+
+fn get_uv_from(dir: &Path, url: &str) -> Result<PathBuf, Problem> {
     let home = dir.join("uv");
     let uv = home.join(format!("uv{}", std::env::consts::EXE_SUFFIX));
     if quiet(uv.clone()).arg("--version").output().is_ok_and(|o| o.status.success()) {
@@ -432,9 +490,10 @@ fn get_uv(dir: &Path) -> Result<PathBuf, Problem> {
     }
     let stopped = |d: String| Problem::new(&format!("The download of uv stopped. Make sure that the computer is connected to the internet. {AGAIN}"), d);
     std::fs::create_dir_all(&home).map_err(|e| stopped(e.to_string()))?;
-    let zip = home.join("uv.zip");
-    download(UV_ZIP, &zip, &|_| {}).map_err(|p| stopped(p.details))?;
-    let expected = fetch_text(&format!("{UV_ZIP}.sha256")).map_err(stopped)?;
+    // (A .zip on Windows, a .tar.gz on a Mac: tar opens both.)
+    let zip = home.join(url.rsplit('/').next().unwrap_or("uv.zip"));
+    download(url, &zip, &|_| {}).map_err(|p| stopped(p.details))?;
+    let expected = fetch_text(&format!("{url}.sha256")).map_err(stopped)?;
     let expected = expected.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
     let got = sha256(&zip).map_err(|e| stopped(e.to_string()))?;
     if expected.len() != 64 || got != expected {
@@ -630,7 +689,7 @@ mod tests {
     use super::*;
 
     fn gpu(name: &str, compute: (u32, u32), driver: &str) -> Gpu {
-        Gpu { name: name.into(), compute, driver: driver.into() }
+        Gpu { name: name.into(), compute, driver: driver.into(), apple: false }
     }
 
     #[test]
@@ -648,6 +707,23 @@ mod tests {
         let old_driver = plan(&gpu("NVIDIA GeForce RTX 5080", (12, 0), "572.16")).unwrap_err();
         assert!(old_driver.starts_with("CoTracker needs NVIDIA driver 580 or later. This computer has driver 572.16. Update the NVIDIA driver."), "{old_driver}");
         assert_eq!(plan(&gpu("NVIDIA GeForce GTX 780", (3, 5), "474.30")), Err("The NVIDIA GeForce GTX 780 is too old for CoTracker.".into()));
+    }
+
+    #[test]
+    fn apple_silicon_gets_pypis_pytorch_on_mps() {
+        let mac = Gpu { name: "Apple M3 Pro".into(), compute: (0, 0), driver: "macOS 26.1".into(), apple: true };
+        assert_eq!(plan(&mac), Ok(MPS));
+        assert_eq!(MPS.index, None);
+        assert_eq!(MPS.device, "mps");
+    }
+
+    /// This Mac's chip is found (every Apple silicon Mac has one).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_macs_chip_is_found() {
+        let g = super::gpu().expect("Apple silicon");
+        eprintln!("{g:?}");
+        assert!(g.apple && g.name.starts_with("Apple M") && g.driver.starts_with("macOS "), "{g:?}");
     }
 
     #[test]
@@ -706,14 +782,15 @@ mod tests {
 
     /// The whole setup for real, into `TT_COTRACKER_SETUP_TEST` (a scratch
     /// folder): uv, Python, PyTorch, the packages, the code, the model, and
-    /// the worker loading on this computer's NVIDIA card. Downloads about
-    /// 2.5 GB, so only when asked: `cargo test -p tt_app full_setup -- --ignored`
+    /// the worker loading on this computer's NVIDIA card or Apple silicon.
+    /// Downloads about 2.5 GB (0.3 GB on a Mac), so only when asked:
+    /// `cargo test -p tt_app full_setup -- --ignored`
     /// (`TT_COTRACKER_CUDA=cu130` installs what an RTX 50 card gets).
     #[test]
     #[ignore]
     fn full_setup_for_real() {
         let dir = PathBuf::from(std::env::var("TT_COTRACKER_SETUP_TEST").expect("TT_COTRACKER_SETUP_TEST: a scratch folder"));
-        let gpu = nvidia_gpu().expect("an NVIDIA card");
+        let gpu = super::gpu().expect("an NVIDIA card or Apple silicon");
         let t0 = Instant::now();
         let last = Mutex::new(String::new());
         let step = |s: Step| {
@@ -729,7 +806,7 @@ mod tests {
         let device = install(&dir, &gpu, &step).unwrap_or_else(|p| panic!("{}
 {}", p.what, p.details));
         eprintln!("[{:>4} s] done: CoTracker loads on {device}", t0.elapsed().as_secs());
-        assert_eq!(device, "cuda");
+        assert_eq!(device, plan(&gpu).expect("a plan").device);
         assert!(dir.join("env").is_dir() && dir.join("scaled_online.pth").is_file() && !dir.join("cache").exists(), "installed, cache gone");
     }
 

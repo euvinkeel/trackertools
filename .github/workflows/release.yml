@@ -12,6 +12,12 @@
 #
 # The zip holds trackertools.exe alone (the updater installs from it): FFmpeg
 # isn't bundled, the app sets it up on its first start (tt_app::setup).
+#
+# A release also builds the Mac's (Apple silicon) download,
+# trackertools-macos-arm64.zip, with scripts/package_macos.sh. Only for a
+# release, and it can't stop the Windows one: macOS runner minutes may not be
+# available to this repository's account (the macOS workflow's first runs
+# stopped within seconds, before any step).
 name: Release
 
 on:
@@ -82,3 +88,36 @@ jobs:
           } else {
             gh release create $env:TAG trackertools-windows-x64.zip trackertools-windows-x64.zip.sha256 --title "trackertools $env:TAG" --generate-notes
           }
+
+  macos:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-15
+    timeout-minutes: 60
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.sha }}
+      - name: Rust 1.95
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/portable"
+      - name: Build and package
+        run: scripts/package_macos.sh --version "$TAG"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="dist/trackertools-macos-arm64.zip dist/trackertools-macos-arm64.zip.sha256"
+          # The Windows job can make the release first; then this one adds to it.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $files --clobber
+          else
+            gh release create "$TAG" $files --title "trackertools $TAG" --generate-notes || gh release upload "$TAG" $files --clobber
+          fi

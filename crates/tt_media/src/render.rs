@@ -182,6 +182,7 @@ fn parse_probe(text: &str) -> StreamInfo {
 }
 
 pub(crate) fn command(program: &Path) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))] // (only Windows sets a flag)
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {

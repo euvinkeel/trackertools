@@ -4,11 +4,12 @@
 //!
 //! Only a copy built on a computer that still has its source checkout shows
 //! it (the folder it was built from, known at compile time, with
-//! `scripts/package_windows.ps1` and `.git`): a released copy built on
+//! its packaging script, `scripts/package_windows.ps1` or
+//! `scripts/package_macos.sh`, and `.git`): a released copy built on
 //! GitHub's machines doesn't. It can switch the checkout to another branch
 //! first (local ones, and GitHub's after Fetch: a pull request's branch, to
 //! try it before merging), when nothing in the checkout is uncommitted. The
-//! build is the packaging script's (`-InstallTo` this program's folder,
+//! build is the packaging script's (installed to this program's folder,
 //! versioned as the latest tag), so the first one takes minutes and later
 //! ones less. When it is done trackertools saves, closes and starts the new
 //! build, as an update does ([`crate::update::RestartWith`]).
@@ -25,15 +26,29 @@ use crate::update::{quiet, system_tool};
 /// Lines of the build's output kept to show.
 const LOG_LINES: usize = 400;
 
+/// The packaging script for this computer, in the checkout's `scripts`.
+fn package_script() -> Option<&'static str> {
+    if cfg!(windows) {
+        Some("package_windows.ps1")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("package_macos.sh")
+    } else {
+        None
+    }
+}
+
+/// This program's file name: `trackertools.exe` on Windows, `trackertools` elsewhere.
+pub fn program_file() -> String {
+    format!("trackertools{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// The source checkout this program was built from, if this computer still has it.
 pub fn source_dir() -> Option<PathBuf> {
-    if !cfg!(windows) {
-        return None;
-    }
+    let script = package_script()?;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
     let dir = dir.canonicalize().ok()?;
     let dir = PathBuf::from(dir.to_string_lossy().trim_start_matches(r"\\?\"));
-    (dir.join("scripts").join("package_windows.ps1").is_file() && dir.join(".git").exists()).then_some(dir)
+    (dir.join("scripts").join(script).is_file() && dir.join(".git").exists()).then_some(dir)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,9 +141,16 @@ impl Rebuild {
         self.set(State::Running { what: "Building\u{2026} (the first time takes several minutes)".into() });
         std::thread::spawn(move || {
             let tag = git(&dir, &["describe", "--tags", "--abbrev=0"]).ok().map(|t| t.trim().to_string()).filter(|t| t.starts_with('v')).unwrap_or_else(|| "v0.1.0".into());
-            let script = dir.join("scripts").join("package_windows.ps1");
-            let mut cmd = quiet(system_tool("WindowsPowerShell\\v1.0\\powershell"));
-            cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script).arg("-Version").arg(&tag).arg("-InstallTo").arg(&home);
+            let script = dir.join("scripts").join(package_script().unwrap_or_default());
+            let mut cmd = if cfg!(windows) {
+                let mut cmd = quiet(system_tool("WindowsPowerShell\\v1.0\\powershell"));
+                cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script).arg("-Version").arg(&tag).arg("-InstallTo").arg(&home);
+                cmd
+            } else {
+                let mut cmd = quiet(PathBuf::from("/bin/bash"));
+                cmd.arg(&script).arg("--version").arg(&tag).arg("--install-to").arg(&home);
+                cmd
+            };
             cmd.current_dir(&dir).stdout(Stdio::piped()).stderr(Stdio::piped());
             let status = match cmd.spawn() {
                 Ok(mut child) => {
@@ -145,7 +167,7 @@ impl Rebuild {
                 Err(e) => Err(e.to_string()),
             };
             match status {
-                Ok(s) if s.success() && home.join("trackertools.exe").is_file() => me.set(State::Done),
+                Ok(s) if s.success() && home.join(program_file()).is_file() => me.set(State::Done),
                 Ok(s) => me.set(State::Failed(format!("The build stopped ({s}). The log below says why."))),
                 Err(e) => me.set(State::Failed(format!("Couldn't start the build: {e}"))),
             }
@@ -207,7 +229,7 @@ pub fn drive(ctx: &egui::Context, world: &mut World) {
                 && let Some(home) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf))
             {
                 tracing::info!("built from the source checkout: restarting");
-                world.resource_mut::<crate::update::RestartWith>().0 = Some(home.join("trackertools.exe"));
+                world.resource_mut::<crate::update::RestartWith>().0 = Some(home.join(program_file()));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
