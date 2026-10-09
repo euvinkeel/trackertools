@@ -1175,6 +1175,28 @@ fn fits(shape: &Shape, at: [i64; 2], member: &Member<'_>) -> f32 {
     if va <= 0.0 || vb <= 0.0 { 0.0 } else { c / (va * vb).sqrt() }
 }
 
+/// How far a shot (the shape's top-left at `top` in it) is from `shape` on the
+/// shape's sure pixels, weighted by how sure: the mean difference in luma, and
+/// in colour (the mean of U and V). None: it shows none of them.
+fn looks_like(shape: &Shape, s: &Shot, top: [f64; 2]) -> Option<(f32, f32)> {
+    let (mut luma, mut colour, mut total) = (0.0, 0.0, 0.0);
+    for y in 0..shape.h {
+        for x in 0..shape.w {
+            let i = y * shape.w + x;
+            let a = shape.alpha[i];
+            if a < 0.5 {
+                continue;
+            }
+            let (sx, sy) = (top[0] + x as f64, top[1] + y as f64);
+            let (Some(p), Some(u), Some(v)) = (s.img.sample(sx, sy), s.u.sample(sx, sy), s.v.sample(sx, sy)) else { continue };
+            luma += a * (p - shape.value[i]).abs();
+            colour += a * ((u - shape.u[i]).abs() + (v - shape.v[i]).abs()) / 2.0;
+            total += a;
+        }
+    }
+    (total > 0.0).then(|| (luma / total, colour / total))
+}
+
 /// How far `member` is off `shape` (cut from the first member's grid at
 /// `at`): the shift (within 2 px, to a fraction) that matches its sure
 /// pixels best (normalized cross-correlation). None: too little to match.
@@ -1428,6 +1450,11 @@ fn root(set: &[usize], mut i: usize) -> usize {
 
 /// A paint whose pixels match its pattern's shape less than this is left out of it.
 const FITS: f32 = 0.5;
+/// A find joins a shape's shots ([`Model::grow`]) only if, on the shape's sure
+/// pixels, it is this close (levels, on average) in brightness …
+const GROW_LUMA: f32 = 40.0;
+/// … and this close in colour (chroma levels, the mean of U and V).
+const GROW_COLOUR: f32 = 15.0;
 
 fn debug() -> bool {
     std::env::var_os("TT_CURSOR_DEBUG").is_some()
@@ -1709,6 +1736,13 @@ impl Model {
         let shape = &self.shapes[i];
         let mut added = 0;
         for (s, top) in found {
+            // Only a find that looks like the shape is the cursor on another
+            // background. Another colour (a yellow twin), another brightness
+            // (the cursor dimmed) or no cursor at all (a look-alike patch of
+            // scenery) would wipe out every pixel it differs on.
+            if !looks_like(shape, &s, top).is_some_and(|(luma, colour)| luma <= GROW_LUMA && colour <= GROW_COLOUR) {
+                continue;
+            }
             // (Where each shot has the shape's top-left on the screen.)
             let here = [s.origin[0] as f64 + top[0], s.origin[1] as f64 + top[1]];
             let fresh = members.iter().all(|(m, d, _)| {
@@ -2364,6 +2398,31 @@ mod tests {
         assert!(f.score > 0.9, "score {}", f.score);
         let truth = [tips[3][0] as f64 + 0.5, tips[3][1] as f64];
         assert!((f.tip[0] - truth[0]).abs() < 1.01 && (f.tip[1] - truth[1]).abs() < 1.01, "tip {:?} vs {:?}", f.tip, truth);
+    }
+
+    /// Learning more ([`Model::grow`]) takes a find of the arrow on a new
+    /// background, not one in another colour (a yellow twin of the arrow:
+    /// its body would be lost), nor one a lot dimmer: those are left out.
+    #[test]
+    fn a_twin_in_another_colour_or_brightness_is_not_learned_from() {
+        let tips = [[60, 50], [130, 90], [40, 120]];
+        let shots: Vec<PaintShots> = (0..3).map(|i| painted(i as i64 * 10, i as u32 + 1, tips[i], [[14, 7], [-15, -9]])).collect();
+        let mut model = learn(shots, CENTRED);
+        assert_eq!(model.shapes.len(), 1);
+        let finder = Finder::new(model.shapes.clone());
+        let plain = Frame::grey(frame(220, 180, 7, [150, 30]));
+        let hit = *finder.find(&Pyramid::new(plain.clone(), finder.levels), [0.0, 0.0, 220.0, 180.0], 1, 0.6).first().expect("found");
+        let sh = model.shapes[0].clone();
+        let find = |f: &Frame| Shot::found(0, f, hit.at, sh.w, sh.h);
+        // The same pixels, yellow; the same pixels, a third as bright.
+        let yellow = Frame { y: plain.y.clone(), u: Img { px: vec![40.0; plain.u.px.len()], ..plain.u.clone() }, v: Img { px: vec![160.0; plain.v.px.len()], ..plain.v.clone() } };
+        let dim = Frame { y: Img { px: plain.y.px.iter().map(|p| 16.0 + (p - 16.0) / 3.0).collect(), ..plain.y.clone() }, ..plain.clone() };
+        for odd in [&yellow, &dim] {
+            model.grow(0, vec![find(odd)]);
+            assert_eq!(model.shapes[0], sh, "learned from a find that isn't it");
+        }
+        model.grow(0, vec![find(&plain)]);
+        assert_eq!(model.shapes[0].shots, sh.shots + 1, "the arrow on a new background is learned from");
     }
 
     /// One paint and the frames near it (the cursor moved, the screen
