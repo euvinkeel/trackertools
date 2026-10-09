@@ -65,6 +65,9 @@ pub const OUTSIDE: u32 = 2;
 /// Flag: the tracker is switched off on this frame (`off`): left out, as a lost frame is.
 pub const OFF: u32 = 4;
 
+/// A new cursor tracker's `min_score`: it searches the whole frame, so only a close match counts.
+pub const CURSOR_MIN_SCORE: f32 = 0.8;
+
 /// A tracker frame's flags (0 = trustworthy); frames of older 7-channel outputs have none.
 pub fn flags(v: &[f32]) -> u32 {
     v.get(7).map_or(0, |f| *f as u32)
@@ -99,6 +102,9 @@ pub enum Method {
     /// pixel followed, as a CoTracker, from its reset points; each frame's
     /// result as soon as that frame is in. Run by the same worker.
     TapNext,
+    /// A mouse cursor: paints loosely over it on a few frames, from which it
+    /// learns the cursor's shapes, found on every frame (`job::cursor`). Built in.
+    Cursor,
 }
 
 impl Method {
@@ -112,13 +118,18 @@ impl Method {
         matches!(self, Method::CoTracker | Method::TapNext)
     }
 
+    /// Its looks are paints (a press brushes).
+    pub fn paints(self) -> bool {
+        matches!(self, Method::Paint | Method::Cursor)
+    }
+
     /// What its looks are called: a template tracker's are patterns it
     /// matches ("look"), CoTracker's the pixel it follows from there on
     /// ("reset point").
     pub fn look_word(self) -> &'static str {
         match self {
             Method::CoTracker | Method::TapNext => "reset point",
-            Method::Paint => "paint",
+            Method::Paint | Method::Cursor => "paint",
             _ => "look",
         }
     }
@@ -384,6 +395,11 @@ fn look_name(method: Method, n: usize) -> String {
     format!("{}{} {n}", word[..1].to_uppercase(), &word[1..])
 }
 
+/// A cursor tracker's `n`th paint of `pattern`: "Pattern 2 · paint 3".
+fn pattern_paint_name(pattern: u32, n: usize) -> String {
+    format!("Pattern {} \u{b7} paint {n}", pattern + 1)
+}
+
 /// A tracker entity following `guide` (None: the whole frame) from `look`
 /// (its seed) in `space`, as part of an edit. `placed`: the user put the
 /// look there (else it came from the guide's point, so the finished path is
@@ -393,11 +409,16 @@ fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Option<Entity>, look: Loo
     let auto = tx.create_signal(TRACK_CHANNELS);
     let anchor = look.frame;
     let new = tx.world().get_resource::<NewTrackers>().copied().unwrap_or_default();
-    let look = tx.spawn((Name::new(look_name(new.method, 1)), look));
+    let first = if new.method == Method::Cursor { pattern_paint_name(look.pattern, 1) } else { look_name(new.method, 1) };
+    let look = tx.spawn((Name::new(first), look));
     let mut inputs: Vec<(String, Entity)> = guide.map(|g| ("guide".to_string(), g)).into_iter().collect();
     inputs.extend(space.map(|v| ("space".to_string(), v)));
     inputs.push(("look".to_string(), look));
-    let tracker = Tracker { center_on_guide: !placed && guide.is_some(), method: new.method, ..Tracker::at(anchor) };
+    let mut tracker = Tracker { center_on_guide: !placed && guide.is_some(), method: new.method, ..Tracker::at(anchor) };
+    // (A cursor is found anywhere on the frame: only a close match counts.)
+    if new.method == Method::Cursor {
+        tracker.min_score = CURSOR_MIN_SCORE;
+    }
     tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), human::AutoOutput(auto), tracker, runner::TrackBook::default(), new.run))
 }
 
@@ -473,7 +494,12 @@ pub fn reseed_with_look(world: &mut World, tracker: Entity, look: Look) -> Optio
 pub fn add_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity> {
     let n = look::looks_of(world, tracker).len() + 1;
     let method = method_of(world, tracker);
-    let name = look_name(method, n);
+    let name = if method == Method::Cursor {
+        let k = look::looks_of(world, tracker).iter().filter(|l| world.get::<Look>(**l).is_some_and(|o| o.pattern == look.pattern)).count();
+        pattern_paint_name(look.pattern, k + 1)
+    } else {
+        look_name(method, n)
+    };
     let mut made = None;
     edit(world, &format!("Add {}", method.look_word()), |tx| {
         let e = tx.spawn((Name::new(name), look));
@@ -488,7 +514,7 @@ pub fn add_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity
 /// pattern to a template tracker).
 pub fn looks_fit(from: Method, to: Method) -> bool {
     let kind = |m: Method| match m {
-        Method::Paint => 0,
+        Method::Paint | Method::Cursor => 0,
         m if m.point() => 1,
         Method::Template => 2,
         Method::Manual => 3,
@@ -720,6 +746,7 @@ impl Module for TrackModule {
             .component::<human::HumanLayer>(Class::Document)
             .component::<off::TrackerOff>(Class::Document)
             .declare::<runner::PaintPoints>(Class::Derived)
+            .declare::<runner::CursorShapes>(Class::Derived)
             .declare::<human::Composed>(Class::Derived)
             .declare::<PausedOnOpen>(Class::Derived)
             .declare::<human::DrawTool>(Class::Derived)

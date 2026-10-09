@@ -41,6 +41,7 @@ use crate::template::{Estimate, LookTemplate, Settings, TEMPLATE_R, TemplateTrac
 use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
 
 mod learned;
+pub mod cursor;
 pub mod paint;
 
 pub use learned::{
@@ -61,6 +62,8 @@ pub struct LookSpec {
     pub center: [f64; 2],
     pub half: [f64; 2],
     pub mask: Option<Vec<u8>>,
+    /// A cursor tracker's paint: the pattern it teaches.
+    pub pattern: u32,
 }
 
 /// The look on frame `f` that counts there (a painted one first), if any.
@@ -227,6 +230,8 @@ pub enum Msg {
     Points(Vec<(FrameIndex, Vec<PointMark>)>),
     /// A paint tracker's states on its paints' frames (`paint::PaintState`).
     PaintStates(Vec<paint::PaintState>),
+    /// What a cursor tracker learned (`cursor`): sent as soon as it is, and again once it learned more.
+    CursorShapes(cursor::Learned),
     Finished,
     Failed(String),
 }
@@ -274,25 +279,11 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
             let out = tx.clone();
             // (Whatever it held is dropped while unwinding: a CoTracker worker is stopped.)
             let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
-                let mut worker = Worker {
-                    spec,
-                    shared,
-                    tx: out,
-                    out: Vec::new(),
-                    marks: Vec::new(),
-                    states: Vec::new(),
-                    flushed: Instant::now(),
-                    half: [TEMPLATE_R as f64; 2],
-                    margin: TEMPLATE_R as f64 + 2.0,
-                    offsets: Vec::new(),
-                    stretch: Vec::new(),
-                    stretch_bytes: Some(0),
-                    near: None,
-                    paint: None,
-                };
+                let mut worker = Worker::new(spec, shared, out);
                 let result = match worker.spec.method {
                     Method::Template => worker.run(),
                     Method::CoTracker | Method::Paint | Method::TapNext => worker.run_learned(),
+                    Method::Cursor => worker.run_cursor(),
                     // (A manual dot is never planned: nothing to track.)
                     Method::Manual => Ok(()),
                 };
@@ -306,6 +297,26 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
             });
         })
         .expect("spawn tracker thread")
+}
+
+/// Learn a cursor tracker's patterns (`cursor`) in a thread of its own,
+/// whether it tracks or not, so they show while the user paints. It sends
+/// [`Msg::CursorShapes`] (as soon as it has them, and again once it learned
+/// more), then [`Msg::Finished`] or [`Msg::Failed`]. Its jobs share what it
+/// learns (or it theirs). `spec`'s frames aren't tracked.
+pub fn spawn_learning(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("cursor learning".into())
+        .spawn(move || {
+            let out = tx.clone();
+            let result = std::panic::catch_unwind(AssertUnwindSafe(move || Worker::new(spec, shared, out).cursor_model().map(|_| ())));
+            let _ = tx.send(match result {
+                Ok(Ok(())) => Msg::Finished,
+                Ok(Err(e)) => Msg::Failed(format!("{e:#}")),
+                Err(panic) => Msg::Failed(format!("learning stopped on an error: {}", panic_message(panic.as_ref()))),
+            });
+        })
+        .expect("spawn learning thread")
 }
 
 /// What a panic said.
@@ -340,6 +351,25 @@ struct Worker {
 }
 
 impl Worker {
+    fn new(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>) -> Worker {
+        Worker {
+            spec,
+            shared,
+            tx,
+            out: Vec::new(),
+            marks: Vec::new(),
+            states: Vec::new(),
+            flushed: Instant::now(),
+            half: [TEMPLATE_R as f64; 2],
+            margin: TEMPLATE_R as f64 + 2.0,
+            offsets: Vec::new(),
+            stretch: Vec::new(),
+            stretch_bytes: Some(0),
+            near: None,
+            paint: None,
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.shared.cancel.load(Ordering::Relaxed)
     }

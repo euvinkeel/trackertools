@@ -635,5 +635,6 @@ fn describe(action: Action) -> &'static str {
         ClearMarks => "Clear the in and out points (exports render the whole video)",
         GoToIn => "Go to the in point",
         GoToOut => "Go to the out point",
+        Pattern(_) => "Cursor tracker: the pattern the brush teaches (Shift+brush: a new one)",
     }
 }

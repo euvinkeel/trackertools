@@ -25,12 +25,17 @@ pub struct Look {
     pub half_h: f32,
     /// Which pixels are the subject: `MASK_N × MASK_N` cells over the
     /// rectangle, row-major, 0–255. Empty = none painted (centre-weighted).
+    /// (A paint's can be finer: `n × n`, see `tool::brush_paint`.)
     pub mask: Vec<u8>,
+    /// A cursor tracker's paint: which of its patterns it teaches (from 0;
+    /// `job::cursor`). Shift+brush starts another.
+    #[reflect(default)]
+    pub pattern: u32,
 }
 
 impl Look {
     pub fn new(frame: FrameIndex, center: [f64; 2], half: [f64; 2]) -> Self {
-        Self { frame, x: center[0] as f32, y: center[1] as f32, half_w: half[0].max(1.0) as f32, half_h: half[1].max(1.0) as f32, mask: Vec::new() }
+        Self { frame, x: center[0] as f32, y: center[1] as f32, half_w: half[0].max(1.0) as f32, half_h: half[1].max(1.0) as f32, mask: Vec::new(), pattern: 0 }
     }
 
     pub fn center(&self) -> [f64; 2] {
@@ -85,6 +90,14 @@ pub fn auto_masked(world: &World, mut look: Look) -> Look {
         look.mask = mask;
     }
     look
+}
+
+/// A cursor tracker's patterns: those its paints teach, in order.
+pub fn patterns_of(world: &World, tracker: Entity) -> Vec<u32> {
+    let mut v: Vec<u32> = looks_of(world, tracker).iter().filter_map(|l| world.get::<Look>(*l)).map(|l| l.pattern).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// The tracker a look belongs to.

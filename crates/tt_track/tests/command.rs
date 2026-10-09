@@ -254,3 +254,60 @@ fn track_from_reseeds_where_a_look_is_and_runs_them() {
     undo(&mut core.world);
     assert_eq!(core.world.get::<Tracker>(a).map(|t| t.anchor), Some(50), "undone");
 }
+
+/// A cursor tracker's patterns (on request: "shift + brush … for quickly
+/// adding a new shape. call them Patterns … switchable with 1-9 keys"):
+/// a brush teaches the pattern picked (the last painted at first), Shift+brush
+/// starts a new one on the selected cursor tracker (not a new tracker), keys
+/// 1–0 pick one, and brushing again on a frame adds to that pattern's paint there.
+#[test]
+fn a_cursor_trackers_brush_teaches_patterns() {
+    let mut app = AppBuilder::new();
+    app.add_module(CoreModules).add_module(TrackModule);
+    let mut core = app.build();
+    core.world.resource_mut::<tt_track::NewTrackers>().method = tt_track::Method::Cursor;
+    core.world.resource_mut::<Transport>().frame_count = 300;
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Track;
+    let at = |core: &mut Core, f: i64| {
+        core.world.resource_mut::<Transport>().seek(f);
+        core.run_pre_ui();
+    };
+    let pattern_on = |core: &mut Core, t: Entity, f: i64| -> Vec<u32> {
+        looks_of(&core.world, t).iter().filter_map(|l| core.world.get::<Look>(*l)).filter(|l| l.frame == f).map(|l| l.pattern).collect()
+    };
+
+    // Nothing selected: a brush makes a cursor tracker, its paint pattern 1 (0).
+    at(&mut core, 100);
+    drag(&mut core, [200.0, 200.0], [230.0, 210.0], false);
+    let t = core.world.resource::<Selection>().primary().expect("the new tracker is selected");
+    assert_eq!(core.world.get::<Tracker>(t).map(|p| (p.method, p.min_score)), Some((tt_track::Method::Cursor, tt_track::CURSOR_MIN_SCORE)));
+    assert_eq!(pattern_on(&mut core, t, 100), vec![0]);
+    // Another frame: the same pattern.
+    at(&mut core, 110);
+    drag(&mut core, [300.0, 200.0], [320.0, 220.0], false);
+    assert_eq!(pattern_on(&mut core, t, 110), vec![0]);
+    // Shift+brush: a new pattern on this tracker, not a new tracker; and it is picked.
+    at(&mut core, 120);
+    drag(&mut core, [100.0, 100.0], [120.0, 120.0], true);
+    assert_eq!(pattern_on(&mut core, t, 120), vec![1]);
+    assert_eq!(live_trackers(&mut core), vec![t]);
+    at(&mut core, 130);
+    drag(&mut core, [150.0, 100.0], [170.0, 120.0], false);
+    assert_eq!(pattern_on(&mut core, t, 130), vec![1], "the picked pattern: the new one");
+    // Key 1: pattern 1 again; a second brush on the frame adds to its paint there.
+    core.world.resource_mut::<PendingActions>().push(Action::Pattern(0));
+    at(&mut core, 140);
+    drag(&mut core, [150.0, 100.0], [170.0, 120.0], false);
+    drag(&mut core, [400.0, 300.0], [420.0, 320.0], false);
+    assert_eq!(pattern_on(&mut core, t, 140), vec![0], "one paint, added to");
+    assert_eq!(tt_track::look::patterns_of(&core.world, t), vec![0, 1]);
+    let names: Vec<String> = looks_of(&core.world, t).iter().filter_map(|l| core.world.get::<Name>(*l)).map(|n| n.to_string()).collect();
+    assert_eq!(names, ["Pattern 1 \u{b7} paint 1", "Pattern 1 \u{b7} paint 2", "Pattern 2 \u{b7} paint 1", "Pattern 2 \u{b7} paint 2", "Pattern 1 \u{b7} paint 3"]);
+    // Selecting a paint picks its pattern.
+    let second = looks_of(&core.world, t)[2];
+    core.world.resource_mut::<Selection>().select_only(second);
+    at(&mut core, 150);
+    drag(&mut core, [150.0, 100.0], [170.0, 120.0], false);
+    assert_eq!(pattern_on(&mut core, t, 150), vec![1], "its paint selected: pattern 2, on that tracker");
+    assert_eq!(live_trackers(&mut core), vec![t]);
+}

@@ -111,6 +111,20 @@ pub struct PaintStates(pub std::collections::BTreeMap<FrameIndex, Arc<crate::job
 #[derive(Component, Debug, Clone, Default)]
 pub struct PaintPoints(pub std::collections::BTreeMap<FrameIndex, Vec<PointMark>>);
 
+/// What a cursor tracker learned from its paints (`job::cursor`), for the
+/// app to show: learned in the background as soon as its paints change,
+/// tracking or not ([`learn_cursor`]). Not saved (learned again).
+#[derive(Component, Debug, Clone, Default)]
+pub struct CursorShapes {
+    /// What it was learned from (`job::cursor::model_key`).
+    pub key: u64,
+    pub learned: crate::job::cursor::Learned,
+    /// Still learning (from newer paints, or learning more).
+    pub learning: bool,
+    /// Why learning failed.
+    pub error: Option<String>,
+}
+
 #[derive(Component, Clone, Debug, Default)]
 pub struct TrackStatus {
     pub forward: Option<SideStatus>,
@@ -219,6 +233,85 @@ pub struct TrackJobs {
     /// When drained results last marked the document changed (`WallClock`
     /// seconds): at most every [`RESULTS_SAVED_EVERY`].
     results_touched: Option<f64>,
+    /// Cursor trackers learning their patterns in the background ([`learn_cursor`]).
+    learners: HashMap<Entity, Learner>,
+}
+
+/// A cursor tracker learning in the background: from what (`key`), its
+/// messages, and its cancel flag (dropped: cancelled).
+struct Learner {
+    key: u64,
+    rx: Mutex<Receiver<Msg>>,
+    shared: Arc<Shared>,
+}
+
+impl Drop for Learner {
+    fn drop(&mut self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// What a cursor tracker's plan learns from (`job::cursor::model_key`).
+fn cursor_key(plan: &Plan) -> u64 {
+    crate::job::cursor::model_key(&plan.video.path, &plan.looks, plan.k, plan.lo, plan.lo + plan.guide.len() as FrameIndex)
+}
+
+/// A cursor tracker learns its patterns as soon as its paints change,
+/// tracking or not, so the user sees what each paint teaches it: a thread
+/// of its own ([`crate::job::spawn_learning`]), whose results land in
+/// [`CursorShapes`]. Its jobs share what it learns.
+fn learn_cursor(world: &mut World, op: Entity, footage: &Footage) {
+    let Some(plan) = world.resource::<TrackJobs>().basis.get(&op).map(|b| b.plan.clone()).filter(|p| p.params.method == Method::Cursor) else {
+        world.resource_mut::<TrackJobs>().learners.remove(&op);
+        return;
+    };
+    let key = cursor_key(&plan);
+    // What it says.
+    let mut msgs = Vec::new();
+    if let Some(l) = world.resource::<TrackJobs>().learners.get(&op) {
+        let rx = l.rx.lock().expect("not poisoned");
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+    }
+    for m in msgs {
+        let lkey = world.resource::<TrackJobs>().learners.get(&op).map_or(key, |l| l.key);
+        match m {
+            Msg::CursorShapes(learned) => {
+                world.entity_mut(op).insert(CursorShapes { key: lkey, learned, learning: true, error: None });
+            }
+            Msg::Finished | Msg::Failed(_) => {
+                let error = if let Msg::Failed(e) = m { Some(e) } else { None };
+                world.resource_mut::<TrackJobs>().learners.remove(&op);
+                let mut e = world.entity_mut(op);
+                match e.get_mut::<CursorShapes>() {
+                    Some(mut c) => (c.learning, c.error) = (false, error),
+                    None => {
+                        e.insert(CursorShapes { key: lkey, learning: false, error, ..Default::default() });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let shown = world.get::<CursorShapes>(op).map(|c| c.key);
+    let running = world.resource::<TrackJobs>().learners.get(&op).map(|l| l.key);
+    if running == Some(key) || (running.is_none() && shown == Some(key)) {
+        world.resource_mut::<TrackJobs>().pending |= running.is_some();
+        return;
+    }
+    // Paints changed: learn again (an older learning stops).
+    let label = world.get::<Name>(op).map_or_else(|| format!("tracker {op}"), |n| format!("{n} ({op})"));
+    let spec = job_spec(&plan, Side::Forward, plan.anchor, plan.anchor, None, footage, label);
+    let shared = Arc::new(Shared::new(FrameIndex::MAX, plan.anchor));
+    let (tx, rx) = channel();
+    crate::job::spawn_learning(spec, shared.clone(), tx);
+    let mut jobs = world.resource_mut::<TrackJobs>();
+    jobs.learners.insert(op, Learner { key, rx: Mutex::new(rx), shared });
+    jobs.pending = true;
+    if let Some(mut c) = world.get_mut::<CursorShapes>(op) {
+        c.learning = true;
+    }
 }
 
 impl TrackJobs {
@@ -413,6 +506,10 @@ impl Plan {
         let changed: Vec<FrameIndex> = frames.iter().copied().filter(|f| at(&self.looks, *f) != at(&old.looks, *f)).collect();
         let paint = self.params.method == Method::Paint;
         let (lo, hi) = (self.lo.min(old.lo), self.hi.max(old.hi) + 1);
+        // A cursor tracker learns its shapes from all its paints: any change is every frame's.
+        if self.params.method == Method::Cursor && !changed.is_empty() {
+            return std::iter::once(lo..hi).collect();
+        }
         let mut out = Vec::new();
         for c in changed {
             let before = frames.iter().copied().filter(|f| *f < c).max();
@@ -465,6 +562,7 @@ pub fn run_trackers(world: &mut World) {
         let mut jobs = world.resource_mut::<TrackJobs>();
         jobs.running.retain(|(e, _), _| live.contains(e));
         jobs.basis.retain(|e, _| live.contains(e));
+        jobs.learners.retain(|e, _| live.contains(e));
         jobs.pending = false;
         jobs.worker_wanted_before = std::mem::take(&mut jobs.worker_wanted);
         jobs.worker_queued_before = std::mem::take(&mut jobs.worker_queued);
@@ -478,6 +576,7 @@ pub fn run_trackers(world: &mut World) {
         let mut jobs = world.resource_mut::<TrackJobs>();
         jobs.running.clear();
         jobs.basis.clear();
+        jobs.learners.clear();
         jobs.video = Some(footage.original.clone());
         jobs.pending = !live.is_empty();
         let extent = extent(world);
@@ -510,6 +609,7 @@ pub fn run_trackers(world: &mut World) {
         }
         drain(world, op);
         replan(world, op, &footage);
+        learn_cursor(world, op, &footage);
         stop_unwanted(world, op);
         let waiting = start_jobs(world, op, &footage);
         settle(world, op);
@@ -618,6 +718,11 @@ fn drain(world: &mut World, op: Entity) {
                 for s in states {
                     kept.0.insert(s.frame, Arc::new(s));
                 }
+            }
+            Msg::CursorShapes(learned) => {
+                let key = world.resource::<TrackJobs>().basis.get(&op).map_or(0, |b| cursor_key(&b.plan));
+                let learning = world.resource::<TrackJobs>().learners.contains_key(&op);
+                world.entity_mut(op).insert(CursorShapes { key, learned, learning, error: None });
             }
             Msg::Finished => {
                 world.resource_mut::<TrackJobs>().running.remove(&(op, side));
@@ -1087,7 +1192,14 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         .iter()
         .filter_map(|e| world.get::<Look>(*e))
         .filter(|l| (lo..=hi).contains(&l.frame))
-        .map(|l| LookSpec { frame: l.frame, center: l.center(), half: l.half(), mask: l.painted().map(<[u8]>::to_vec) })
+        .map(|l| LookSpec {
+            frame: l.frame,
+            center: l.center(),
+            half: l.half(),
+            // (A paint's mask can be finer than a look's: `tool::brush_paint`.)
+            mask: l.painted().map(<[u8]>::to_vec).or_else(|| (params.method.paints() && crate::job::paint::mask_side(&l.mask).is_some() && l.mask.iter().any(|c| *c > 0)).then(|| l.mask.clone())),
+            pattern: l.pattern,
+        })
         .collect();
     // It starts on its anchor frame, from the look there (a painted one
     // first); with no look there (it was deleted), from its first look.
@@ -1121,6 +1233,8 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     };
     let video = match (params.rendition, &footage.proxy) {
         (Rendition::Original, _) | (_, None) => original.clone(),
+        // (A cursor is a few pixels: always every one of them.)
+        _ if params.method == Method::Cursor => original.clone(),
         (Rendition::Proxy, Some(p)) => p.clone(),
         // Keep reading what the results so far came from while it serves
         // (the original always does), so a proxy that became ready meanwhile
