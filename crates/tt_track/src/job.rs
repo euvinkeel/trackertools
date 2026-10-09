@@ -43,6 +43,7 @@ use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
 mod learned;
 pub mod cursor;
 pub mod paint;
+pub mod sam;
 
 pub use learned::{
     availability as cotracker_availability, forget_availability as forget_cotracker_availability, installed_dir as cotracker_dir, installed_python as cotracker_python,

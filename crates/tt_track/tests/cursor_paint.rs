@@ -82,8 +82,13 @@ fn track_boxes(video: &Path, lo: i64, hi: i64, paints: Vec<Look>) -> (Out, Boxes
     let out = w.resource::<SignalStore>().get(w.get::<tt_core::op::Output>(op).expect("output").0).expect("signal");
     let frames = (lo..=hi).map(|f| out.get(f).map(|v| ([v[0] as f64, v[1] as f64], tt_track::flags(v), v[6]))).collect();
     let boxes = (lo..=hi).map(|f| out.get(f).filter(|v| tt_track::flags(v) == 0).map(|v| [(v[4] - v[2]).round() as i64, (v[5] - v[3]).round() as i64])).collect();
-    let shapes = w.get::<CursorShapes>(op).map(|s| s.learned.shapes.clone()).unwrap_or_default();
-    (frames, boxes, shapes, secs)
+    let learned = w.get::<CursorShapes>(op).map(|s| s.learned.clone()).unwrap_or_default();
+    if std::env::var_os("TT_CURSOR_DEBUG").is_some() || std::env::var_os("TT_SHOW_PAINTS").is_some() {
+        for p in &learned.paints {
+            eprintln!("paint on frame {} (pattern {}): {:?}", p.frame, p.pattern + 1, p.used);
+        }
+    }
+    (frames, boxes, learned.shapes, secs)
 }
 
 /// Draw the shapes learned (`#` dark, `o` light, `.` unsure), for the log.
@@ -272,4 +277,36 @@ fn learns_while_paused() {
     let w = &core.world;
     let out = w.resource::<SignalStore>().get(w.get::<tt_core::op::Output>(op).expect("output").0).expect("signal");
     assert!(out.present_hull().is_none(), "paused: nothing tracked");
+}
+
+/// Paints from a project (`TT_CURSOR_LOOKS`: a JSON of `video` and `looks`,
+/// each `frame, x, y, half_w, half_h, mask, pattern`), learned and tracked
+/// over `TT_CURSOR_RANGE` (`lo,hi`; by default the paints' frames and 60
+/// after): what each pattern learns, and what became of each paint. For
+/// looking into a user's paints.
+#[test]
+fn paints_from_a_project() {
+    let Some(path) = std::env::var_os("TT_CURSOR_LOOKS") else { return };
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).expect("json")).expect("json");
+    let looks: Vec<Look> = v["looks"]
+        .as_array()
+        .expect("looks")
+        .iter()
+        .map(|l| {
+            let f = |k: &str| l[k].as_f64().expect(k);
+            let mask = l["mask"].as_array().expect("mask").iter().map(|m| m.as_u64().expect("cell") as u8).collect();
+            Look { mask, pattern: l["pattern"].as_u64().unwrap_or(0) as u32, ..Look::new(f("frame") as i64, [f("x"), f("y")], [f("half_w"), f("half_h")]) }
+        })
+        .collect();
+    let (lo, hi) = match std::env::var("TT_CURSOR_RANGE") {
+        Ok(r) => {
+            let (a, b) = r.split_once(',').expect("lo,hi");
+            (a.trim().parse().expect("lo"), b.trim().parse().expect("hi"))
+        }
+        Err(_) => (looks.iter().map(|l| l.frame).min().expect("a look"), looks.iter().map(|l| l.frame).max().expect("a look") + 60),
+    };
+    let (out, _, shapes, secs) = track_boxes(Path::new(v["video"].as_str().expect("video")), lo, hi, looks);
+    show(&shapes);
+    let found = out.iter().filter(|o| o.is_some_and(|(_, f, _)| f == 0)).count();
+    eprintln!("{} frames in {secs:.1} s: found on {found}", hi - lo + 1);
 }
