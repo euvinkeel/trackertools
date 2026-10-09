@@ -401,9 +401,12 @@ const CUT_OUT_CLEAR: f32 = 0.15;
 /// cross-correlation: only the cursor's pixels count, not what is behind
 /// it). None: `a` has none, or nothing in `b` matches well and clearly.
 pub fn align_moving(a: &Shot, b: &Shot) -> Option<Aligned> {
-    let mask = a.moving.as_ref()?;
+    let moved = a.moving.as_ref()?;
     let (w, h) = (a.img.w, a.img.h);
-    let on: Vec<usize> = (0..w * h).filter(|i| mask[*i] && a.painted[*i]).collect();
+    // What moved, and what it walls in: on a page the cursor's own colour,
+    // only its outline changes; its body is inside it.
+    let outside = reachable_from_border(moved, w, h);
+    let on: Vec<usize> = (0..w * h).filter(|i| (moved[*i] || !outside[*i]) && a.painted[*i]).collect();
     let (x0, y0) = (on.iter().map(|i| i % w).min()?, on.iter().map(|i| i / w).min()?);
     let (x1, y1) = (on.iter().map(|i| i % w).max()? + 1, on.iter().map(|i| i / w).max()? + 1);
     let (tw, th) = (x1 - x0, y1 - y0);
@@ -442,15 +445,21 @@ pub fn align_moving(a: &Shot, b: &Shot) -> Option<Aligned> {
     Some(Aligned { d: [fx - x0 as f64, fy - y0 as f64], score: top * 1000.0, ratio: second / top })
 }
 
-/// Line `b` up with `a`: by what moved in either ([`align_moving`]), else by their edges ([`align`]).
+/// Line `b` up with `a`: by what moved in either ([`align_moving`]: the
+/// clearer, as what moves in one may be more than the cursor, a spinner
+/// beside it that the other hasn't), else by their edges ([`align`]).
 pub fn line_up(a: &Shot, b: &Shot) -> Option<Aligned> {
-    if a.moving.is_some() {
-        return align_moving(a, b);
+    if a.moving.is_none() && b.moving.is_none() {
+        return align(a, b);
     }
-    if b.moving.is_some() {
-        return align_moving(b, a).map(|x| Aligned { d: [-x.d[0], -x.d[1]], ..x });
+    let there = align_moving(a, b);
+    let back = align_moving(b, a).map(|x| Aligned { d: [-x.d[0], -x.d[1]], ..x });
+    // (Clearer: the best further above the next best.)
+    let clear = |x: &Aligned| x.score * (1.0 - x.ratio);
+    match (there, back) {
+        (Some(x), Some(y)) => Some(if clear(&y) > clear(&x) { y } else { x }),
+        (x, y) => x.or(y),
     }
-    align(a, b)
 }
 
 /// Whether `a` and `b` mostly show the same screen with `b` moved by `d` (a
@@ -508,8 +517,10 @@ type Owned = (Shot, [f64; 2], Option<usize>);
 
 /// The shape `members` agree on, `paints` of them the user's, and where its
 /// top-left lies in the first. None: they agree on too little. `strict`: a
-/// pixel is sure only where most of them agree (members known to fit);
-/// else where a clear bunch does (to see which members don't fit).
+/// pixel is sure only where every paint agrees (members known to fit: each
+/// paint with the frames near it is one say, as they mostly show the same
+/// background); else where a clear bunch of shots does (to see which
+/// members don't fit).
 ///
 /// A pixel is the cursor where the shots agree on its value, and it is on
 /// or inside edges they agree on (each steep, pointing the same way in
@@ -523,6 +534,8 @@ fn shape_of(members: &[Member<'_>], paints: usize, strict: bool) -> Option<(Shap
     let mut alpha = vec![0.0; w * h];
     let mut edge = vec![false; w * h];
     let mut v: Vec<f32> = Vec::with_capacity(n);
+    // Which say each value is: its paint's (a frame near a paint is its paint's; a find is its own).
+    let mut says: Vec<usize> = Vec::with_capacity(n);
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -534,8 +547,9 @@ fn shape_of(members: &[Member<'_>], paints: usize, strict: bool) -> Option<(Shap
                 continue;
             }
             v.clear();
+            says.clear();
             let (mut gsum, mut glen) = ([0.0f32; 2], 0.0f32);
-            for (s, d, _) in members {
+            for (k, (s, d, parent)) in members.iter().enumerate() {
                 let (sx, sy) = (x as f64 + d[0], y as f64 + d[1]);
                 if !s.painted_at(sx, sy) {
                     continue;
@@ -544,6 +558,7 @@ fn shape_of(members: &[Member<'_>], paints: usize, strict: bool) -> Option<(Shap
                     continue;
                 };
                 v.push(p);
+                says.push(parent.unwrap_or(k));
                 let g = [(r - l) / 2.0, (b - u) / 2.0];
                 gsum = [gsum[0] + g[0], gsum[1] + g[1]];
                 glen += g[0].hypot(g[1]);
@@ -571,6 +586,25 @@ fn shape_of(members: &[Member<'_>], paints: usize, strict: bool) -> Option<(Shap
             value[i] = mean;
             let (lo, hi) = if strict { (0.55, 0.8) } else { (0.35, 0.6) };
             alpha[i] = if best >= 2 { smoothstep(lo, hi, share) * (v.len() as f32 / n as f32).min(1.0) } else { 0.0 };
+            // Strict: the cursor is the same picture on every frame, so a
+            // pixel any paint shows otherwise (most of its shots) is behind
+            // it: a white page behind it on most paints but not on one, or a
+            // spinner beside it on some. (With six or more paints, one in six
+            // may disagree: a paint lined up a little off.)
+            if strict {
+                let mut seen: Vec<(usize, u32, u32)> = Vec::new();
+                for (p, g) in v.iter().zip(&says) {
+                    let agrees = u32::from((p - mean).abs() <= slack);
+                    match seen.iter_mut().find(|(s, _, _)| s == g) {
+                        Some((_, a, t)) => (*a, *t) = (*a + agrees, *t + 1),
+                        None => seen.push((*g, agrees, 1)),
+                    }
+                }
+                let against = seen.iter().filter(|(_, a, t)| a * 2 < *t).count();
+                if against > seen.len() / 6 {
+                    alpha[i] = 0.0;
+                }
+            }
             let m = v.len() as f32;
             let steep = gsum[0].hypot(gsum[1]) / m;
             edge[i] = steep >= AGREED_EDGE && glen > 0.0 && gsum[0].hypot(gsum[1]) / glen >= COHERENT;
@@ -609,10 +643,10 @@ fn shape_of(members: &[Member<'_>], paints: usize, strict: bool) -> Option<(Shap
 /// Frames near a paint show the same screen with the cursor moved: where a
 /// pixel of the shape (`alpha` and `value`, in the first member's grid)
 /// was, a frame near it shows what is behind it, unless the cursor moved
-/// onto that spot there too (and looks like that there). Where that looks
-/// the same as the pixel, the pixel is that background, not the cursor (or
-/// the cursor's colour is the background's there, where it can't be seen
-/// anyway): its alpha goes, by how many of the frames that saw behind it say so.
+/// onto that spot there too (and looks like that there). A pixel that looks
+/// the same as what is behind it on every paint that saw behind it is that
+/// background, not the cursor (or the cursor where it can't be seen
+/// anyway): its alpha goes.
 fn background_where_it_moved(members: &[Member<'_>], value: &[f32], alpha: &mut [f32], w: usize, h: usize) {
     let cover = alpha.to_vec();
     // What the shape shows at a point, if it is (maybe) the cursor there.
@@ -630,7 +664,8 @@ fn background_where_it_moved(members: &[Member<'_>], value: &[f32], alpha: &mut 
             if alpha[i] <= 0.0 {
                 continue;
             }
-            let (mut behind, mut differs) = (0.0f32, 0.0f32);
+            // Per paint: how many of its frames near saw behind the pixel and found it the same, or not.
+            let mut views: Vec<(usize, u32, u32)> = Vec::new();
             for (near, dn, parent) in members {
                 let Some(p) = parent else { continue };
                 let (paint, dp, _) = &members[*p];
@@ -642,14 +677,18 @@ fn background_where_it_moved(members: &[Member<'_>], value: &[f32], alpha: &mut 
                 if shows(there[0] - dn[0], there[1] - dn[1]).is_some_and(|c| (c - now).abs() <= SAME) {
                     continue;
                 }
-                if (was - now).abs() <= SAME {
-                    behind += 1.0;
-                } else {
-                    differs += 1.0;
+                let same = u32::from((was - now).abs() <= SAME);
+                match views.iter_mut().find(|(q, _, _)| q == p) {
+                    Some((_, b, d)) => (*b, *d) = (*b + same, *d + 1 - same),
+                    None => views.push((*p, same, 1 - same)),
                 }
             }
-            if behind + differs >= 1.0 {
-                alpha[i] *= smoothstep(0.3, 0.7, differs / (behind + differs));
+            // The same as behind it on a paint only means it can't be seen
+            // there (the cursor's white on a white page); where any paint
+            // shows it differs from what is behind, it is the cursor. Where
+            // none does, it is that background.
+            if !views.is_empty() && !views.iter().any(|(_, b, d)| d > b) {
+                alpha[i] = 0.0;
             }
         }
     }
@@ -1591,6 +1630,84 @@ mod tests {
         let img = frame(220, 180, 9, [150, 40]);
         let f = *finder.find(&Pyramid::new(img, finder.levels), [0.0, 0.0, 220.0, 180.0], 3, 0.6).first().expect("found");
         assert!((f.tip[0] - 150.5).abs() < 1.01 && (f.tip[1] - 40.0).abs() < 1.01, "tip {:?}", f.tip);
+    }
+
+    /// The cursor is the same picture on every paint, so what isn't is
+    /// background (on request: "white backgrounds should not be merging into
+    /// the cursor … there's a painted area where the cursor is clearly not on
+    /// a white background … sometimes there is a loading blue windows circle
+    /// next to it but on other frames there isn't"): three paints on a white
+    /// page and one on a dark busy one, a spinner beside the arrow on two of
+    /// them. Only the arrow is learned: no white around it, no spinner.
+    #[test]
+    fn what_any_paint_shows_otherwise_is_background() {
+        let (w, h) = (220usize, 180usize);
+        // A white page, or the busy blocks darkened; the arrow at `tip`; the spinner (mid grey, a ring) beside it.
+        let make = |white: bool, seed: u32, tip: [usize; 2], spinner: bool| {
+            let mut img = frame(w, h, seed, tip);
+            let shape = arrow();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    let on = (x as i64 - tip[0] as i64, y as i64 - tip[1] as i64);
+                    if (0..12).contains(&on.0) && (0..18).contains(&on.1) && shape[on.1 as usize][on.0 as usize] > 0 {
+                        continue;
+                    }
+                    img.px[i] = if white { 240.0 } else { img.px[i] * 0.35 };
+                    let r = ((on.0 - 16) as f64).hypot((on.1 - 20) as f64);
+                    if spinner && (4.0..7.0).contains(&r) {
+                        img.px[i] = 105.0;
+                    }
+                }
+            }
+            img
+        };
+        let paints: Vec<PaintShots> = [(true, 1, [60usize, 40usize], true), (true, 2, [120, 70], false), (true, 3, [50, 110], true), (false, 4, [140, 30], false)]
+            .iter()
+            .enumerate()
+            .map(|(k, (white, seed, tip, spinner))| {
+                let look = LookSpec { frame: k as i64 * 10, center: [tip[0] as f64 + 12.0, tip[1] as f64 + 12.0], half: [36.0, 36.0], mask: None, pattern: 0 };
+                let mut shot = Shot::of_paint(&look, [1.0, 1.0], &make(*white, *seed, *tip, *spinner)).expect("shot");
+                let near: Vec<Shot> = [[14i64, 7i64], [-15, -9]]
+                    .iter()
+                    .map(|m| make(*white, *seed, [(tip[0] as i64 + m[0]) as usize, (tip[1] as i64 + m[1]) as usize], *spinner))
+                    .map(|img| Shot::near_paint(&look, [1.0, 1.0], look.frame + 1, &img).expect("near"))
+                    .collect();
+                shot.mark_moving(&near);
+                PaintShots::new(shot, 0, near)
+            })
+            .collect();
+        let model = learn(paints);
+        assert_eq!(model.shapes.len(), 1);
+        let s = &model.shapes[0];
+        // Where the arrow is in the shape: found on a fresh dark frame with a spinner, its tip there.
+        let finder = Finder::new(model.shapes.clone());
+        let f = *finder.find(&Pyramid::new(make(false, 9, [100, 80], true), finder.levels), [0.0, 0.0, w as f64, h as f64], 3, 0.6).first().expect("found");
+        assert!((f.tip[0] - 100.5).abs() < 1.01 && (f.tip[1] - 80.0).abs() < 1.01, "tip {:?}", f.tip);
+        let (ox, oy) = (100.0 - f.at[0], 80.0 - f.at[1]);
+        let shape = arrow();
+        let (mut stray, mut sure) = (Vec::new(), 0);
+        for y in 0..s.h {
+            for x in 0..s.w {
+                if s.alpha[y * s.w + x] <= 0.5 {
+                    continue;
+                }
+                sure += 1;
+                // (In the arrow's pixels, a pixel of slack for the fraction it was lined up by.)
+                let (ax, ay) = ((x as f64 - ox).round() as i64, (y as f64 - oy).round() as i64);
+                let near_arrow = (-1..=1).any(|dy| {
+                    (-1..=1).any(|dx| {
+                        let (px, py) = (ax + dx, ay + dy);
+                        (0..12).contains(&px) && (0..18).contains(&py) && shape[py as usize][px as usize] > 0
+                    })
+                });
+                if !near_arrow {
+                    stray.push((ax, ay, s.value[y * s.w + x] as i64));
+                }
+            }
+        }
+        assert!(sure >= 80, "the arrow: {sure} px");
+        assert!(stray.is_empty(), "sure pixels off the arrow (white page, spinner): {stray:?}");
     }
 
     /// A look-alike that stays put loses to the cursor, which moves: also
