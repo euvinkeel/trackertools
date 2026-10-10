@@ -73,6 +73,8 @@ pub enum Action {
     GoToIn,
     /// Go to the out point (the end, if none).
     GoToOut,
+    /// A cursor tracker's pattern a brush teaches (0 = the first: key 1; key 0 is the tenth).
+    Pattern(u8),
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -170,6 +172,17 @@ impl Default for Keymap {
                 (b(Key::Letter('x'), Mods { ctrl: false, shift: false, alt: true }, false), ClearMarks),
                 (b(Key::Letter('i'), Mods::SHIFT, false), GoToIn),
                 (b(Key::Letter('o'), Mods::SHIFT, false), GoToOut),
+                // A cursor tracker's patterns: 1–9, and 0 for the tenth.
+                (b(Key::Letter('1'), Mods::NONE, false), Pattern(0)),
+                (b(Key::Letter('2'), Mods::NONE, false), Pattern(1)),
+                (b(Key::Letter('3'), Mods::NONE, false), Pattern(2)),
+                (b(Key::Letter('4'), Mods::NONE, false), Pattern(3)),
+                (b(Key::Letter('5'), Mods::NONE, false), Pattern(4)),
+                (b(Key::Letter('6'), Mods::NONE, false), Pattern(5)),
+                (b(Key::Letter('7'), Mods::NONE, false), Pattern(6)),
+                (b(Key::Letter('8'), Mods::NONE, false), Pattern(7)),
+                (b(Key::Letter('9'), Mods::NONE, false), Pattern(8)),
+                (b(Key::Letter('0'), Mods::NONE, false), Pattern(9)),
             ],
         }
     }

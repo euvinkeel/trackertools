@@ -23,6 +23,12 @@
 //!   between them are one paint), or a new paint on this frame
 //!   ([`crate::job::paint`]). Alt+brush erases from its paint here.
 //!
+//! - **Cursor** trackers paint the same way ([`crate::job::cursor`]), each
+//!   paint teaching one of its *patterns* (an arrow, a hand …): a brush
+//!   teaches the pattern picked (keys 1–0, a click on it, or the selected
+//!   paint's; else the last painted), Shift+brush starts a new one.
+//!   Selecting one of its paints and brushing adds to that tracker.
+//!
 //! New template looks get their mask painted automatically ([`crate::look::LookDefaults`]).
 //!
 //! The guide (search region and motion prior) is the selected sketch (or
@@ -55,12 +61,50 @@ pub struct TrackTool {
     pub reseed: Option<Entity>,
     /// A paint stroke in progress: the pointer's path (shown space's pixels).
     pub stroke: Vec<[f64; 2]>,
+    /// Per cursor tracker: the pattern a plain brush teaches (picked).
+    pub patterns: std::collections::HashMap<Entity, u32>,
+    /// The press in progress starts a new pattern (Shift, on a cursor tracker).
+    pub new_pattern: bool,
+    /// The selection last seen: selecting a cursor tracker's paint picks its pattern.
+    seen: Option<Entity>,
 }
 
 impl Default for TrackTool {
     fn default() -> Self {
-        Self { brush: 14.0, drag: None, refused: None, reseed: None, stroke: Vec::new() }
+        Self { brush: 14.0, drag: None, refused: None, reseed: None, stroke: Vec::new(), patterns: Default::default(), new_pattern: false, seen: None }
     }
+}
+
+/// The paint tracker a brush adds to: the selected one, or the one whose paint is selected.
+pub fn paint_tracker(world: &World) -> Option<Entity> {
+    let e = world.resource::<Selection>().primary()?;
+    let t = if is_tracker(world, e) {
+        e
+    } else if world.get::<Look>(e).is_some() {
+        crate::look::owner_of(world, e)?
+    } else {
+        return None;
+    };
+    world.get::<Tracker>(t).is_some_and(|p| p.method.paints()).then_some(t)
+}
+
+/// The cursor tracker a brush teaches (see [`paint_tracker`]).
+pub fn cursor_tracker(world: &World) -> Option<Entity> {
+    paint_tracker(world).filter(|t| world.get::<Tracker>(*t).is_some_and(|p| p.method == Method::Cursor))
+}
+
+/// The pattern a plain brush teaches cursor tracker `t`: the one picked,
+/// else the last painted's (0 with none).
+pub fn active_pattern(world: &World, tool: &TrackTool, t: Entity) -> u32 {
+    if let Some(p) = tool.patterns.get(&t) {
+        return *p;
+    }
+    crate::look::looks_of(world, t).last().and_then(|l| world.get::<Look>(*l)).map_or(0, |l| l.pattern)
+}
+
+/// A pattern no paint of `t` teaches yet: the one after the last.
+pub fn next_pattern(world: &World, t: Entity) -> u32 {
+    crate::look::patterns_of(world, t).last().map_or(0, |p| p + 1)
 }
 
 /// What a brush stroke makes of a paint: the stroke `path` with radius `r`
@@ -146,6 +190,8 @@ impl TrackTool {
 
 /// `Set::Tools`: the Track tool's presses.
 pub fn track_tool(world: &mut World) {
+    // 1–0: a cursor tracker's pattern (only the Track tool's).
+    let picks = world.resource_mut::<tt_core::input::PendingActions>().take(|a| matches!(a, tt_core::input::Action::Pattern(_)));
     if world.resource::<ActiveTool>().0 != Tool::Track {
         let mut tool = world.resource_mut::<TrackTool>();
         (tool.drag, tool.reseed) = (None, None);
@@ -161,6 +207,18 @@ pub fn track_tool(world: &mut World) {
     let frame = world.resource::<Transport>().frame();
     let shift = world.resource::<KeysHeld>().mods.shift;
     let mut tool = world.resource::<TrackTool>().clone();
+    let cursor = cursor_tracker(world);
+    if let (Some(t), Some(tt_core::input::Action::Pattern(n))) = (cursor, picks.last()) {
+        tool.patterns.insert(t, *n as u32);
+    }
+    // Selecting a cursor tracker's paint picks its pattern.
+    let primary = world.resource::<Selection>().primary();
+    if primary != tool.seen {
+        tool.seen = primary;
+        if let (Some(t), Some(look)) = (cursor, primary.and_then(|e| world.get::<Look>(e))) {
+            tool.patterns.insert(t, look.pattern);
+        }
+    }
     // Ctrl+wheel sizes the click's pattern; the plain wheel stays the viewport's zoom.
     if p.wheel != 0.0 && tool.drag.is_none() && world.resource::<KeysHeld>().mods.ctrl {
         tool.brush = (tool.brush * 1.15f32.powf(p.wheel)).clamp(3.0, 400.0);
@@ -169,12 +227,14 @@ pub fn track_tool(world: &mut World) {
     if let Some(t) = p.pressed
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
     {
-        tool.drag = Some((at, frame, shift));
+        // (On a cursor tracker, Shift starts a new pattern, not a new tracker.)
+        tool.new_pattern = shift && cursor.is_some();
+        tool.drag = Some((at, frame, shift && !tool.new_pattern));
         tool.refused = None;
         tool.stroke = vec![at];
     }
     // A paint tracker's press brushes: the path, kept until it is let go.
-    let painting = tool.drag.is_some_and(|(_, _, shift)| method_for(world, shift) == Method::Paint);
+    let painting = tool.drag.is_some_and(|(_, _, shift)| method_for(world, shift).paints());
     if painting {
         let since = p.pressed.unwrap_or(f64::NEG_INFINITY);
         tool.stroke.extend(p.samples.iter().filter(|s| s[0] >= since).map(|s| [s[1], s[2]]));
@@ -187,7 +247,12 @@ pub fn track_tool(world: &mut World) {
         let path: Vec<[f64; 2]> = path.iter().map(|p| map.to_source(*p)).collect();
         let r = tool.brush as f64 / p.scale.max(1e-9) * map.a;
         let erase = world.resource::<KeysHeld>().mods.alt;
-        tool.refused = brush(world, f, &path, r, shift, erase, tool.reseed.take()).err();
+        // A cursor tracker's pattern: the one picked, or a new one.
+        let pattern = cursor.filter(|_| !shift).map(|t| (t, if tool.new_pattern { next_pattern(world, t) } else { active_pattern(world, &tool, t) }));
+        tool.refused = brush(world, f, &path, r, shift, erase, tool.reseed.take(), pattern.map(|(_, p)| p)).err();
+        if let (Some((t, p)), None) = (pattern, &tool.refused) {
+            tool.patterns.insert(t, p);
+        }
     }
     if ended && let Some((start, f, shift)) = tool.drag.take() {
         tool.stroke.clear();
@@ -204,11 +269,15 @@ pub fn track_tool(world: &mut World) {
 }
 
 /// A brush stroke (source px, radius `r`) on frame `f`: added to the
-/// selected paint tracker's paint on this frame (or, `erase`, taken out of
-/// it: a paint left empty goes), else a new paint (`place`). Err = why not.
-fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool, erase: bool, reseed: Option<Entity>) -> Result<(), String> {
-    let tracker = world.resource::<Selection>().primary().filter(|e| is_tracker(world, *e)).filter(|_| !new).filter(|e| world.get::<Tracker>(*e).is_some_and(|t| t.method == Method::Paint));
-    let here = tracker.and_then(|t| crate::look::looks_of(world, t).into_iter().find(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == f)));
+/// selected paint tracker's paint on this frame (a cursor tracker's of
+/// `pattern`), or, `erase`, taken out of it: a paint left empty goes; else
+/// a new paint (of `pattern`; with no tracker, `place`). Err = why not.
+#[allow(clippy::too_many_arguments)]
+fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool, erase: bool, reseed: Option<Entity>, pattern: Option<u32>) -> Result<(), String> {
+    let tracker = paint_tracker(world).filter(|_| !new);
+    let here = tracker.and_then(|t| {
+        crate::look::looks_of(world, t).into_iter().find(|l| world.get::<Look>(*l).is_some_and(|l| l.frame == f && pattern.is_none_or(|p| l.pattern == p)))
+    });
     match (here, erase) {
         (Some(l), _) => {
             let old = world.get::<Look>(l).cloned().expect("a look");
@@ -228,19 +297,30 @@ fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool,
             }
             Ok(())
         }
-        (None, true) => Err("Nothing to erase: this tracker has no paint on this frame".into()),
+        (None, true) => Err(match pattern {
+            Some(p) => format!("Nothing to erase: pattern {} has no paint on this frame", p + 1),
+            None => "Nothing to erase: this tracker has no paint on this frame".into(),
+        }),
         (None, false) => {
             let (c, h, mask) = paint_look(path, r);
             let mut look = Look::new(f, c, h);
             look.mask = mask;
-            place(world, look, new, reseed)
+            look.pattern = pattern.unwrap_or(0);
+            match tracker.filter(|t| reseed != Some(*t)) {
+                Some(t) => {
+                    add_look(world, t, look);
+                    Ok(())
+                }
+                None => place(world, look, new, reseed),
+            }
         }
     }
 }
 
 /// What a press makes: the selected tracker's kind (unless `new`), else the kind chosen for new ones.
 pub fn method_for(world: &World, new: bool) -> Method {
-    let selected = world.resource::<Selection>().primary().filter(|e| is_tracker(world, *e)).filter(|_| !new);
+    // (A paint tracker's paint selected: that tracker's.)
+    let selected = world.resource::<Selection>().primary().filter(|e| is_tracker(world, *e)).or_else(|| paint_tracker(world)).filter(|_| !new);
     match selected.and_then(|t| world.get::<Tracker>(t)) {
         Some(t) => t.method,
         None => world.get_resource::<NewTrackers>().map_or(Method::Template, |n| n.method),
@@ -269,7 +349,7 @@ fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Re
                 add_look(world, t, auto_masked(world, look));
             }
             // Another paint (on a frame with one already: both count).
-            Method::Paint => {
+            Method::Paint | Method::Cursor => {
                 add_look(world, t, look);
             }
         }
@@ -294,7 +374,7 @@ mod tests {
     use crate::job::paint::on;
 
     fn spec(made: &([f64; 2], [f64; 2], Vec<u8>)) -> LookSpec {
-        LookSpec { frame: 0, center: made.0, half: made.1, mask: Some(made.2.clone()) }
+        LookSpec { frame: 0, center: made.0, half: made.1, mask: Some(made.2.clone()), pattern: 0 }
     }
 
     /// Strokes far apart are one paint (the gap stays unpainted, with fine

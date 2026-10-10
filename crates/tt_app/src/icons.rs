@@ -52,7 +52,7 @@ impl Glyph {
 
     pub fn tracker(method: Method) -> Glyph {
         match method {
-            Method::Template => Glyph::Template,
+            Method::Template | Method::Cursor => Glyph::Template,
             Method::CoTracker | Method::Paint | Method::TapNext => Glyph::CoTracker,
             Method::Manual => Glyph::Manual,
         }

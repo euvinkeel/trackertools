@@ -10,6 +10,7 @@ pub mod layer_export;
 pub mod look_editor;
 mod menu;
 pub mod outliner;
+pub mod patterns;
 mod settings;
 mod overlay;
 mod tracks;
@@ -291,10 +292,11 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             (tt_track::Method::Template, "⌖ Template tracker", "matches the pattern you show it on every frame: fast, sub-pixel, built in"),
             (tt_track::Method::CoTracker, "⌖ CoTracker", "Meta's CoTracker3, a learned point tracker, run in Python (PyTorch and its weights)"),
             (tt_track::Method::Paint, "⌖ Paint", "brush over the subject: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them (robust to some points getting lost or hidden)"),
+            (tt_track::Method::Cursor, "⌖ Cursor", "paint loosely over the mouse cursor on a few frames: it learns what the cursor looks like and finds it on every frame (built in). Shift+brush: a new pattern, for each shape the cursor takes (arrow, hand …); keys 1–0 pick one"),
             (tt_track::Method::TapNext, "⌖ TAPNext", "experimental: Google DeepMind's TAPNext++, a point tracker that gives each frame's result at once (click the pixel to follow, as CoTracker)"),
         ] {
             let usable = match method {
-                tt_track::Method::Template => Ok(()),
+                tt_track::Method::Template | tt_track::Method::Cursor => Ok(()),
                 tt_track::Method::TapNext => tt_track::job::tapnext_availability(),
                 _ => cotracker.clone(),
             };

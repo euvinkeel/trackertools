@@ -1014,7 +1014,7 @@ fn lanes(
                     painter.text(Pos2::new(x0 + 3.0, y + 2.0), egui::Align2::LEFT_TOP, "off", egui::FontId::proportional(9.0), style::TEXT.gamma_multiply(0.8));
                 }
             }
-            // Its looks (white squares) or a CoTracker's reset points (white diamonds), on their frames.
+            // Its looks (white squares; a cursor tracker's in their pattern's colour) or a CoTracker's reset points (white diamonds), on their frames.
             for l in tt_track::look::looks_of(world, e) {
                 let Some(look) = world.get::<tt_track::look::Look>(l) else { continue };
                 if !visible.contains(&look.frame) {
@@ -1026,7 +1026,9 @@ fn lanes(
                     hits.ticks.push((l, Rect::from_center_size(c, Vec2::splat(9.0))));
                 }
                 let lit = selection.is_selected(l);
-                let pin = style::PIN.gamma_multiply(if lit || selected { 1.0 } else { 0.6 });
+                // (A cursor tracker's paints: their pattern's colour.)
+                let base = if method == Some(tt_track::Method::Cursor) { super::patterns::colour(look.pattern) } else { style::PIN };
+                let pin = base.gamma_multiply(if lit || selected { 1.0 } else { 0.6 });
                 if method.is_some_and(tt_track::Method::point) {
                     icons::diamond(&painter, c, if lit { 5.0 } else { 4.0 }, Stroke::new(1.0, egui::Color32::from_black_alpha(160)), Some(pin));
                 } else {

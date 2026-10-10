@@ -423,7 +423,7 @@ mod tests {
                 }
             }
         }
-        LookSpec { frame: 0, center, half: [half, half], mask: Some(mask) }
+        LookSpec { frame: 0, center, half: [half, half], mask: Some(mask), pattern: 0 }
     }
 
     #[test]

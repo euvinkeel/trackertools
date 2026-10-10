@@ -101,6 +101,11 @@ impl Scene {
                     Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
                 ]);
             }
+            // `=cursor`: the pointer over the video (the brush shows its pattern under it; TT_SCENE_HOVER=x,y).
+            if *n >= 5 && self.mode == "cursor" {
+                let at = std::env::var("TT_SCENE_HOVER").ok().and_then(|s| s.split_once(',').and_then(|(x, y)| Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))));
+                self.inject.push(Event::PointerMoved(at.unwrap_or(egui::pos2(640.0, 420.0))));
+            }
             // Then down the panel to the views' preview.
             if (10..24).contains(n)
                 && self.mode == "settings"
@@ -112,7 +117,8 @@ impl Scene {
                     Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -40.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move },
                 ]);
             }
-            return *n > 45;
+            // (`=cursor` keeps the pointer there.)
+            return *n > 45 && self.mode != "cursor";
         }
         match self.sketch {
             None => {
@@ -291,6 +297,25 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         }
         world.resource_mut::<NewTrackers>().method = Method::Template;
     }
+    // `=cursor`: a cursor tracker on the sprite, painted loosely: pattern 1 on
+    // three frames, pattern 2 on one; selected, the Track tool on.
+    let mut cursor = None;
+    if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "cursor") {
+        world.resource_mut::<NewTrackers>().method = Method::Cursor;
+        let paint = |f: FrameIndex, pattern: u32| {
+            let c = at(f, [0.0, 0.0]);
+            let (centre, half, mask) = tt_track::tool::paint_look(&[[c[0] - 12.0, c[1] - 8.0], [c[0] + 10.0, c[1] + 10.0]], 18.0);
+            Look { mask, pattern, ..Look::new(f, centre, half) }
+        };
+        cursor = tt_track::add_unguided_tracker(world, paint(600, 0));
+        if let Some(t) = cursor {
+            for (f, p) in [(640, 0), (680, 0), (620, 1)] {
+                tt_track::add_look(world, t, paint(f, p));
+            }
+            tt_core::span::set_span(world, t, tt_core::span::Span::new(560, 700));
+        }
+        world.resource_mut::<NewTrackers>().method = Method::Template;
+    }
     // A manual dot: a path drawn by hand.
     let mut dot = None;
     edit(world, "Scene: a manual dot", |tx| {
@@ -314,8 +339,11 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         world.resource_mut::<tt_core::selection::Selection>().select_only(g);
         return subject;
     }
-    if let Some(t) = painted.or(loose) {
+    if let Some(t) = cursor.or(painted).or(loose) {
         world.resource_mut::<tt_core::selection::Selection>().select_only(t);
+    }
+    if cursor.is_some() {
+        world.resource_mut::<tt_core::tool::ActiveTool>().0 = tt_core::tool::Tool::Track;
     }
     if painted.is_some() {
         world.resource_mut::<tt_core::tool::ActiveTool>().0 = tt_core::tool::Tool::Track;
