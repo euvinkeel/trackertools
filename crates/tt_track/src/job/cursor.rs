@@ -189,13 +189,6 @@ pub struct Shot {
     /// A paint's: where its painted pixels centre (its pixels), where the
     /// cursor is, give or take ([`Window`]).
     pub centre: Option<[f64; 2]>,
-    /// A paint's: SAM 2's candidate masks of the cursor in it, if SAM ran ([`super::sam`]).
-    pub sam: Vec<super::sam::Candidate>,
-    /// Which of them it goes by (lined up with the other paints': [`Model::learn_pattern`]).
-    pub mask: Option<usize>,
-    /// A paint's: frames near it where the cursor has left the paint (it
-    /// changed, and the cursor isn't found in it): what is behind it, all of it.
-    pub behind: Vec<Shot>,
 }
 
 /// A pixel changed by more than this (levels) in a frame near: something moved there …
@@ -225,7 +218,7 @@ impl Shot {
             [on.iter().map(|i| (i % w) as f64).sum::<f64>() / n, on.iter().map(|i| (i / w) as f64).sum::<f64>() / n]
         });
         let (img, u, v) = frame.crop(x0, y0, w, h);
-        Some(Shot { frame: look.frame, origin: [x0, y0], img, u, v, painted, moving: None, centre, sam: Vec::new(), mask: None, behind: Vec::new() })
+        Some(Shot { frame: look.frame, origin: [x0, y0], img, u, v, painted, moving: None, centre })
     }
 
     /// Around a paint, on a frame near it (`f`): the paint's rectangle grown
@@ -233,7 +226,7 @@ impl Shot {
     pub fn near_paint(look: &LookSpec, k: [f64; 2], f: FrameIndex, frame: &Frame) -> Option<Shot> {
         let (x0, y0, w, h) = rect(look.center, [look.half[0] * 1.5, look.half[1] * 1.5], k, 2.0, &frame.y)?;
         let (img, u, v) = frame.crop(x0, y0, w, h);
-        Some(Shot { frame: f, origin: [x0, y0], img, u, v, painted: vec![true; w * h], moving: None, centre: None, sam: Vec::new(), mask: None, behind: Vec::new() })
+        Some(Shot { frame: f, origin: [x0, y0], img, u, v, painted: vec![true; w * h], moving: None, centre: None })
     }
 
     /// Where a shape `w × h` was found on frame `f` (its top-left at `at`):
@@ -242,7 +235,7 @@ impl Shot {
         let origin = [at[0].floor() as i64 - 3, at[1].floor() as i64 - 3];
         let (w, h) = (w + 7, h + 7);
         let (img, u, v) = frame.crop(origin[0], origin[1], w, h);
-        (Shot { frame: f, origin, img, u, v, painted: vec![true; w * h], moving: None, centre: None, sam: Vec::new(), mask: None, behind: Vec::new() }, [at[0] - origin[0] as f64, at[1] - origin[1] as f64])
+        (Shot { frame: f, origin, img, u, v, painted: vec![true; w * h], moving: None, centre: None }, [at[0] - origin[0] as f64, at[1] - origin[1] as f64])
     }
 
     /// Mark where it moved ([`Shot::moving`]): painted pixels that differ
@@ -275,7 +268,7 @@ impl Shot {
         self.moving = (on >= 8 && on * 2 <= painted).then_some(m);
     }
 
-    /// Its pixels in RGB (BT.709 for HD, else BT.601; video range), for SAM and to show.
+    /// Its pixels in RGB (BT.709 for HD, else BT.601; video range), to show.
     pub fn rgb(&self) -> Vec<u8> {
         let hd = self.img.h >= 160 || self.img.w >= 160;
         let (rv, gu, gv, bu) = if hd { (1.793, 0.213, 0.533, 2.112) } else { (1.596, 0.392, 0.813, 2.017) };
@@ -285,45 +278,6 @@ impl Shot {
             out.extend([y + rv * v, y - gu * u - gv * v, y + bu * u].map(|c| c.round().clamp(0.0, 255.0) as u8));
         }
         out
-    }
-
-    /// Where to tell SAM the cursor is, and isn't: what moved (or the
-    /// paint's centre), and the paint's edge. Crop pixels; true: the cursor.
-    pub fn sam_points(&self) -> Vec<([f64; 2], bool)> {
-        let w = self.img.w;
-        let mut out = Vec::new();
-        if let Some(m) = &self.moving {
-            let on: Vec<usize> = (0..m.len()).filter(|i| m[*i]).collect();
-            let n = on.len() as f64;
-            let c = [on.iter().map(|i| (i % w) as f64).sum::<f64>() / n, on.iter().map(|i| (i / w) as f64).sum::<f64>() / n];
-            let mut near = on.clone();
-            near.sort_by(|a, b| {
-                let d = |i: usize| ((i % w) as f64 - c[0]).powi(2) + ((i / w) as f64 - c[1]).powi(2);
-                d(*a).total_cmp(&d(*b))
-            });
-            out.extend(near.iter().step_by((near.len() / 4).max(1)).take(4).map(|i| ([(i % w) as f64 + 0.5, (i / w) as f64 + 0.5], true)));
-        }
-        if out.is_empty()
-            && let Some(c) = self.centre
-        {
-            out.push(([c[0] + 0.5, c[1] + 0.5], true));
-        }
-        // The paint's edge: not the cursor.
-        let h = self.img.h;
-        let edge: Vec<usize> = (0..w * h)
-            .filter(|i| self.painted[*i])
-            .filter(|i| {
-                let (x, y) = (i % w, i / w);
-                x == 0 || y == 0 || x + 1 == w || y + 1 == h || !self.painted[i - 1] || !self.painted[i + 1] || !self.painted[i - w] || !self.painted[i + w]
-            })
-            .collect();
-        out.extend(edge.iter().step_by((edge.len() / 8).max(1)).take(8).map(|i| ([(i % w) as f64 + 0.5, (i / w) as f64 + 0.5], false)));
-        out
-    }
-
-    /// The mask it goes by, if SAM gave it one.
-    fn chosen(&self) -> Option<&Vec<bool>> {
-        self.mask.and_then(|m| self.sam.get(m)).map(|(m, _)| m)
     }
 
     /// Whether the pixel nearest point (`x`, `y`) is painted.
@@ -700,17 +654,12 @@ fn shape_of(members: &[Member<'_>], votes: &[usize], paints: usize, strict: bool
     let mut c: Vec<(f32, f32)> = Vec::with_capacity(n);
     // Which say each value is: its paint's (a frame near a paint is its paint's; a find is its own).
     let mut says: Vec<usize> = Vec::with_capacity(n);
-    // SAM gave the paints masks: they say where the cursor is, and matting what it looks like.
-    let with_masks = strict && members.iter().any(|(s, _, p)| p.is_none() && s.chosen().is_some());
-    if with_masks && n > 1 {
-        return matte(members, votes, paints);
-    }
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
             if n == 1 {
-                // One shot: the paint itself (where SAM says, if it did).
-                if first.chosen().map_or(first.painted[i], |m| m[i]) {
+                // One shot: the paint itself.
+                if first.painted[i] {
                     (value[i], cu[i], cv[i], alpha[i]) = (first.img.px[i], first.u.px[i], first.v.px[i], 1.0);
                 }
                 continue;
@@ -787,7 +736,7 @@ fn shape_of(members: &[Member<'_>], votes: &[usize], paints: usize, strict: bool
             edge[i] = steep >= AGREED_EDGE && glen > 0.0 && gsum[0].hypot(gsum[1]) / glen >= COHERENT;
         }
     }
-    if n > 1 && !with_masks {
+    if n > 1 {
         background_where_it_moved(members, &value, &mut alpha, w, h);
         // On or inside the agreed edges: near one (2 px), or walled in by them.
         let band = within(&edge, w, h, 2);
@@ -815,226 +764,6 @@ fn shape_of(members: &[Member<'_>], votes: &[usize], paints: usize, strict: bool
         }
     }
     crop_shape(value, cu, cv, alpha, w, h, n, paints)
-}
-
-/// How many of `paint`'s painted pixels differ from the same spot of the screen in `near`.
-fn changed(paint: &Shot, near: &Shot) -> usize {
-    let w = paint.img.w;
-    (0..paint.img.px.len())
-        .filter(|i| paint.painted[*i])
-        .filter(|i| {
-            let (nx, ny) = (paint.origin[0] + (i % w) as i64 - near.origin[0], paint.origin[1] + (i / w) as i64 - near.origin[1]);
-            near.img.at(nx, ny).is_some_and(|q| (q - paint.img.px[*i]).abs() > MOVED)
-        })
-        .count()
-}
-
-/// Where SAM's masks put the cursor, at least this share of the paints: it may be there.
-const SUPPORT: f32 = 0.5;
-/// Backgrounds this different (the sum over paints and channels of the
-/// squared difference from their mean) tell a pixel's colour from its solidity.
-const DIVERSE: f32 = 900.0;
-
-/// The cursor by SAM and matting (on request: "try that"): SAM's masks (each
-/// paint's, lined up, a pixel grown: its edge falls inside a thin outline)
-/// say where the cursor may be. There, each pixel is the cursor's colour
-/// `F` laid over what is behind it at solidity `α`: `O = α·F + (1 − α)·B`.
-/// Each paint shows it over its own background `B`, known from its frames
-/// near (the same spot of the screen, where the cursor has moved off), so
-/// two or more paints over different backgrounds give `α` and `F` (least
-/// squares, in luma and colour together): a thin outline comes out solid
-/// and dark whatever is behind it, the page behind it see-through. Where
-/// the backgrounds don't differ, a pixel unlike its background is solid,
-/// one like it see-through; with no background known, the masks' vote.
-fn matte(members: &[Member<'_>], votes: &[usize], paints: usize) -> Option<(Shape, [i64; 2])> {
-    let (first, _, _) = members.first()?;
-    let (w, h) = (first.img.w, first.img.h);
-    // The paints (one a say) and their masks, grown a pixel.
-    let mut sayers: Vec<(usize, Vec<bool>)> = Vec::new();
-    for (k, (s, _, parent)) in members.iter().enumerate() {
-        if parent.is_some() {
-            continue;
-        }
-        let vote = votes.get(k).copied().unwrap_or(k);
-        if let Some(m) = s.chosen()
-            && !sayers.iter().any(|(j, _)| votes.get(*j).copied().unwrap_or(*j) == vote)
-        {
-            sayers.push((k, within(m, s.img.w, s.img.h, 1)));
-        }
-    }
-    let at = |k: usize, x: f64, y: f64| -> Option<(usize, usize)> {
-        let (s, d, _) = &members[k];
-        let (mx, my) = ((x + d[0]).round() as i64, (y + d[1]).round() as i64);
-        ((0..s.img.w as i64).contains(&mx) && (0..s.img.h as i64).contains(&my)).then_some((mx as usize, my as usize))
-    };
-    // 1. Where the cursor may be.
-    let mut support = vec![0.0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let (mut yes, mut all) = (0, 0);
-            for (k, m) in &sayers {
-                if let Some((mx, my)) = at(*k, x as f64, y as f64) {
-                    all += 1;
-                    yes += usize::from(m[my * members[*k].0.img.w + mx]);
-                }
-            }
-            if all > 0 {
-                support[y * w + x] = yes as f32 / all as f32;
-            }
-        }
-    }
-    let supported = |x: f64, y: f64| -> bool {
-        let (x, y) = (x.round() as i64, y.round() as i64);
-        (0..w as i64).contains(&x) && (0..h as i64).contains(&y) && support[y as usize * w + x as usize] >= SUPPORT
-    };
-    // 2. Each pixel's colour and solidity.
-    let (mut value, mut cu, mut cv, mut alpha) = (vec![0.0f32; w * h], vec![128.0f32; w * h], vec![128.0f32; w * h], vec![0.0f32; w * h]);
-    // (Development: what each paint shows and what is behind it, lined up.)
-    let dump_ob = std::env::var_os("TT_CURSOR_DUMP").is_some();
-    let mut shows: Vec<Vec<Option<[f32; 3]>>> = if dump_ob { vec![vec![None; w * h]; sayers.len()] } else { Vec::new() };
-    let mut behinds: Vec<Vec<Option<[f32; 3]>>> = if dump_ob { vec![vec![None; w * h]; sayers.len()] } else { Vec::new() };
-    let mut diverse = vec![0.0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if support[i] < SUPPORT {
-                continue;
-            }
-            // Per paint: what it shows here, and what is behind it (if a frame near saw it).
-            let mut seen: Vec<([f32; 3], Option<[f32; 3]>)> = Vec::new();
-            for (k, _) in &sayers {
-                let (s, d, _) = &members[*k];
-                let (sx, sy) = (x as f64 + d[0], y as f64 + d[1]);
-                let (Some(oy), Some(ou), Some(ov)) = (s.img.sample(sx, sy), s.u.sample(sx, sy), s.v.sample(sx, sy)) else { continue };
-                let mut behind = None;
-                for (n, (near, dn, parent)) in members.iter().enumerate() {
-                    if *parent != Some(*k) {
-                        continue;
-                    }
-                    let _ = n;
-                    // The same spot of the screen in the frame near; there, its cursor covers what lines up with `q − dn`.
-                    let (qx, qy) = (s.origin[0] as f64 + sx - near.origin[0] as f64, s.origin[1] as f64 + sy - near.origin[1] as f64);
-                    if supported(qx - dn[0], qy - dn[1]) {
-                        continue;
-                    }
-                    if let (Some(by), Some(bu), Some(bv)) = (near.img.sample(qx, qy), near.u.sample(qx, qy), near.v.sample(qx, qy)) {
-                        behind = Some([by, bu, bv]);
-                        break;
-                    }
-                }
-                // (Or a frame near where the cursor has left: all of it is behind.)
-                for clear in &s.behind {
-                    if behind.is_some() {
-                        break;
-                    }
-                    let (qx, qy) = (s.origin[0] as f64 + sx - clear.origin[0] as f64, s.origin[1] as f64 + sy - clear.origin[1] as f64);
-                    if let (Some(by), Some(bu), Some(bv)) = (clear.img.sample(qx, qy), clear.u.sample(qx, qy), clear.v.sample(qx, qy)) {
-                        behind = Some([by, bu, bv]);
-                    }
-                }
-                seen.push(([oy, ou, ov], behind));
-            }
-            if seen.is_empty() {
-                continue;
-            }
-            if dump_ob {
-                for (j, (o, b)) in seen.iter().enumerate() {
-                    if let Some(slot) = shows.get_mut(j) {
-                        slot[i] = Some(*o);
-                        behinds[j][i] = *b;
-                    }
-                }
-            }
-            let pairs: Vec<([f32; 3], [f32; 3])> = seen.iter().filter_map(|(o, b)| b.map(|b| (*o, b))).collect();
-            let m = pairs.len() as f32;
-            let (a, f) = if pairs.len() >= 2 {
-                let mean = |sel: &dyn Fn(&([f32; 3], [f32; 3])) -> [f32; 3]| -> [f32; 3] {
-                    let mut acc = [0.0; 3];
-                    for p in &pairs {
-                        let v = sel(p);
-                        for c in 0..3 {
-                            acc[c] += v[c] / m;
-                        }
-                    }
-                    acc
-                };
-                let r = |p: &([f32; 3], [f32; 3])| [p.0[0] - p.1[0], p.0[1] - p.1[1], p.0[2] - p.1[2]];
-                let (rm, bm) = (mean(&r), mean(&|p| p.1));
-                let (mut num, mut den) = (0.0, 0.0);
-                for p in &pairs {
-                    let rr = r(p);
-                    for c in 0..3 {
-                        num += (rr[c] - rm[c]) * (p.1[c] - bm[c]);
-                        den += (p.1[c] - bm[c]).powi(2);
-                    }
-                }
-                diverse[i] = den;
-                if den >= DIVERSE {
-                    let a = (-num / den).clamp(0.0, 1.0);
-                    let f = if a > 0.05 { [0, 1, 2].map(|c| (rm[c] + a * bm[c]) / a) } else { mean(&|p| p.0) };
-                    (a, f)
-                } else {
-                    let unlike = rm[0].abs() > SAME || rm[1].abs() > SAME_COLOUR || rm[2].abs() > SAME_COLOUR;
-                    (if unlike { 1.0 } else { 0.0 }, mean(&|p| p.0))
-                }
-            } else if let Some((o, b)) = pairs.first() {
-                let unlike = (o[0] - b[0]).abs() > SAME || (o[1] - b[1]).abs() > SAME_COLOUR || (o[2] - b[2]).abs() > SAME_COLOUR;
-                (if unlike { 1.0 } else { 0.0 }, *o)
-            } else {
-                // No background known: the masks' vote, the paints' median.
-                let mut ys: Vec<f32> = seen.iter().map(|(o, _)| o[0]).collect();
-                ys.sort_by(f32::total_cmp);
-                let n = seen.len() as f32;
-                (support[i], [ys[ys.len() / 2], seen.iter().map(|(o, _)| o[1]).sum::<f32>() / n, seen.iter().map(|(o, _)| o[2]).sum::<f32>() / n])
-            };
-            (value[i], cu[i], cv[i]) = (f[0].clamp(0.0, 255.0), f[1].clamp(0.0, 255.0), f[2].clamp(0.0, 255.0));
-            alpha[i] = a;
-        }
-    }
-    if let Some(dir) = std::env::var_os("TT_CURSOR_DUMP") {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::path::PathBuf::from(dir);
-        let pgm = |name: &str, px: Vec<u8>| {
-            let mut out = format!("P5 {w} {h} 255\n").into_bytes();
-            out.extend(px);
-            let _ = std::fs::write(dir.join(format!("matte{k}_{name}.pgm")), out);
-        };
-        pgm("support", support.iter().map(|v| (v * 255.0) as u8).collect());
-        pgm("alpha", alpha.iter().map(|v| (v * 255.0) as u8).collect());
-        pgm("diverse", diverse.iter().map(|v| (v / DIVERSE * 128.0).min(255.0) as u8).collect());
-        let shot = Shot { frame: 0, origin: [0, 0], img: Img { w, h, px: value.clone() }, u: Img { w, h, px: cu.clone() }, v: Img { w, h, px: cv.clone() }, painted: vec![true; w * h], moving: None, centre: None, sam: Vec::new(), mask: None, behind: Vec::new() };
-        let mut out = format!("P6 {w} {h} 255\n").into_bytes();
-        out.extend(shot.rgb());
-        let _ = std::fs::write(dir.join(format!("matte{k}_colour.ppm")), out);
-        // Each paint's view, and what is behind it (magenta: unknown).
-        let as_ppm = |px: &[Option<[f32; 3]>]| {
-            let mut out = format!("P6 {w} {h} 255\n").into_bytes();
-            let y: Vec<f32> = px.iter().map(|p| p.map_or(0.0, |p| p[0])).collect();
-            let u: Vec<f32> = px.iter().map(|p| p.map_or(128.0, |p| p[1])).collect();
-            let v: Vec<f32> = px.iter().map(|p| p.map_or(128.0, |p| p[2])).collect();
-            let shot = Shot { frame: 0, origin: [0, 0], img: Img { w, h, px: y }, u: Img { w, h, px: u }, v: Img { w, h, px: v }, painted: vec![true; w * h], moving: None, centre: None, sam: Vec::new(), mask: None, behind: Vec::new() };
-            let rgb = shot.rgb();
-            for (i, p) in px.iter().enumerate() {
-                out.extend(if p.is_some() { [rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]] } else { [255, 0, 255] });
-            }
-            out
-        };
-        for (j, (sk, _)) in sayers.iter().enumerate() {
-            let f = members[*sk].0.frame;
-            let _ = std::fs::write(dir.join(format!("matte{k}_f{f}_shows.ppm")), as_ppm(&shows[j]));
-            let _ = std::fs::write(dir.join(format!("matte{k}_f{f}_behind.ppm")), as_ppm(&behinds[j]));
-        }
-    }
-    // The cursor is one piece: the sure pixels' largest piece, and the pixels next to it.
-    let keep = largest_piece(&value, &alpha, w, h)?;
-    let near = within(&keep, w, h, 1);
-    for i in 0..w * h {
-        if !near[i] {
-            alpha[i] = 0.0;
-        }
-    }
-    crop_shape(value, cu, cv, alpha, w, h, members.len(), paints)
 }
 
 /// Frames near a paint show the same screen with the cursor moved: where a
@@ -1340,17 +1069,9 @@ pub struct PaintShots {
 
 impl PaintShots {
     /// The paint and the frames near it that line up with it (the cursor moved there).
-    pub fn new(mut paint: Shot, pattern: u32, near: Vec<Shot>) -> PaintShots {
-        let mut lined = Vec::new();
-        for s in near {
-            match line_up(&paint, &s, None) {
-                Some(a) => lined.push((s, a.d)),
-                // Not found in it: if the paint changed there, the cursor left: what is behind it.
-                None if changed(&paint, &s) >= 8 => paint.behind.push(s),
-                None => {}
-            }
-        }
-        PaintShots { paint, pattern, near: lined }
+    pub fn new(paint: Shot, pattern: u32, near: Vec<Shot>) -> PaintShots {
+        let near = near.into_iter().filter_map(|s| line_up(&paint, &s, None).map(|a| (s, a.d))).collect();
+        PaintShots { paint, pattern, near }
     }
 }
 
@@ -1408,38 +1129,6 @@ impl Model {
     }
 }
 
-/// A candidate mask could be the cursor: some of the paint, not most of it.
-fn plausible(p: &Shot, m: usize) -> bool {
-    let painted = p.painted.iter().filter(|b| **b).count().max(1);
-    let on = p.sam[m].0.iter().zip(&p.painted).filter(|(a, b)| **a && **b).count();
-    on >= 6 && on * 2 <= painted
-}
-
-/// A paint's best candidate on its own: SAM's best score among the plausible.
-fn pick_alone(p: &Shot) -> Option<usize> {
-    (0..p.sam.len()).filter(|m| plausible(p, *m)).max_by(|a, b| p.sam[*a].1.total_cmp(&p.sam[*b].1))
-}
-
-/// How much two masks, each in its own shot (`a`: width `aw`, lined up by
-/// `da`; `b`: `bw × bh`, by `db`), are the same pixels (intersection over union).
-fn overlap(a: &[bool], aw: usize, da: [f64; 2], b: &[bool], bw: usize, bh: usize, db: [f64; 2]) -> f64 {
-    let (mut both, mut na) = (0usize, 0usize);
-    for (i, on) in a.iter().enumerate() {
-        if !*on {
-            continue;
-        }
-        na += 1;
-        // Its point in the reference, then in `b`.
-        let (x, y) = ((i % aw) as f64 - da[0], (i / aw) as f64 - da[1]);
-        let (bx, by) = ((x + db[0]).round() as i64, (y + db[1]).round() as i64);
-        if (0..bw as i64).contains(&bx) && (0..bh as i64).contains(&by) && b[by as usize * bw + bx as usize] {
-            both += 1;
-        }
-    }
-    let nb = b.iter().filter(|x| **x).count();
-    if na + nb == 0 { 0.0 } else { both as f64 / (na + nb - both) as f64 }
-}
-
 /// The first of `i`'s set (union-find without the rank: a few paints).
 fn root(set: &[usize], mut i: usize) -> usize {
     while set[i] != i {
@@ -1484,16 +1173,6 @@ impl Model {
     /// up), and what they agree on; a paint that doesn't fit what the
     /// others make is left out of it.
     fn learn_pattern(&mut self, pattern: u32, paints: &[&PaintShots], centred: f64) {
-        // With SAM's masks: each paint's best candidate to start with, lined up by it.
-        let picked: Vec<PaintShots> = paints.iter().map(|p| (*p).clone()).map(|mut p| {
-            if let Some(m) = pick_alone(&p.paint) {
-                p.paint.mask = Some(m);
-                p.paint.moving = Some(p.paint.sam[m].0.clone());
-            }
-            p
-        }).collect();
-        let paints: Vec<&PaintShots> = picked.iter().collect();
-        let paints = &paints[..];
         let n = paints.len();
         let mut pair: Vec<Vec<Option<Aligned>>> = vec![vec![None; n]; n];
         // Paints of the same still screen (the cursor parked, nothing moving):
@@ -1536,68 +1215,6 @@ impl Model {
         }
         let mut group: Vec<usize> = (0..n).filter(|i| d[*i].is_some()).collect();
         let mut used = vec![PaintUse::NotLinedUp; n];
-        // Lined up, each paint's mask: the candidate that best covers what the others' do.
-        let mut chosen: Vec<Option<usize>> = paints.iter().map(|p| p.paint.mask).collect();
-        for _ in 0..2 {
-            for j in &group {
-                let p = &paints[*j].paint;
-                if p.sam.is_empty() {
-                    continue;
-                }
-                let dj = d[*j].expect("lined up");
-                let best = (0..p.sam.len()).filter(|m| plausible(p, *m)).max_by(|a, b| {
-                    let agree = |m: usize| -> f64 {
-                        group.iter().filter(|i| *i != j).filter_map(|i| {
-                            let q = &paints[*i].paint;
-                            let c = chosen[*i]?;
-                            Some(overlap(&p.sam[m].0, p.img.w, dj, &q.sam[c].0, q.img.w, q.img.h, d[*i].expect("lined up")))
-                        }).sum()
-                    };
-                    agree(*a).total_cmp(&agree(*b))
-                });
-                if best.is_some() {
-                    chosen[*j] = best;
-                }
-            }
-        }
-        // (Owned copies with the choice: shape_of reads it.)
-        let picked: Vec<PaintShots> = paints.iter().zip(&chosen).map(|(p, m)| {
-            let mut p = (*p).clone();
-            p.paint.mask = *m;
-            p
-        }).collect();
-        // (Development: each paint's pixels and the mask it goes by, as pictures.)
-        if let Some(dir) = std::env::var_os("TT_CURSOR_DUMP") {
-            let dir = std::path::PathBuf::from(dir);
-            let _ = std::fs::create_dir_all(&dir);
-            for (k, p) in paints.iter().enumerate() {
-                let (w, h) = (p.paint.img.w, p.paint.img.h);
-                let mut ppm = format!("P6 {w} {h} 255
-").into_bytes();
-                ppm.extend(p.paint.rgb());
-                let _ = std::fs::write(dir.join(format!("p{pattern}_{k}_f{}.ppm", p.paint.frame)), ppm);
-                for (m, (mask, score)) in p.paint.sam.iter().enumerate() {
-                    let mut pgm = format!("P5 {w} {h} 255
-").into_bytes();
-                    pgm.extend(mask.iter().map(|b| if *b { 255u8 } else { 0 }));
-                    let tag = if chosen[k] == Some(m) { "chosen" } else { "cand" };
-                    let _ = std::fs::write(dir.join(format!("p{pattern}_{k}_f{}_m{m}_{tag}_{:.2}.pgm", p.paint.frame, score)), pgm);
-                }
-                if let Some(dk) = d[k] {
-                    let _ = std::fs::write(dir.join(format!("p{pattern}_{k}_f{}_d.txt", p.paint.frame)), format!("{} {}", dk[0], dk[1]));
-                }
-                let pts: Vec<String> = p.paint.sam_points().iter().map(|(q, on)| format!("{} {} {}", q[0], q[1], u8::from(*on))).collect();
-                let _ = std::fs::write(dir.join(format!("p{pattern}_{k}_f{}_points.txt", p.paint.frame)), pts.join("\n"));
-                let mut pgm = format!("P5 {} {} 255\n", p.paint.img.w, p.paint.img.h).into_bytes();
-                pgm.extend(p.paint.painted.iter().map(|b| if *b { 255u8 } else { 0 }));
-                let _ = std::fs::write(dir.join(format!("p{pattern}_{k}_f{}_painted.pgm", p.paint.frame)), pgm);
-            }
-        }
-        if debug() {
-            eprintln!("pattern {pattern}: masks {:?}", picked.iter().map(|p| p.paint.mask.map(|m| (m, p.paint.sam[m].0.iter().filter(|b| **b).count()))).collect::<Vec<_>>());
-        }
-        let paints: Vec<&PaintShots> = picked.iter().collect();
-        let paints = &paints[..];
         // A group's members (lined up with its first paint), whose paint each is, and whose say.
         let build = |group: &[usize], d: &[Option<[f64; 2]>]| {
             let mut members: Vec<Owned> = Vec::new();
@@ -1700,18 +1317,6 @@ impl Model {
                 used[*j] = if r != *j && group.contains(&r) { PaintUse::SameAs(paints[r].paint.frame) } else { PaintUse::Used };
             }
             self.paints.extend(paints.iter().zip(&used).map(|(p, u)| PaintSeen { frame: p.paint.frame, pattern, used: *u }));
-            if let (Some(dir), Some((shape, _))) = (std::env::var_os("TT_CURSOR_DUMP"), &made) {
-                let dir = std::path::PathBuf::from(dir);
-                let (w, h) = (shape.w, shape.h);
-                let mut f = format!("P5 {w} {h} 255
-").into_bytes();
-                f.extend(shape.value.iter().map(|v| v.clamp(0.0, 255.0) as u8));
-                let _ = std::fs::write(dir.join(format!("shape{pattern}_value.pgm")), f);
-                let mut f = format!("P5 {w} {h} 255
-").into_bytes();
-                f.extend(shape.alpha.iter().map(|v| (v * 255.0).clamp(0.0, 255.0) as u8));
-                let _ = std::fs::write(dir.join(format!("shape{pattern}_alpha.pgm")), f);
-            }
             match made {
                 Some((mut shape, at)) => {
                     shape.pattern = pattern;
@@ -2012,10 +1617,7 @@ impl Finder {
         let tip = self.shapes[i].tip;
         // Its colour: a match of the right shape in another colour isn't it.
         let off = t.colour_off(&frame.frame, x, y);
-        if std::env::var_os("TT_COLOUR_DEBUG").is_some() && v > 0.5 {
-            eprintln!("    refine: score {v:.2}, colour off {off:.1}");
-        }
-        let v = if std::env::var_os("TT_NO_COLOUR").is_some() { v } else { v * (1.0 - smoothstep(COLOUR_FREE, COLOUR_GONE, off)) };
+        let v = v * (1.0 - smoothstep(COLOUR_FREE, COLOUR_GONE, off));
         Some(Found { shape: i, at: pos, tip: [pos[0] + tip[0], pos[1] + tip[1]], score: v })
     }
 }
@@ -2154,7 +1756,6 @@ impl super::Worker {
             return Ok(Some(m.clone()));
         }
         let k = s.k;
-        let sam_ok = super::sam::availability().is_ok();
         let mut paints = Vec::new();
         for look in s.looks.iter() {
             let frames = self.decode_run(look.frame - NEAR, look.frame + NEAR)?;
@@ -2166,14 +1767,6 @@ impl super::Worker {
             let near: Vec<Shot> = frames.iter().filter(|(f, _)| (*f - look.frame).abs() == NEAR).filter_map(|(f, img)| Shot::near_paint(look, k, *f, img)).collect();
             let mut shot = shot;
             shot.mark_moving(&near);
-            // SAM 2, where it is set up: which pixels of the paint are the cursor.
-            if sam_ok {
-                let scale = (512.0 / shot.img.w.max(shot.img.h) as f64).clamp(2.0, 8.0) as u32;
-                match super::sam::segment(&shot.rgb(), shot.img.w, shot.img.h, &shot.sam_points(), scale) {
-                    Ok(c) => shot.sam = c,
-                    Err(e) => tracing::warn!("{}: SAM 2 on the paint on frame {}: {e:#}", s.label, look.frame),
-                }
-            }
             paints.push(PaintShots::new(shot, look.pattern, near));
         }
         let mut model = learn(paints, CENTRED * k[0].max(k[1]));

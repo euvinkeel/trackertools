@@ -309,4 +309,9 @@ fn paints_from_a_project() {
     show(&shapes);
     let found = out.iter().filter(|o| o.is_some_and(|(_, f, _)| f == 0)).count();
     eprintln!("{} frames in {secs:.1} s: found on {found}", hi - lo + 1);
+    if std::env::var_os("TT_DUMP").is_some() {
+        for (i, o) in out.iter().enumerate() {
+            eprintln!("  {} {:?}", lo + i as i64, o);
+        }
+    }
 }
