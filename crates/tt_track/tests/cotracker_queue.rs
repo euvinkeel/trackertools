@@ -316,6 +316,8 @@ fn a_job_that_panics_reports_a_failure() {
         root: false,
         label: "a test job".into(),
         cursor: Default::default(),
+        icons: Default::default(),
+        icon_sizes: Vec::new(),
     };
     let (threads, workers) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -324,7 +326,7 @@ fn a_job_that_panics_reports_a_failure() {
     match last {
         Some(Msg::Failed(e)) => assert!(e.starts_with("the tracker stopped on an error: "), "{e}"),
         Some(Msg::Finished) => panic!("finished"),
-        Some(Msg::Frames(_) | Msg::Points(_) | Msg::PaintStates(_) | Msg::CursorShapes(_)) | None => panic!("no last word"),
+        Some(Msg::Frames(_) | Msg::Points(_) | Msg::PaintStates(_) | Msg::CursorShapes(_) | Msg::IconFit(_)) | None => panic!("no last word"),
     }
     assert_eq!((threads.load(Ordering::Relaxed), workers.load(Ordering::Relaxed)), (0, 0));
 }

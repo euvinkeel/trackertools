@@ -559,10 +559,29 @@ fn counts(ui: &egui::Ui, world: &World, e: Entity) -> (usize, usize) {
     c
 }
 
+/// A paint's picture in the Inspector, px a side.
+const PAINT_TILE: f32 = 52.0;
+
+/// `n` items `size` px square, as many to a row as fit the width (egui's
+/// wrapped rows can't tell a nested layout's width beforehand, so a row of
+/// them ran off the panel).
+fn flex_grid(ui: &mut egui::Ui, n: usize, size: f32, mut item: impl FnMut(&mut egui::Ui, usize)) {
+    let gap = ui.spacing().item_spacing.x;
+    let cols = (((ui.available_width() + gap) / (size + gap)).floor() as usize).max(1);
+    for row in (0..n).step_by(cols) {
+        ui.horizontal(|ui| {
+            for i in row..(row + cols).min(n) {
+                item(ui, i);
+            }
+        });
+    }
+}
+
 /// A slider (`slider`, on a copy of `value`) on a setting of tracker `e`
 /// (`set` writes it; `[what, tip]`): one undo step a drag.
 fn setting_slider(ui: &mut egui::Ui, world: &mut World, e: Entity, value: f32, slider: impl FnOnce(&mut f32) -> egui::Slider<'_>, [what, tip]: [&str; 2], set: impl FnOnce(&mut Tracker, f32)) {
     let mut v = value;
+    ui.spacing_mut().slider_width = (ui.available_width() - 64.0).clamp(40.0, 160.0);
     let r = ui.add(slider(&mut v)).on_hover_text(tip);
     let label = format!("Edit {what}");
     if r.drag_started() {
@@ -618,6 +637,7 @@ fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if let Some(err) = &shapes.error {
         ui.colored_label(LOST, format!("Learning failed: {err}"));
     }
+    // (Not a wrapped row: there the width left reads as the whole row's, and the slider ran off the panel.)
     ui.horizontal(|ui| {
         ui.label("Paints centred within");
         setting_slider(
@@ -640,8 +660,8 @@ fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         let paints: Vec<Entity> = looks_of(world, e).into_iter().filter(|l| world.get::<Look>(*l).is_some_and(|l| l.pattern == p)).collect();
         let learned = shapes.learned.shapes.iter().find(|s| s.pattern == p).cloned();
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let (rect, r) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::click());
+        ui.horizontal_top(|ui| {
+            let (rect, r) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::click());
             let tex = learned.as_ref().map(|s| (super::patterns::texture(ui.ctx(), e, s), [s.w, s.h]));
             super::patterns::tile(ui.painter(), rect, tex.as_ref().map(|(t, s)| (t, *s)), p, p == active);
             let key = super::patterns::key(p).map(|k| format!(" (key {k})")).unwrap_or_default();
@@ -658,10 +678,10 @@ fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                     None => n,
                 };
                 ui.label(egui::RichText::new(format!("Pattern {}", p + 1)).color(c).strong());
-                ui.label(egui::RichText::new(what).small().color(style::MUTED));
+                ui.add(egui::Label::new(egui::RichText::new(what).small().color(style::MUTED)).wrap());
+                let min = tracker.pattern_score(p);
                 ui.horizontal(|ui| {
-                    let min = tracker.pattern_score(p);
-                    ui.label(egui::RichText::new("Match at least").small());
+                    ui.label(egui::RichText::new("Match \u{2265}").small()).on_hover_text("Match at least");
                     setting_slider(
                         ui,
                         world,
@@ -677,45 +697,51 @@ fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                             None => t.pattern_scores.push(tt_track::PatternScore { pattern: p, min_score: v }),
                         },
                     );
-                    if let Some((score, Some(q))) = result
-                        && q == p
-                    {
-                        ui.label(egui::RichText::new(format!("frame {here}: {score:.2}")).small().color(if score >= min { TRACK } else { LOST }))
-                            .on_hover_text("This pattern's match on the frame shown");
-                    }
                 });
+                if let Some((score, Some(q))) = result
+                    && q == p
+                {
+                    ui.label(egui::RichText::new(format!("frame {here}: {score:.2}")).small().color(if score >= min { TRACK } else { LOST }))
+                        .on_hover_text("This pattern's match on the frame shown");
+                }
             });
         });
-        // Its paints, as pictures.
-        ui.horizontal_wrapped(|ui| {
-            for l in &paints {
-                let Some(f) = world.get::<Look>(*l).map(|l| l.frame) else { continue };
-                let seen = shapes.learned.paints.iter().find(|s| s.frame == f && s.pattern == p).filter(|s| s.picture.w > 0);
-                ui.vertical(|ui| {
-                    let (rect, r) = ui.allocate_exact_size(Vec2::splat(64.0), egui::Sense::click());
-                    let tip = match seen {
-                        Some(s) => {
-                            let tex = super::patterns::paint_texture(ui.ctx(), e, s);
-                            super::patterns::paint_tile(ui.painter(), rect, &tex, s, learned.as_ref().map(|s| [s.w, s.h]), LOST);
-                            format!("{}. Click: go to it (select it: the brush teaches its pattern)", super::patterns::paint_words(s))
-                        }
-                        None => {
-                            ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, style::MUTED), StrokeKind::Inside);
-                            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "\u{2026}", FontId::proportional(14.0), style::MUTED);
-                            format!("Frame {f}: not learned from yet. Click: go to it")
-                        }
-                    };
-                    if r.on_hover_text(tip).clicked() {
-                        world.resource_mut::<Selection>().select_only(*l);
-                        world.resource_mut::<PendingActions>().push(Action::Seek(f));
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{f}")).small().color(style::MUTED));
-                        if ui.small_button("x").on_hover_text("Remove this paint (it learns again without it)").clicked() {
-                            remove = Some(*l);
-                        }
-                    });
-                });
+        // Its paints, as pictures: as many to a row as fit.
+        let mut cells: Vec<(Entity, FrameIndex)> = paints.iter().filter_map(|l| world.get::<Look>(*l).map(|k| (*l, k.frame))).collect();
+        cells.sort_by_key(|(_, f)| *f);
+        flex_grid(ui, cells.len(), PAINT_TILE, |ui, i| {
+            let (l, f) = cells[i];
+            let seen = shapes.learned.paints.iter().find(|s| s.frame == f && s.pattern == p).filter(|s| s.picture.w > 0);
+            let (rect, r) = ui.allocate_exact_size(Vec2::splat(PAINT_TILE), egui::Sense::click());
+            let tip = match seen {
+                Some(s) => {
+                    let tex = super::patterns::paint_texture(ui.ctx(), e, s);
+                    super::patterns::paint_tile(ui.painter(), rect, &tex, s, learned.as_ref().map(|s| [s.w, s.h]), LOST);
+                    format!("{}. Click: go to it (select it: the brush teaches its pattern)", super::patterns::paint_words(s))
+                }
+                None => {
+                    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, style::MUTED), StrokeKind::Inside);
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "\u{2026}", FontId::proportional(14.0), style::MUTED);
+                    format!("Frame {f}: not learned from yet. Click: go to it")
+                }
+            };
+            // Its frame, on it.
+            let label = ui.painter().layout_no_wrap(format!("{f}"), FontId::proportional(9.5), Color32::from_gray(225));
+            let chip = Rect::from_min_size(rect.left_bottom() - Vec2::new(-2.0, label.size().y + 3.0), label.size() + Vec2::new(4.0, 1.0));
+            ui.painter().rect_filled(chip, 2.0, Color32::from_black_alpha(170));
+            ui.painter().galley(chip.min + Vec2::new(2.0, 0.5), label, Color32::from_gray(225));
+            // Remove, at its corner (over the picture: it takes the click).
+            let x = Rect::from_min_size(rect.right_top() + Vec2::new(-15.0, 2.0), Vec2::splat(13.0));
+            let xr = ui.interact(x, ui.id().with(("remove paint", l)), egui::Sense::click());
+            if r.hovered() || xr.hovered() {
+                ui.painter().rect_filled(x, 2.0, if xr.hovered() { LOST } else { Color32::from_black_alpha(190) });
+                ui.painter().text(x.center(), Align2::CENTER_CENTER, "\u{d7}", FontId::proportional(11.0), Color32::WHITE);
+            }
+            if xr.on_hover_text("Remove this paint (it learns again without it)").clicked() {
+                remove = Some(l);
+            } else if r.on_hover_text(tip).clicked() {
+                world.resource_mut::<Selection>().select_only(l);
+                world.resource_mut::<PendingActions>().push(Action::Seek(f));
             }
         });
     }
@@ -877,7 +903,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         let trackers: Vec<Entity> = world.resource::<Selection>().entities.iter().copied().filter(|t| is_tracker(world, *t)).collect();
         let run = run_of(world, e);
         let mut asked = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (r, button, _, tip) in RUNS {
                 if ui.selectable_label(run == r, button).on_hover_text(tip).clicked() {
                     asked = Some(r);
@@ -914,7 +940,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.add(egui::Label::new(text).wrap());
     });
     if hull.is_some() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if drawn_at(world, e, here).is_some() && ui.small_button(format!("Erase frame {here}")).on_hover_text("Its own result shows here again").clicked() {
                 erase = Some(Some(here..here + 1));
             }
@@ -969,12 +995,16 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if let Some(l) = remove {
         tt_core::commands::delete(world, &[l]);
     }
+    // A template tracker: cursor icons as more looks.
+    if method == Method::Template {
+        super::cursor_icons::section(ui, world, e);
+    }
     let reseed_tip = if method.point() {
         "Start it again from the playhead, from its reset point on this frame (with none here, click the pixel first)"
     } else {
         "Start it again from the playhead, from your look on this frame (with none here, drag around the subject first)"
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button("Re-seed here").on_hover_text(reseed_tip).clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }

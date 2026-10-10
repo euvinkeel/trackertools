@@ -3918,6 +3918,7 @@ dependencies = [
  "bevy_ecs",
  "bevy_reflect",
  "blake3",
+ "png",
  "ron",
  "serde",
  "serde_json",

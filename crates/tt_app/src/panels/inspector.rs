@@ -115,6 +115,8 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                     std::any::TypeId::of::<tt_core::focus::FocusParams>(),
                     // (A layer's values have their own section: `layer_inspector`.)
                     std::any::TypeId::of::<tt_core::layer::LayerParams>(),
+                    // (A tracker's cursor icons have their own section: `cursor_icons`.)
+                    std::any::TypeId::of::<tt_track::icons::CursorIcons>(),
                 ];
                 if class == Class::Derived || hidden.contains(&r.type_id()) || (manual && r.type_id() == std::any::TypeId::of::<tt_track::Tracker>()) {
                     return None;
@@ -128,6 +130,8 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     };
     components.sort_by(|a, b| a.1.cmp(&b.1));
 
+    // (Text fields as wide as half the panel, not egui's 280 px: a name beside an entity ran off a narrow panel.)
+    ui.spacing_mut().text_edit_width = (ui.available_width() * 0.5).clamp(60.0, 280.0);
     let mut pending: Option<PendingEdit> = None;
     for (path, short, mut value, class) in components {
         egui::CollapsingHeader::new(&short).id_salt((&path, e)).default_open(true).show(ui, |ui| {

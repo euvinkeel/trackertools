@@ -75,6 +75,26 @@ pub fn look_on(looks: &[LookSpec], f: FrameIndex) -> Option<usize> {
 /// A look matching another this well on its frame is aligned to it.
 const ALIGN_SCORE: f32 = 0.75;
 
+/// Per size tried (video px per icon px), each look's best score.
+type Sweep = Vec<(f64, Vec<f32>)>;
+
+/// A cursor icon is never matched smaller than this (video px, its longer side).
+const ICON_MIN_PX: f64 = 8.0;
+/// A pack's size (video px per icon px) where it is neither set nor found from the looks.
+const ICON_SIZE: f64 = 1.0;
+/// Each icon is matched at its size, and this much smaller and bigger.
+const ICON_STEP: f64 = 0.1;
+
+/// A look as cut on its own frame, for the icons to be matched against:
+/// where its point is (view px), its patch and where in it to look.
+struct SeenLook {
+    frame: FrameIndex,
+    point: [f64; 2],
+    grid: Grid,
+    window: [[f64; 2]; 2],
+    patch: Patch,
+}
+
 /// Which way a job runs from the anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Side {
@@ -153,6 +173,10 @@ pub struct JobSpec {
     pub label: String,
     /// A cursor tracker's own settings.
     pub cursor: cursor::Settings,
+    /// A template tracker's cursor icons (`icons`), and each pack's size in
+    /// the video where it is set (video px per icon px; else what matches its looks best).
+    pub icons: Arc<Vec<crate::icons::Icon>>,
+    pub icon_sizes: Vec<(String, f64)>,
 }
 
 /// What a job is doing.
@@ -234,6 +258,8 @@ pub enum Msg {
     PaintStates(Vec<paint::PaintState>),
     /// What a cursor tracker learned (`cursor`): sent as soon as it is, and again once it learned more.
     CursorShapes(cursor::Learned),
+    /// The size a template tracker's icons were matched at, and the look they lined up with.
+    IconFit(crate::icons::IconFit),
     Finished,
     Failed(String),
 }
@@ -554,6 +580,7 @@ impl Worker {
         order.sort_by_key(|i| (*i != seed, (looks[*i].frame - anchor).abs(), *i));
         let mut frames: Vec<(FrameIndex, Vec<u8>)> = Vec::new();
         let mut out: Vec<(usize, LookTemplate)> = Vec::new();
+        let mut seen: Vec<SeenLook> = Vec::new();
         self.offsets = vec![[0.0, 0.0]; looks.len()];
         for i in order {
             let look = &looks[i];
@@ -587,10 +614,126 @@ impl Worker {
                 t.offset = [c[0] - (p[0] - o[0]), c[1] - (p[1] - o[1])];
             }
             self.offsets[i] = t.offset;
+            seen.push(SeenLook { frame: look.frame, point: [c[0] - t.offset[0], c[1] - t.offset[1]], grid, window, patch });
             out.push((i, t));
         }
         out.sort_by_key(|(i, _)| *i);
-        Ok(out.into_iter().map(|(_, t)| t).collect())
+        let mut templates: Vec<LookTemplate> = out.into_iter().map(|(_, t)| t).collect();
+        templates.extend(self.icon_templates(&seen));
+        Ok(templates)
+    }
+
+    /// The tracker's cursor icons as more looks ([`crate::icons`]). Each
+    /// pack at its size: the one set, else the one at which its icons match
+    /// its looks best (each look's best icon, averaged), if they match one
+    /// well. A look is a pack's if that pack matches it best, at any size:
+    /// one arrow looks a bit like another, at another size. Their point is the point of the look an icon lines up
+    /// with best (every icon's hotspot the same way off it), else their
+    /// hotspot. Each icon goes in at its size and a step either side: a size
+    /// a little off, or a cursor blurred by its motion, still has one that fits.
+    fn icon_templates(&mut self, seen: &[SeenLook]) -> Vec<LookTemplate> {
+        let icons = self.spec.icons.clone();
+        if icons.is_empty() {
+            return Vec::new();
+        }
+        let (tolerance, scale) = (self.spec.settings.tolerance, self.spec.scale);
+        let a = self.map(self.spec.anchor).a;
+        let make = |ids: &[usize], size: f64| -> Vec<(usize, LookTemplate, [f64; 2])> {
+            ids.iter().filter_map(|i| crate::icons::template_of(&icons[*i], size / a * scale, tolerance).map(|(t, hot)| (*i, t, hot))).collect()
+        };
+        // Each look's best match among `made`: which icon, where (patch px), its score.
+        let best_on = |made: &[(usize, LookTemplate, [f64; 2])], l: &SeenLook| {
+            made.iter()
+                .filter_map(|(i, t, hot)| best_match(&l.patch, &t.template, l.window, None).map(|m| (*i, *hot, m)))
+                .max_by(|x, y| x.2.score.total_cmp(&y.2.score))
+        };
+        let mut packs: Vec<&str> = Vec::new();
+        for i in icons.iter() {
+            if !packs.contains(&i.pack.as_str()) {
+                packs.push(&i.pack);
+            }
+        }
+        // Per pack: its icons, and per size tried, each look's best score.
+        let sweeps: Vec<(Vec<usize>, Sweep)> = packs
+            .iter()
+            .map(|pack| {
+                let ids: Vec<usize> = (0..icons.len()).filter(|i| icons[*i].pack == *pack).collect();
+                // (Sizes a few percent apart; none so small an icon is a blob of a few px in the video.)
+                let biggest = ids.iter().map(|i| icons[*i].w.max(icons[*i].h)).max().unwrap_or(1) as f64;
+                let mut sweep = Vec::new();
+                let mut s = (ICON_MIN_PX / biggest).max(0.2);
+                while s <= 4.0 && !seen.is_empty() {
+                    let m = make(&ids, s);
+                    sweep.push((s, seen.iter().map(|l| best_on(&m, l).map_or(0.0, |(_, _, m)| m.score)).collect()));
+                    s *= 1.04;
+                }
+                (ids, sweep)
+            })
+            .collect();
+        // Each look's pack: the one that matches it best, at any size.
+        let owner: Vec<Option<usize>> = (0..seen.len())
+            .map(|k| {
+                (0..packs.len())
+                    .map(|p| (p, sweeps[p].1.iter().map(|(_, v)| v[k]).fold(f32::NEG_INFINITY, f32::max)))
+                    .filter(|(_, best)| *best >= ALIGN_SCORE)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(p, _)| p)
+            })
+            .collect();
+        let mut fits = Vec::new();
+        let mut made: Vec<(usize, LookTemplate, [f64; 2])> = Vec::new();
+        let mut steps: Vec<(f64, Vec<usize>)> = Vec::new();
+        for (p, pack) in packs.iter().enumerate() {
+            let (ids, sweep) = &sweeps[p];
+            let ids = ids.clone();
+            let set = self.spec.icon_sizes.iter().find(|(q, _)| q == pack).map(|(_, s)| *s).filter(|s| *s > 0.0);
+            let mine: Vec<usize> = (0..seen.len()).filter(|k| owner[*k] == Some(p)).collect();
+            let (size, auto) = match set {
+                Some(s) => (s, false),
+                // Its looks' best size; none of the looks is its: no size to go by.
+                None => (
+                    sweep
+                        .iter()
+                        .filter(|_| !mine.is_empty())
+                        .map(|(s, v)| (*s, mine.iter().map(|k| v[*k]).sum::<f32>()))
+                        .max_by(|a, b| a.1.total_cmp(&b.1))
+                        .map_or(ICON_SIZE, |(s, _)| s),
+                    true,
+                ),
+            };
+            let m = make(&ids, size);
+            let matched = mine.iter().any(|k| best_on(&m, &seen[*k]).is_some_and(|(_, _, m)| m.score >= ALIGN_SCORE));
+            fits.push(crate::icons::PackFit { pack: pack.to_string(), size: size as f32, auto, matched });
+            made.extend(m);
+            steps.push((size, ids));
+        }
+        // Lined up: the best match of any icon on any look's frame.
+        let mut lined: Option<(f32, [f64; 2], String)> = None;
+        for (k, l) in seen.iter().enumerate() {
+            let Some(p) = owner[k] else { continue };
+            let own: Vec<(usize, LookTemplate, [f64; 2])> = made.iter().filter(|(i, _, _)| icons[*i].pack == packs[p]).cloned().collect();
+            if let Some((i, hot, m)) = best_on(&own, l).filter(|(_, _, m)| m.score >= ALIGN_SCORE)
+                && lined.as_ref().is_none_or(|(s, _, _)| m.score > *s)
+            {
+                let c = l.grid.to_view(m.pos);
+                let hotspot = [c[0] + hot[0] / scale, c[1] + hot[1] / scale];
+                lined = Some((m.score, [l.point[0] - hotspot[0], l.point[1] - hotspot[1]], format!("{} {} on frame {}", icons[i].pack, icons[i].name, l.frame)));
+            }
+        }
+        let d = lined.as_ref().map_or([0.0, 0.0], |(_, d, _)| *d);
+        tracing::info!("{}: {} cursor icon(s), {fits:?}, {}", self.spec.label, icons.len(), lined.as_ref().map_or("lined up with no look".to_string(), |(s, _, n)| format!("lined up with the look ({n}, {s:.2})")));
+        let _ = self.tx.send(Msg::IconFit(crate::icons::IconFit { packs: fits, lined_up: lined.map(|(_, _, n)| n) }));
+        for (size, ids) in &steps {
+            made.extend(make(ids, size / (1.0 + ICON_STEP)));
+            made.extend(make(ids, size * (1.0 + ICON_STEP)));
+        }
+        // Each icon's point: its hotspot, moved as the lined-up one's is.
+        made.into_iter()
+            .map(|(_, mut t, hot)| {
+                t.offset = [-hot[0] / scale - d[0], -hot[1] / scale - d[1]];
+                t
+            })
+            .collect()
     }
 
     fn decode_one(&self, f: FrameIndex) -> Result<Vec<u8>> {
