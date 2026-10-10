@@ -253,7 +253,7 @@ impl Drop for Learner {
 
 /// What a cursor tracker's plan learns from (`job::cursor::model_key`).
 fn cursor_key(plan: &Plan) -> u64 {
-    crate::job::cursor::model_key(&plan.video.path, &plan.looks, plan.k, plan.lo, plan.lo + plan.guide.len() as FrameIndex)
+    crate::job::cursor::model_key(&plan.video.path, &plan.looks, plan.k, plan.lo, plan.lo + plan.guide.len() as FrameIndex, plan.params.centred as f64)
 }
 
 /// A cursor tracker learns its patterns as soon as its paints change,
@@ -467,6 +467,7 @@ impl Plan {
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && p.matching == q.matching
             && p.method == q.method
+            && (p.centred, &p.pattern_scores) == (q.centred, &q.pattern_scores)
             && self.root == old.root;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
             (Some((g, m)), Some((h, n))) => g.iter().zip(h).all(|(a, b)| close(*a, *b)) && close(m.a, n.a) && close(m.b[0], n.b[0]) && close(m.b[1], n.b[1]),
@@ -996,6 +997,10 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
         method: p.method,
         root: plan.root,
         label,
+        cursor: crate::job::cursor::Settings {
+            centred: p.centred.clamp(1.0, 200.0) as f64,
+            scores: p.pattern_scores.iter().map(|s| (s.pattern, s.min_score.clamp(-1.0, 1.0))).collect(),
+        },
     }
 }
 
@@ -1261,6 +1266,14 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     let m = &p.matching;
     for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64, p.method as u8 as f64] {
         put(x);
+    }
+    // (A cursor tracker's own settings; other trackers' stamps stay as they were.)
+    if p.method == Method::Cursor {
+        put(p.centred as f64);
+        for s in &p.pattern_scores {
+            put(s.pattern as f64);
+            put(s.min_score as f64);
+        }
     }
     for x in [lo as f64, hi as f64, original.width as f64, original.height as f64, original.frames.len() as f64] {
         put(x);

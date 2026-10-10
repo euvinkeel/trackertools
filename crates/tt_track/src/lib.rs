@@ -286,6 +286,21 @@ pub struct Tracker {
     /// Templates (built in), or CoTracker3 (a Python worker; see `job::learned`).
     #[reflect(default)]
     pub method: Method,
+    /// A cursor tracker: its paints are about centred on the cursor, within
+    /// this many px (source) each way; paints are lined up within twice that.
+    #[reflect(default = "centred")]
+    pub centred: f32,
+    /// A cursor tracker: a pattern's own match score below which a frame
+    /// counts as lost (patterns not listed: `min_score`).
+    #[reflect(default)]
+    pub pattern_scores: Vec<PatternScore>,
+}
+
+/// One cursor pattern's match score (`Tracker::pattern_scores`).
+#[derive(Reflect, Clone, Debug, PartialEq)]
+pub struct PatternScore {
+    pub pattern: u32,
+    pub min_score: f32,
 }
 
 /// How alike a place must look to count as one of a tracker's looks
@@ -324,9 +339,33 @@ fn yes() -> bool {
     true
 }
 
+fn centred() -> f32 {
+    job::cursor::CENTRED as f32
+}
+
 impl Tracker {
     pub fn at(anchor: FrameIndex) -> Self {
-        Self { anchor, direction: Direction::Both, follow_playhead: false, feature: 0.4, search: 1.0, adapt: 0.25, min_score: 0.6, rendition: Rendition::Auto, center_on_guide: false, fuse: true, matching: Matching::default(), method: Method::Template }
+        Self {
+            anchor,
+            direction: Direction::Both,
+            follow_playhead: false,
+            feature: 0.4,
+            search: 1.0,
+            adapt: 0.25,
+            min_score: 0.6,
+            rendition: Rendition::Auto,
+            center_on_guide: false,
+            fuse: true,
+            matching: Matching::default(),
+            method: Method::Template,
+            centred: centred(),
+            pattern_scores: Vec::new(),
+        }
+    }
+
+    /// A cursor pattern's match score: its own, or the tracker's.
+    pub fn pattern_score(&self, pattern: u32) -> f32 {
+        self.pattern_scores.iter().find(|s| s.pattern == pattern).map_or(self.min_score, |s| s.min_score)
     }
 }
 
@@ -764,6 +803,7 @@ impl Module for TrackModule {
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .register_type::<Matching>()
+            .register_type::<PatternScore>()
             .register_type::<Method>()
             .declare::<TrackStatus>(Class::Derived)
             .declare::<runner::TrackJobs>(Class::Derived)

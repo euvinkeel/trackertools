@@ -559,14 +559,56 @@ fn counts(ui: &egui::Ui, world: &World, e: Entity) -> (usize, usize) {
     c
 }
 
+/// A slider (`slider`, on a copy of `value`) on a setting of tracker `e`
+/// (`set` writes it; `[what, tip]`): one undo step a drag.
+fn setting_slider(ui: &mut egui::Ui, world: &mut World, e: Entity, value: f32, slider: impl FnOnce(&mut f32) -> egui::Slider<'_>, [what, tip]: [&str; 2], set: impl FnOnce(&mut Tracker, f32)) {
+    let mut v = value;
+    let r = ui.add(slider(&mut v)).on_hover_text(tip);
+    let label = format!("Edit {what}");
+    if r.drag_started() {
+        world.resource_mut::<tt_core::history::History>().begin(label.clone());
+    }
+    if r.changed() {
+        tt_core::history::edit(world, &label, |tx| tx.modify::<Tracker>(e, |t| set(t, v)));
+    }
+    if r.drag_stopped() {
+        world.resource_mut::<tt_core::history::History>().end();
+    }
+}
+
+/// A cursor tracker's result on frame `f`: its score, and which pattern it
+/// found (told by the size of its box; none when lost).
+fn cursor_result(world: &World, e: Entity, f: FrameIndex, shapes: &[tt_track::job::cursor::Shape]) -> Option<(f32, Option<u32>)> {
+    let sig = world.get::<Output>(e).and_then(|o| world.resource::<SignalStore>().get(o.0))?;
+    let v = sig.get(f)?;
+    if v.len() < 8 {
+        return None;
+    }
+    let score = v[6];
+    if tt_track::flags(v) & LOST_FLAG != 0 {
+        return Some((score, None));
+    }
+    let (bw, bh) = ((v[4] - v[2]).max(1e-3), (v[5] - v[3]).max(1e-3));
+    // (The box is the shape at the video's scale: the same scale both ways for the right one.)
+    let p = shapes.iter().min_by(|a, b| {
+        let off = |s: &tt_track::job::cursor::Shape| ((s.w as f32 / bw) / (s.h as f32 / bh)).ln().abs();
+        off(a).total_cmp(&off(b))
+    });
+    Some((score, p.map(|s| s.pattern)))
+}
+
 /// A cursor tracker's patterns: each one's tile (what it learned; click:
-/// the pattern the brush teaches), how many paints it has, and its paints
-/// (go to one, or remove it).
+/// the pattern the brush teaches), its match score (and this frame's), and
+/// its paints as pictures (where it lies in each; framed by what became of
+/// each; go to one, or remove it); and how centred the paints are.
 fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     let shapes = world.get::<tt_track::runner::CursorShapes>(e).cloned().unwrap_or_default();
     let tool = world.resource::<TrackTool>().clone();
     let active = tt_track::tool::active_pattern(world, &tool, e);
     let patterns = tt_track::look::patterns_of(world, e);
+    let Some(tracker) = world.get::<Tracker>(e).cloned() else { return };
+    let here = world.resource::<Transport>().frame();
+    let result = cursor_result(world, e, here, &shapes.learned.shapes);
     if shapes.learning {
         ui.horizontal(|ui| {
             ui.spinner();
@@ -576,12 +618,28 @@ fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if let Some(err) = &shapes.error {
         ui.colored_label(LOST, format!("Learning failed: {err}"));
     }
+    ui.horizontal(|ui| {
+        ui.label("Paints centred within");
+        setting_slider(
+            ui,
+            world,
+            e,
+            tracker.centred,
+            |v| egui::Slider::new(v, 2.0..=40.0).step_by(1.0).suffix(" px"),
+            [
+                "paint centring",
+                "How far from the cursor's middle your paints may be (video px). Looser paints need more; more also lets a paint line up on something else that looks alike",
+            ],
+            |t, v| t.centred = v,
+        );
+    });
     let mut pick = None;
     let mut remove = None;
     for p in &patterns {
         let p = *p;
         let paints: Vec<Entity> = looks_of(world, e).into_iter().filter(|l| world.get::<Look>(*l).is_some_and(|l| l.pattern == p)).collect();
         let learned = shapes.learned.shapes.iter().find(|s| s.pattern == p).cloned();
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let (rect, r) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::click());
             let tex = learned.as_ref().map(|s| (super::patterns::texture(ui.ctx(), e, s), [s.w, s.h]));
@@ -592,31 +650,81 @@ fn patterns_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             }
             ui.vertical(|ui| {
                 let c = super::patterns::colour(p);
+                let n = if paints.len() == 1 { "1 paint".to_string() } else { format!("{} paints", paints.len()) };
                 let what = match &learned {
-                    Some(s) if s.left_out > 0 => format!("{} paints \u{b7} {}\u{d7}{} px \u{b7} {} left out (they don't match the others)", paints.len(), s.w, s.h, s.left_out),
-                    Some(s) => format!("{} paints \u{b7} {}\u{d7}{} px", paints.len(), s.w, s.h),
-                    None if shapes.learned.unlearned.contains(&p) => format!("{} paints \u{b7} nothing learned yet: paint the cursor where the background differs, or paint it tightly", paints.len()),
-                    None => format!("{} paints", paints.len()),
+                    Some(s) if s.left_out > 0 => format!("{n} \u{b7} {}\u{d7}{} px \u{b7} {} left out (red)", s.w, s.h, s.left_out),
+                    Some(s) => format!("{n} \u{b7} {}\u{d7}{} px", s.w, s.h),
+                    None if shapes.learned.unlearned.contains(&p) => format!("{n} \u{b7} nothing learned yet: paint the cursor where the background differs, or paint it tightly"),
+                    None => n,
                 };
                 ui.label(egui::RichText::new(format!("Pattern {}", p + 1)).color(c).strong());
                 ui.label(egui::RichText::new(what).small().color(style::MUTED));
-                ui.horizontal_wrapped(|ui| {
-                    for l in &paints {
-                        let Some(f) = world.get::<Look>(*l).map(|l| l.frame) else { continue };
-                        if ui.small_button(format!("{f}")).on_hover_text("Go to this paint (select it: the brush teaches its pattern)").clicked() {
-                            world.resource_mut::<Selection>().select_only(*l);
-                            world.resource_mut::<PendingActions>().push(Action::Seek(f));
-                        }
-                        if ui.small_button("x").on_hover_text("Remove this paint (it learns again without it)").clicked() {
-                            remove = Some(*l);
-                        }
+                ui.horizontal(|ui| {
+                    let min = tracker.pattern_score(p);
+                    ui.label(egui::RichText::new("Match at least").small());
+                    setting_slider(
+                        ui,
+                        world,
+                        e,
+                        min,
+                        |v| egui::Slider::new(v, 0.3..=1.0).step_by(0.01).fixed_decimals(2),
+                        [
+                            "pattern match score",
+                            "Frames where this pattern matches less than this are lost (red). Lower it if it misses the cursor; raise it if it finds things that aren't",
+                        ],
+                        move |t, v| match t.pattern_scores.iter_mut().find(|s| s.pattern == p) {
+                            Some(s) => s.min_score = v,
+                            None => t.pattern_scores.push(tt_track::PatternScore { pattern: p, min_score: v }),
+                        },
+                    );
+                    if let Some((score, Some(q))) = result
+                        && q == p
+                    {
+                        ui.label(egui::RichText::new(format!("frame {here}: {score:.2}")).small().color(if score >= min { TRACK } else { LOST }))
+                            .on_hover_text("This pattern's match on the frame shown");
                     }
                 });
             });
         });
+        // Its paints, as pictures.
+        ui.horizontal_wrapped(|ui| {
+            for l in &paints {
+                let Some(f) = world.get::<Look>(*l).map(|l| l.frame) else { continue };
+                let seen = shapes.learned.paints.iter().find(|s| s.frame == f && s.pattern == p).filter(|s| s.picture.w > 0);
+                ui.vertical(|ui| {
+                    let (rect, r) = ui.allocate_exact_size(Vec2::splat(64.0), egui::Sense::click());
+                    let tip = match seen {
+                        Some(s) => {
+                            let tex = super::patterns::paint_texture(ui.ctx(), e, s);
+                            super::patterns::paint_tile(ui.painter(), rect, &tex, s, learned.as_ref().map(|s| [s.w, s.h]), LOST);
+                            format!("{}. Click: go to it (select it: the brush teaches its pattern)", super::patterns::paint_words(s))
+                        }
+                        None => {
+                            ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, style::MUTED), StrokeKind::Inside);
+                            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "\u{2026}", FontId::proportional(14.0), style::MUTED);
+                            format!("Frame {f}: not learned from yet. Click: go to it")
+                        }
+                    };
+                    if r.on_hover_text(tip).clicked() {
+                        world.resource_mut::<Selection>().select_only(*l);
+                        world.resource_mut::<PendingActions>().push(Action::Seek(f));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{f}")).small().color(style::MUTED));
+                        if ui.small_button("x").on_hover_text("Remove this paint (it learns again without it)").clicked() {
+                            remove = Some(*l);
+                        }
+                    });
+                });
+            }
+        });
+    }
+    if let Some((score, None)) = result {
+        let best = if score > 0.0 { format!("best match {score:.2}") } else { "no pattern matches".to_string() };
+        ui.label(egui::RichText::new(format!("Frame {here}: lost ({best})")).small().color(LOST));
     }
     ui.label(
-        egui::RichText::new("Track tool: brush teaches the picked pattern; Shift+brush starts a new one (another shape of the cursor); keys 1\u{2013}0 pick one").small().color(style::MUTED),
+        egui::RichText::new("Track tool: brush teaches the picked pattern; Shift+brush starts a new one (another shape of the cursor); keys 1\u{2013}0 pick one. In each paint's picture, the pattern's box shows where it was found").small().color(style::MUTED),
     );
     if let Some(p) = pick {
         world.resource_mut::<TrackTool>().patterns.insert(e, p);

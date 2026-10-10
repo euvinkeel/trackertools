@@ -6,7 +6,7 @@
 
 use bevy_ecs::prelude::*;
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, TextureHandle, Vec2};
-use tt_track::job::cursor::Shape;
+use tt_track::job::cursor::{PaintSeen, PaintUse, Shape};
 use tt_track::runner::CursorShapes;
 
 /// The first ten patterns' colours (keys 1–0): easy to tell apart, none the red of a lost frame.
@@ -109,5 +109,70 @@ pub fn key(p: u32) -> Option<String> {
         0..=8 => Some(format!("{}", p + 1)),
         9 => Some("0".to_string()),
         _ => None,
+    }
+}
+
+/// A texture of a paint's picture (`PaintSeen::picture`): its pixels,
+/// dimmed where it isn't painted. Made again when it is learned again.
+pub fn paint_texture(ctx: &egui::Context, tracker: Entity, seen: &PaintSeen) -> TextureHandle {
+    let pic = &seen.picture;
+    let id = egui::Id::new(("cursor-paint", tracker, seen.frame, seen.pattern));
+    // (A new picture is a new allocation: its address tells it apart.)
+    let stamp = (std::sync::Arc::as_ptr(&pic.rgb) as usize, pic.w, pic.h);
+    if let Some((s, t)) = ctx.data(|d| d.get_temp::<((usize, usize, usize), TextureHandle)>(id))
+        && s == stamp
+    {
+        return t;
+    }
+    let rgba: Vec<u8> = (0..pic.w * pic.h)
+        .flat_map(|i| {
+            let k = if pic.painted.get(i).copied().unwrap_or(false) { 1.0 } else { 0.35 };
+            let c = |j: usize| (pic.rgb.get(3 * i + j).copied().unwrap_or(0) as f32 * k) as u8;
+            [c(0), c(1), c(2), 255]
+        })
+        .collect();
+    let image = egui::ColorImage::from_rgba_unmultiplied([pic.w.max(1), pic.h.max(1)], &rgba);
+    let t = ctx.load_texture(format!("cursor-paint-{tracker}-{}-{}", seen.pattern, seen.frame), image, egui::TextureOptions::NEAREST);
+    ctx.data_mut(|d| d.insert_temp(id, (stamp, t.clone())));
+    t
+}
+
+/// A paint's tile in `rect`: its picture (as big as fits), where its
+/// pattern's shape lies in it (`shape`: its size), framed by what became of
+/// it: its pattern's colour if learned from (fainter: one say with another
+/// paint of the same screen), red if left out.
+pub fn paint_tile(painter: &Painter, rect: Rect, tex: &TextureHandle, seen: &PaintSeen, shape: Option<[usize; 2]>, lost: Color32) {
+    let pic = &seen.picture;
+    let c = colour(seen.pattern);
+    painter.rect_filled(rect, 3.0, Color32::from_gray(24));
+    let inner = rect.shrink(2.0);
+    let k = (inner.width() / pic.w.max(1) as f32).min(inner.height() / pic.h.max(1) as f32);
+    let r = Rect::from_center_size(inner.center(), Vec2::new(pic.w as f32 * k, pic.h as f32 * k));
+    painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    if let (Some(at), Some([w, h])) = (seen.picture.shape_at, shape) {
+        let b = Rect::from_min_size(r.min + Vec2::new(at[0] as f32 * k, at[1] as f32 * k), Vec2::new(w as f32 * k, h as f32 * k));
+        painter.rect_stroke(b, 0.0, Stroke::new(1.0, c), StrokeKind::Outside);
+    }
+    let edge = match seen.used {
+        PaintUse::Used => Stroke::new(1.5, c),
+        PaintUse::SameAs(_) => Stroke::new(1.0, c.gamma_multiply(0.5)),
+        PaintUse::NotLinedUp | PaintUse::LeftOut => Stroke::new(1.5, lost),
+    };
+    painter.rect_stroke(rect, 3.0, edge, StrokeKind::Inside);
+}
+
+/// What became of a paint, in words (its tile's tooltip).
+pub fn paint_words(seen: &PaintSeen) -> String {
+    match seen.used {
+        PaintUse::Used => format!("Frame {}: learned from", seen.frame),
+        PaintUse::SameAs(f) => format!("Frame {}: the same still screen as the paint on frame {f}, so the two count as one", seen.frame),
+        PaintUse::NotLinedUp => format!(
+            "Frame {}: left out. Nothing near its middle lines up with the other paints. Is the cursor in it, and about centred?",
+            seen.frame
+        ),
+        PaintUse::LeftOut => format!(
+            "Frame {}: left out. It lines up, but doesn't look like what the other paints agree on. Another shape of the cursor? Paint it as its own pattern (Shift+brush)",
+            seen.frame
+        ),
     }
 }

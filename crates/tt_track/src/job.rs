@@ -151,6 +151,8 @@ pub struct JobSpec {
     pub root: bool,
     /// Which tracker it is, for the log ("Tracker 2 (14v1)").
     pub label: String,
+    /// A cursor tracker's own settings.
+    pub cursor: cursor::Settings,
 }
 
 /// What a job is doing.

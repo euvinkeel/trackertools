@@ -315,6 +315,7 @@ fn a_job_that_panics_reports_a_failure() {
         method: Method::Template,
         root: false,
         label: "a test job".into(),
+        cursor: Default::default(),
     };
     let (threads, workers) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (tx, rx) = std::sync::mpsc::channel();

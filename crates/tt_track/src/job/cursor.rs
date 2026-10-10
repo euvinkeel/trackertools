@@ -1107,12 +1107,26 @@ pub enum PaintUse {
     LeftOut,
 }
 
-/// A paint, as the app is shown it: its frame and pattern, and what became of it.
+/// A paint, as the app is shown it: its frame and pattern, what became of
+/// it, and its picture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaintSeen {
     pub frame: FrameIndex,
     pub pattern: u32,
     pub used: PaintUse,
+    pub picture: Picture,
+}
+
+/// A paint's pixels as learned from (rendition px, RGB), which of them are
+/// painted, and where its pattern's shape lies in them (its top-left), if
+/// it lines up with the others.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Picture {
+    pub w: usize,
+    pub h: usize,
+    pub rgb: std::sync::Arc<Vec<u8>>,
+    pub painted: std::sync::Arc<Vec<bool>>,
+    pub shape_at: Option<[f64; 2]>,
 }
 
 /// What the app is shown of what a cursor tracker learned.
@@ -1149,8 +1163,30 @@ fn debug() -> bool {
     std::env::var_os("TT_CURSOR_DEBUG").is_some()
 }
 
-/// A paint is about centred on the cursor within this many px (rendition), by default.
+/// A paint is about centred on the cursor within this many px (source), by default.
 pub const CENTRED: f64 = 10.0;
+
+/// A cursor tracker's settings (from its `Tracker`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settings {
+    /// Paints are about centred on the cursor within this many px (source).
+    pub centred: f64,
+    /// Per pattern, its own match score (others: the tracker's).
+    pub scores: Vec<(u32, f32)>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { centred: CENTRED, scores: Vec::new() }
+    }
+}
+
+impl Settings {
+    /// Pattern `p`'s match score, `min` unless it has its own.
+    pub fn score(&self, p: u32, min: f32) -> f32 {
+        self.scores.iter().find(|(q, _)| *q == p).map_or(min, |(_, s)| *s)
+    }
+}
 
 /// Learn the cursor's shapes from its paints (see the module docs): each
 /// pattern's from its own paints, each paint about centred on the cursor
@@ -1316,7 +1352,24 @@ impl Model {
                 let r = root(&same, *j);
                 used[*j] = if r != *j && group.contains(&r) { PaintUse::SameAs(paints[r].paint.frame) } else { PaintUse::Used };
             }
-            self.paints.extend(paints.iter().zip(&used).map(|(p, u)| PaintSeen { frame: p.paint.frame, pattern, used: *u }));
+            // (Where the shape lies in each paint lined up: its top-left in the first member, moved by the paint's `d`.)
+            let base = group.first().and_then(|j| d[*j]).unwrap_or([0.0, 0.0]);
+            let at_in = |j: usize| match (&made, d[j]) {
+                (Some((_, at)), Some(dj)) => Some([at[0] as f64 + dj[0] - base[0], at[1] as f64 + dj[1] - base[1]]),
+                _ => None,
+            };
+            self.paints.extend(paints.iter().zip(&used).enumerate().map(|(j, (p, u))| PaintSeen {
+                frame: p.paint.frame,
+                pattern,
+                used: *u,
+                picture: Picture {
+                    w: p.paint.img.w,
+                    h: p.paint.img.h,
+                    rgb: std::sync::Arc::new(p.paint.rgb()),
+                    painted: std::sync::Arc::new(p.paint.painted.clone()),
+                    shape_at: at_in(j),
+                },
+            }));
             match made {
                 Some((mut shape, at)) => {
                     shape.pattern = pattern;
@@ -1376,10 +1429,10 @@ impl Model {
 
 /// What a model is learned from, as a number: a tracker's jobs and its
 /// learning in the background share one model ([`model_slot`]).
-pub fn model_key(video: &std::path::Path, looks: &[LookSpec], k: [f64; 2], lo: FrameIndex, hi: FrameIndex) -> u64 {
+pub fn model_key(video: &std::path::Path, looks: &[LookSpec], k: [f64; 2], lo: FrameIndex, hi: FrameIndex, centred: f64) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(video.to_string_lossy().as_bytes());
-    h.update(format!("{looks:?} {k:?} {lo} {hi}").as_bytes());
+    h.update(format!("{looks:?} {k:?} {lo} {hi} {centred}").as_bytes());
     u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
 }
 
@@ -1664,12 +1717,12 @@ const STILL_FRAMES: u32 = 8;
 const TIE: f32 = 0.15;
 
 impl Chooser {
-    /// The cursor among `found` (best first), scoring at least `min`; None:
-    /// not visible. Of those about as good as the best: one that moves over
-    /// one that stays put (a look-alike in the scenery), then one near where
-    /// it was (within `reach`), then the best.
-    pub fn choose(&mut self, found: &[Found], min: f32, reach: f64) -> Option<Found> {
-        let good: Vec<Found> = found.iter().copied().filter(|f| f.score >= min).collect();
+    /// The cursor among `found` (best first), each scoring at least its
+    /// shape's `mins`; None: not visible. Of those about as good as the best:
+    /// one that moves over one that stays put (a look-alike in the scenery),
+    /// then one near where it was (within `reach`), then the best.
+    pub fn choose(&mut self, found: &[Found], mins: &[f32], reach: f64) -> Option<Found> {
+        let good: Vec<Found> = found.iter().copied().filter(|f| mins.get(f.shape).is_none_or(|m| f.score >= *m)).collect();
         // Which have stayed put.
         let mut still = Vec::new();
         for f in &good {
@@ -1748,7 +1801,7 @@ impl super::Worker {
     /// What the paints show (learned once for both jobs). None: cancelled.
     pub(super) fn cursor_model(&self) -> anyhow::Result<Option<std::sync::Arc<Model>>> {
         let s = &self.spec;
-        let key = model_key(&s.video.path, &s.looks, s.k, s.lo, s.lo + s.guide.len() as FrameIndex);
+        let key = model_key(&s.video.path, &s.looks, s.k, s.lo, s.lo + s.guide.len() as FrameIndex, s.cursor.centred);
         let slot = model_slot(key);
         let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = held.as_ref() {
@@ -1769,7 +1822,7 @@ impl super::Worker {
             shot.mark_moving(&near);
             paints.push(PaintShots::new(shot, look.pattern, near));
         }
-        let mut model = learn(paints, CENTRED * k[0].max(k[1]));
+        let mut model = learn(paints, s.cursor.centred * k[0].max(k[1]));
         // (Shown at once; learning more takes a few seconds.)
         let _ = self.tx.send(super::Msg::CursorShapes(model.learned()));
         // Learn more where the shapes are found for sure, across the range.
@@ -1825,11 +1878,12 @@ impl super::Worker {
     fn cursor_frame(&mut self, finder: &Finder, chooser: &mut Chooser, f: FrameIndex, frame: Frame) {
         let region = self.cursor_region(f, frame.y.w, frame.y.h);
         let pyramid = Pyramid::new(frame, finder.levels);
-        let min = self.spec.settings.min_score;
-        let found = finder.find(&pyramid, region, 3, min);
+        // (Each pattern has its own match score: the search keeps the lowest.)
+        let mins: Vec<f32> = finder.shapes.iter().map(|sh| self.spec.cursor.score(sh.pattern, self.spec.settings.min_score)).collect();
+        let found = finder.find(&pyramid, region, 3, mins.iter().copied().fold(f32::INFINITY, f32::min));
         let k = self.spec.k;
         let src = |p: [f64; 2]| [p[0] / k[0], p[1] / k[1]];
-        let (pos, rect, score, lost) = match chooser.choose(&found, min, REACH) {
+        let (pos, rect, score, lost) = match chooser.choose(&found, &mins, REACH) {
             Some(hit) => {
                 let sh = &finder.shapes[hit.shape];
                 (src(hit.tip), [src(hit.at), src([hit.at[0] + sh.w as f64, hit.at[1] + sh.h as f64])], hit.score, false)
@@ -2119,14 +2173,14 @@ mod tests {
         let decoy = [100.0, 100.0];
         let mut last = None;
         for x in 0..10 {
-            last = c.choose(&[f([20.0 + 3.0 * x as f64, 30.0], 0.97), f(decoy, 0.99)], 0.6, 40.0);
+            last = c.choose(&[f([20.0 + 3.0 * x as f64, 30.0], 0.97), f(decoy, 0.99)], &[0.6], 40.0);
         }
         // (It matches better, but stays put while the cursor moves.)
         assert_eq!(last.map(|p| p.tip), Some([47.0, 30.0]));
         // It rests on the look-alike …
-        assert_eq!(c.choose(&[f(decoy, 0.99)], 0.6, 40.0).map(|p| p.tip), Some(decoy));
+        assert_eq!(c.choose(&[f(decoy, 0.99)], &[0.6], 40.0).map(|p| p.tip), Some(decoy));
         // … and flicks away: both match, it was on the look-alike, yet it goes.
-        assert_eq!(c.choose(&[f(decoy, 0.99), f([300.0, 200.0], 0.97)], 0.6, 40.0).map(|p| p.tip), Some([300.0, 200.0]));
+        assert_eq!(c.choose(&[f(decoy, 0.99), f([300.0, 200.0], 0.97)], &[0.6], 40.0).map(|p| p.tip), Some([300.0, 200.0]));
     }
 }
 
