@@ -903,7 +903,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         let trackers: Vec<Entity> = world.resource::<Selection>().entities.iter().copied().filter(|t| is_tracker(world, *t)).collect();
         let run = run_of(world, e);
         let mut asked = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (r, button, _, tip) in RUNS {
                 if ui.selectable_label(run == r, button).on_hover_text(tip).clicked() {
                     asked = Some(r);
@@ -940,7 +940,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.add(egui::Label::new(text).wrap());
     });
     if hull.is_some() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if drawn_at(world, e, here).is_some() && ui.small_button(format!("Erase frame {here}")).on_hover_text("Its own result shows here again").clicked() {
                 erase = Some(Some(here..here + 1));
             }
@@ -995,12 +995,16 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     if let Some(l) = remove {
         tt_core::commands::delete(world, &[l]);
     }
+    // A template tracker: cursor icons as more looks.
+    if method == Method::Template {
+        super::cursor_icons::section(ui, world, e);
+    }
     let reseed_tip = if method.point() {
         "Start it again from the playhead, from its reset point on this frame (with none here, click the pixel first)"
     } else {
         "Start it again from the playhead, from your look on this frame (with none here, drag around the subject first)"
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button("Re-seed here").on_hover_text(reseed_tip).clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }
