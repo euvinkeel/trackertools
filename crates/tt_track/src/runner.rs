@@ -397,6 +397,9 @@ struct Plan {
     seed: Option<[f64; 2]>,
     /// No guide: `guide` is the whole frame, and the search follows the tracker.
     root: bool,
+    /// A template tracker's cursor icons (`icons::CursorIcons`).
+    icons: Arc<Vec<crate::icons::Icon>>,
+    icon_sizes: Vec<(String, f64)>,
 }
 
 impl Plan {
@@ -468,6 +471,8 @@ impl Plan {
             && p.matching == q.matching
             && p.method == q.method
             && (p.centred, &p.pattern_scores) == (q.centred, &q.pattern_scores)
+            && self.icons == old.icons
+            && self.icon_sizes == old.icon_sizes
             && self.root == old.root;
         let same = |f: FrameIndex| match (self.inputs(f), old.inputs(f)) {
             (Some((g, m)), Some((h, n))) => g.iter().zip(h).all(|(a, b)| close(*a, *b)) && close(m.a, n.a) && close(m.b[0], n.b[0]) && close(m.b[1], n.b[1]),
@@ -719,6 +724,9 @@ fn drain(world: &mut World, op: Entity) {
                 for s in states {
                     kept.0.insert(s.frame, Arc::new(s));
                 }
+            }
+            Msg::IconFit(fit) => {
+                world.entity_mut(op).insert(fit);
             }
             Msg::CursorShapes(learned) => {
                 let key = world.resource::<TrackJobs>().basis.get(&op).map_or(0, |b| cursor_key(&b.plan));
@@ -997,6 +1005,8 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
         method: p.method,
         root: plan.root,
         label,
+        icons: plan.icons.clone(),
+        icon_sizes: plan.icon_sizes.clone(),
         cursor: crate::job::cursor::Settings {
             centred: p.centred.clamp(1.0, 200.0) as f64,
             scores: p.pattern_scores.iter().map(|s| (s.pattern, s.min_score.clamp(-1.0, 1.0))).collect(),
@@ -1293,11 +1303,27 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     if root {
         put(-1.0);
     }
+    // A template tracker's icons (none: its stamp stays what it was).
+    let (icons, icon_sizes) = match world.get::<crate::icons::CursorIcons>(op).filter(|c| params.method == Method::Template && !c.icons.is_empty()) {
+        Some(c) => {
+            let sizes: Vec<(String, f64)> = c.sizes.iter().filter(|s| s.size > 0.0).map(|s| (s.pack.clone(), s.size as f64)).collect();
+            for (p, s) in &sizes {
+                put(*s);
+                put(f64::from_bits(u64::from_le_bytes(blake3::hash(p.as_bytes()).as_bytes()[..8].try_into().expect("8 bytes"))));
+            }
+            for i in &c.icons {
+                [i.w as f64, i.h as f64, i.hotspot[0] as f64, i.hotspot[1] as f64].iter().for_each(|x| put(*x));
+                put(f64::from_bits(u64::from_le_bytes(blake3::hash(&i.rgba).as_bytes()[..8].try_into().expect("8 bytes"))));
+            }
+            (c.icons.clone(), sizes)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
     h.update(original.path.to_string_lossy().as_bytes());
     let stamp = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"));
 
     let span = tt_core::span::span_of(world, op).range();
-    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed, root })
+    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed, root, icons: Arc::new(icons), icon_sizes })
 }
 
 /// Fill gaps by linear interpolation; ends hold the nearest value.

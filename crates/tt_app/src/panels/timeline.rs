@@ -183,10 +183,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         ui.monospace(timecode(t.frame(), t.fps));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             fit = ui.button("Fit").on_hover_text("Show the whole clip").clicked();
-            ui.label(
-                egui::RichText::new("wheel on the ruler or Ctrl+wheel: zoom · Shift+wheel: pan · wheel on lanes: scroll · middle-drag: pan both · drag lanes: box select · drag a manual dot onto a tracker: merge · right-click: menu")
-                    .weak()
-                    .small(),
+            // (Cut short where it doesn't fit, all of it on hover: it was drawn over the buttons.)
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("wheel on the ruler or Ctrl+wheel: zoom · Shift+wheel: pan · wheel on lanes: scroll · middle-drag: pan both · drag lanes: box select · drag a manual dot onto a tracker: merge · right-click: menu")
+                        .weak()
+                        .small(),
+                )
+                .truncate(),
             );
         });
     });

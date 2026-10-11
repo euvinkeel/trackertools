@@ -2,6 +2,7 @@
 //! queue actions/intents; they never own state or mutate the document directly.
 
 mod brush;
+mod cursor_icons;
 pub mod export;
 mod focus_inspector;
 mod inspector;
@@ -191,7 +192,8 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let kind = world.resource::<tt_track::NewTrackers>().method;
     let cotracker = tt_track::job::cotracker_availability();
     let t = world.resource::<Transport>();
-    ui.horizontal(|ui| {
+    // (Wraps onto a second line in a narrow window, instead of running off it.)
+    ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new("trackertools").strong().color(style::ACCENT));
         ui.separator();
         open = ui.button("Open…").on_hover_text("Open a video (Ctrl+O), or drop a file on the window").clicked();

@@ -30,6 +30,7 @@
 
 pub mod export;
 pub mod human;
+pub mod icons;
 pub mod image;
 pub mod job;
 pub mod look;
@@ -784,8 +785,10 @@ impl Module for TrackModule {
             .component::<human::AutoOutput>(Class::Document)
             .component::<human::HumanLayer>(Class::Document)
             .component::<off::TrackerOff>(Class::Document)
+            .component::<icons::CursorIcons>(Class::Document)
             .declare::<runner::PaintPoints>(Class::Derived)
             .declare::<runner::CursorShapes>(Class::Derived)
+            .declare::<icons::IconFit>(Class::Derived)
             .declare::<human::Composed>(Class::Derived)
             .declare::<PausedOnOpen>(Class::Derived)
             .declare::<human::DrawTool>(Class::Derived)
@@ -803,6 +806,10 @@ impl Module for TrackModule {
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .register_type::<Matching>()
+            .register_type::<icons::Icon>()
+            .register_type::<Vec<icons::Icon>>()
+            .register_type::<icons::PackSize>()
+            .register_type::<Vec<icons::PackSize>>()
             .register_type::<PatternScore>()
             .register_type::<Method>()
             .declare::<TrackStatus>(Class::Derived)

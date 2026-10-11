@@ -316,6 +316,21 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         }
         world.resource_mut::<NewTrackers>().method = Method::Template;
     }
+    // `=icons`: the tracker with no sketch has cursor icons, the first pack
+    // found sized from its looks, the second sized by hand.
+    if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "icons")
+        && let Some(t) = loose
+    {
+        let packs = tt_track::icons::packs();
+        let mut set = tt_track::icons::CursorIcons::default();
+        for (i, p) in packs.iter().enumerate() {
+            set.icons.extend(p.icons.iter().cloned());
+            if i == 1 {
+                set.sizes.push(tt_track::icons::PackSize { pack: p.name.to_string(), size: 0.8 });
+            }
+        }
+        edit(world, "Scene: cursor icons", |tx| tx.insert(t, set));
+    }
     // A manual dot: a path drawn by hand.
     let mut dot = None;
     edit(world, "Scene: a manual dot", |tx| {

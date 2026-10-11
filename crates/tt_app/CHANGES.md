@@ -1,4 +1,6 @@
 ## Not released yet
+- Template trackers: add the cursors on this computer (Windows' own, a Roblox install's) in the Inspector, under Cursor icons. The tracker matches each as one more look, so it keeps following the cursor when it turns into one of them. Each pack's size is found from the looks, or set by hand. Add only the pack your video shows.
+- In a narrow window, the top bar wraps onto a second line and the Inspector's rows wrap, instead of running off the edge.
 - Cursor trackers: brush loosely over the mouse cursor on a few frames. It learns what the cursor looks like and finds it on every frame. Shift+brush starts a new pattern for another shape of the cursor (a hand, an I-beam); keys 1–0 pick one. Each pattern shows in its colour, and what it learned shows under the brush and in the Inspector. Frames where nothing matches are marked red. In the Inspector, each paint shows as a picture with where its pattern was found in it (red if it was left out, and why), each pattern has its own match score, and a setting says how far from the cursor's middle paints may be.
 - Paint trackers: a large paint with gaps in it no longer counts as its whole rectangle.
 - Settings > Updates shows what changed in each version, and what is not released yet.
