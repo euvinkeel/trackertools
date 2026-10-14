@@ -46,7 +46,8 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.label("Cursor icons:");
         let found = packs();
         if found.is_empty() {
-            ui.label(egui::RichText::new("none found on this computer (Windows' cursors, or a Roblox install)").small().color(style::MUTED));
+            let looked = if cfg!(target_os = "macos") { "macOS's cursors, or a Roblox install" } else { "Windows' cursors, or a Roblox install" };
+            ui.label(egui::RichText::new(format!("none found on this computer ({looked})")).small().color(style::MUTED));
         }
         for pack in found {
             if added.iter().any(|p| p == pack.name) {
