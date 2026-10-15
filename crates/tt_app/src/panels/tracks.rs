@@ -63,6 +63,7 @@ pub fn kind_name(method: Method) -> &'static str {
         Method::Manual => "manual dot",
         Method::Paint => "paint tracker",
         Method::Cursor => "cursor tracker",
+        Method::Jev => "Jev tracker",
     }
 }
 
@@ -835,9 +836,13 @@ pub fn inspector(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             (Method::Paint, "Paint tracker", "Brush over what to follow in this sketch: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them. It searches inside this sketch's box, in its view."),
             (Method::Cursor, "Cursor tracker", "Paint loosely over the mouse cursor inside this sketch on a few frames: it learns what the cursor looks like and finds it on every frame (built in). Shift+brush: a new pattern, for each shape the cursor takes."),
             (Method::TapNext, "TAPNext", "Experimental. Click the pixel to follow in this sketch: Google DeepMind's TAPNext++, a point tracker that gives each frame's result at once. It searches inside this sketch's box, in its view."),
-        ] {
+            (Method::Jev, "Jev (dev)", "Dev only, experimental. Brush over the subject in this sketch on 3 to 5 frames, then click Ask Jev in the Inspector: TypeSafe's Jev boxes the subject on every Nth frame after the last paint, over the network (paid)."),
+        ]
+        .into_iter()
+        .filter(|(m, _, _)| *m != Method::Jev || crate::dev_build())
+        {
             let usable = match method {
-                Method::Template | Method::Cursor => true,
+                Method::Template | Method::Cursor | Method::Jev => true,
                 Method::TapNext => tt_track::job::tapnext_availability().is_ok(),
                 _ => cotracker.is_ok(),
             };
@@ -876,6 +881,8 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                 "paint loosely over the cursor on a few frames where the background differs; Shift+brush a new pattern for each shape it takes (keys 1\u{2013}0 pick one). Frames where no pattern matches well are marked lost (red)"
             } else if method == Method::Paint {
                 "where it slips: Track tool, brush over the subject on that frame (a reset paint: points not on it are left out from there)"
+            } else if method == Method::Jev {
+                "brush over the subject on 3 to 5 frames (each paint is an example), then Ask Jev below"
             } else {
                 "where it misses: Track tool, drag around the subject (a new look, pinned there)"
             };
@@ -968,7 +975,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         }
         ui.label(match method {
             Method::CoTracker | Method::TapNext => "Reset points:",
-            Method::Paint => "Paints:",
+            Method::Paint | Method::Jev => "Paints:",
             _ => "Looks:",
         });
         for l in &looks {
@@ -976,7 +983,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             let f = look.frame;
             let label = if method.point() {
                 format!("frame {} \u{b7} {:.0}, {:.0}", look.frame, look.x, look.y)
-            } else if method == Method::Paint {
+            } else if matches!(method, Method::Paint | Method::Jev) {
                 format!("frame {} \u{b7} {:.0}\u{d7}{:.0}", look.frame, 2.0 * look.half_w, 2.0 * look.half_h)
             } else {
                 let painted = if look.painted().is_some() { " \u{b7} masked" } else { " \u{b7} unpainted" };
@@ -998,6 +1005,10 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     // A template tracker: cursor icons as more looks.
     if method == Method::Template {
         super::cursor_icons::section(ui, world, e);
+    }
+    // A Jev tracker: its key, settings, Ask Jev, and what Jev answered.
+    if method == Method::Jev {
+        super::jev::section(ui, world, e);
     }
     let reseed_tip = if method.point() {
         "Start it again from the playhead, from its reset point on this frame (with none here, click the pixel first)"

@@ -675,7 +675,7 @@ impl Stream {
 impl Worker {
     /// The crop's scale for this job (crop px per view px): the guide's box
     /// (× `search`) on every frame the job reads fits, with a margin.
-    fn crop_scale(&self, frames: impl Iterator<Item = FrameIndex>) -> f64 {
+    pub(super) fn crop_scale(&self, frames: impl Iterator<Item = FrameIndex>) -> f64 {
         let s = &self.spec;
         let (mut hw, mut hh) = (8.0f64, 8.0f64);
         // With no guide the "box" is the whole frame: it fits exactly (the
@@ -687,8 +687,8 @@ impl Worker {
             hh = hh.max((b[1] - b[3]).max(b[5] - b[1]) * search);
         }
         let mut w = (k * hw).max(k * hh * CROP_W as f64 / CROP_H as f64);
-        // A paint tracker's paints fit too (they can be spread over the picture), with a margin.
-        if s.method == Method::Paint {
+        // A paint (or Jev) tracker's paints fit too (they can be spread over the picture), with a margin.
+        if matches!(s.method, Method::Paint | Method::Jev) {
             for l in s.looks.iter().filter(|l| (s.lo..s.lo + s.maps.len() as FrameIndex).contains(&l.frame)) {
                 let g = self.guide_point(l.frame);
                 let b = self.map(l.frame).box_from_source([l.center[0], l.center[1], l.center[0] - l.half[0], l.center[1] - l.half[1], l.center[0] + l.half[0], l.center[1] + l.half[1]]);
@@ -701,7 +701,7 @@ impl Worker {
 
     /// Frame `f` (decoded, NV12) through the tracker's view: the crop around
     /// the guide's point at `scale`, as RGB bytes, and its grid.
-    fn crop(&self, frame: &[u8], f: FrameIndex, scale: f64) -> (Grid, Vec<u8>) {
+    pub(super) fn crop(&self, frame: &[u8], f: FrameIndex, scale: f64) -> (Grid, Vec<u8>) {
         let (map, s) = (self.map(f), &self.spec);
         let g = self.guide_point(f);
         let grid = Grid { origin: [g[0] - CROP_W as f64 / 2.0 / scale, g[1] - CROP_H as f64 / 2.0 / scale], scale };

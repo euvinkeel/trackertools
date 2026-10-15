@@ -111,6 +111,11 @@ pub struct PaintStates(pub std::collections::BTreeMap<FrameIndex, Arc<crate::job
 #[derive(Component, Debug, Clone, Default)]
 pub struct PaintPoints(pub std::collections::BTreeMap<FrameIndex, Vec<PointMark>>);
 
+/// What Jev answered on each frame it was asked about (`job::jev`), for the
+/// app to show. Not saved: the frames' boxes are (the tracker's output).
+#[derive(Component, Debug, Clone, Default)]
+pub struct JevAnswers(pub std::collections::BTreeMap<FrameIndex, crate::job::jev::Answer>);
+
 /// What a cursor tracker learned from its paints (`job::cursor`), for the
 /// app to show: learned in the background as soon as its paints change,
 /// tracking or not ([`learn_cursor`]). Not saved (learned again).
@@ -728,6 +733,16 @@ fn drain(world: &mut World, op: Entity) {
             Msg::IconFit(fit) => {
                 world.entity_mut(op).insert(fit);
             }
+            Msg::Jev(answers) => {
+                let mut e = world.entity_mut(op);
+                if e.get::<JevAnswers>().is_none() {
+                    e.insert(JevAnswers::default());
+                }
+                let mut kept = e.get_mut::<JevAnswers>().expect("inserted");
+                for a in answers {
+                    kept.0.insert(a.frame, a);
+                }
+            }
             Msg::CursorShapes(learned) => {
                 let key = world.resource::<TrackJobs>().basis.get(&op).map_or(0, |b| cursor_key(&b.plan));
                 let learning = world.resource::<TrackJobs>().learners.contains_key(&op);
@@ -735,6 +750,11 @@ fn drain(world: &mut World, op: Entity) {
             }
             Msg::Finished => {
                 world.resource_mut::<TrackJobs>().running.remove(&(op, side));
+                // A Jev tracker asked once is paused again: a new paint or setting doesn't ask (and pay) by itself.
+                let jev = world.get::<Tracker>(op).is_some_and(|t| t.method == Method::Jev);
+                if jev && !world.resource::<TrackJobs>().running.keys().any(|(o, _)| *o == op) {
+                    crate::set_run(world, op, crate::TrackRun::Paused);
+                }
             }
             Msg::Failed(e) => {
                 tracing::warn!("tracker {op} ({side:?}) failed: {e}");
@@ -1011,6 +1031,7 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
             centred: p.centred.clamp(1.0, 200.0) as f64,
             scores: p.pattern_scores.iter().map(|s| (s.pattern, s.min_score.clamp(-1.0, 1.0))).collect(),
         },
+        jev: p.jev.clone(),
     }
 }
 
@@ -1276,6 +1297,12 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     let m = &p.matching;
     for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64, p.method as u8 as f64] {
         put(x);
+    }
+    // (A Jev tracker's own settings: new answers are asked for, and paid, only when they change.)
+    if p.method == Method::Jev {
+        put(p.jev.every as f64);
+        put(p.jev.frames as f64);
+        put(p.jev.examples as u8 as f64);
     }
     // (A cursor tracker's own settings; other trackers' stamps stay as they were.)
     if p.method == Method::Cursor {

@@ -106,6 +106,10 @@ pub enum Method {
     /// A mouse cursor: paints loosely over it on a few frames, from which it
     /// learns the cursor's shapes, found on every frame (`job::cursor`). Built in.
     Cursor,
+    /// Dev only, experimental: TypeSafe's Jev (a System One model, over the
+    /// network) asked where the painted subject is, on every Nth frame after
+    /// the last paint (`job::jev`).
+    Jev,
 }
 
 impl Method {
@@ -121,7 +125,7 @@ impl Method {
 
     /// Its looks are paints (a press brushes).
     pub fn paints(self) -> bool {
-        matches!(self, Method::Paint | Method::Cursor)
+        matches!(self, Method::Paint | Method::Cursor | Method::Jev)
     }
 
     /// What its looks are called: a template tracker's are patterns it
@@ -130,7 +134,7 @@ impl Method {
     pub fn look_word(self) -> &'static str {
         match self {
             Method::CoTracker | Method::TapNext => "reset point",
-            Method::Paint | Method::Cursor => "paint",
+            Method::Paint | Method::Cursor | Method::Jev => "paint",
             _ => "look",
         }
     }
@@ -295,6 +299,39 @@ pub struct Tracker {
     /// counts as lost (patterns not listed: `min_score`).
     #[reflect(default)]
     pub pattern_scores: Vec<PatternScore>,
+    /// A Jev tracker's own settings (`job::jev`).
+    #[reflect(default)]
+    pub jev: JevSettings,
+}
+
+/// A Jev tracker's settings (`Method::Jev`, `job::jev`).
+#[derive(Reflect, Clone, Debug, PartialEq)]
+pub struct JevSettings {
+    /// Ask about every this many frames after the last paint…
+    pub every: u32,
+    /// …this many frames in all.
+    pub frames: u32,
+    /// How each paint is shown to Jev as an example.
+    pub examples: JevExamples,
+}
+
+impl Default for JevSettings {
+    fn default() -> Self {
+        Self { every: 5, frames: 60, examples: JevExamples::Dimmed }
+    }
+}
+
+/// How a Jev tracker's paints are shown to Jev as examples of its subject
+/// (each a crop of the paint's frame through the tracker's view).
+#[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JevExamples {
+    /// The whole crop, what isn't painted darkened.
+    #[default]
+    Dimmed,
+    /// The whole crop, the painted area outlined.
+    Outlined,
+    /// Only around the painted area (scaled up).
+    Tight,
 }
 
 /// One cursor pattern's match score (`Tracker::pattern_scores`).
@@ -361,6 +398,7 @@ impl Tracker {
             method: Method::Template,
             centred: centred(),
             pattern_scores: Vec::new(),
+            jev: JevSettings::default(),
         }
     }
 
@@ -449,6 +487,8 @@ fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Option<Entity>, look: Loo
     let auto = tx.create_signal(TRACK_CHANNELS);
     let anchor = look.frame;
     let new = tx.world().get_resource::<NewTrackers>().copied().unwrap_or_default();
+    // (A Jev tracker asks over the network, and pays, for what it tracks: it waits to be asked, paints and all.)
+    let run = if new.method == Method::Jev { TrackRun::Paused } else { new.run };
     let first = if new.method == Method::Cursor { pattern_paint_name(look.pattern, 1) } else { look_name(new.method, 1) };
     let look = tx.spawn((Name::new(first), look));
     let mut inputs: Vec<(String, Entity)> = guide.map(|g| ("guide".to_string(), g)).into_iter().collect();
@@ -459,7 +499,7 @@ fn spawn_tracker(tx: &mut Tx<'_>, name: String, guide: Option<Entity>, look: Loo
     if new.method == Method::Cursor {
         tracker.min_score = CURSOR_MIN_SCORE;
     }
-    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), human::AutoOutput(auto), tracker, runner::TrackBook::default(), new.run))
+    tx.spawn((Name::new(name), Operator { kind: "track".into() }, Inputs(inputs), Output(out), human::AutoOutput(auto), tracker, runner::TrackBook::default(), run))
 }
 
 /// A look around the guide's point on `frame`: a square of `feature` × its
@@ -554,7 +594,7 @@ pub fn add_look(world: &mut World, tracker: Entity, look: Look) -> Option<Entity
 /// pattern to a template tracker).
 pub fn looks_fit(from: Method, to: Method) -> bool {
     let kind = |m: Method| match m {
-        Method::Paint | Method::Cursor => 0,
+        Method::Paint | Method::Cursor | Method::Jev => 0,
         m if m.point() => 1,
         Method::Template => 2,
         Method::Manual => 3,
@@ -806,6 +846,8 @@ impl Module for TrackModule {
             .register_type::<Direction>()
             .register_type::<Rendition>()
             .register_type::<Matching>()
+            .register_type::<JevSettings>()
+            .register_type::<JevExamples>()
             .register_type::<icons::Icon>()
             .register_type::<Vec<icons::Icon>>()
             .register_type::<icons::PackSize>()

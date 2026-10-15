@@ -349,7 +349,7 @@ fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Re
                 add_look(world, t, auto_masked(world, look));
             }
             // Another paint (on a frame with one already: both count).
-            Method::Paint | Method::Cursor => {
+            Method::Paint | Method::Cursor | Method::Jev => {
                 add_look(world, t, look);
             }
         }

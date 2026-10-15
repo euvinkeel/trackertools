@@ -28,6 +28,12 @@ mod tree;
 mod update;
 mod video;
 
+/// A copy built from source (not a release), or `TT_DEV` set: dev-only
+/// features show (the Jev tracker).
+pub fn dev_build() -> bool {
+    !update::installable() || std::env::var_os("TT_DEV").is_some()
+}
+
 fn main() -> eframe::Result {
     // (Started again after an error: the old process has exited before the log opens.)
     recover::wait_for_old();
