@@ -331,12 +331,12 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         if let Some(t) = jev {
             tt_track::add_look(world, t, paint(610));
             tt_track::add_look(world, t, paint(620));
-            // `TT_SCENE_JEV_ASK=1`: and asked (paid): 30 frames, every 5, tight examples.
+            // `TT_SCENE_JEV_ASK=1`: and asked (paid): the whole sketch, every 5, at most 30 frames, tight examples.
             if std::env::var_os("TT_SCENE_JEV_ASK").is_some() {
                 edit(world, "Scene: Jev settings", |tx| {
                     tx.modify::<tt_track::Tracker>(t, |p| p.jev = tt_track::JevSettings { every: 5, frames: 30, ..tt_track::JevSettings::default() })
                 });
-                tt_track::set_run(world, t, TrackRun::Forward);
+                tt_track::job::jev::ask(world, t, 0, 100_000);
             }
         }
         world.resource_mut::<NewTrackers>().method = Method::Template;

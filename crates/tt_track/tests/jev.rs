@@ -151,11 +151,43 @@ fn setup() -> Option<(Core, Entity)> {
     Some((core, guide))
 }
 
+/// Run until tracker `op` is settled and the fake has seen at least `n` requests.
+fn until_asked(core: &mut Core, op: Entity, seen: &Arc<Mutex<Vec<Seen>>>, n: usize) {
+    let start = Instant::now();
+    for _ in 0..3 {
+        core.run_pre_ui();
+    }
+    while !settled(&core.world, op) || seen.lock().unwrap().len() < n {
+        assert!(start.elapsed() < Duration::from_secs(60), "still asking ({} of {n} seen)", seen.lock().unwrap().len());
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let start = Instant::now();
+    while core.world.resource::<TrackJobs>().threads() > 0 {
+        assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The frames the fake was asked about from request `from` on, in order.
+fn asked_since(seen: &Arc<Mutex<Vec<Seen>>>, from: usize) -> Vec<i64> {
+    let mut f: Vec<i64> = seen.lock().unwrap()[from..].iter().map(|s| s.frame).collect();
+    f.sort();
+    f
+}
+
+/// The tracker's output on frame `f`: point, flags, score.
+fn out_at(w: &World, op: Entity, f: i64) -> ([f64; 2], u32, f32) {
+    let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+    sig.get(f).map(|v| ([v[0] as f64, v[1] as f64], tt_track::flags(v), v[6])).unwrap_or_else(|| panic!("no result on {f}"))
+}
+
 #[test]
-fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
+fn a_jev_tracker_asks_about_the_grid_in_the_range_asked() {
     let Some((mut core, guide)) = setup() else { return };
     let (url, seen) = fake_jev();
-    // SAFETY: the only test in this binary; nothing else reads these.
+    // SAFETY: the only test in this binary that runs by default; nothing else reads these.
     unsafe {
         std::env::set_var("TT_JEV_URL", &url);
         std::env::set_var("TYPESAFE_API_KEY", "test-key-123");
@@ -167,10 +199,12 @@ fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
         look.mask = mask;
         look
     };
+    // Painted on 600 (the anchor) and 606; the grid: every 4 from 600 (572 … 596, 604 … 660), 606 left out.
     let op = tt_track::add_tracker_with_look(&mut core.world, guide, paint(600)).expect("tracker");
     set_span(&mut core.world, op, Span::new(570, 660));
     tt_track::add_look(&mut core.world, op, paint(606)).expect("a second paint");
-    core.world.get_mut::<Tracker>(op).expect("settings").jev = JevSettings { every: 4, frames: 10, fill: false, ..JevSettings::default() };
+    core.world.get_mut::<Tracker>(op).expect("settings").jev = JevSettings { every: 4, fill: false, ..JevSettings::default() };
+    assert_eq!(tt_track::job::jev::grid(600, 4, &[600, 606], 600, 620), [604, 608, 612, 616, 620]);
 
     // It waits to be asked: nothing is sent while it is painted.
     for _ in 0..20 {
@@ -179,161 +213,100 @@ fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
     }
     assert!(seen.lock().unwrap().is_empty(), "a new Jev tracker is paused");
     assert_eq!(tt_track::run_of(&core.world, op), TrackRun::Paused);
-    tt_track::set_run(&mut core.world, op, TrackRun::Both);
-    let start = Instant::now();
-    for _ in 0..3 {
-        core.run_pre_ui();
-    }
-    while !settled(&core.world, op) {
-        assert!(start.elapsed() < Duration::from_secs(120), "still asking");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(2));
-    }
+
+    // Asked about 608–640: the grid's frames there, nothing else.
+    tt_track::job::jev::ask(&mut core.world, op, 608, 640);
+    let first: Vec<i64> = (608..=640).step_by(4).collect();
+    until_asked(&mut core, op, &seen, first.len());
     let w = &core.world;
     assert!(w.get::<OpError>(op).is_none(), "{:?}", w.get::<OpError>(op));
     assert_eq!(coverage(w, op), Some(570..661), "both ways over its span");
-
-    let asked: Vec<i64> = (1..=10).map(|i| 606 + 4 * i).collect();
-    let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
-    let at = |f: i64| sig.get(f).map(|v| ([v[0] as f64, v[1] as f64], tt_track::flags(v), v[6])).expect("a result");
-    for &f in &asked {
-        let (p, flags, score) = at(f);
+    assert_eq!(asked_since(&seen, 0), first);
+    for &f in &first {
+        let (p, flags, score) = out_at(w, op, f);
         let d = (p[0] - truth(f)[0]).hypot(p[1] - truth(f)[1]);
         assert!(d < 1.0, "frame {f}: the box's centre is the crop's, the guide's point: {p:?} vs {:?}", truth(f));
-        let lost = f % 3 == 0;
-        assert_eq!(flags & tt_track::LOST != 0, lost, "frame {f}: lost only where Jev can't see it");
-        assert_eq!(flags & tt_track::OFF, 0, "frame {f} was asked about");
+        assert_eq!(flags & tt_track::LOST != 0, f % 3 == 0, "frame {f}: lost only where Jev can't see it");
         assert!((score - 0.75).abs() < 1e-6, "the box's confidence: {score}");
     }
-    for f in [570, 599, 601, 611, 615, 647, 660] {
-        assert_ne!(at(f).1 & tt_track::OFF, 0, "frame {f}: not asked about, left out");
+    for f in [570, 596, 601, 604, 610, 644, 660] {
+        assert_ne!(out_at(w, op, f).1 & tt_track::OFF, 0, "frame {f}: not asked about, left out");
     }
-    let (p, flags, score) = at(606);
+    let (p, flags, score) = out_at(w, op, 606);
     assert!(flags == 0 && score == 1.0 && (p[0] - truth(606)[0]).abs() < 6.0, "a paint's frame shows the paint: {p:?}");
-
     let answers = w.get::<JevAnswers>(op).expect("Jev's answers");
-    assert_eq!(answers.answers.keys().copied().collect::<Vec<_>>(), asked);
+    assert_eq!(answers.answers.keys().copied().collect::<Vec<_>>(), first);
     assert!(answers.answers.values().all(|a| a.tokens == 999 && a.error.is_none() && a.view_p.len() == 3));
-    assert_eq!(answers.answers[&618].view, "not_in_view");
+    assert_eq!(answers.answers[&612].view, "not_in_view");
     assert_eq!(answers.examples.len(), 2, "the examples it sent, one per paint");
-    // What Jev sees is the sketch's box: the crop's sides (outside the 70 px square box) are grey, its middle isn't.
-    let (w, h, px) = tt_track::icons::read_png(answers.answers[&610].image.as_ref().expect("image")).expect("a PNG");
-    let at = |x: u32, y: u32| &px[((y * w + x) * 4) as usize..((y * w + x) * 4 + 3) as usize];
-    assert_eq!((at(3, h / 2), at(w - 4, h / 2)), (&[128u8, 128, 128][..], &[128u8, 128, 128][..]), "outside the sketch's box: grey");
-    assert_ne!(at(w / 2, h / 2), &[128u8, 128, 128][..], "inside: the picture");
     assert!(answers.answers.values().all(|a| a.image.as_ref().is_some_and(|i| i.starts_with(b"\x89PNG")) && a.edges == [0.45, 0.4, 0.55, 0.6]), "each frame's image and box");
-
+    // What Jev sees is the sketch's box: the crop's sides (outside the 70 px square box) are grey, its middle isn't.
+    let (w_px, h_px, px) = tt_track::icons::read_png(answers.answers[&608].image.as_ref().expect("image")).expect("a PNG");
+    let at = |x: u32, y: u32| &px[((y * w_px + x) * 4) as usize..((y * w_px + x) * 4 + 3) as usize];
+    assert_eq!((at(3, h_px / 2), at(w_px - 4, h_px / 2)), (&[128u8, 128, 128][..], &[128u8, 128, 128][..]), "outside the sketch's box: grey");
+    assert_ne!(at(w_px / 2, h_px / 2), &[128u8, 128, 128][..], "inside: the picture");
     let requests = seen.lock().unwrap().clone();
-    assert_eq!(requests.len(), 10, "one request a frame asked about");
     for s in &requests {
         assert_eq!(s.auth, "Bearer test-key-123");
         assert!(s.images_header, "the images header");
         assert_eq!(s.parts, ["request", "ex0", "ex1", "frame"], "frame {}", s.frame);
     }
-    let mut frames: Vec<i64> = requests.iter().map(|s| s.frame).collect();
-    frames.sort();
-    assert_eq!(frames, asked);
+    assert_eq!(tt_track::run_of(&core.world, op), TrackRun::Paused, "done: paused again");
 
-    let start = Instant::now();
-    while core.world.resource::<TrackJobs>().threads() > 0 {
-        assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    // Retry one frame: that frame alone is asked again.
-    let start = Instant::now();
-    while core.world.resource::<TrackJobs>().threads() > 0 {
-        assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let count = seen.lock().unwrap().len();
-    tt_track::job::jev::retry(&mut core.world, op, &[622]);
-    let start = Instant::now();
-    for _ in 0..3 {
-        core.run_pre_ui();
-    }
-    while !settled(&core.world, op) || seen.lock().unwrap().len() == count {
-        assert!(start.elapsed() < Duration::from_secs(60), "still asking");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let after: Vec<i64> = seen.lock().unwrap()[count..].iter().map(|s| s.frame).collect();
-    assert_eq!(after, [622], "frame 622 alone, asked again");
-    assert_eq!(core.world.get::<JevAnswers>(op).expect("answers").answers.len(), 10, "the others kept");
-
-    // Ask again: every frame again.
-    let count = seen.lock().unwrap().len();
-    tt_track::job::jev::ask(&mut core.world, op);
-    let start = Instant::now();
-    for _ in 0..3 {
-        core.run_pre_ui();
-    }
-    while !settled(&core.world, op) || seen.lock().unwrap().len() < count + 10 {
-        assert!(start.elapsed() < Duration::from_secs(60), "still asking again");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert_eq!(seen.lock().unwrap().len(), count + 10, "all 10 asked again");
-    assert_eq!(core.world.get::<JevAnswers>(op).expect("answers").answers.len(), 10);
-
-    // Filled: the frames between two answers (or a paint and an answer) on the line between them.
-    let count = seen.lock().unwrap().len();
-    core.world.get_mut::<Tracker>(op).expect("settings").jev.fill = true;
-    tt_track::job::jev::ask(&mut core.world, op);
-    let start = Instant::now();
-    for _ in 0..3 {
-        core.run_pre_ui();
-    }
-    while !settled(&core.world, op) || seen.lock().unwrap().len() < count + 10 {
-        assert!(start.elapsed() < Duration::from_secs(60), "still asking with fill");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let out_at = |w: &World, f: i64| {
-        let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
-        sig.get(f).map(|v| ([v[0] as f64, v[1] as f64], tt_track::flags(v), v[6])).expect("a result")
-    };
+    // Another range, before the first paint: asked there; the answers on 608–640 stay.
+    let n = seen.lock().unwrap().len();
+    tt_track::job::jev::ask(&mut core.world, op, 570, 599);
+    let before: Vec<i64> = (572..=596).step_by(4).collect();
+    until_asked(&mut core, op, &seen, n + before.len());
+    assert_eq!(asked_since(&seen, n), before, "572–596 only");
     let w = &core.world;
-    let (a, b, (m, flags, _)) = (out_at(w, 610).0, out_at(w, 614).0, out_at(w, 612));
-    assert!((m[0] - (a[0] + b[0]) / 2.0).abs() < 0.01 && (m[1] - (a[1] + b[1]) / 2.0).abs() < 0.01, "612: halfway between 610 and 614: {m:?}");
-    assert_eq!(flags, 0, "612: found, as both ends are");
-    assert_ne!(out_at(w, 616).1 & tt_track::LOST, 0, "616: next to 618, which Jev can't see: lost");
-    assert_eq!(out_at(w, 608).1 & tt_track::OFF, 0, "608: between the paint on 606 and 610, filled");
-    assert_ne!(out_at(w, 660).1 & tt_track::OFF, 0, "660: after the last answer, left out");
+    assert_eq!(w.get::<JevAnswers>(op).expect("answers").answers.len(), first.len() + before.len(), "the others kept");
+    assert_eq!(out_at(w, op, 608).1, 0, "608's answer still stands");
+    assert!((out_at(w, op, 584).0[0] - truth(584)[0]).abs() < 1.0, "584: asked (backward)");
+
+    // Retry one frame: that frame alone.
+    let n = seen.lock().unwrap().len();
+    tt_track::job::jev::retry(&mut core.world, op, &[620]);
+    until_asked(&mut core, op, &seen, n + 1);
+    assert_eq!(asked_since(&seen, n), [620], "620 alone, asked again");
+
+    // Filled: a setting (so everything asks again); the frames between two answers (or a paint and an answer) on the line between them.
+    let n = seen.lock().unwrap().len();
+    core.world.get_mut::<Tracker>(op).expect("settings").jev.fill = true;
+    tt_track::job::jev::ask(&mut core.world, op, 600, 660);
+    let after: Vec<i64> = (604..=660).step_by(4).collect();
+    until_asked(&mut core, op, &seen, n + after.len());
+    assert_eq!(asked_since(&seen, n), after, "604–660 only");
+    let w = &core.world;
+    let (a, b, (m, flags, _)) = (out_at(w, op, 616).0, out_at(w, op, 620).0, out_at(w, op, 618));
+    assert!((m[0] - (a[0] + b[0]) / 2.0).abs() < 0.01 && (m[1] - (a[1] + b[1]) / 2.0).abs() < 0.01, "618: halfway between 616 and 620: {m:?}");
+    assert_eq!(flags, 0, "618: found, as both ends are");
+    assert_ne!(out_at(w, op, 610).1 & tt_track::LOST, 0, "610: next to 612, which Jev can't see: lost");
+    assert_eq!(out_at(w, op, 602).1 & tt_track::OFF, 0, "602: between the paint on 600 and 604, filled");
+    assert_ne!(out_at(w, op, 590).1 & tt_track::OFF, 0, "590: not asked about since the setting changed: left out");
 
     // The least confidence: frames go lost and back as it moves, with no request.
-    let count = seen.lock().unwrap().len();
+    let n = seen.lock().unwrap().len();
     core.world.get_mut::<Tracker>(op).expect("settings").jev.min_confidence = 0.8;
     for _ in 0..10 {
         core.run_pre_ui();
     }
-    assert_ne!(out_at(&core.world, 610).1 & tt_track::LOST, 0, "610 (confidence 0.75): lost below 0.8");
+    assert_ne!(out_at(&core.world, op, 616).1 & tt_track::LOST, 0, "616 (confidence 0.75): lost below 0.8");
     core.world.get_mut::<Tracker>(op).expect("settings").jev.min_confidence = 0.5;
     for _ in 0..10 {
         core.run_pre_ui();
     }
-    assert_eq!(out_at(&core.world, 610).1, 0, "610: found again above 0.5");
-    assert_eq!(seen.lock().unwrap().len(), count, "moving it asked nothing");
+    assert_eq!(out_at(&core.world, op, 616).1, 0, "616: found again above 0.5");
+    assert_eq!(seen.lock().unwrap().len(), n, "moving it asked nothing");
 
-    // Done: paused again, so a new paint doesn't ask by itself.
-    assert_eq!(tt_track::run_of(&core.world, op), TrackRun::Paused);
-    let count = seen.lock().unwrap().len();
-    tt_track::add_look(&mut core.world, op, paint(608)).expect("a third paint");
+    // Paused: a new paint asks nothing by itself.
+    tt_track::add_look(&mut core.world, op, paint(630)).expect("a third paint");
     for _ in 0..50 {
         core.run_pre_ui();
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(seen.lock().unwrap().len(), count, "no request after a new paint");
-
-    let start = Instant::now();
-    while core.world.resource::<TrackJobs>().threads() > 0 {
-        assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
-        core.run_pre_ui();
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert_eq!(seen.lock().unwrap().len(), n, "no request after a new paint");
 }
-
 
 /// The real Jev on the sprite (`TT_JEV_LIVE=1`; the key from the Keychain or
 /// `TYPESAFE_API_KEY`; paid): painted on frames 600, 610 and 620, then asked
@@ -374,7 +347,7 @@ fn live_jev_on_the_sprite() {
         tt_track::add_look(&mut core.world, op, paint(610)).expect("paint");
         tt_track::add_look(&mut core.world, op, paint(620)).expect("paint");
         core.world.get_mut::<Tracker>(op).expect("settings").jev = JevSettings { every, frames, examples: style, ..JevSettings::default() };
-        tt_track::set_run(&mut core.world, op, TrackRun::Forward);
+        tt_track::job::jev::ask(&mut core.world, op, 621, 620 + (frames * every) as i64);
         let start = Instant::now();
         for _ in 0..3 {
             core.run_pre_ui();

@@ -39,6 +39,8 @@ struct Draft {
     /// The key as typed (never shown), and why saving it failed.
     key: String,
     key_error: Option<String>,
+    /// The range to ask about, as set here.
+    range: Option<(i64, i64)>,
 }
 
 /// Whether there is an API key, looked for at most every [`KEY_RECHECK`] s.
@@ -96,7 +98,7 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.label(egui::RichText::new("Jev (dev only, experimental)").strong());
     ui.label(
         egui::RichText::new(format!(
-            "TypeSafe's Jev ({}) is asked where the painted subject is, on every Nth frame after the last paint. It gets each paint and each frame as a crop that follows the sketch. Each frame is one request over the network.",
+            "TypeSafe's Jev ({}) is asked where the painted subject is, on every Nth frame counted from the first paint, in the range you ask about. It sees only the sketch's box. Each frame asked is one request over the network.",
             jev::MODEL
         ))
         .small()
@@ -125,32 +127,28 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.label(egui::RichText::new("Or add it in Terminal (security add-generic-password -U -s trackertools-typesafe -a api -w), or set TYPESAFE_API_KEY.").small().color(style::MUTED));
     }
 
-    // Its settings: edited here, applied with a button.
+    // What each answer depends on: edited here, applied with a button (the answers so far are then for the old settings).
     let mut s = d.settings.clone().unwrap_or_else(|| tracker.jev.clone());
     ui.horizontal_wrapped(|ui| {
         ui.label("Every");
-        ui.add(egui::DragValue::new(&mut s.every).range(1..=600).suffix(" frames"));
-        ui.label("\u{b7}");
-        ui.add(egui::DragValue::new(&mut s.frames).range(1..=500).suffix(" frames in all"));
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Examples:");
+        ui.add(egui::DragValue::new(&mut s.every).range(1..=600).suffix(" frames")).on_hover_text("The grid: every Nth frame, counted from the first paint, both ways");
+        ui.label("\u{b7} examples:");
         for (style, text, tip) in [
             (JevExamples::Tight, "tight", "Only around the painted area, scaled up (the default: the closest, and the cheapest)"),
-            (JevExamples::Dimmed, "rest darkened", "The paint's whole crop, what isn't painted darkened"),
+            (JevExamples::Dimmed, "darkened", "The paint's whole crop, what isn't painted darkened"),
             (JevExamples::Outlined, "outlined", "The paint's whole crop, the painted area outlined in magenta"),
         ] {
             ui.radio_value(&mut s.examples, style, text).on_hover_text(tip);
         }
     });
     ui.checkbox(&mut s.fill, "Fill between answers").on_hover_text("Frames between two answers (or a paint and an answer) on the straight line between them, lost if either is. Off: left out");
-    // (The least confidence applies at once, below: it asks nothing again.)
-    s.min_confidence = tracker.jev.min_confidence;
+    // (These apply at once, elsewhere: they ask nothing again.)
+    (s.min_confidence, s.frames, s.ask_from, s.ask_to) = (tracker.jev.min_confidence, tracker.jev.frames, tracker.jev.ask_from, tracker.jev.ask_to);
     let changed = s != tracker.jev;
     d.settings = changed.then(|| s.clone());
     if changed {
         ui.horizontal(|ui| {
-            if ui.button("Apply").on_hover_text("Its answers so far are for the old settings: Ask Jev asks again with these").clicked() {
+            if ui.button("Apply").on_hover_text("Its answers so far are for the old settings: ask again with these").clicked() {
                 tt_core::history::edit(world, "Edit Jev settings", |tx| tx.modify::<Tracker>(e, |t| t.jev = s.clone()));
                 d.settings = None;
             }
@@ -159,42 +157,87 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             }
         });
     }
-
     min_slider(ui, world, e, min);
 
-    // What it would ask about.
+    // Ask: a range, what it covers, and the button.
     let painted = paints(world, e);
-    let last = painted.iter().max().copied();
-    let s = &tracker.jev;
-    match last {
-        None => {
-            ui.label(egui::RichText::new("Track tool: brush over the subject on 3 to 5 frames first (each paint is an example).").color(style::MUTED));
-        }
-        Some(last) => {
-            let (first, end) = (last + s.every as i64, last + s.every as i64 * s.frames as i64);
-            ui.label(egui::RichText::new(format!("{} paints \u{b7} it asks about frames {first}\u{2013}{end}, every {} (as far as the sketch goes): {} requests", painted.len(), s.every, s.frames)).small());
-        }
-    }
-
-    // Ask, and what came back.
-    let ready = key && last.is_some() && !changed;
-    let why_not = if !key {
-        "Save the API key first"
-    } else if last.is_none() {
-        "Paint over the subject first"
-    } else {
-        "Apply or cancel the settings first"
-    };
     let got = answers(world, e);
-    ui.horizontal_wrapped(|ui| {
-        controls(ui, world, e, &got, ready, why_not);
-        if ui.button("\u{1F50D} Open the Jev viewer").on_hover_text("Every frame Jev was asked about, as it was sent, with Jev's box on it").clicked() {
-            open_viewer(ui.ctx(), e);
-        }
+    let (lo, hi) = span(world, e);
+    let here = world.resource::<Transport>().frame();
+    let (mut from, mut to) = d.range.unwrap_or_else(|| last_range(world, e));
+    egui::Frame::group(ui.style()).inner_margin(6.0).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Ask frames").strong());
+            ui.add(egui::DragValue::new(&mut from).range(lo..=hi));
+            ui.label("\u{2013}");
+            ui.add(egui::DragValue::new(&mut to).range(lo..=hi));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            if ui.small_button("Whole sketch").on_hover_text("Every frame the tracker can reach").clicked() {
+                (from, to) = (lo, hi);
+            }
+            let marks = tt_core::marks::marks(world);
+            if marks.is_set() {
+                let r = marks.frames(world.resource::<Transport>().frame_count);
+                if ui.small_button("In\u{2013}Out").on_hover_text(format!("The timeline's in and out points: {}\u{2013}{}", r.start, r.end - 1)).clicked() {
+                    (from, to) = (r.start.max(lo), (r.end - 1).min(hi));
+                }
+            }
+            if ui.small_button("From here").on_hover_text("From the playhead to the end of the sketch").clicked() {
+                (from, to) = (here.clamp(lo, hi), hi);
+            }
+            if ui.small_button("\u{b1}60 here").on_hover_text("60 frames either side of the playhead").clicked() {
+                (from, to) = ((here - 60).max(lo), (here + 60).min(hi));
+            }
+        });
+        let (a, b) = (from.min(to), from.max(to));
+        let first = painted.iter().min().copied();
+        let grid = first.map_or_else(Vec::new, |anchor| jev::grid(anchor, tracker.jev.every, &painted, a, b));
+        let n = grid.len().min(tracker.jev.frames as usize);
+        let per = if got.is_empty() { 2_000.0 } else { got.iter().map(|x| x.tokens as f64).sum::<f64>() / got.len() as f64 };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{} frames on the grid (every {}) \u{b7} about ${:.4}", grid.len(), tracker.jev.every, n as f64 * per * PRICE_PER_TOKEN)).small(),
+            );
+            ui.label(egui::RichText::new("\u{b7} at most").small());
+            let mut cap = tracker.jev.frames;
+            if ui.add(egui::DragValue::new(&mut cap).range(1..=2000).suffix(" an ask")).on_hover_text("A cap on the requests one ask sends (the frames nearest the first paint first)").changed() {
+                tt_core::history::edit(world, "Edit Jev's cap", |tx| tx.modify::<Tracker>(e, |t| t.jev.frames = cap));
+            }
+        });
+        let ready = key && first.is_some() && !changed && n > 0;
+        let why_not = if !key {
+            "Save the API key first"
+        } else if first.is_none() {
+            "Track tool: brush over the subject on 3 to 5 frames first (each paint is an example)"
+        } else if changed {
+            "Apply or cancel the settings first"
+        } else {
+            "No frame of the grid in that range"
+        };
+        ui.horizontal_wrapped(|ui| {
+            if busy(world, e) {
+                busy_row(ui, world, e, &got);
+            } else if ui
+                .add_enabled(ready, egui::Button::new(egui::RichText::new(format!("\u{25B6} Ask Jev about these {n} frames")).strong()))
+                .on_hover_text("Send the requests (paid): the grid's frames in the range, asked again if they were. Answers elsewhere stay. It pauses again when done")
+                .on_disabled_hover_text(why_not)
+                .clicked()
+            {
+                jev::ask(world, e, a, b);
+                open_viewer(ui.ctx(), e);
+            }
+            retry_buttons(ui, world, e, &got, key && !changed);
+        });
     });
+    d.range = Some((from, to));
+
+    if ui.button("\u{1F50D} Open the Jev viewer").on_hover_text("Every frame Jev was asked about, as it was sent, with Jev's box on it").clicked() {
+        open_viewer(ui.ctx(), e);
+    }
     if !got.is_empty() {
         ui.label(summary(&got, min));
-        let here = world.resource::<Transport>().frame();
         if let Some(a) = got.iter().find(|a| a.frame == here) {
             ui.label(egui::RichText::new(format!("This frame: {}", describe(a))).color(colour(a, min)));
         }
@@ -202,38 +245,66 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.ctx().data_mut(|m| m.insert_temp(id, d));
 }
 
-/// Ask / Ask again, Retry failed, Retry unsure, Stop.
-fn controls(ui: &mut egui::Ui, world: &mut World, e: Entity, got: &[Answer], ready: bool, why_not: &str) {
+/// The frames tracker `e` can reach (its sketch's), both included.
+fn span(world: &World, e: Entity) -> (i64, i64) {
+    world.get::<tt_core::span::Reach>(e).map_or((0, world.resource::<Transport>().frame_count.max(1) - 1), |r| (r.0, r.1))
+}
+
+/// The range it was last asked about, else its whole span.
+fn last_range(world: &World, e: Entity) -> (i64, i64) {
+    match world.get::<Tracker>(e).map(|t| (t.jev.ask_from, t.jev.ask_to)) {
+        Some((a, b)) if b >= a => (a, b),
+        _ => span(world, e),
+    }
+}
+
+/// Asking now: how far, and Stop.
+fn busy_row(ui: &mut egui::Ui, world: &mut World, e: Entity, got: &[Answer]) {
+    ui.spinner();
+    ui.label(format!("Asking Jev\u{2026} {} answered", got.len()));
+    if ui.button("Stop").on_hover_text("Requests already sent still finish (and are paid)").clicked() {
+        tt_track::set_run(world, e, TrackRun::Paused);
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+}
+
+/// Retry failed, Retry the lost (below the least confidence).
+fn retry_buttons(ui: &mut egui::Ui, world: &mut World, e: Entity, got: &[Answer], ready: bool) {
     if busy(world, e) {
-        ui.spinner();
-        ui.label(format!("Asking Jev\u{2026} {} answered", got.len()));
-        if ui.button("Stop").on_hover_text("Requests already sent still finish (and are paid)").clicked() {
-            tt_track::set_run(world, e, TrackRun::Paused);
-        }
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         return;
     }
-    let label = if got.is_empty() { "\u{25B6} Ask Jev" } else { "\u{21BB} Ask Jev again (every frame)" };
-    let tip = "Send the requests (paid). It pauses again when done: new paints or settings don't ask by themselves";
-    if ui.add_enabled(ready, egui::Button::new(egui::RichText::new(label).strong())).on_hover_text(tip).on_disabled_hover_text(why_not).clicked() {
-        jev::ask(world, e);
-        open_viewer(ui.ctx(), e);
-    }
     let failed: Vec<i64> = got.iter().filter(|a| a.error.is_some()).map(|a| a.frame).collect();
-    if !failed.is_empty() && ui.add_enabled(ready, egui::Button::new(format!("Retry failed ({})", failed.len()))).on_disabled_hover_text(why_not).clicked() {
+    if !failed.is_empty() && ui.add_enabled(ready, egui::Button::new(format!("Retry failed ({})", failed.len()))).clicked() {
         jev::retry(world, e, &failed);
     }
     let min = world.get::<Tracker>(e).map_or(0.0, |t| t.jev.min_confidence);
-    let unsure: Vec<i64> = got.iter().filter(|a| a.error.is_none() && a.confidence < min).map(|a| a.frame).collect();
-    if !unsure.is_empty()
+    let lost: Vec<i64> = got.iter().filter(|a| a.error.is_none() && a.confidence < min).map(|a| a.frame).collect();
+    if !lost.is_empty()
         && ui
-            .add_enabled(ready, egui::Button::new(format!("Retry the lost ({})", unsure.len())))
+            .add_enabled(ready, egui::Button::new(format!("Retry the lost ({})", lost.len())))
             .on_hover_text(format!("Ask again about the frames where the box's confidence is under {min:.2} (Lost below)"))
-            .on_disabled_hover_text(why_not)
             .clicked()
     {
-        jev::retry(world, e, &unsure);
+        jev::retry(world, e, &lost);
     }
+}
+
+/// The viewer's: Ask again (the last range), the retries, or how far it is.
+fn controls(ui: &mut egui::Ui, world: &mut World, e: Entity, got: &[Answer], ready: bool, why_not: &str) {
+    if busy(world, e) {
+        busy_row(ui, world, e, got);
+        return;
+    }
+    let (a, b) = last_range(world, e);
+    if ui
+        .add_enabled(ready, egui::Button::new(egui::RichText::new(format!("\u{21BB} Ask again: frames {a}\u{2013}{b}")).strong()))
+        .on_hover_text("The range last asked about, again (paid). Another range: the tracker's Inspector")
+        .on_disabled_hover_text(why_not)
+        .clicked()
+    {
+        jev::ask(world, e, a, b);
+    }
+    retry_buttons(ui, world, e, got, ready);
 }
 
 /// The answers in a line: how many, sure, times, cost.

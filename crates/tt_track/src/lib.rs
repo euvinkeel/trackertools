@@ -307,10 +307,19 @@ pub struct Tracker {
 /// A Jev tracker's settings (`Method::Jev`, `job::jev`).
 #[derive(Reflect, Clone, Debug, PartialEq)]
 pub struct JevSettings {
-    /// Ask about every this many frames after the last paint…
+    /// Jev is asked about every this many frames, counted from the first
+    /// paint (the anchor) both ways, paints' frames left out: the grid.
     pub every: u32,
-    /// …this many frames in all.
+    /// At most this many requests an ask (the grid frames nearest the anchor first).
     pub frames: u32,
+    /// The frames the next ask covers (both included): the grid's frames
+    /// there are asked about, the rest are left as they are. `ask_to <
+    /// ask_from`: all of them. Not part of what results depend on: asking
+    /// another range keeps the answers elsewhere.
+    #[reflect(default)]
+    pub ask_from: FrameIndex,
+    #[reflect(default = "no_frame")]
+    pub ask_to: FrameIndex,
     /// How each paint is shown to Jev as an example.
     pub examples: JevExamples,
     /// Frames between two answers (or a paint and an answer) on the
@@ -327,9 +336,13 @@ fn jev_min_confidence() -> f32 {
     0.2
 }
 
+fn no_frame() -> FrameIndex {
+    -1
+}
+
 impl Default for JevSettings {
     fn default() -> Self {
-        Self { every: 5, frames: 60, examples: JevExamples::Tight, fill: true, min_confidence: jev_min_confidence() }
+        Self { every: 5, frames: 200, ask_from: 0, ask_to: no_frame(), examples: JevExamples::Tight, fill: true, min_confidence: jev_min_confidence() }
     }
 }
 

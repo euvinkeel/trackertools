@@ -9,9 +9,11 @@
 //!   crop that follows the guide as CoTracker's, [`CROP_W`] × [`CROP_H`]), the
 //!   subject shown as the tracker's [`JevExamples`] says: the rest darkened,
 //!   the painted area outlined, or only around it (scaled up).
-//! - **Frames asked about:** every `every`th frame after the last paint,
-//!   `frames` of them (forward only), each the same crop. Full frames are
-//!   never sent.
+//! - **Frames asked about:** the grid, every `every`th frame counted from
+//!   the first paint (the anchor), both ways over the sketch, paints' frames
+//!   left out; an ask covers the grid's frames in its range (`ask_from`,
+//!   `ask_to`; [`ask`]) and at most `frames` of them. Each the same crop
+//!   (full frames are never sent).
 //! - **Inside the sketch only:** the crop fits the sketch's box (× its
 //!   search) on the frames asked about ([`BOX_MARGIN`]), and what is outside
 //!   the box on each frame is grey, in the examples too: Jev can't box a
@@ -107,11 +109,16 @@ impl Worker {
         let (from, to, side) = (self.spec.from, self.spec.to, self.spec.side);
         let settings = self.spec.jev.clone();
         let paints: Vec<LookSpec> = self.spec.looks.iter().filter(|l| l.mask.is_some()).cloned().collect();
-        let samples: Vec<FrameIndex> = match (side, paints.iter().map(|l| l.frame).max()) {
-            (Side::Forward, Some(last)) => (1..=settings.frames.max(1) as FrameIndex).map(|i| last + i * settings.every.max(1) as FrameIndex).filter(|f| (from..=to).contains(f)).collect(),
-            _ => Vec::new(),
-        };
         let dir: FrameIndex = if side == Side::Forward { 1 } else { -1 };
+        // The grid (every Nth frame from the anchor, paints' frames left out) in this job's frames and the range asked, nearest the anchor first.
+        let anchor = self.spec.anchor;
+        let window = |f: &FrameIndex| settings.ask_to < settings.ask_from || (settings.ask_from..=settings.ask_to).contains(f);
+        let painted: Vec<FrameIndex> = paints.iter().map(|l| l.frame).collect();
+        let mut samples: Vec<FrameIndex> = if paints.is_empty() { Vec::new() } else { grid(anchor, settings.every, &painted, from, to).into_iter().filter(window).collect() };
+        if side == Side::Backward {
+            samples.reverse();
+        }
+        samples.truncate(settings.frames.max(1) as usize);
         let mut next = from;
         // (Resuming after `from`: the paint before it, if any, is where filling starts from.)
         let mut fill = Fill { on: settings.fill, prev: None };
@@ -139,7 +146,7 @@ impl Worker {
             let (w, h, px) = example(&rgb, grid, self.map(l.frame), l, settings.examples);
             examples.push(png(&px, w, h)?);
         }
-        tracing::info!("{}: Jev asked about {} frames (every {} after frame {}), {} examples ({:?})", self.spec.label, samples.len(), settings.every, samples[0] - settings.every as FrameIndex, examples.len(), settings.examples);
+        tracing::info!("{}: Jev asked about {} frames ({}\u{2013}{}, every {} from frame {anchor}), {} examples ({:?})", self.spec.label, samples.len(), samples[0], samples[samples.len() - 1], settings.every, examples.len(), settings.examples);
         let _ = self.tx.send(super::Msg::JevExamples(examples.iter().map(|e| std::sync::Arc::new(e.clone())).collect()));
         let examples = std::sync::Arc::new(examples);
 
@@ -150,11 +157,16 @@ impl Worker {
             if !self.wait_for(f, || stream = None) {
                 return Ok(());
             }
-            if stream.is_none() {
-                held = None;
-                stream = Some(tt_media::FrameStream::start(&self.spec.video, self.presented(f), &self.spec.decode)?);
+            // Forward: one stream read in order. Backward: each frame on its own (they are few).
+            if side == Side::Backward {
+                buf = self.decode_one(f)?;
+            } else {
+                if stream.is_none() {
+                    held = None;
+                    stream = Some(tt_media::FrameStream::start(&self.spec.video, self.presented(f), &self.spec.decode)?);
+                }
+                self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
             }
-            self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
             let (grid, mut rgb) = self.crop(&buf, f, scale);
             self.grey_outside(&mut rgb, grid, f);
             let image = std::sync::Arc::new(png(&rgb, CROP_W, CROP_H)?);
@@ -301,22 +313,36 @@ struct Fill {
 
 // ------------------------------------------------------------ asking
 
-/// Ask Jev about every frame tracker `t` asks about, again (paid): its
-/// answers so far go, and it runs forward until done (then pauses again).
-pub fn ask(world: &mut bevy_ecs::world::World, t: bevy_ecs::entity::Entity) {
-    let frames = tt_core::op::extent(world);
-    crate::runner::redo(world, t, &[frames]);
+/// Ask Jev about the grid's frames from `first` to `last` (both included)
+/// of tracker `t`, again if it was (paid): its answers there go, those
+/// elsewhere stay. It runs both ways until done, then pauses again.
+pub fn ask(world: &mut bevy_ecs::world::World, t: bevy_ecs::entity::Entity, first: FrameIndex, last: FrameIndex) {
+    let (first, last) = (first.min(last), first.max(last));
+    let Some(mut tracker) = world.get_mut::<crate::Tracker>(t) else { return };
+    (tracker.jev.ask_from, tracker.jev.ask_to) = (first, last);
     if let Some(mut a) = world.get_mut::<crate::runner::JevAnswers>(t) {
-        a.answers.clear();
+        a.answers.retain(|f, _| !(first..=last).contains(f));
     }
-    crate::set_run(world, t, crate::TrackRun::Forward);
+    crate::runner::redo(world, t, std::slice::from_ref(&(first..last + 1)));
+    crate::set_run(world, t, crate::TrackRun::Both);
 }
 
 /// Ask Jev again about these of tracker `t`'s frames only (paid); the
 /// other answers stay.
 pub fn retry(world: &mut bevy_ecs::world::World, t: bevy_ecs::entity::Entity, frames: &[FrameIndex]) {
+    let (Some(first), Some(last)) = (frames.iter().min(), frames.iter().max()) else { return };
+    if let Some(mut tracker) = world.get_mut::<crate::Tracker>(t) {
+        (tracker.jev.ask_from, tracker.jev.ask_to) = (*first, *last);
+    }
     crate::runner::redo(world, t, &frames.iter().map(|f| *f..*f + 1).collect::<Vec<_>>());
-    crate::set_run(world, t, crate::TrackRun::Forward);
+    crate::set_run(world, t, crate::TrackRun::Both);
+}
+
+/// The grid's frames (see the module docs) from `first` to `last` of a
+/// tracker anchored on `anchor` with paints on `paints`: what an ask there covers.
+pub fn grid(anchor: FrameIndex, every: u32, paints: &[FrameIndex], first: FrameIndex, last: FrameIndex) -> Vec<FrameIndex> {
+    let every = every.max(1) as FrameIndex;
+    (first.min(last)..=first.max(last)).filter(|f| (f - anchor).rem_euclid(every) == 0 && !paints.contains(f)).collect()
 }
 
 // ------------------------------------------------------------ the examples

@@ -1011,6 +1011,10 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> Waiting {
         let label = world.get::<Name>(op).map_or_else(|| format!("tracker {op}"), |n| format!("{n} ({op})"));
         let mut spec = job_spec(&plan, side, from, to, resume, footage, label);
         spec.paint_resume = paint_resume;
+        // A Jev tracker's range to ask and its cap as they are now (they aren't part of the plan: changing them keeps its results).
+        if let Some(t) = world.get::<Tracker>(op).filter(|t| t.method == Method::Jev) {
+            (spec.jev.ask_from, spec.jev.ask_to, spec.jev.frames) = (t.jev.ask_from, t.jev.ask_to, t.jev.frames);
+        }
         specs.push((now, spec));
     }
     specs.sort_by_key(|(now, _)| !*now);
@@ -1337,8 +1341,8 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     }
     // (A Jev tracker's own settings: new answers are asked for, and paid, only when they change.)
     if p.method == Method::Jev {
+        // (Not `frames` or the range to ask: they say what an ask covers, not what an answer is.)
         put(p.jev.every as f64);
-        put(p.jev.frames as f64);
         put(p.jev.examples as u8 as f64);
         put(p.jev.fill as u8 as f64);
     }
