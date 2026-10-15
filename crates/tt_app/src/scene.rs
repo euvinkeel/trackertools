@@ -331,6 +331,13 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         if let Some(t) = jev {
             tt_track::add_look(world, t, paint(610));
             tt_track::add_look(world, t, paint(620));
+            // `TT_SCENE_JEV_ASK=1`: and asked (paid): 30 frames, every 5, tight examples.
+            if std::env::var_os("TT_SCENE_JEV_ASK").is_some() {
+                edit(world, "Scene: Jev settings", |tx| {
+                    tx.modify::<tt_track::Tracker>(t, |p| p.jev = tt_track::JevSettings { every: 5, frames: 30, examples: tt_track::JevExamples::Tight })
+                });
+                tt_track::set_run(world, t, TrackRun::Forward);
+            }
         }
         world.resource_mut::<NewTrackers>().method = Method::Template;
     }
@@ -374,7 +381,7 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
     }
     if let Some(t) = jev {
         world.resource_mut::<tt_core::selection::Selection>().select_only(t);
-        world.resource_mut::<tt_core::transport::Transport>().seek(620);
+        world.resource_mut::<tt_core::transport::Transport>().seek(if std::env::var_os("TT_SCENE_JEV_ASK").is_some() { 645 } else { 620 });
         return subject;
     }
     if let Some(t) = cursor.or(painted).or(loose) {

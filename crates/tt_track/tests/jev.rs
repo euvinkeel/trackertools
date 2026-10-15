@@ -47,6 +47,14 @@ fn truth(f: i64) -> [f64; 2] {
     p.map(|v| 2.0 * (v.floor() / 2.0).floor() + 10.5)
 }
 
+/// The guide's point on frame `f`: the sprite, or (`TT_JEV_ROUGH=<px>`, the
+/// live test) up to that far off it, as a rough sketch is.
+fn rough(f: i64) -> [f64; 2] {
+    let r: f64 = std::env::var("TT_JEV_ROUGH").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let t = truth(f);
+    [t[0] + r * (f as f64 / 23.0).sin(), t[1] + r * (f as f64 / 31.0).cos()]
+}
+
 /// One request as the fake saw it.
 #[derive(Debug, Clone)]
 struct Seen {
@@ -135,7 +143,7 @@ fn setup() -> Option<(Core, Entity)> {
         let mut store = w.resource_mut::<SignalStore>();
         let s = store.get_mut(sig).expect("created");
         for f in 0..1200 {
-            let c = truth(f);
+            let c = rough(f);
             s.set(f, &[c[0], c[1], c[0] - 35.0, c[1] - 35.0, c[0] + 35.0, c[1] + 35.0].map(|v| v as f32));
         }
     }
@@ -239,5 +247,107 @@ fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
         assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
         core.run_pre_ui();
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+
+/// The real Jev on the sprite (`TT_JEV_LIVE=1`; the key from the Keychain or
+/// `TYPESAFE_API_KEY`; paid): painted on frames 600, 610 and 620, then asked
+/// about `TT_JEV_FRAMES` frames (30) every `TT_JEV_EVERY` (5), for each
+/// example style in `TT_JEV_STYLES` (dimmed,outlined,tight). Prints, per
+/// style, the box centres' distance from the sprite (px), what Jev said it
+/// sees, times and tokens; `TT_JEV_OUT=<file>` writes every answer as JSON.
+#[test]
+#[ignore]
+fn live_jev_on_the_sprite() {
+    if std::env::var_os("TT_JEV_LIVE").is_none() {
+        eprintln!("skipped: TT_JEV_LIVE is not set (this sends paid requests)");
+        return;
+    }
+    let num = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (frames, every) = (num("TT_JEV_FRAMES", 30), num("TT_JEV_EVERY", 5));
+    let styles: Vec<tt_track::JevExamples> = std::env::var("TT_JEV_STYLES")
+        .unwrap_or_else(|_| "dimmed,outlined,tight".into())
+        .split(',')
+        .map(|s| match s.trim() {
+            "outlined" => tt_track::JevExamples::Outlined,
+            "tight" => tt_track::JevExamples::Tight,
+            _ => tt_track::JevExamples::Dimmed,
+        })
+        .collect();
+    let mut all = Vec::new();
+    for style in styles {
+        let Some((mut core, guide)) = setup() else { return };
+        let paint = |f: i64| {
+            let at = truth(f);
+            let (c, h, mask) = tt_track::tool::paint_look(&[[at[0] - 6.0, at[1] - 6.0], [at[0] + 6.0, at[1] + 6.0], [at[0] + 6.0, at[1] - 6.0], [at[0] - 6.0, at[1] + 6.0]], 9.0);
+            let mut look = Look::new(f, c, h);
+            look.mask = mask;
+            look
+        };
+        let op = tt_track::add_tracker_with_look(&mut core.world, guide, paint(600)).expect("tracker");
+        set_span(&mut core.world, op, Span::new(600, 620 + (frames * every) as i64));
+        tt_track::add_look(&mut core.world, op, paint(610)).expect("paint");
+        tt_track::add_look(&mut core.world, op, paint(620)).expect("paint");
+        core.world.get_mut::<Tracker>(op).expect("settings").jev = JevSettings { every, frames, examples: style };
+        tt_track::set_run(&mut core.world, op, TrackRun::Forward);
+        let start = Instant::now();
+        for _ in 0..3 {
+            core.run_pre_ui();
+        }
+        while !settled(&core.world, op) {
+            assert!(start.elapsed() < Duration::from_secs(900), "still asking");
+            core.run_pre_ui();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let wall = start.elapsed().as_secs_f64();
+        let w = &core.world;
+        if let Some(e) = w.get::<OpError>(op) {
+            panic!("{style:?}: {}", e.0);
+        }
+        let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+        let answers = w.get::<JevAnswers>(op).cloned().unwrap_or_default();
+        let (mut d, mut middle): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let (mut tokens, mut ms, mut failed, mut not_seen) = (0u64, Vec::new(), 0, 0);
+        for (f, a) in &answers.0 {
+            tokens += a.tokens;
+            if a.error.is_some() {
+                failed += 1;
+                eprintln!("  {f}: failed: {}", a.error.as_deref().unwrap_or_default());
+                continue;
+            }
+            ms.push(a.ms);
+            let v = sig.get(*f).expect("a result");
+            let dist = (v[0] as f64 - truth(*f)[0]).hypot(v[1] as f64 - truth(*f)[1]);
+            let (bw, bh) = (v[4] - v[2], v[5] - v[3]);
+            if a.visible < 0.5 || a.view == "not_in_view" {
+                not_seen += 1;
+            }
+            d.push(dist);
+            middle.push((rough(*f)[0] - truth(*f)[0]).hypot(rough(*f)[1] - truth(*f)[1]));
+            eprintln!("  {f}: off by {dist:6.1} px · box {bw:4.0}x{bh:<4.0} · conf {:.2} · seen {:.2} · {} · {} ms · {} tok", a.confidence, a.visible, a.view, a.ms, a.tokens);
+            all.push(serde_json::json!({ "style": format!("{style:?}"), "frame": f, "error_px": dist, "box": [v[2], v[3], v[4], v[5]], "truth": truth(*f), "confidence": a.confidence, "visible": a.visible, "view": a.view, "ms": a.ms, "tokens": a.tokens }));
+        }
+        d.sort_by(f64::total_cmp);
+        middle.sort_by(f64::total_cmp);
+        ms.sort_unstable();
+        let q = |v: &[f64], p: f64| v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
+        eprintln!(
+            "{style:?}: {} answered ({failed} failed) in {wall:.0} s · off by median {:.1} px, 90% {:.1}, max {:.1} (guessing the crop's middle: median {:.1}, max {:.1}) · within 10 px {}/{} · said not seen {not_seen} · {} ms median · {tokens} tokens (${:.5})",
+            answers.0.len(),
+            q(&d, 0.5),
+            q(&d, 0.9),
+            q(&d, 1.0),
+            q(&middle, 0.5),
+            q(&middle, 1.0),
+            d.iter().filter(|x| **x <= 10.0).count(),
+            d.len(),
+            ms.get(ms.len() / 2).copied().unwrap_or(0),
+            tokens as f64 * 0.042e-6
+        );
+        drop(core);
+    }
+    if let Some(out) = std::env::var_os("TT_JEV_OUT") {
+        std::fs::write(out, serde_json::to_string_pretty(&all).expect("json")).expect("written");
     }
 }
