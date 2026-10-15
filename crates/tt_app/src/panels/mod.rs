@@ -44,6 +44,7 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
     crate::update::prompt(ui.ctx(), world);
     layer_export::ui(ui.ctx(), world);
     crate::setup::window(ui.ctx(), &mut world.resource_mut::<crate::setup::Doctor>());
+    jev::viewer(ui.ctx(), world);
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
 }

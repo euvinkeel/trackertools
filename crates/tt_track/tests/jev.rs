@@ -212,9 +212,11 @@ fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
     assert!(flags == 0 && score == 1.0 && (p[0] - truth(606)[0]).abs() < 6.0, "a paint's frame shows the paint: {p:?}");
 
     let answers = w.get::<JevAnswers>(op).expect("Jev's answers");
-    assert_eq!(answers.0.keys().copied().collect::<Vec<_>>(), asked);
-    assert!(answers.0.values().all(|a| a.tokens == 999 && a.error.is_none() && a.view_p.len() == 3));
-    assert_eq!(answers.0[&618].view, "not_in_view");
+    assert_eq!(answers.answers.keys().copied().collect::<Vec<_>>(), asked);
+    assert!(answers.answers.values().all(|a| a.tokens == 999 && a.error.is_none() && a.view_p.len() == 3));
+    assert_eq!(answers.answers[&618].view, "not_in_view");
+    assert_eq!(answers.examples.len(), 2, "the examples it sent, one per paint");
+    assert!(answers.answers.values().all(|a| a.image.as_ref().is_some_and(|i| i.starts_with(b"\x89PNG")) && a.edges == [0.45, 0.4, 0.55, 0.6]), "each frame's image and box");
 
     let requests = seen.lock().unwrap().clone();
     assert_eq!(requests.len(), 10, "one request a frame asked about");
@@ -233,6 +235,43 @@ fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
         core.run_pre_ui();
         std::thread::sleep(Duration::from_millis(5));
     }
+    // Retry one frame: that frame alone is asked again.
+    let start = Instant::now();
+    while core.world.resource::<TrackJobs>().threads() > 0 {
+        assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let count = seen.lock().unwrap().len();
+    tt_track::job::jev::retry(&mut core.world, op, &[622]);
+    let start = Instant::now();
+    for _ in 0..3 {
+        core.run_pre_ui();
+    }
+    while !settled(&core.world, op) || seen.lock().unwrap().len() == count {
+        assert!(start.elapsed() < Duration::from_secs(60), "still asking");
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let after: Vec<i64> = seen.lock().unwrap()[count..].iter().map(|s| s.frame).collect();
+    assert_eq!(after, [622], "frame 622 alone, asked again");
+    assert_eq!(core.world.get::<JevAnswers>(op).expect("answers").answers.len(), 10, "the others kept");
+
+    // Ask again: every frame again.
+    let count = seen.lock().unwrap().len();
+    tt_track::job::jev::ask(&mut core.world, op);
+    let start = Instant::now();
+    for _ in 0..3 {
+        core.run_pre_ui();
+    }
+    while !settled(&core.world, op) || seen.lock().unwrap().len() < count + 10 {
+        assert!(start.elapsed() < Duration::from_secs(60), "still asking again");
+        core.run_pre_ui();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(seen.lock().unwrap().len(), count + 10, "all 10 asked again");
+    assert_eq!(core.world.get::<JevAnswers>(op).expect("answers").answers.len(), 10);
+
     // Done: paused again, so a new paint doesn't ask by itself.
     assert_eq!(tt_track::run_of(&core.world, op), TrackRun::Paused);
     let count = seen.lock().unwrap().len();
@@ -242,6 +281,7 @@ fn a_jev_tracker_asks_about_every_nth_frame_after_its_paints() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(seen.lock().unwrap().len(), count, "no request after a new paint");
+
     let start = Instant::now();
     while core.world.resource::<TrackJobs>().threads() > 0 {
         assert!(start.elapsed() < Duration::from_secs(20), "job threads still alive");
@@ -309,7 +349,7 @@ fn live_jev_on_the_sprite() {
         let answers = w.get::<JevAnswers>(op).cloned().unwrap_or_default();
         let (mut d, mut middle): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         let (mut tokens, mut ms, mut failed, mut not_seen) = (0u64, Vec::new(), 0, 0);
-        for (f, a) in &answers.0 {
+        for (f, a) in &answers.answers {
             tokens += a.tokens;
             if a.error.is_some() {
                 failed += 1;
@@ -334,7 +374,7 @@ fn live_jev_on_the_sprite() {
         let q = |v: &[f64], p: f64| v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
         eprintln!(
             "{style:?}: {} answered ({failed} failed) in {wall:.0} s · off by median {:.1} px, 90% {:.1}, max {:.1} (guessing the crop's middle: median {:.1}, max {:.1}) · within 10 px {}/{} · said not seen {not_seen} · {} ms median · {tokens} tokens (${:.5})",
-            answers.0.len(),
+            answers.answers.len(),
             q(&d, 0.5),
             q(&d, 0.9),
             q(&d, 1.0),

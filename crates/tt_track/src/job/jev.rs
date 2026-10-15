@@ -77,7 +77,14 @@ pub struct Answer {
     pub ms: u32,
     /// The request failed: why (the frame is lost).
     pub error: Option<String>,
+    /// The box as Jev gave it: `[left, top, right, bottom]`, fractions of the image.
+    pub edges: [f32; 4],
+    /// The image Jev was asked about (the crop, PNG), to show with the box.
+    pub image: Option<std::sync::Arc<Vec<u8>>>,
 }
+
+/// A request in flight: its answers, and the image it asked about.
+type Asked = JoinHandle<(Result<Reply>, std::sync::Arc<Vec<u8>>)>;
 
 /// A request's answers as read: the box (fractions of the image), and the rest.
 struct Reply {
@@ -119,11 +126,12 @@ impl Worker {
             examples.push(png(&px, w, h)?);
         }
         tracing::info!("{}: Jev asked about {} frames (every {} after frame {}), {} examples ({:?})", self.spec.label, samples.len(), settings.every, samples[0] - settings.every as FrameIndex, examples.len(), settings.examples);
+        let _ = self.tx.send(super::Msg::JevExamples(examples.iter().map(|e| std::sync::Arc::new(e.clone())).collect()));
         let examples = std::sync::Arc::new(examples);
 
         let mut stream: Option<tt_media::FrameStream> = None;
         let (mut held, mut buf) = (None, Vec::new());
-        let mut pending: VecDeque<(FrameIndex, Grid, JoinHandle<Result<Reply>>)> = VecDeque::new();
+        let mut pending: VecDeque<(FrameIndex, Grid, Asked)> = VecDeque::new();
         for &f in &samples {
             if !self.wait_for(f, || stream = None) {
                 return Ok(());
@@ -134,9 +142,9 @@ impl Worker {
             }
             self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
             let (grid, rgb) = self.crop(&buf, f, scale);
-            let image = png(&rgb, CROP_W, CROP_H)?;
+            let image = std::sync::Arc::new(png(&rgb, CROP_W, CROP_H)?);
             let (url, key, examples, style) = (url.clone(), key.clone(), examples.clone(), settings.examples);
-            pending.push_back((f, grid, std::thread::spawn(move || ask(&url, &key, &examples, &image, style, f))));
+            pending.push_back((f, grid, std::thread::spawn(move || (request_frame(&url, &key, &examples, &image, style, f), image))));
             while pending.len() >= IN_FLIGHT {
                 let (f, grid, h) = pending.pop_front().expect("one");
                 self.jev_answered(f, grid, h, &mut next, &paints)?;
@@ -153,11 +161,13 @@ impl Worker {
     }
 
     /// Frame `f`'s answer is in: the frames before it left out, then it.
-    fn jev_answered(&mut self, f: FrameIndex, grid: Grid, h: JoinHandle<Result<Reply>>, next: &mut FrameIndex, paints: &[LookSpec]) -> Result<()> {
-        let reply = h.join().map_err(|_| anyhow!("the request for frame {f} stopped on an error"))?;
+    fn jev_answered(&mut self, f: FrameIndex, grid: Grid, h: Asked, next: &mut FrameIndex, paints: &[LookSpec]) -> Result<()> {
+        let (reply, image) = h.join().map_err(|_| anyhow!("the request for frame {f} stopped on an error"))?;
         self.jev_skip_to(f, next, paints);
         let answer = match reply {
-            Ok(Reply { edges: [left, top, right, bottom], answer }) => {
+            Ok(Reply { edges: [left, top, right, bottom], mut answer }) => {
+                answer.edges = [left, top, right, bottom].map(|v| v as f32);
+                answer.image = Some(image);
                 let map = *self.map(f);
                 let corner = |x: f64, y: f64| map.to_source(grid.to_view([x * CROP_W as f64, y * CROP_H as f64]));
                 let (a, b) = (corner(left, top), corner(right, bottom));
@@ -175,7 +185,7 @@ impl Worker {
                 tracing::warn!("{}: Jev on frame {f}: {e}", self.spec.label);
                 let g = self.guide(f);
                 self.out.push((f, [g[0], g[1], g[0] - 8.0, g[1] - 8.0, g[0] + 8.0, g[1] + 8.0, 0.0, LOST as f64].map(|v| v as f32)));
-                Answer { frame: f, error: Some(e), ..Answer::default() }
+                Answer { frame: f, error: Some(e), image: Some(image), ..Answer::default() }
             }
         };
         let _ = self.tx.send(super::Msg::Jev(vec![answer]));
@@ -206,6 +216,26 @@ impl Worker {
         }
         self.flush();
     }
+}
+
+// ------------------------------------------------------------ asking
+
+/// Ask Jev about every frame tracker `t` asks about, again (paid): its
+/// answers so far go, and it runs forward until done (then pauses again).
+pub fn ask(world: &mut bevy_ecs::world::World, t: bevy_ecs::entity::Entity) {
+    let frames = tt_core::op::extent(world);
+    crate::runner::redo(world, t, &[frames]);
+    if let Some(mut a) = world.get_mut::<crate::runner::JevAnswers>(t) {
+        a.answers.clear();
+    }
+    crate::set_run(world, t, crate::TrackRun::Forward);
+}
+
+/// Ask Jev again about these of tracker `t`'s frames only (paid); the
+/// other answers stay.
+pub fn retry(world: &mut bevy_ecs::world::World, t: bevy_ecs::entity::Entity, frames: &[FrameIndex]) {
+    crate::runner::redo(world, t, &frames.iter().map(|f| *f..*f + 1).collect::<Vec<_>>());
+    crate::set_run(world, t, crate::TrackRun::Forward);
 }
 
 // ------------------------------------------------------------ the examples
@@ -362,7 +392,7 @@ fn request(n_examples: usize, style: JevExamples, nonce: &str) -> serde_json::Va
 }
 
 /// Ask Jev about frame `f` (its crop as a PNG), with the examples.
-fn ask(url: &str, key: &str, examples: &[Vec<u8>], frame: &[u8], style: JevExamples, f: FrameIndex) -> Result<Reply> {
+fn request_frame(url: &str, key: &str, examples: &[Vec<u8>], frame: &[u8], style: JevExamples, f: FrameIndex) -> Result<Reply> {
     static N: AtomicU64 = AtomicU64::new(0);
     let nonce = format!("{}-{}-{}", std::process::id(), f, N.fetch_add(1, Ordering::Relaxed));
     let dir = std::env::temp_dir().join(format!("tt-jev-{nonce}"));

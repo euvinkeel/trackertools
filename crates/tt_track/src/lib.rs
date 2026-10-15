@@ -317,7 +317,7 @@ pub struct JevSettings {
 
 impl Default for JevSettings {
     fn default() -> Self {
-        Self { every: 5, frames: 60, examples: JevExamples::Dimmed }
+        Self { every: 5, frames: 60, examples: JevExamples::Tight }
     }
 }
 
@@ -326,11 +326,13 @@ impl Default for JevSettings {
 #[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum JevExamples {
     /// The whole crop, what isn't painted darkened.
-    #[default]
     Dimmed,
     /// The whole crop, the painted area outlined.
     Outlined,
-    /// Only around the painted area (scaled up).
+    /// Only around the painted area (scaled up). The default: on the sprite
+    /// with a rough sketch, the closest (median 5 px against 9 and 15) and
+    /// the cheapest (a third fewer tokens).
+    #[default]
     Tight,
 }
 

@@ -265,6 +265,8 @@ pub enum Msg {
     IconFit(crate::icons::IconFit),
     /// What Jev answered on these frames (`jev`).
     Jev(Vec<jev::Answer>),
+    /// The examples a Jev job sends (PNGs, one per paint), for the app to show.
+    JevExamples(Vec<Arc<Vec<u8>>>),
     Finished,
     Failed(String),
 }

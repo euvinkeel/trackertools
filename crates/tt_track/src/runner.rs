@@ -111,10 +111,15 @@ pub struct PaintStates(pub std::collections::BTreeMap<FrameIndex, Arc<crate::job
 #[derive(Component, Debug, Clone, Default)]
 pub struct PaintPoints(pub std::collections::BTreeMap<FrameIndex, Vec<PointMark>>);
 
-/// What Jev answered on each frame it was asked about (`job::jev`), for the
-/// app to show. Not saved: the frames' boxes are (the tracker's output).
+/// What Jev answered on each frame it was asked about (`job::jev`), and the
+/// examples it was given, for the app to show. Not saved: the frames' boxes
+/// are (the tracker's output).
 #[derive(Component, Debug, Clone, Default)]
-pub struct JevAnswers(pub std::collections::BTreeMap<FrameIndex, crate::job::jev::Answer>);
+pub struct JevAnswers {
+    pub answers: std::collections::BTreeMap<FrameIndex, crate::job::jev::Answer>,
+    /// The examples (PNGs), as the last job sent them.
+    pub examples: Vec<Arc<Vec<u8>>>,
+}
 
 /// What a cursor tracker learned from its paints (`job::cursor`), for the
 /// app to show: learned in the background as soon as its paints change,
@@ -740,8 +745,15 @@ fn drain(world: &mut World, op: Entity) {
                 }
                 let mut kept = e.get_mut::<JevAnswers>().expect("inserted");
                 for a in answers {
-                    kept.0.insert(a.frame, a);
+                    kept.answers.insert(a.frame, a);
                 }
+            }
+            Msg::JevExamples(examples) => {
+                let mut e = world.entity_mut(op);
+                if e.get::<JevAnswers>().is_none() {
+                    e.insert(JevAnswers::default());
+                }
+                e.get_mut::<JevAnswers>().expect("inserted").examples = examples;
             }
             Msg::CursorShapes(learned) => {
                 let key = world.resource::<TrackJobs>().basis.get(&op).map_or(0, |b| cursor_key(&b.plan));
@@ -876,6 +888,31 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
         states.0.retain(|f, _| done.contains(*f));
     }
     world.resource_mut::<TrackJobs>().basis.insert(op, Basis { plan, done, failed: false, unsettled: true });
+}
+
+/// Track `frames` of tracker `op` again although nothing it depends on
+/// changed (a Jev tracker asked again: its answers vary): they are no
+/// longer done, and stale until replaced. Its run state says when.
+pub fn redo(world: &mut World, op: Entity, frames: &[Range<FrameIndex>]) {
+    let forget: RangeSet = {
+        let mut set = RangeSet::new();
+        for r in frames.iter().filter(|r| !r.is_empty()) {
+            set.insert(r.clone());
+        }
+        set
+    };
+    if let Some(b) = world.resource_mut::<TrackJobs>().basis.get_mut(&op) {
+        b.done = difference(&b.done, &forget);
+        b.failed = false;
+        b.unsettled = true;
+    }
+    if let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0)
+        && let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out)
+    {
+        for r in forget.ranges() {
+            sig.mark_stale(r.clone());
+        }
+    }
 }
 
 /// Stop the jobs the tracker's run state no longer asks for (paused, or
