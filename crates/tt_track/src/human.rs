@@ -73,6 +73,8 @@ pub struct Composed {
     manual: bool,
     /// Where it was switched off (`off`).
     off: Option<crate::off::TrackerOff>,
+    /// A Jev tracker's least box confidence (its bits): below, a frame is lost.
+    min: Option<u32>,
 }
 
 /// Whether `tracker` is a manual dot (no algorithm: only what is drawn).
@@ -130,8 +132,15 @@ fn default_half(world: &World, tracker: Entity) -> [f32; 2] {
 
 /// One frame of the output from the layers: the drawn point (valid), else
 /// the automatic result as it is, else nothing.
-fn composed(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2], off: Option<&crate::off::TrackerOff>) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
+fn composed(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2], off: Option<&crate::off::TrackerOff>, min: Option<f32>) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
     let (mut v, state) = layered(f, auto, human, half)?;
+    // A Jev tracker's box Jev was less sure of (its score: the confidence) than asked: lost. (A drawn frame scores 1.)
+    if let Some(m) = min
+        && crate::flags(&v) & crate::OFF == 0
+        && v[6] < m
+    {
+        v[7] = (crate::flags(&v) | crate::LOST) as f32;
+    }
     // Switched off here: flagged, so what reads it leaves it out.
     if off.is_some_and(|o| o.is_off(f)) {
         v[7] = (crate::flags(&v) | crate::OFF) as f32;
@@ -169,6 +178,8 @@ pub fn compose(world: &mut World, tracker: Entity) {
     let manual = is_manual(world, tracker);
     let half = default_half(world, tracker);
     let off = world.get::<crate::off::TrackerOff>(tracker).cloned().filter(|o| !o.0.is_empty());
+    let min = world.get::<Tracker>(tracker).filter(|t| t.method == Method::Jev).map(|t| t.jev.min_confidence);
+    let min_bits = min.map(f32::to_bits);
     let (a, h) = {
         let store = world.resource::<SignalStore>();
         (if manual { None } else { store.get(auto).cloned() }, world.get::<HumanLayer>(tracker).and_then(|id| store.get(id.0)).cloned())
@@ -177,7 +188,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
     let mut todo = RangeSet::new();
     let mut revalidate = false;
     match world.get::<Composed>(tracker) {
-        Some(p) if p.manual == manual && p.off == off => {
+        Some(p) if p.manual == manual && p.off == off && p.min == min_bits => {
             todo.union(&changed(a.as_ref(), p.auto.as_ref()));
             todo.union(&changed(h.as_ref(), p.human.as_ref()));
             revalidate = p.output != version;
@@ -204,7 +215,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
         }
     }
     // Nothing changed: nothing to do (not even a new snapshot).
-    if todo.is_empty() && world.get::<Composed>(tracker).is_some_and(|p| p.output == version && p.manual == manual && p.off == off) {
+    if todo.is_empty() && world.get::<Composed>(tracker).is_some_and(|p| p.output == version && p.manual == manual && p.off == off && p.min == min_bits) {
         return;
     }
     let mut written = RangeSet::new();
@@ -214,7 +225,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
         let mut clear: Vec<std::ops::Range<FrameIndex>> = Vec::new();
         for r in todo.ranges() {
             for f in r.clone() {
-                match composed(f, a.as_ref(), h.as_ref(), half, off.as_ref()) {
+                match composed(f, a.as_ref(), h.as_ref(), half, off.as_ref(), min) {
                     Some((v, state)) => {
                         let same = sig.get(f).is_some_and(|w| w == v) && sig.state(f) == state;
                         if !same {
@@ -239,7 +250,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
         }
     }
     let version = world.resource::<SignalStore>().get(out).map_or(0, Signal::version);
-    world.entity_mut(tracker).insert(Composed { auto: a, human: h, output: version, manual, off });
+    world.entity_mut(tracker).insert(Composed { auto: a, human: h, output: version, manual, off, min: min_bits });
     if !written.is_empty() {
         let mut inv = world.resource_mut::<Invalidations>();
         for r in written.ranges() {
@@ -531,13 +542,13 @@ mod tests {
         human.set(6, &[50.0, 60.0]);
         human.set(9, &[70.0, 80.0]);
         let half = [DOT_HALF; 2];
-        assert_eq!(composed(5, Some(&auto), Some(&human), half, None), Some(([10.0, 20.0, 6.0, 16.0, 14.0, 24.0, 0.8, 0.0], FrameState::Valid)));
+        assert_eq!(composed(5, Some(&auto), Some(&human), half, None, None), Some(([10.0, 20.0, 6.0, 16.0, 14.0, 24.0, 0.8, 0.0], FrameState::Valid)));
         // Drawn over a lost, stale result: the drawn point, its box's size, trusted.
-        assert_eq!(composed(6, Some(&auto), Some(&human), half, None), Some(([50.0, 60.0, 46.0, 56.0, 54.0, 64.0, 1.0, 0.0], FrameState::Valid)));
+        assert_eq!(composed(6, Some(&auto), Some(&human), half, None, None), Some(([50.0, 60.0, 46.0, 56.0, 54.0, 64.0, 1.0, 0.0], FrameState::Valid)));
         // Drawn where nothing was tracked: a dot's box.
-        assert_eq!(composed(9, Some(&auto), Some(&human), half, None), Some(([70.0, 80.0, 62.0, 72.0, 78.0, 88.0, 1.0, 0.0], FrameState::Valid)));
-        assert_eq!(composed(7, Some(&auto), Some(&human), half, None), None);
+        assert_eq!(composed(9, Some(&auto), Some(&human), half, None, None), Some(([70.0, 80.0, 62.0, 72.0, 78.0, 88.0, 1.0, 0.0], FrameState::Valid)));
+        assert_eq!(composed(7, Some(&auto), Some(&human), half, None, None), None);
         // A manual dot: its drawing alone.
-        assert_eq!(composed(5, None, Some(&human), half, None), None);
+        assert_eq!(composed(5, None, Some(&human), half, None, None), None);
     }
 }

@@ -334,7 +334,7 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
             // `TT_SCENE_JEV_ASK=1`: and asked (paid): 30 frames, every 5, tight examples.
             if std::env::var_os("TT_SCENE_JEV_ASK").is_some() {
                 edit(world, "Scene: Jev settings", |tx| {
-                    tx.modify::<tt_track::Tracker>(t, |p| p.jev = tt_track::JevSettings { every: 5, frames: 30, examples: tt_track::JevExamples::Tight })
+                    tx.modify::<tt_track::Tracker>(t, |p| p.jev = tt_track::JevSettings { every: 5, frames: 30, ..tt_track::JevSettings::default() })
                 });
                 tt_track::set_run(world, t, TrackRun::Forward);
             }

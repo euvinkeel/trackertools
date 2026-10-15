@@ -687,8 +687,8 @@ impl Worker {
             hh = hh.max((b[1] - b[3]).max(b[5] - b[1]) * search);
         }
         let mut w = (k * hw).max(k * hh * CROP_W as f64 / CROP_H as f64);
-        // A paint (or Jev) tracker's paints fit too (they can be spread over the picture), with a margin.
-        if matches!(s.method, Method::Paint | Method::Jev) {
+        // A paint tracker's paints fit too (they can be spread over the picture), with a margin.
+        if s.method == Method::Paint {
             for l in s.looks.iter().filter(|l| (s.lo..s.lo + s.maps.len() as FrameIndex).contains(&l.frame)) {
                 let g = self.guide_point(l.frame);
                 let b = self.map(l.frame).box_from_source([l.center[0], l.center[1], l.center[0] - l.half[0], l.center[1] - l.half[1], l.center[0] + l.half[0], l.center[1] + l.half[1]]);

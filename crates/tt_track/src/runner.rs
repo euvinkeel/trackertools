@@ -1340,6 +1340,7 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         put(p.jev.every as f64);
         put(p.jev.frames as f64);
         put(p.jev.examples as u8 as f64);
+        put(p.jev.fill as u8 as f64);
     }
     // (A cursor tracker's own settings; other trackers' stamps stay as they were.)
     if p.method == Method::Cursor {

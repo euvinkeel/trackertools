@@ -12,6 +12,10 @@
 //! - **Frames asked about:** every `every`th frame after the last paint,
 //!   `frames` of them (forward only), each the same crop. Full frames are
 //!   never sent.
+//! - **Inside the sketch only:** the crop fits the sketch's box (× its
+//!   search) on the frames asked about ([`BOX_MARGIN`]), and what is outside
+//!   the box on each frame is grey, in the examples too: Jev can't box a
+//!   look-alike beside the sketch. (A tracker with no sketch: the whole picture.)
 //! - **One request a frame**, three questions about the same images: a Box
 //!   (where the subject is), a Noul (it can be seen), and a Choice (visible,
 //!   partly hidden, not in view). A Box always answers a box, so the other
@@ -57,6 +61,10 @@ const MAX_SIDE: usize = 1568;
 /// The Keychain item (a Mac) that holds the API key.
 pub const KEYCHAIN_SERVICE: &str = "trackertools-typesafe";
 const KEYCHAIN_ACCOUNT: &str = "api";
+/// The crop around the sketch's box: this much bigger than it (the rest grey).
+const BOX_MARGIN: f64 = 1.05;
+/// What is outside the sketch's box, in the images Jev gets.
+const GREY: [u8; 3] = [128, 128, 128];
 /// The outline drawn around a painted area ([`JevExamples::Outlined`]).
 const OUTLINE: [u8; 3] = [255, 0, 255];
 
@@ -105,23 +113,29 @@ impl Worker {
         };
         let dir: FrameIndex = if side == Side::Forward { 1 } else { -1 };
         let mut next = from;
+        // (Resuming after `from`: the paint before it, if any, is where filling starts from.)
+        let mut fill = Fill { on: settings.fill, prev: None };
+        if let Some(l) = paints.iter().filter(|l| (from - l.frame) * dir > 0).min_by_key(|l| (from - l.frame).abs()) {
+            fill.prev = Some((l.frame, [l.center[0], l.center[1], l.center[0] - l.half[0], l.center[1] - l.half[1], l.center[0] + l.half[0], l.center[1] + l.half[1], 1.0, 0.0]));
+        }
         if samples.is_empty() {
-            self.jev_skip_to(to + dir, &mut next, &paints);
+            self.jev_skip_to(to + dir, None, &mut next, &paints, &mut fill);
             return Ok(());
         }
         let key = api_key().ok_or_else(|| anyhow!("no TypeSafe API key: enter it in the tracker's Inspector, or set TYPESAFE_API_KEY"))?;
         let url = endpoint()?;
         self.shared.set_phase(Phase::Tracking);
 
-        // The examples: each paint through the view, at the scale every frame asked about fits.
-        let scale = self.crop_scale(paints.iter().map(|l| l.frame).chain(samples.iter().copied()));
+        // The examples: each paint through the view, at the scale the sketch's box fits on every frame asked about.
+        let scale = self.jev_scale(paints.iter().map(|l| l.frame).chain(samples.iter().copied()));
         let mut examples = Vec::new();
         for l in &paints {
             let frame = self.decode_one(l.frame)?;
             if self.cancelled() {
                 return Ok(());
             }
-            let (grid, rgb) = self.crop(&frame, l.frame, scale);
+            let (grid, mut rgb) = self.crop(&frame, l.frame, scale);
+            self.grey_outside(&mut rgb, grid, l.frame);
             let (w, h, px) = example(&rgb, grid, self.map(l.frame), l, settings.examples);
             examples.push(png(&px, w, h)?);
         }
@@ -141,30 +155,68 @@ impl Worker {
                 stream = Some(tt_media::FrameStream::start(&self.spec.video, self.presented(f), &self.spec.decode)?);
             }
             self.read_to(stream.as_mut().expect("opened"), &mut held, &mut buf, f)?;
-            let (grid, rgb) = self.crop(&buf, f, scale);
+            let (grid, mut rgb) = self.crop(&buf, f, scale);
+            self.grey_outside(&mut rgb, grid, f);
             let image = std::sync::Arc::new(png(&rgb, CROP_W, CROP_H)?);
             let (url, key, examples, style) = (url.clone(), key.clone(), examples.clone(), settings.examples);
             pending.push_back((f, grid, std::thread::spawn(move || (request_frame(&url, &key, &examples, &image, style, f), image))));
             while pending.len() >= IN_FLIGHT {
                 let (f, grid, h) = pending.pop_front().expect("one");
-                self.jev_answered(f, grid, h, &mut next, &paints)?;
+                self.jev_answered(f, grid, h, &mut next, &paints, &mut fill)?;
             }
         }
         while let Some((f, grid, h)) = pending.pop_front() {
             if self.cancelled() {
                 return Ok(());
             }
-            self.jev_answered(f, grid, h, &mut next, &paints)?;
+            self.jev_answered(f, grid, h, &mut next, &paints, &mut fill)?;
         }
-        self.jev_skip_to(to + dir, &mut next, &paints);
+        self.jev_skip_to(to + dir, None, &mut next, &paints, &mut fill);
         Ok(())
     }
 
-    /// Frame `f`'s answer is in: the frames before it left out, then it.
-    fn jev_answered(&mut self, f: FrameIndex, grid: Grid, h: Asked, next: &mut FrameIndex, paints: &[LookSpec]) -> Result<()> {
+    /// The crop's scale (crop px per view px): the sketch's box (× its
+    /// search) on every frame of `frames` fits, with [`BOX_MARGIN`]. With no
+    /// sketch, CoTracker's (the whole picture).
+    fn jev_scale(&self, frames: impl Iterator<Item = FrameIndex>) -> f64 {
+        if self.spec.root {
+            return self.crop_scale(frames);
+        }
+        let (mut hw, mut hh) = (8.0f64, 8.0f64);
+        for f in frames {
+            let b = self.map(f).box_from_source(self.guide(f));
+            hw = hw.max((b[0] - b[2]).max(b[4] - b[0]) * self.spec.search);
+            hh = hh.max((b[1] - b[3]).max(b[5] - b[1]) * self.spec.search);
+        }
+        let w = (2.0 * BOX_MARGIN * hw).max(2.0 * BOX_MARGIN * hh * CROP_W as f64 / CROP_H as f64);
+        CROP_W as f64 / w
+    }
+
+    /// Grey out what is outside the sketch's box (× its search) on frame
+    /// `f` in its crop `rgb` (`grid`): Jev sees only where the sketch says
+    /// the subject is. (With no sketch, nothing.)
+    fn grey_outside(&self, rgb: &mut [u8], grid: Grid, f: FrameIndex) {
+        if self.spec.root {
+            return;
+        }
+        let b = self.map(f).box_from_source(self.guide(f));
+        let k = self.spec.search;
+        let lo = grid.from_view([b[0] - (b[0] - b[2]) * k, b[1] - (b[1] - b[3]) * k]);
+        let hi = grid.from_view([b[0] + (b[4] - b[0]) * k, b[1] + (b[5] - b[1]) * k]);
+        for y in 0..CROP_H {
+            for x in 0..CROP_W {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                if px < lo[0] || px > hi[0] || py < lo[1] || py > hi[1] {
+                    rgb[(y * CROP_W + x) * 3..(y * CROP_W + x) * 3 + 3].copy_from_slice(&GREY);
+                }
+            }
+        }
+    }
+
+    /// Frame `f`'s answer is in: the frames before it, then it.
+    fn jev_answered(&mut self, f: FrameIndex, grid: Grid, h: Asked, next: &mut FrameIndex, paints: &[LookSpec], fill: &mut Fill) -> Result<()> {
         let (reply, image) = h.join().map_err(|_| anyhow!("the request for frame {f} stopped on an error"))?;
-        self.jev_skip_to(f, next, paints);
-        let answer = match reply {
+        let (row, answer) = match reply {
             Ok(Reply { edges: [left, top, right, bottom], mut answer }) => {
                 answer.edges = [left, top, right, bottom].map(|v| v as f32);
                 answer.image = Some(image);
@@ -172,10 +224,11 @@ impl Worker {
                 let corner = |x: f64, y: f64| map.to_source(grid.to_view([x * CROP_W as f64, y * CROP_H as f64]));
                 let (a, b) = (corner(left, top), corner(right, bottom));
                 let c = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-                let lost = answer.visible < 0.5 || answer.view == "not_in_view";
+                // (Lost where Jev says it can't be seen. Its "can be seen" Noul isn't used: about 0.8 whatever the picture.
+                // A box it is unsure of is lost by the tracker's min_confidence, as the output is composed.)
+                let lost = answer.view == "not_in_view";
                 let flags = if lost { LOST } else { 0 } | if self.outside(f, map.from_source(c)) { OUTSIDE } else { 0 };
-                self.out.push((f, [c[0], c[1], a[0], a[1], b[0], b[1], answer.confidence as f64, flags as f64].map(|v| v as f32)));
-                answer
+                ([c[0], c[1], a[0], a[1], b[0], b[1], answer.confidence as f64, flags as f64], answer)
             }
             Err(e) => {
                 let e = format!("{e:#}");
@@ -184,10 +237,12 @@ impl Worker {
                 }
                 tracing::warn!("{}: Jev on frame {f}: {e}", self.spec.label);
                 let g = self.guide(f);
-                self.out.push((f, [g[0], g[1], g[0] - 8.0, g[1] - 8.0, g[0] + 8.0, g[1] + 8.0, 0.0, LOST as f64].map(|v| v as f32)));
-                Answer { frame: f, error: Some(e), image: Some(image), ..Answer::default() }
+                ([g[0], g[1], g[0] - 8.0, g[1] - 8.0, g[0] + 8.0, g[1] + 8.0, 0.0, LOST as f64], Answer { frame: f, error: Some(e), image: Some(image), ..Answer::default() })
             }
         };
+        self.jev_skip_to(f, Some(row), next, paints, fill);
+        self.out.push((f, row.map(|v| v as f32)));
+        fill.prev = Some((f, row));
         let _ = self.tx.send(super::Msg::Jev(vec![answer]));
         self.shared.at.store(f, Ordering::Relaxed);
         *next = f + if self.spec.side == Side::Forward { 1 } else { -1 };
@@ -196,16 +251,36 @@ impl Worker {
     }
 
     /// Every frame from `next` up to (not including) `end` that Jev isn't
-    /// asked about: a paint's frame shows the paint, the rest are left out.
-    fn jev_skip_to(&mut self, end: FrameIndex, next: &mut FrameIndex, paints: &[LookSpec]) {
+    /// asked about: a paint's frame shows the paint; with `fill`, a frame
+    /// between two known ones (paints, answers; `end_row`: the answer on
+    /// `end`) is on the straight line between them, lost if either is; the
+    /// rest are left out ([`OFF`]).
+    fn jev_skip_to(&mut self, end: FrameIndex, end_row: Option<[f64; 8]>, next: &mut FrameIndex, paints: &[LookSpec], fill: &mut Fill) {
         let dir: FrameIndex = if self.spec.side == Side::Forward { 1 } else { -1 };
+        let paint_row = |l: &LookSpec| [l.center[0], l.center[1], l.center[0] - l.half[0], l.center[1] - l.half[1], l.center[0] + l.half[0], l.center[1] + l.half[1], 1.0, 0.0];
         while (end - *next) * dir > 0 {
             let f = *next;
             let row = match paints.iter().find(|l| l.frame == f) {
-                Some(l) => [l.center[0], l.center[1], l.center[0] - l.half[0], l.center[1] - l.half[1], l.center[0] + l.half[0], l.center[1] + l.half[1], 1.0, 0.0],
+                Some(l) => {
+                    let row = paint_row(l);
+                    fill.prev = Some((f, row));
+                    row
+                }
                 None => {
-                    let g = self.guide(f);
-                    [g[0], g[1], g[0], g[1], g[0], g[1], 0.0, OFF as f64]
+                    // The next known frame: a paint before `end`, else `end`'s answer.
+                    let ahead = paints.iter().filter(|l| (l.frame - f) * dir > 0 && (end - l.frame) * dir > 0).min_by_key(|l| (l.frame - f).abs()).map(|l| (l.frame, paint_row(l)));
+                    match (fill.on, fill.prev, ahead.or(end_row.map(|r| (end, r)))) {
+                        (true, Some((pf, pr)), Some((nf, nr))) => {
+                            let t = (f - pf) as f64 / (nf - pf) as f64;
+                            let mut row: [f64; 8] = std::array::from_fn(|c| pr[c] + (nr[c] - pr[c]) * t);
+                            row[7] = if (pr[7] as u32 | nr[7] as u32) & LOST != 0 { LOST as f64 } else { 0.0 };
+                            row
+                        }
+                        _ => {
+                            let g = self.guide(f);
+                            [g[0], g[1], g[0], g[1], g[0], g[1], 0.0, OFF as f64]
+                        }
+                    }
                 }
             };
             self.out.push((f, row.map(|v| v as f32)));
@@ -216,6 +291,12 @@ impl Worker {
         }
         self.flush();
     }
+}
+
+/// Filling frames between known ones: on, and the last known frame (in the job's direction).
+struct Fill {
+    on: bool,
+    prev: Option<(FrameIndex, [f64; 8])>,
 }
 
 // ------------------------------------------------------------ asking
@@ -358,7 +439,7 @@ fn intro(style: JevExamples) -> String {
         JevExamples::Outlined => "In each picture the subject is outlined in magenta.",
         JevExamples::Tight => "Each picture is cut closely around the subject.",
     };
-    format!("The pictures in `examples` show one subject, on other frames of the same video. {how}")
+    format!("The pictures in `examples` show one subject, on other frames of the same video. {how} Plain grey areas are outside the region to search: the subject is never there.")
 }
 
 /// The request's JSON: `examples` and `frame` in the state, each image an asset of its multipart part.

@@ -28,9 +28,8 @@ use crate::style;
 const PRICE_PER_TOKEN: f64 = 0.042e-6;
 /// The key is looked for again this often (s): `security` runs each time on a Mac.
 const KEY_RECHECK: f64 = 3.0;
-/// Box confidence at or above which an answer counts as sure, and below which as unsure.
+/// Box confidence at or above which a kept answer shows as sure (else in between).
 const SURE: f32 = 0.5;
-const UNSURE: f32 = 0.3;
 
 /// What the section keeps between frames (egui's memory, per tracker).
 #[derive(Clone, Default)]
@@ -82,12 +81,13 @@ fn busy(world: &World, e: Entity) -> bool {
 
 pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     let Some(tracker) = world.get::<Tracker>(e).cloned() else { return };
+    let min = tracker.jev.min_confidence;
     let id = egui::Id::new(("jev", e));
     let mut d: Draft = ui.ctx().data_mut(|m| m.get_temp(id)).unwrap_or_default();
     let key = has_key(ui.ctx(), false);
     // (The scene demo that asks shows the viewer, once.)
     let shown = egui::Id::new(("jev-scene-viewer", e));
-    if std::env::var_os("TT_SCENE_JEV_ASK").is_some() && !ui.ctx().data(|m| m.get_temp::<bool>(shown).unwrap_or(false)) {
+    if std::env::var_os("TT_SCENE_JEV_ASK").is_some() && std::env::var("TT_SCENE_JEV_VIEWER").as_deref() != Ok("0") && !ui.ctx().data(|m| m.get_temp::<bool>(shown).unwrap_or(false)) {
         ui.ctx().data_mut(|m| m.insert_temp(shown, true));
         open_viewer(ui.ctx(), e);
     }
@@ -143,6 +143,9 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             ui.radio_value(&mut s.examples, style, text).on_hover_text(tip);
         }
     });
+    ui.checkbox(&mut s.fill, "Fill between answers").on_hover_text("Frames between two answers (or a paint and an answer) on the straight line between them, lost if either is. Off: left out");
+    // (The least confidence applies at once, below: it asks nothing again.)
+    s.min_confidence = tracker.jev.min_confidence;
     let changed = s != tracker.jev;
     d.settings = changed.then(|| s.clone());
     if changed {
@@ -156,6 +159,8 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             }
         });
     }
+
+    min_slider(ui, world, e, min);
 
     // What it would ask about.
     let painted = paints(world, e);
@@ -188,10 +193,10 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         }
     });
     if !got.is_empty() {
-        ui.label(summary(&got));
+        ui.label(summary(&got, min));
         let here = world.resource::<Transport>().frame();
         if let Some(a) = got.iter().find(|a| a.frame == here) {
-            ui.label(egui::RichText::new(format!("This frame: {}", describe(a))).color(colour(a)));
+            ui.label(egui::RichText::new(format!("This frame: {}", describe(a))).color(colour(a, min)));
         }
     }
     ui.ctx().data_mut(|m| m.insert_temp(id, d));
@@ -218,11 +223,12 @@ fn controls(ui: &mut egui::Ui, world: &mut World, e: Entity, got: &[Answer], rea
     if !failed.is_empty() && ui.add_enabled(ready, egui::Button::new(format!("Retry failed ({})", failed.len()))).on_disabled_hover_text(why_not).clicked() {
         jev::retry(world, e, &failed);
     }
-    let unsure: Vec<i64> = got.iter().filter(|a| a.error.is_none() && a.confidence < UNSURE).map(|a| a.frame).collect();
+    let min = world.get::<Tracker>(e).map_or(0.0, |t| t.jev.min_confidence);
+    let unsure: Vec<i64> = got.iter().filter(|a| a.error.is_none() && a.confidence < min).map(|a| a.frame).collect();
     if !unsure.is_empty()
         && ui
-            .add_enabled(ready, egui::Button::new(format!("Retry unsure ({})", unsure.len())))
-            .on_hover_text(format!("Ask again about the frames where the box's confidence is under {UNSURE}"))
+            .add_enabled(ready, egui::Button::new(format!("Retry the lost ({})", unsure.len())))
+            .on_hover_text(format!("Ask again about the frames where the box's confidence is under {min:.2} (Lost below)"))
             .on_disabled_hover_text(why_not)
             .clicked()
     {
@@ -231,17 +237,18 @@ fn controls(ui: &mut egui::Ui, world: &mut World, e: Entity, got: &[Answer], rea
 }
 
 /// The answers in a line: how many, sure, times, cost.
-fn summary(got: &[Answer]) -> String {
+fn summary(got: &[Answer], min: f32) -> String {
     let ok: Vec<&Answer> = got.iter().filter(|a| a.error.is_none()).collect();
     let failed = got.len() - ok.len();
-    let sure = ok.iter().filter(|a| a.confidence >= SURE).count();
+    let kept = ok.iter().filter(|a| a.confidence >= min).count();
     let tokens: u64 = got.iter().map(|a| a.tokens).sum();
     let mut ms: Vec<u32> = ok.iter().map(|a| a.ms).collect();
     ms.sort_unstable();
     let mean = if ok.is_empty() { 0.0 } else { ok.iter().map(|a| a.confidence as f64).sum::<f64>() / ok.len() as f64 };
     format!(
-        "{} answered \u{b7} {sure} sure (box confidence \u{2265} {SURE}) \u{b7} confidence {mean:.2} on average \u{b7} {} ms a request (median) \u{b7} {tokens} tokens (${:.4}){}",
+        "{} answered \u{b7} {kept} kept (box confidence \u{2265} {min:.2}), {} lost \u{b7} confidence {mean:.2} on average \u{b7} {} ms a request (median) \u{b7} {tokens} tokens (${:.4}){}",
         got.len(),
+        ok.len() - kept,
         ms.get(ms.len() / 2).copied().unwrap_or(0),
         tokens as f64 * PRICE_PER_TOKEN,
         if failed > 0 { format!(" \u{b7} {failed} failed") } else { String::new() }
@@ -265,11 +272,11 @@ fn view_words(v: &str) -> &str {
     }
 }
 
-/// An answer's colour: sure (the accent), in between (amber), unsure or failed (red).
-fn colour(a: &Answer) -> Color32 {
-    if a.error.is_some() || a.confidence < UNSURE {
+/// An answer's colour: lost (below `min`, red, as failed), kept and sure (the accent), kept in between (amber).
+fn colour(a: &Answer, min: f32) -> Color32 {
+    if a.error.is_some() || a.confidence < min {
         style::LOST
-    } else if a.confidence < SURE {
+    } else if a.confidence < SURE.max(min) {
         Color32::from_rgb(0xf5, 0xb0, 0x3a)
     } else {
         style::ACCENT
@@ -296,6 +303,7 @@ pub fn viewer(ctx: &egui::Context, world: &mut World) {
         return;
     };
     let name = world.get::<bevy_ecs::name::Name>(e).map_or("a Jev tracker".to_string(), |n| n.to_string());
+    let min = tracker.jev.min_confidence;
     let mut open = true;
     let size_id = egui::Id::new("jev-viewer-card");
     let mut card: f32 = ctx.data(|d| d.get_temp(size_id)).unwrap_or(240.0);
@@ -324,13 +332,20 @@ pub fn viewer(ctx: &egui::Context, world: &mut World) {
                 ui.separator();
                 ui.label("Card size");
                 ui.add(egui::Slider::new(&mut card, 140.0..=520.0).show_value(false));
+                ui.separator();
+                min_slider(ui, world, e, min);
+                ui.separator();
                 ui.checkbox(&mut zoom, "Zoom to the box").on_hover_text("Show each crop around Jev's box (3 times its size) instead of the whole crop");
             });
             if !got.is_empty() {
-                ui.label(summary(&got));
+                ui.label(summary(&got, min));
             }
             ui.horizontal_wrapped(|ui| {
-                for (c, t) in [(style::ACCENT, format!("sure (box confidence \u{2265} {SURE})")), (Color32::from_rgb(0xf5, 0xb0, 0x3a), format!("{UNSURE}\u{2013}{SURE}")), (style::LOST, format!("unsure (< {UNSURE}) or failed"))] {
+                for (c, t) in [
+                    (style::ACCENT, format!("kept, sure (box confidence \u{2265} {SURE})")),
+                    (Color32::from_rgb(0xf5, 0xb0, 0x3a), format!("kept ({min:.2}\u{2013}{SURE})")),
+                    (style::LOST, format!("lost (below {min:.2}) or failed")),
+                ] {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
                     ui.painter().rect_stroke(r.shrink(1.0), 2.0, Stroke::new(2.0, c), StrokeKind::Middle);
                     ui.label(egui::RichText::new(t).small());
@@ -369,7 +384,7 @@ pub fn viewer(ctx: &egui::Context, world: &mut World) {
                     for a in row {
                         ui.allocate_ui_with_layout(Vec2::new(card, card * 0.75 + 64.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             egui::Frame::new()
-                                .stroke(Stroke::new(if a.frame == here { 2.0 } else { 1.0 }, if a.frame == here { style::TEXT } else { colour(a).gamma_multiply(0.6) }))
+                                .stroke(Stroke::new(if a.frame == here { 2.0 } else { 1.0 }, if a.frame == here { style::TEXT } else { colour(a, min).gamma_multiply(0.6) }))
                                 .corner_radius(4.0)
                                 .inner_margin(4.0)
                                 .show(ui, |ui| {
@@ -400,13 +415,13 @@ pub fn viewer(ctx: &egui::Context, world: &mut World) {
                                         let [l, t, rr, b] = a.edges;
                                         let to = |x: f32, y: f32| rect.min + Vec2::new((x - uv.min.x) / uv.width() * w, (y - uv.min.y) / uv.height() * h);
                                         let bx = Rect::from_min_max(to(l, t), to(rr, b));
-                                        ui.painter().rect_stroke(bx, 1.0, Stroke::new(2.0, colour(a)), StrokeKind::Middle);
-                                        ui.painter().circle_filled(bx.center(), 2.5, colour(a));
+                                        ui.painter().rect_stroke(bx, 1.0, Stroke::new(2.0, colour(a, min)), StrokeKind::Middle);
+                                        ui.painter().circle_filled(bx.center(), 2.5, colour(a, min));
                                     }
                                     if r.on_hover_text("Go to this frame").clicked() {
                                         seek = Some(a.frame);
                                     }
-                                    ui.label(egui::RichText::new(format!("frame {}", a.frame)).strong().color(colour(a)));
+                                    ui.label(egui::RichText::new(format!("frame {}", a.frame)).strong().color(colour(a, min)));
                                     let line = match &a.error {
                                         Some(err) => format!("failed: {err}"),
                                         None => format!("box {:.2} \u{b7} {} \u{b7} seen {:.2}\n{} ms \u{b7} {} tokens", a.confidence, view_words(&a.view), a.visible, a.ms, a.tokens),
@@ -441,4 +456,25 @@ pub fn viewer(ctx: &egui::Context, world: &mut World) {
     if !open {
         ctx.data_mut(|d| d.insert_temp::<Option<Entity>>(viewer_id(), None));
     }
+}
+
+/// The least box confidence a frame needs (else it is lost): applied at once,
+/// as the output is composed, asking nothing again. One undo step a drag.
+fn min_slider(ui: &mut egui::Ui, world: &mut World, e: Entity, min: f32) {
+    ui.horizontal(|ui| {
+        ui.label("Lost below");
+        let mut v = min;
+        let r = ui
+            .add(egui::Slider::new(&mut v, 0.0..=1.0).step_by(0.01).fixed_decimals(2).text("box confidence"))
+            .on_hover_text("Jev's boxes it is less sure of than this count as lost (red; left out of what follows the tracker). Moving it asks nothing again: the frames change at once");
+        if r.drag_started() {
+            world.resource_mut::<tt_core::history::History>().begin("Edit Jev's least confidence".to_string());
+        }
+        if r.changed() {
+            tt_core::history::edit(world, "Edit Jev's least confidence", |tx| tx.modify::<Tracker>(e, |t| t.jev.min_confidence = v));
+        }
+        if r.drag_stopped() {
+            world.resource_mut::<tt_core::history::History>().end();
+        }
+    });
 }

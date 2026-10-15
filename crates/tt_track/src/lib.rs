@@ -313,11 +313,23 @@ pub struct JevSettings {
     pub frames: u32,
     /// How each paint is shown to Jev as an example.
     pub examples: JevExamples,
+    /// Frames between two answers (or a paint and an answer) on the
+    /// straight line between them; off: left out.
+    #[reflect(default = "yes")]
+    pub fill: bool,
+    /// A box Jev is less sure of than this counts as lost. Applied as the
+    /// output is composed (`human::compose`): moving it asks nothing again.
+    #[reflect(default = "jev_min_confidence")]
+    pub min_confidence: f32,
+}
+
+fn jev_min_confidence() -> f32 {
+    0.2
 }
 
 impl Default for JevSettings {
     fn default() -> Self {
-        Self { every: 5, frames: 60, examples: JevExamples::Tight }
+        Self { every: 5, frames: 60, examples: JevExamples::Tight, fill: true, min_confidence: jev_min_confidence() }
     }
 }
 
