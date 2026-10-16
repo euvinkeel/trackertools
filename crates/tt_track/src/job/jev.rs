@@ -503,7 +503,7 @@ fn request_frame(url: &str, key: &str, examples: &[Vec<u8>], frame: &[u8], style
     static N: AtomicU64 = AtomicU64::new(0);
     let nonce = format!("{}-{}-{}", std::process::id(), f, N.fetch_add(1, Ordering::Relaxed));
     let dir = std::env::temp_dir().join(format!("tt-jev-{nonce}"));
-    std::fs::create_dir_all(&dir)?;
+    private_dir(&dir)?;
     let done = (|| {
         for (i, ex) in examples.iter().enumerate() {
             std::fs::write(dir.join(format!("ex{i}.png")), ex)?;
@@ -589,6 +589,19 @@ fn curl() -> Command {
     Command::new("curl")
 }
 
+/// Make the folder `dir`, open to this user only (on unix): the request's
+/// images (the video's crops) and its key header go in it, until it is deleted.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
 /// Write `bytes` to `path`, readable by this user only (on unix).
 fn private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut o = std::fs::OpenOptions::new();
@@ -647,7 +660,8 @@ pub fn save_api_key(key: &str) -> Result<()> {
         let out = child.wait_with_output()?;
         // (With TYPESAFE_API_KEY set, that is what api_key() gives: the Keychain can't be checked through it.)
         if !out.status.success() || (api_key().as_deref() != Some(key) && std::env::var_os("TYPESAFE_API_KEY").is_none()) {
-            bail!("the Keychain did not keep the key: {}", String::from_utf8_lossy(&out.stderr).trim());
+            // (What `security` said, the key blanked out in case it repeats its input.)
+            bail!("the Keychain did not keep the key: {}", String::from_utf8_lossy(&out.stderr).trim().replace(key, "\u{2022}\u{2022}\u{2022}"));
         }
         return Ok(());
     }
@@ -721,6 +735,20 @@ mod tests {
         assert_eq!((r.answer.confidence, r.answer.visible, r.answer.view.as_str(), r.answer.tokens), (0.8, 0.9, "partly_hidden", 1234));
         assert_eq!(r.answer.view_p.len(), 3);
         assert!(read_reply(r#"{"answers":{}}"#).is_err(), "no box");
+    }
+
+    /// The request's folder is this user's alone (its key header and the video's crops go in it).
+    #[cfg(unix)]
+    #[test]
+    fn the_request_folder_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tt-jev-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        private_dir(&dir).unwrap();
+        private_file(&dir.join("headers"), b"x").unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(dir.join("headers")).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
