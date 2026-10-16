@@ -10,8 +10,10 @@
 //! the video, its transparency the mask (`job`'s `look_templates`). Icons
 //! aren't shipped with the app: a pack is read from this computer's own
 //! files — Windows' cursor scheme (the registry's, else its default
-//! cursors) and a Roblox install's — so a cursor that changes icon is
-//! followed without a look on a frame of each icon.
+//! cursors), a Mac's standard cursors (AppKit's, drawn at 2 px a point, as
+//! a Retina screen and its recordings show them) and a Roblox install's —
+//! so a cursor that changes icon is followed without a look on a frame of
+//! each icon.
 //!
 //! The size the icon has in the video (screen scaling, the recording's
 //! resolution) comes from the tracker's own looks: the job tries sizes and
@@ -101,7 +103,7 @@ pub struct Pack {
 /// The packs on this computer (none where nothing is found), read once.
 pub fn packs() -> &'static [Pack] {
     static PACKS: std::sync::OnceLock<Vec<Pack>> = std::sync::OnceLock::new();
-    PACKS.get_or_init(|| [windows_pack(), roblox_pack()].into_iter().flatten().collect())
+    PACKS.get_or_init(|| [windows_pack(), mac_pack(), roblox_pack()].into_iter().flatten().collect())
 }
 
 /// Windows' cursors, by role (the scheme's registry value, its default file).
@@ -174,12 +176,19 @@ fn windows_scheme() -> Vec<(String, PathBuf)> {
 
 /// Roblox's player cursors (the newest install that has them). Roblox
 /// draws a cursor image centred on the mouse: the hotspot is its middle.
+/// Windows: each version in `%LOCALAPPDATA%\Roblox\Versions`; a Mac: the
+/// app (`/Applications`, or the person's own Applications folder).
 pub fn roblox_pack() -> Option<Pack> {
-    let versions = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Roblox").join("Versions");
-    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&versions)
-        .ok()?
-        .flatten()
-        .map(|e| e.path().join("content/textures/Cursors/KeyboardMouse"))
+    let installs: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        [Some(PathBuf::from("/Applications")), home.map(|h| h.join("Applications"))].into_iter().flatten().map(|a| a.join("Roblox.app/Contents/Resources")).collect()
+    } else {
+        let versions = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Roblox").join("Versions");
+        std::fs::read_dir(&versions).ok()?.flatten().map(|e| e.path()).collect()
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = installs
+        .into_iter()
+        .map(|p| p.join("content/textures/Cursors/KeyboardMouse"))
         .filter(|d| d.join("ArrowFarCursor.png").is_file())
         .map(|d| (std::fs::metadata(&d).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), d))
         .collect();
@@ -193,6 +202,124 @@ pub fn roblox_pack() -> Option<Pack> {
         })
         .collect();
     (!icons.is_empty()).then_some(Pack { name: "Roblox", source: dir, icons })
+}
+
+/// A Mac's standard cursors, as AppKit has them (none elsewhere).
+#[cfg(target_os = "macos")]
+pub fn mac_pack() -> Option<Pack> {
+    mac::pack()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mac_pack() -> Option<Pack> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::path::PathBuf;
+
+    use objc2::rc::Retained;
+    use objc2::{AnyThread, ClassType, msg_send};
+    use objc2_app_kit::{NSBitmapImageRep, NSCursor, NSDeviceRGBColorSpace, NSGraphicsContext};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    use super::{Icon, Pack, crop};
+
+    /// Pixels a point: a Retina screen's, which recordings on a Mac show.
+    const SCALE: f64 = 2.0;
+
+    /// The cursors by role. (No busy or help cursor: macOS has none as an NSCursor.)
+    fn cursors() -> Vec<(&'static str, Retained<NSCursor>)> {
+        // (Sent as messages, not objc2's methods: before AppKit has its
+        // application, as in a test, they answer nil, which objc2's panic on.)
+        macro_rules! cursor {
+            ($sel:ident) => {{
+                // SAFETY: a class method of NSCursor that takes nothing and returns an NSCursor, or nil.
+                let c: Option<Retained<NSCursor>> = unsafe { msg_send![NSCursor::class(), $sel] };
+                c
+            }};
+        }
+        [
+            ("Arrow", cursor!(arrowCursor)),
+            ("Hand", cursor!(pointingHandCursor)),
+            ("Open hand", cursor!(openHandCursor)),
+            ("Closed hand", cursor!(closedHandCursor)),
+            ("I-beam", cursor!(IBeamCursor)),
+            ("Crosshair", cursor!(crosshairCursor)),
+            ("Unavailable", cursor!(operationNotAllowedCursor)),
+            ("Copy", cursor!(dragCopyCursor)),
+            ("Link", cursor!(dragLinkCursor)),
+            ("Context menu", cursor!(contextualMenuCursor)),
+            // (Deprecated, but their replacements need macOS 15; these show the same arrows.)
+            ("Resize left/right", cursor!(resizeLeftRightCursor)),
+            ("Resize up/down", cursor!(resizeUpDownCursor)),
+        ]
+        .into_iter()
+        .filter_map(|(name, c)| Some((name, c?)))
+        .collect()
+    }
+
+    pub fn pack() -> Option<Pack> {
+        let icons: Vec<Icon> = cursors()
+            .into_iter()
+            .filter_map(|(name, cursor)| {
+                let icon = draw(&cursor, name).map_err(|e| tracing::debug!("macOS cursor {name}: {e}")).ok()?;
+                Some(crop(icon))
+            })
+            .collect();
+        (!icons.is_empty()).then(|| Pack { name: "macOS", source: PathBuf::from("AppKit (NSCursor)"), icons })
+    }
+
+    /// The cursor's image drawn at [`SCALE`] into an RGBA bitmap, and its hotspot (px from the top-left).
+    fn draw(cursor: &NSCursor, name: &str) -> Result<Icon, String> {
+        let image = cursor.image();
+        let size = image.size();
+        let (w, h) = ((size.width * SCALE).round() as usize, (size.height * SCALE).round() as usize);
+        if w == 0 || h == 0 || w > 512 || h > 512 {
+            return Err(format!("size {w}x{h}"));
+        }
+        // SAFETY: a null `planes` makes AppKit allocate the pixels; 8-bit RGBA, interleaved.
+        let rep = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(),
+                std::ptr::null_mut(),
+                w as isize,
+                h as isize,
+                8,
+                4,
+                true,
+                false,
+                NSDeviceRGBColorSpace,
+                (w * 4) as isize,
+                32,
+            )
+        }
+        .ok_or("no bitmap")?;
+        let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep).ok_or("no graphics context")?;
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&ctx));
+        image.drawInRect(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w as f64, h as f64)));
+        ctx.flushGraphics();
+        NSGraphicsContext::restoreGraphicsState_class();
+        let (data, row) = (rep.bitmapData(), rep.bytesPerRow() as usize);
+        if data.is_null() || row < w * 4 {
+            return Err("no pixels".into());
+        }
+        // SAFETY: the bitmap is `row` bytes a row, `h` rows, alive while `rep` is.
+        let px = unsafe { std::slice::from_raw_parts(data, row * h) };
+        // Premultiplied (AppKit draws that way) → straight alpha, row by row (the top row first).
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for p in px[y * row..y * row + w * 4].chunks_exact(4) {
+                let a = p[3];
+                let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
+                rgba.extend_from_slice(&[un(p[0]), un(p[1]), un(p[2]), a]);
+            }
+        }
+        let hot = cursor.hotSpot();
+        Ok(Icon { pack: "macOS".into(), name: name.into(), w: w as u32, h: h as u32, rgba, hotspot: [(hot.x * SCALE) as f32, (hot.y * SCALE) as f32] })
+    }
 }
 
 /// A `.cur`, `.ico` or animated `.ani` (its first frame): the image nearest
@@ -475,6 +602,44 @@ mod tests {
         assert!(m.score > 0.95, "score {}", m.score);
         let tip = [m.pos[0] + hot[0], m.pos[1] + hot[1]];
         assert!((tip[0] - 31.0).abs() < 0.6 && (tip[1] - 17.0).abs() < 0.6, "tip at {tip:?}");
+    }
+
+    /// A Mac's own cursors: AppKit draws each, the arrow's point is at its
+    /// tip (top-left), the hand's on its finger. `TT_ICON_DUMP=<folder>`
+    /// writes each as a PNG to look at.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_macs_cursors_are_read() {
+        // (The app has AppKit's application; a test starts it.)
+        // SAFETY: +[NSApplication sharedApplication] takes nothing and makes the application once.
+        let _: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![objc2::class!(NSApplication), sharedApplication] };
+        let pack = mac_pack().expect("AppKit's cursors");
+        let names: Vec<&str> = pack.icons.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.len() >= 10 && names.contains(&"Arrow") && names.contains(&"Hand"), "{names:?}");
+        let dump = std::env::var_os("TT_ICON_DUMP").map(std::path::PathBuf::from);
+        for i in &pack.icons {
+            eprintln!("{}: {}x{}, point {:?}", i.name, i.w, i.h, i.hotspot);
+            if let Some(d) = &dump {
+                std::fs::create_dir_all(d).unwrap();
+                let f = std::fs::File::create(d.join(format!("{}.png", i.name.replace('/', "-")))).unwrap();
+                let mut e = png::Encoder::new(f, i.w, i.h);
+                e.set_color(png::ColorType::Rgba);
+                e.write_header().unwrap().write_image_data(&i.rgba).unwrap();
+            }
+        }
+        for i in &pack.icons {
+            assert!(i.w >= 16 && i.h >= 16 && i.w <= 128 && i.h <= 128, "{}: {}x{}", i.name, i.w, i.h);
+            // (macOS's own points can sit a pixel or two off the drawn edge: the arrow's is at (4, 2) pt, above its solid tip.)
+            assert!(i.hotspot.iter().zip([i.w, i.h]).all(|(p, n)| *p >= -4.0 && *p <= n as f32 + 4.0), "{}: {:?}", i.name, i.hotspot);
+            assert!(i.rgba.chunks(4).any(|p| p[3] == 255 && p[0] < 64) && i.rgba.chunks(4).any(|p| p[3] == 255 && p[0] > 192), "{}: black and white", i.name);
+        }
+        let arrow = pack.icons.iter().find(|i| i.name == "Arrow").unwrap();
+        // Roblox's, from the Mac app where it is installed.
+        if std::path::Path::new("/Applications/Roblox.app").is_dir() {
+            let roblox = roblox_pack().expect("Roblox's cursors from the Mac app");
+            assert_eq!(roblox.icons.len(), 3, "{:?}", roblox.source);
+        }
+        assert!(arrow.hotspot[0] < arrow.w as f32 / 3.0 && arrow.hotspot[1] < 4.0, "the arrow's tip: {:?}", arrow.hotspot);
     }
 
     #[test]
