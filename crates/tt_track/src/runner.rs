@@ -111,6 +111,16 @@ pub struct PaintStates(pub std::collections::BTreeMap<FrameIndex, Arc<crate::job
 #[derive(Component, Debug, Clone, Default)]
 pub struct PaintPoints(pub std::collections::BTreeMap<FrameIndex, Vec<PointMark>>);
 
+/// What Jev answered on each frame it was asked about (`job::jev`), and the
+/// examples it was given, for the app to show. Not saved: the frames' boxes
+/// are (the tracker's output).
+#[derive(Component, Debug, Clone, Default)]
+pub struct JevAnswers {
+    pub answers: std::collections::BTreeMap<FrameIndex, crate::job::jev::Answer>,
+    /// The examples (PNGs), as the last job sent them.
+    pub examples: Vec<Arc<Vec<u8>>>,
+}
+
 /// What a cursor tracker learned from its paints (`job::cursor`), for the
 /// app to show: learned in the background as soon as its paints change,
 /// tracking or not ([`learn_cursor`]). Not saved (learned again).
@@ -728,6 +738,23 @@ fn drain(world: &mut World, op: Entity) {
             Msg::IconFit(fit) => {
                 world.entity_mut(op).insert(fit);
             }
+            Msg::Jev(answers) => {
+                let mut e = world.entity_mut(op);
+                if e.get::<JevAnswers>().is_none() {
+                    e.insert(JevAnswers::default());
+                }
+                let mut kept = e.get_mut::<JevAnswers>().expect("inserted");
+                for a in answers {
+                    kept.answers.insert(a.frame, a);
+                }
+            }
+            Msg::JevExamples(examples) => {
+                let mut e = world.entity_mut(op);
+                if e.get::<JevAnswers>().is_none() {
+                    e.insert(JevAnswers::default());
+                }
+                e.get_mut::<JevAnswers>().expect("inserted").examples = examples;
+            }
             Msg::CursorShapes(learned) => {
                 let key = world.resource::<TrackJobs>().basis.get(&op).map_or(0, |b| cursor_key(&b.plan));
                 let learning = world.resource::<TrackJobs>().learners.contains_key(&op);
@@ -735,6 +762,11 @@ fn drain(world: &mut World, op: Entity) {
             }
             Msg::Finished => {
                 world.resource_mut::<TrackJobs>().running.remove(&(op, side));
+                // A Jev tracker asked once is paused again: a new paint or setting doesn't ask (and pay) by itself.
+                let jev = world.get::<Tracker>(op).is_some_and(|t| t.method == Method::Jev);
+                if jev && !world.resource::<TrackJobs>().running.keys().any(|(o, _)| *o == op) {
+                    crate::set_run(world, op, crate::TrackRun::Paused);
+                }
             }
             Msg::Failed(e) => {
                 tracing::warn!("tracker {op} ({side:?}) failed: {e}");
@@ -858,6 +890,31 @@ fn replan(world: &mut World, op: Entity, footage: &Footage) {
     world.resource_mut::<TrackJobs>().basis.insert(op, Basis { plan, done, failed: false, unsettled: true });
 }
 
+/// Track `frames` of tracker `op` again although nothing it depends on
+/// changed (a Jev tracker asked again: its answers vary): they are no
+/// longer done, and stale until replaced. Its run state says when.
+pub fn redo(world: &mut World, op: Entity, frames: &[Range<FrameIndex>]) {
+    let forget: RangeSet = {
+        let mut set = RangeSet::new();
+        for r in frames.iter().filter(|r| !r.is_empty()) {
+            set.insert(r.clone());
+        }
+        set
+    };
+    if let Some(b) = world.resource_mut::<TrackJobs>().basis.get_mut(&op) {
+        b.done = difference(&b.done, &forget);
+        b.failed = false;
+        b.unsettled = true;
+    }
+    if let Some(out) = world.get::<AutoOutput>(op).map(|o| o.0)
+        && let Some(sig) = world.resource_mut::<SignalStore>().get_mut(out)
+    {
+        for r in forget.ranges() {
+            sig.mark_stale(r.clone());
+        }
+    }
+}
+
 /// Stop the jobs the tracker's run state no longer asks for (paused, or
 /// turned the other way): dropping one cancels it; its results so far stay.
 fn stop_unwanted(world: &mut World, op: Entity) {
@@ -954,6 +1011,10 @@ fn start_jobs(world: &mut World, op: Entity, footage: &Footage) -> Waiting {
         let label = world.get::<Name>(op).map_or_else(|| format!("tracker {op}"), |n| format!("{n} ({op})"));
         let mut spec = job_spec(&plan, side, from, to, resume, footage, label);
         spec.paint_resume = paint_resume;
+        // A Jev tracker's range to ask and its cap as they are now (they aren't part of the plan: changing them keeps its results).
+        if let Some(t) = world.get::<Tracker>(op).filter(|t| t.method == Method::Jev) {
+            (spec.jev.ask_from, spec.jev.ask_to, spec.jev.frames) = (t.jev.ask_from, t.jev.ask_to, t.jev.frames);
+        }
         specs.push((now, spec));
     }
     specs.sort_by_key(|(now, _)| !*now);
@@ -1011,6 +1072,7 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
             centred: p.centred.clamp(1.0, 200.0) as f64,
             scores: p.pattern_scores.iter().map(|s| (s.pattern, s.min_score.clamp(-1.0, 1.0))).collect(),
         },
+        jev: p.jev.clone(),
     }
 }
 
@@ -1276,6 +1338,13 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     let m = &p.matching;
     for x in [m.contrast as f64, m.brightness as f64, m.colour as u8 as f64, m.colour_slack as f64, p.method as u8 as f64] {
         put(x);
+    }
+    // (A Jev tracker's own settings: new answers are asked for, and paid, only when they change.)
+    if p.method == Method::Jev {
+        // (Not `frames` or the range to ask: they say what an ask covers, not what an answer is.)
+        put(p.jev.every as f64);
+        put(p.jev.examples as u8 as f64);
+        put(p.jev.fill as u8 as f64);
     }
     // (A cursor tracker's own settings; other trackers' stamps stay as they were.)
     if p.method == Method::Cursor {

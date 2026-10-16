@@ -6,6 +6,7 @@ mod cursor_icons;
 pub mod export;
 mod focus_inspector;
 mod inspector;
+mod jev;
 mod layer_inspector;
 pub mod layer_export;
 pub mod look_editor;
@@ -43,6 +44,7 @@ pub fn draw(ui: &mut egui::Ui, world: &mut World) {
     crate::update::prompt(ui.ctx(), world);
     layer_export::ui(ui.ctx(), world);
     crate::setup::window(ui.ctx(), &mut world.resource_mut::<crate::setup::Doctor>());
+    jev::viewer(ui.ctx(), world);
     // A rename the outliner didn't take (its tab isn't showing) is dropped, not kept for later.
     world.resource_mut::<tt_core::commands::RenameRequest>().0 = None;
 }
@@ -296,9 +298,13 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
             (tt_track::Method::Paint, "⌖ Paint", "brush over the subject: CoTracker follows many points on it, and the tracker moves, turns and scales with most of them (robust to some points getting lost or hidden)"),
             (tt_track::Method::Cursor, "⌖ Cursor", "paint loosely over the mouse cursor on a few frames: it learns what the cursor looks like and finds it on every frame (built in). Shift+brush: a new pattern, for each shape the cursor takes (arrow, hand …); keys 1–0 pick one"),
             (tt_track::Method::TapNext, "⌖ TAPNext", "experimental: Google DeepMind's TAPNext++, a point tracker that gives each frame's result at once (click the pixel to follow, as CoTracker)"),
-        ] {
+            (tt_track::Method::Jev, "⌖ Jev (dev)", "dev only, experimental: brush over the subject on 3 to 5 frames, then Ask Jev in the Inspector: TypeSafe's Jev boxes the subject on every Nth frame after the last paint (over the network, paid)"),
+        ]
+        .into_iter()
+        .filter(|(m, _, _)| *m != tt_track::Method::Jev || crate::dev_build())
+        {
             let usable = match method {
-                tt_track::Method::Template | tt_track::Method::Cursor => Ok(()),
+                tt_track::Method::Template | tt_track::Method::Cursor | tt_track::Method::Jev => Ok(()),
                 tt_track::Method::TapNext => tt_track::job::tapnext_availability(),
                 _ => cotracker.clone(),
             };

@@ -316,6 +316,31 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         }
         world.resource_mut::<NewTrackers>().method = Method::Template;
     }
+    // `=jev`: a Jev tracker in the sketch, painted on three frames, selected (paused: it asks only when asked).
+    let mut jev = None;
+    if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "jev") {
+        world.resource_mut::<NewTrackers>().method = Method::Jev;
+        let paint = |f: FrameIndex| {
+            let c = at(f, [0.0, 0.0]);
+            let (centre, half, mask) = tt_track::tool::paint_look(&[[c[0] - 10.0, c[1] - 4.0], [c[0] + 4.0, c[1] + 6.0], [c[0] + 12.0, c[1] - 2.0]], 9.0);
+            let mut l = Look::new(f, centre, half);
+            l.mask = mask;
+            l
+        };
+        jev = tt_track::add_tracker_with_look(world, sketch, paint(600));
+        if let Some(t) = jev {
+            tt_track::add_look(world, t, paint(610));
+            tt_track::add_look(world, t, paint(620));
+            // `TT_SCENE_JEV_ASK=1`: and asked (paid): the whole sketch, every 5, at most 30 frames, tight examples.
+            if std::env::var_os("TT_SCENE_JEV_ASK").is_some() {
+                edit(world, "Scene: Jev settings", |tx| {
+                    tx.modify::<tt_track::Tracker>(t, |p| p.jev = tt_track::JevSettings { every: 5, frames: 30, ..tt_track::JevSettings::default() })
+                });
+                tt_track::job::jev::ask(world, t, 0, 100_000);
+            }
+        }
+        world.resource_mut::<NewTrackers>().method = Method::Template;
+    }
     // `=icons`: the tracker with no sketch has cursor icons, the first pack
     // found sized from its looks, the second sized by hand.
     if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "icons")
@@ -352,6 +377,11 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
         tt_track::off::switch_from(world, &[g], 610, true);
         tt_track::off::switch_from(world, &[g], 640, false);
         world.resource_mut::<tt_core::selection::Selection>().select_only(g);
+        return subject;
+    }
+    if let Some(t) = jev {
+        world.resource_mut::<tt_core::selection::Selection>().select_only(t);
+        world.resource_mut::<tt_core::transport::Transport>().seek(if std::env::var_os("TT_SCENE_JEV_ASK").is_some() { 645 } else { 620 });
         return subject;
     }
     if let Some(t) = cursor.or(painted).or(loose) {

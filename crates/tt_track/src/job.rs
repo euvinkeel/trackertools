@@ -42,6 +42,7 @@ use crate::{LOST, Method, OUTSIDE, TRACK_CHANNELS};
 
 mod learned;
 pub mod cursor;
+pub mod jev;
 pub mod paint;
 
 pub use learned::{
@@ -177,6 +178,8 @@ pub struct JobSpec {
     /// the video where it is set (video px per icon px; else what matches its looks best).
     pub icons: Arc<Vec<crate::icons::Icon>>,
     pub icon_sizes: Vec<(String, f64)>,
+    /// A Jev tracker's own settings.
+    pub jev: crate::JevSettings,
 }
 
 /// What a job is doing.
@@ -260,6 +263,10 @@ pub enum Msg {
     CursorShapes(cursor::Learned),
     /// The size a template tracker's icons were matched at, and the look they lined up with.
     IconFit(crate::icons::IconFit),
+    /// What Jev answered on these frames (`jev`).
+    Jev(Vec<jev::Answer>),
+    /// The examples a Jev job sends (PNGs, one per paint), for the app to show.
+    JevExamples(Vec<Arc<Vec<u8>>>),
     Finished,
     Failed(String),
 }
@@ -312,6 +319,7 @@ pub fn spawn(spec: JobSpec, shared: Arc<Shared>, tx: Sender<Msg>, threads: &Arc<
                     Method::Template => worker.run(),
                     Method::CoTracker | Method::Paint | Method::TapNext => worker.run_learned(),
                     Method::Cursor => worker.run_cursor(),
+                    Method::Jev => worker.run_jev(),
                     // (A manual dot is never planned: nothing to track.)
                     Method::Manual => Ok(()),
                 };
