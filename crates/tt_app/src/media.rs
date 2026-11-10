@@ -99,7 +99,7 @@ fn open_dialog(mut actions: ResMut<PendingActions>, mut request: ResMut<OpenRequ
     }
     // A native dialog blocks this frame until it closes, as expected.
     if let Some(path) =
-        rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "m4v"]).add_filter("All files", &["*"]).pick_file()
+        rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "m4v", "mkv"]).add_filter("All files", &["*"]).pick_file()
     {
         request.0 = Some(path);
     }
