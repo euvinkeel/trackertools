@@ -140,8 +140,8 @@ fn open_requested(world: &mut World) {
         let mut tr = world.resource_mut::<Transport>();
         tr.fps = index.fps;
         tr.frame_count = index.frame_count();
-        tr.playhead = 0.0;
-        tr.playing = false;
+        // (A shuttle running on the last video ends: its rate and direction don't carry over.)
+        tr.seek(0);
     }
 
     let proxy = if median_gop <= PROXY_WHEN_GOP_OVER {
