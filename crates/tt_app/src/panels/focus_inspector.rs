@@ -36,7 +36,8 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.label(
         egui::RichText::new(
             "One point that follows what it focuses on, and at each key moves smoothly over to the next thing: \
-             once there it sits exactly on it. Tab follows it like a camera; right-click it to export it as a stabilized video.",
+             once there it sits exactly on it (or, with Always on the spring, keeps following it on the spring). \
+             Tab follows it like a camera; right-click it to export it as a stabilized video.",
         )
         .weak()
         .small(),
@@ -93,7 +94,7 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
 
     // The spring.
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("How it moves over").strong());
+    ui.label(egui::RichText::new(if p.always_spring { "Its spring" } else { "How it moves over" }).strong());
     egui::Grid::new(("focus-spring", e)).num_columns(2).spacing([6.0, 3.0]).show(ui, |ui| {
         // (label, value, drag speed, range, unit, tip)
         type Row<'a> = (&'a str, &'a mut f32, f64, std::ops::RangeInclusive<f64>, &'a str, &'a str);
@@ -111,6 +112,11 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             ui.end_row();
         }
     });
+    ui.checkbox(&mut next.always_spring, "Always on the spring").on_hover_text(
+        "Off: once a move settles it sits exactly on what it focuses on. \
+         On: it follows it on the spring all the time, trailing a little and riding through its jitter, like a camera on a spring \
+         (a shorter move time follows more tightly; bounce lets it swing past and back).",
+    );
     move_graph(ui, &next, fps);
 
     drag.changed = next != p;

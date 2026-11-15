@@ -27,6 +27,16 @@
 //! sooner). The box's size moves the same way (a view that zooms with what
 //! it follows zooms over too). Frames a target doesn't have (outside its
 //! frames, or a tracker's lost ones) hold or bridge its nearest.
+//!
+//! **Always on the spring** (`FocusParams::always_spring`) *(on request:
+//! "whatever subject it is currently tracking, it will still have the spring
+//! physics … always be under its own spring smoothed motion, giving us an
+//! alternate way to spring-smooth tracking")*: instead of sitting exactly on
+//! its target once a move settles, it is a spring chasing the target on every
+//! frame (the same stiffness and damping the move time and bounce give a
+//! move). It trails a moving target a little and rides through its jitter,
+//! like a camera on a spring; a key's move is the same spring chasing the
+//! new target.
 
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
@@ -65,11 +75,14 @@ pub struct FocusParams {
     pub bounce: f32,
     /// Seconds a move starts before its key.
     pub lead: f32,
+    /// On the spring all the time, not only while moving over (module docs).
+    #[reflect(default)]
+    pub always_spring: bool,
 }
 
 impl Default for FocusParams {
     fn default() -> Self {
-        Self { keys: Vec::new(), move_time: 1.0, bounce: 0.0, lead: 0.0 }
+        Self { keys: Vec::new(), move_time: 1.0, bounce: 0.0, lead: 0.0, always_spring: false }
     }
 }
 
@@ -106,9 +119,7 @@ pub fn spring(t: f64, time: f64, bounce: f64) -> f64 {
     if time <= 0.0 || t >= time {
         return 1.0;
     }
-    let z = (1.0 - bounce.clamp(0.0, 0.9)).max(0.1);
-    // Settling to 0.2 %: about 8.4 / ω critically damped, 6.2 / (ζ ω) below that.
-    let w = if z >= 1.0 { 8.4 / time } else { 6.2 / (z * time) };
+    let (z, w) = spring_rate(time, bounce);
     let raw = |t: f64| {
         if z >= 1.0 {
             1.0 - (1.0 + w * t) * (-w * t).exp()
@@ -119,6 +130,14 @@ pub fn spring(t: f64, time: f64, bounce: f64) -> f64 {
     };
     let u = t / time;
     raw(t) + (1.0 - raw(time)) * u * u * (3.0 - 2.0 * u)
+}
+
+/// The spring that settles to within 0.2 % in `time` seconds with `bounce`:
+/// its damping ratio ζ (1 − bounce) and its natural frequency ω (rad/s).
+fn spring_rate(time: f64, bounce: f64) -> (f64, f64) {
+    let z = (1.0 - bounce.clamp(0.0, 0.9)).max(0.1);
+    // Settling to 0.2 %: about 8.4 / ω critically damped, 6.2 / (ζ ω) below that.
+    (z, if z >= 1.0 { 8.4 / time } else { 6.2 / (z * time) })
 }
 
 /// `[x, y, half width, half height, angle]` of each target on every frame
@@ -154,6 +173,29 @@ pub fn focus_path(p: &FocusParams, targets: &[Option<Vec<[f64; 5]>>], lo: FrameI
     let n = (hi - lo + 1).max(0) as usize;
     let mut out: Vec<Option<[f64; 5]>> = vec![None; n];
     let lead = (p.lead.max(0.0) as f64 * fps).round() as FrameIndex;
+    if p.always_spring && p.move_time > 0.0 {
+        // A spring chasing, on each frame, the target of the last key whose move has started (before them all, the first's).
+        let (z, w) = spring_rate(p.move_time as f64, p.bounce as f64);
+        let dt = 1.0 / fps.max(1e-9);
+        // (Small enough steps that the spring stays stable at any move time.)
+        let steps = (w * dt / 0.2).ceil().max(1.0) as usize;
+        let h = dt / steps as f64;
+        let mut state: Option<([f64; 5], [f64; 5])> = None;
+        for (i, slot) in out.iter_mut().enumerate() {
+            let f = lo + i as FrameIndex;
+            let k = p.keys.iter().rposition(|k| k.frame - lead <= f).unwrap_or(0);
+            let Some(goal) = targets.get(k).and_then(Option::as_ref).map(|t| t[i]) else { continue };
+            let (x, v) = state.get_or_insert((goal, [0.0; 5]));
+            for _ in 0..steps {
+                for c in 0..5 {
+                    v[c] += (w * w * (goal[c] - x[c]) - 2.0 * z * w * v[c]) * h;
+                    x[c] += v[c] * h;
+                }
+            }
+            *slot = Some(*x);
+        }
+        return out;
+    }
     for (k, key) in p.keys.iter().enumerate() {
         let Some(t) = targets.get(k).and_then(Option::as_ref) else { continue };
         // The first key (or one with nothing before it): its target from the start.
@@ -318,6 +360,35 @@ mod tests {
         assert!(peak > 1.05, "a bounce goes past: {peak}");
         assert!((spring(0.999, 1.0, 0.5) - 1.0).abs() < 0.01 && spring(1.0, 1.0, 0.5) == 1.0);
         assert_eq!(spring(0.1, 0.0, 0.0), 1.0, "no move time: a cut");
+    }
+
+    /// Always on the spring: on a still target it sits on it; following a
+    /// moving one it trails a little and smooths its jitter; at a key it
+    /// chases the new target, settling in about the move time (and past it, back, with bounce).
+    #[test]
+    fn always_on_the_spring_it_trails_smooths_and_moves_over() {
+        let fps = 60.0;
+        // A: still at x = 0. B: moving right 2 px a frame from x = 500, with ±3 px of jitter.
+        let a: Vec<[f64; 5]> = (0..=600).map(|_| [0.0, 0.0, 10.0, 10.0, 0.0]).collect();
+        let jitter = |f: usize| if f.is_multiple_of(2) { 3.0 } else { -3.0 };
+        let b: Vec<[f64; 5]> = (0..=600).map(|f| [500.0 + 2.0 * f as f64 + jitter(f), 0.0, 10.0, 10.0, 0.0]).collect();
+        let p = |bounce: f32| FocusParams { keys: vec![FocusKey { frame: 0, target: Entity::PLACEHOLDER }, FocusKey { frame: 100, target: Entity::PLACEHOLDER }], move_time: 0.5, bounce, lead: 0.0, always_spring: true };
+        let path = focus_path(&p(0.0), &[Some(a.clone()), Some(b.clone())], 0, 600, fps);
+        let x = |f: usize| path[f].expect("a point")[0];
+        assert!((0..100).all(|f| x(f).abs() < 1e-9), "on the still target: exactly on it");
+        // Half a second after the key it has nearly arrived; well after, it follows B with a small, steady lag.
+        let lag = |f: usize| 500.0 + 2.0 * f as f64 - x(f);
+        assert!(lag(160) < 25.0, "settling: {}", lag(160));
+        // (A spring following a steady motion trails it by 2ζv/ω: 2 · 120 px/s ÷ 16.8 rad/s ≈ 14 px.)
+        let (z, w) = spring_rate(0.5, 0.0);
+        let expected = 2.0 * z * 120.0 / w;
+        assert!((400..600).all(|f| (lag(f) - lag(400)).abs() < 1.0) && (lag(400) - expected).abs() < 0.25 * expected, "a steady lag of about {expected:.1}: {}", lag(400));
+        // B's jitter (±3 px a frame) is mostly gone.
+        let wobble = (400..600).map(|f| (x(f + 1) - 2.0 * x(f) + x(f - 1)).abs()).fold(0.0, f64::max);
+        assert!(wobble < 1.0, "smoothed: {wobble}");
+        // With bounce, the move goes past where B is and comes back.
+        let bouncy = focus_path(&p(0.5), &[Some(a), Some(b)], 0, 600, fps);
+        assert!((100..300).any(|f| bouncy[f].expect("a point")[0] > 500.0 + 2.0 * f as f64 + 5.0), "it overshoots");
     }
 
     #[test]
