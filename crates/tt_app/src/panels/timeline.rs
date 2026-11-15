@@ -75,12 +75,21 @@ pub struct TimelineView {
     pub lane_scroll: f32,
 }
 
+/// Lanes folded shut on the timeline: what is under them in the tree is
+/// hidden (a fold triangle beside a lane, or a click on the line down its
+/// lanes, as comment threads fold; on request: "collapse stuff like a hacker
+/// news comment hierarchical collapse … so I can tidy the view up").
+#[derive(Resource, Debug, Default)]
+pub struct TimelineFolds(pub std::collections::HashSet<Entity>);
+
 pub struct TimelineModule;
 
 impl Module for TimelineModule {
     fn build(&self, app: &mut AppBuilder) {
         app.declare::<TimelineView>(Class::Session)
             .declare::<TimelineUi>(Class::Derived)
+            .declare::<TimelineFolds>(Class::Session)
+            .init_resource::<TimelineFolds>()
             .init_resource::<TimelineView>()
             .init_resource::<TimelineUi>();
     }
@@ -323,10 +332,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         if fitted { TimelineView { lane_scroll, ..TimelineView::default() } } else { TimelineView { start, span: Some(span), lane_scroll } };
 
     ui_state.lanes_area = Some(lanes_area);
+    ui_state.fold_controls = hits.folds.clone();
     let in_lanes = origin.is_some_and(|o| rows.contains(o));
     ui_state.hover_edge = response.hover_pos().filter(|p| lanes_area.contains(*p)).and_then(|p| hits.edge_at(p));
     if ui_state.hover_edge.is_some() || ui_state.edge.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    if response.hover_pos().is_some_and(|p| hits.folds.iter().any(|(_, r)| r.contains(p))) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if in_lanes
         && response.drag_started_by(egui::PointerButton::Primary)
@@ -460,7 +473,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         && let Some(pos) = response.interact_pointer_pos()
     {
         let under = hits.at(pos);
-        if response.double_clicked() {
+        let fold = hits.folds.iter().find(|(_, r)| r.contains(pos)).map(|(e, _)| *e);
+        if let Some(e) = fold.filter(|_| response.clicked() || response.double_clicked()) {
+            // A fold triangle or a thread's line: fold or unfold it (the selection stays).
+            let mut folds = world.resource_mut::<TimelineFolds>();
+            if !folds.0.remove(&e) {
+                folds.0.insert(e);
+            }
+        } else if response.double_clicked() {
             // Double-click a lane: into the view that follows it.
             if let Some(e) = under.and_then(|e| tt_core::view::followable(world, e)) {
                 world.resource_mut::<Selection>().select_only(e);
@@ -673,6 +693,8 @@ struct Hits {
     ticks: Vec<(Entity, Rect)>,
     /// `(entity, which end, its x, its lane)`: the ends of lifetimes, to drag.
     edges: Vec<(Entity, Edge, f32, Rect)>,
+    /// `(lane, where a click folds or unfolds it)`: its triangle and the line down its lanes.
+    folds: Vec<(Entity, Rect)>,
     /// The box being dragged, as drawn this frame.
     marquee: Option<Rect>,
     /// A spinner turns: keep repainting.
@@ -778,7 +800,22 @@ fn lanes(
     time: f64,
 ) -> Hits {
     use crate::icons::{self, Activity, Glyph};
-    let tree = lane_list(world);
+    // The lanes shown: none under a folded one. `under`: how many lanes each one's subtree has (shown or not).
+    let (tree, under) = {
+        let all = lane_list(world);
+        let folded = &world.resource::<TimelineFolds>().0;
+        let (mut tree, mut under) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < all.len() {
+            let (e, depth, _) = all[i];
+            let n = all[i + 1..].iter().take_while(|(_, d, _)| *d > depth).count();
+            tree.push(all[i]);
+            under.push(n);
+            i += if folded.contains(&e) { n + 1 } else { 1 };
+        }
+        (tree, under)
+    };
+    let folded = world.resource::<TimelineFolds>().0.clone();
     let colors = crate::colors::Colors::new(world);
     let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
@@ -881,8 +918,31 @@ fn lanes(
         let own = colors.of(world, e, glyph);
         let method = world.get::<tt_track::Tracker>(e).map(|t| t.method);
         let manual = method == Some(tt_track::Method::Manual);
-        // The name column: indent, (a tracker's) spinner, icon, name.
-        let mut x = gutter.min.x + 6.0 + depth as f32 * 10.0;
+        // The name column: indent, fold triangle, (a tracker's) spinner, icon, name.
+        let fold_x = gutter.min.x + 7.0 + depth as f32 * 10.0;
+        let mut x = fold_x + 7.0;
+        if under[i] > 0 {
+            let shut = folded.contains(&e);
+            let toggle = Rect::from_center_size(Pos2::new(fold_x, y + LANE_H / 2.0), Vec2::splat(11.0));
+            let lit = hover.is_some_and(|p| toggle.contains(p));
+            let c = if lit { style::TEXT } else { style::MUTED };
+            let (cx, cy) = (fold_x, y + LANE_H / 2.0);
+            let tri = if shut {
+                vec![Pos2::new(cx - 2.0, cy - 4.0), Pos2::new(cx + 3.0, cy), Pos2::new(cx - 2.0, cy + 4.0)]
+            } else {
+                vec![Pos2::new(cx - 4.0, cy - 2.0), Pos2::new(cx + 4.0, cy - 2.0), Pos2::new(cx, cy + 3.0)]
+            };
+            painter.add(egui::Shape::convex_polygon(tri, c, Stroke::NONE));
+            hits.folds.push((e, toggle));
+            // Open: a line down its lanes, as a comment thread has; a click on it folds them.
+            let shown = tree[i + 1..].iter().take_while(|(_, d, _)| *d > depth).count();
+            if !shut && shown > 0 {
+                let line = Rect::from_x_y_ranges(fold_x - 3.5..=fold_x + 3.5, y + LANE_H..=y + (shown + 1) as f32 * LANE_H - 3.0);
+                let lit = hover.is_some_and(|p| line.contains(p));
+                painter.line_segment([line.center_top(), line.center_bottom()], Stroke::new(if lit { 2.0 } else { 1.0 }, if lit { style::TEXT } else { style::RULER }));
+                hits.folds.push((e, line));
+            }
+        }
         if kind == LaneKind::Tracker && !manual {
             let a = Activity::of(world, e);
             hits.moving |= a.moving();
@@ -892,6 +952,8 @@ fn lanes(
         icons::paint_in(&painter, Rect::from_center_size(Pos2::new(x + 6.0, y + LANE_H / 2.0), Vec2::splat(12.0)), glyph, selected, own);
         x += 16.0;
         let name = world.get::<Name>(e).map_or("item".into(), |n| n.to_string());
+        // Folded: how many lanes it hides.
+        let name = if folded.contains(&e) && under[i] > 0 { format!("{name}  +{}", under[i]) } else { name };
         let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
         let label = Rect::from_min_max(Pos2::new(x - 1.0, y + 1.0), Pos2::new((x + galley.size().x + 2.0).min(gutter.max.x - 2.0), y + LANE_H - 1.0));
         let span = span_of(world, e);
@@ -1189,6 +1251,8 @@ pub struct TimelineUi {
     live: bool,
     /// Where the lanes were drawn (the demo aims at it).
     pub lanes_area: Option<Rect>,
+    /// Where a click folds or unfolds a lane, as drawn last (tests aim at them).
+    pub fold_controls: Vec<(Entity, Rect)>,
 }
 
 /// An in or out point (`tt_core::marks`), as a handle on the ruler.
@@ -1340,6 +1404,55 @@ mod tests {
         undo(&mut world);
         assert_eq!(world.get::<Span>(sketch), None, "one undo takes the whole drag back");
         assert!(!world.resource::<History>().can_undo());
+    }
+
+    /// A lane with lanes under it folds like a comment thread: a click on
+    /// its triangle or on the line down its lanes hides them (and says how
+    /// many), the selection stays as it was; a click on the triangle again
+    /// brings them back.
+    #[test]
+    fn a_lane_folds_its_lanes_away_like_a_thread() {
+        let (mut world, sketch) = setup();
+        let (out, auto) = {
+            let mut store = world.resource_mut::<SignalStore>();
+            (store.create(tt_track::TRACK_CHANNELS), store.create(tt_track::TRACK_CHANNELS))
+        };
+        // A tracker guided by the sketch: its lane is under the sketch's.
+        world.spawn((
+            Name::new("Tracker 1"),
+            Operator { kind: "track".into() },
+            tt_core::op::Inputs(vec![("guide".into(), sketch)]),
+            Output(out),
+            tt_track::human::AutoOutput(auto),
+            tt_track::Tracker::at(200),
+            tt_track::runner::TrackBook::default(),
+        ));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut world, Vec::new());
+        frame(&ctx, &mut world, Vec::new());
+        let controls = |w: &World| w.resource::<TimelineUi>().fold_controls.clone();
+        assert_eq!(controls(&world).len(), 2, "the sketch's triangle and the line down its lanes");
+        let click = |ctx: &egui::Context, world: &mut World, at: Pos2| {
+            frame(ctx, world, vec![Event::PointerMoved(at)]);
+            frame(ctx, world, vec![button(at, true)]);
+            frame(ctx, world, vec![button(at, false)]);
+            frame(ctx, world, Vec::new());
+        };
+        // The line (the taller of the two): folds.
+        let line = controls(&world).into_iter().max_by(|a, b| a.1.height().total_cmp(&b.1.height())).expect("the line").1;
+        click(&ctx, &mut world, line.center());
+        assert!(world.resource::<TimelineFolds>().0.contains(&sketch), "folded");
+        assert!(world.resource::<Selection>().entities.is_empty(), "a fold isn't a selection");
+        assert_eq!(controls(&world).len(), 1, "folded: no line, only its triangle");
+        // Where the tracker's lane was, there is nothing to select now.
+        let lanes = world.resource::<TimelineUi>().lanes_area.expect("lanes drawn");
+        click(&ctx, &mut world, Pos2::new(lanes.min.x + 0.4 * lanes.width(), lanes.min.y + 1.5 * LANE_H));
+        assert!(world.resource::<Selection>().entities.is_empty(), "its lanes are hidden");
+        // The triangle: unfolds.
+        let triangle = controls(&world)[0].1;
+        click(&ctx, &mut world, triangle.center());
+        assert!(!world.resource::<TimelineFolds>().0.contains(&sketch), "unfolded");
+        assert_eq!(controls(&world).len(), 2);
     }
 
     /// Dragging a manual dot's frames onto a tracker's lane merges it in:
