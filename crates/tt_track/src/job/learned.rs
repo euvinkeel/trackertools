@@ -794,7 +794,7 @@ impl Worker {
                 }
                 for l in s.looks.iter().filter(|l| l.frame == f) {
                     paints.push((i, l.clone()));
-                    for p in super::paint::sample(l, super::paint::POINTS_PER_PAINT) {
+                    for p in super::paint::sample(l, s.paint_dots) {
                         let c = crop_point(f, self.map(f).from_source(p));
                         if (0.0..CROP_W as f64).contains(&c[0]) && (0.0..CROP_H as f64).contains(&c[1]) {
                             queries.push((i, c));

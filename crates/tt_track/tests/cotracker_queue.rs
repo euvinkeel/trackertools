@@ -319,6 +319,7 @@ fn a_job_that_panics_reports_a_failure() {
         icons: Default::default(),
         icon_sizes: Vec::new(),
         jev: Default::default(),
+        paint_dots: tt_track::job::paint::POINTS_PER_PAINT,
     };
     let (threads, workers) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -541,6 +542,27 @@ fn a_paint_tracker_follows_its_paints() {
     quiet(&mut core);
 }
 
+
+/// Dots per paint (`Tracker::paint_dots`): a paint gives that many points,
+/// and changing it tracks again with the new count.
+#[test]
+fn a_paint_gives_as_many_dots_as_its_tracker_says() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    core.world.resource_mut::<NewTrackers>().method = Method::Paint;
+    let (c, h, mask) = tt_track::tool::paint_look(&[truth(600), [truth(600)[0] + 12.0, truth(600)[1] + 4.0]], 9.0);
+    let mut look = Look::new(600, c, h);
+    look.mask = mask;
+    let op = tt_track::add_tracker_with_look(&mut core.world, guide, look).expect("tracker");
+    set_span(&mut core.world, op, Span::new(595, 610));
+    for n in [6u32, 20] {
+        tt_core::history::edit(&mut core.world, "Dots per paint", |tx| tx.modify::<Tracker>(op, |t| t.paint_dots = n));
+        run(&mut core, &[op], |_| {});
+        let points = core.world.get::<tt_track::runner::PaintPoints>(op).expect("its points");
+        assert_eq!(points.0.get(&605).map(Vec::len), Some(n as usize), "{n} dots a paint");
+    }
+    quiet(&mut core);
+}
 
 /// A reset point added between two others re-tracks only from the one
 /// before it to the one after it (on request: "limit recomputation from

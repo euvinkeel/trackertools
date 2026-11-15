@@ -967,6 +967,25 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     }
     // Its looks (select one to paint its mask), or a CoTracker's reset points.
     let looks = if method == Method::Cursor { Vec::new() } else { looks_of(world, e) };
+    // A paint tracker: how many dots (CoTracker points) a paint gives.
+    if method == Method::Paint {
+        ui.horizontal(|ui| {
+            ui.label("Dots per paint");
+            let n = world.get::<Tracker>(e).map_or(48, |t| t.paint_dots) as f32;
+            setting_slider(
+                ui,
+                world,
+                e,
+                n,
+                |v| egui::Slider::new(v, 4.0..=256.0).logarithmic(true).step_by(1.0),
+                [
+                    "dots per paint",
+                    "The most CoTracker points one paint gives, spread evenly over what you painted. More hold on better when part of the subject is hidden; fewer track a little faster. Changing it tracks again.",
+                ],
+                |t, v| t.paint_dots = v.round() as u32,
+            );
+        });
+    }
     let mut remove = None;
     let here = world.resource::<Transport>().frame();
     ui.horizontal_wrapped(|ui| {

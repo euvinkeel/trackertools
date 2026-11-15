@@ -40,7 +40,7 @@ use super::LookSpec;
 use tt_core::time::FrameIndex;
 use tt_core::view::SpaceMap;
 
-/// The most points one paint gives.
+/// The most points one paint gives, unless its tracker says otherwise (`Tracker::paint_dots`).
 pub const POINTS_PER_PAINT: usize = 48;
 /// A mask cell counts as painted from this value (0–255).
 const PAINTED: u8 = 96;

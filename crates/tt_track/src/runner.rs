@@ -480,7 +480,7 @@ impl Plan {
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && p.matching == q.matching
             && p.method == q.method
-            && (p.centred, &p.pattern_scores) == (q.centred, &q.pattern_scores)
+            && (p.centred, &p.pattern_scores, p.paint_dots) == (q.centred, &q.pattern_scores, q.paint_dots)
             && self.icons == old.icons
             && self.icon_sizes == old.icon_sizes
             && self.root == old.root;
@@ -1073,6 +1073,7 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
             scores: p.pattern_scores.iter().map(|s| (s.pattern, s.min_score.clamp(-1.0, 1.0))).collect(),
         },
         jev: p.jev.clone(),
+        paint_dots: p.paint_dots.clamp(1, 512) as usize,
     }
 }
 
@@ -1366,6 +1367,10 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     for l in &looks {
         [l.frame as f64, l.center[0], l.center[1], l.half[0], l.half[1]].iter().for_each(|x| put(*x));
         l.mask.iter().flatten().for_each(|c| put(*c as f64));
+    }
+    // A paint tracker's dots a paint (only when not the default: saved stamps stay what they were).
+    if params.method == Method::Paint && params.paint_dots as usize != crate::job::paint::POINTS_PER_PAINT {
+        put(params.paint_dots as f64);
     }
     // (Only when there is no guide, so a guided tracker's stamp stays what it was.)
     let root = guide_of(world, op).is_none();

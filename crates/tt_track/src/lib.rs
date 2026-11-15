@@ -310,6 +310,14 @@ pub struct Tracker {
     /// A Jev tracker's own settings (`job::jev`).
     #[reflect(default)]
     pub jev: JevSettings,
+    /// A paint tracker: the most dots (CoTracker points) one paint gives,
+    /// spread evenly over what was painted (`job::paint`).
+    #[reflect(default = "paint_dots")]
+    pub paint_dots: u32,
+}
+
+fn paint_dots() -> u32 {
+    job::paint::POINTS_PER_PAINT as u32
 }
 
 /// A Jev tracker's settings (`Method::Jev`, `job::jev`).
@@ -434,6 +442,7 @@ impl Tracker {
             centred: centred(),
             pattern_scores: Vec::new(),
             jev: JevSettings::default(),
+            paint_dots: paint_dots(),
         }
     }
 

@@ -180,6 +180,8 @@ pub struct JobSpec {
     pub icon_sizes: Vec<(String, f64)>,
     /// A Jev tracker's own settings.
     pub jev: crate::JevSettings,
+    /// A paint tracker: the most points one paint gives.
+    pub paint_dots: usize,
 }
 
 /// What a job is doing.
