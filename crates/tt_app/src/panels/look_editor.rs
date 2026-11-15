@@ -6,7 +6,7 @@
 
 use bevy_ecs::prelude::*;
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, Vec2};
-use tt_core::history::{History, edit};
+use tt_core::history::edit;
 use tt_core::input::{Action, PendingActions};
 use tt_core::transport::Transport;
 use tt_track::look::{Look, MASK_N};
@@ -142,11 +142,6 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             }
         }
     }
-    // A paint drag is one undo step.
-    if response.drag_started() {
-        world.resource_mut::<History>().begin("Paint look mask");
-    }
-
     let mut set: Option<(Vec<u8>, &str)> = changed.then(|| (mask.clone(), "Paint look mask"));
     ui.horizontal(|ui| {
         let mut r = radius;
@@ -168,12 +163,13 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             set = Some((Vec::new(), "Clear mask"));
         }
     });
-    if let Some((m, label)) = set {
-        edit(world, label, |tx| tx.modify::<Look>(e, |l| l.mask = m));
-    }
-    if response.drag_stopped() && world.resource::<History>().in_gesture() {
-        world.resource_mut::<History>().end();
-    }
+    // A paint drag is one undo step (a button's change, one of its own).
+    let drag = tt_core::history::WidgetDrag { started: response.drag_started(), dragging: response.dragged(), changed: set.is_some(), stopped: response.drag_stopped() };
+    tt_core::history::widget_edit(world, "Paint look mask", drag, |w| {
+        if let Some((m, label)) = set {
+            edit(w, label, |tx| tx.modify::<Look>(e, |l| l.mask = m));
+        }
+    });
     if world.resource::<Transport>().frame() != look.frame {
         ui.label(egui::RichText::new(format!("(the look is on frame {}; the viewport shows another)", look.frame)).weak().small());
     }

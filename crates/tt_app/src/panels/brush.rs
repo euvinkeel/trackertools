@@ -5,7 +5,7 @@
 use bevy_ecs::prelude::*;
 use tt_core::autospeed::AutoSpeed;
 use tt_core::capture::{SCALE_RANGE, SketchDefaults, WheelMode};
-use tt_core::history::{History, edit};
+use tt_core::history::edit;
 use tt_core::selection::Selection;
 use tt_core::sketch::{SketchParams, sketch_of};
 use tt_core::transport::Transport;
@@ -77,10 +77,11 @@ fn box_settings(ui: &mut egui::Ui, world: &mut World) {
         None => "Box of new sketches".to_string(),
     });
     note(ui, "Half the box = your hand's jiggle × 2.2 × jiggle gain + padding, then clamped to at least half the smallest box (per axis).");
-    let mut drag = (false, false);
+    let mut drag = tt_core::history::WidgetDrag::default();
     let mut track = |r: egui::Response| {
-        drag.0 |= r.drag_started();
-        drag.1 |= r.drag_stopped();
+        drag.started |= r.drag_started();
+        drag.dragging |= r.dragged();
+        drag.stopped |= r.drag_stopped();
     };
     egui::Grid::new("brush-box").num_columns(2).show(ui, |ui| {
         ui.label("Padding");
@@ -119,20 +120,14 @@ fn box_settings(ui: &mut egui::Ui, world: &mut World) {
         });
     }
 
-    if p != current {
-        match target {
-            Some(e) => {
-                // A drag is one undo step.
-                if drag.0 {
-                    world.resource_mut::<History>().begin(format!("Box of {}", name.as_deref().unwrap_or("sketch")));
-                }
-                edit(world, "Box settings", |tx| tx.insert(e, p.clone()));
-            }
-            None => world.resource_mut::<SketchDefaults>().params = p,
-        }
-    }
-    if drag.1 && target.is_some() && world.resource::<History>().in_gesture() {
-        world.resource_mut::<History>().end();
+    drag.changed = p != current;
+    match target {
+        // A drag is one undo step.
+        Some(e) => tt_core::history::widget_edit(world, &format!("Box of {}", name.as_deref().unwrap_or("sketch")), drag, |w| {
+            edit(w, "Box settings", |tx| tx.insert(e, p.clone()));
+        }),
+        None if drag.changed => world.resource_mut::<SketchDefaults>().params = p,
+        None => {}
     }
     if let Some(e) = target {
         let is_default = world.resource::<SketchDefaults>().params == world.get::<SketchParams>(e).cloned().unwrap_or_default();

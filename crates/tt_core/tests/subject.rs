@@ -310,3 +310,57 @@ fn a_click_on_its_path_keeps_it_and_alt_click_removes_a_pin() {
     assert!(d.core.world.get::<Subject>(s).expect("subject").offsets.is_empty(), "the pin is gone");
     assert_eq!(d.core.world.resource::<History>().undo_label(), Some("Unkey Subject 1"));
 }
+
+/// Ctrl+Z in the middle of a drag undoes the drag so far and ends it: moving
+/// on until the release changes nothing (it used to go on keying, an undo step a frame).
+#[test]
+fn undo_during_a_drag_ends_it() {
+    use tt_core::input::Action;
+    let mut d = Driver::new();
+    let (a, b) = two_points(&mut d);
+    let s = make_subject(&mut d.core.world, &[a, b], 120).expect("a subject");
+    d.core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    d.core.world.resource_mut::<Transport>().seek(120);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let v = value_at(&d.core.world, s, 120).expect("a value");
+    let t0 = d.now;
+    let path = move |t: f64| [v[0] + 300.0 * ((t - t0 - 0.02) / 0.3).clamp(0.0, 1.0), v[1]];
+    d.frame(path, PRESS);
+    d.frames(20, path, HOLD);
+    d.frame(path, common::Input { action: Some(Action::Undo), ..HOLD });
+    d.frames(20, path, HOLD);
+    d.frame(path, UP);
+    let w = &d.core.world;
+    assert!(w.get::<Subject>(s).expect("subject").offsets.is_empty(), "no keys after the undo");
+    assert_eq!(w.resource::<History>().undo_label(), Some("Make Subject 1"), "no undo steps from after it");
+    assert!(!w.resource::<History>().in_gesture());
+}
+
+/// A key's edit while a drag goes on (here: marking the in point) is its own
+/// undo step, not part of the drag's.
+#[test]
+fn an_edit_during_a_drag_is_its_own_undo_step() {
+    use tt_core::input::Action;
+    let mut d = Driver::new();
+    let (a, b) = two_points(&mut d);
+    let s = make_subject(&mut d.core.world, &[a, b], 120).expect("a subject");
+    d.core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    d.core.world.resource_mut::<Transport>().seek(120);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let v = value_at(&d.core.world, s, 120).expect("a value");
+    let t0 = d.now;
+    let path = move |t: f64| [v[0] + 30.0 * ((t - t0 - 0.02) / 0.1).clamp(0.0, 1.0), v[1]];
+    d.frame(path, PRESS);
+    d.frames(10, path, HOLD);
+    d.frame(path, common::Input { action: Some(Action::MarkIn), ..HOLD });
+    d.frames(10, path, HOLD);
+    d.frame(path, UP);
+    // The drag after the key, the key, the drag before it: each its own step.
+    let moved = |w: &World| !w.get::<Subject>(s).expect("subject").offsets.is_empty();
+    assert_eq!(undo(&mut d.core.world).as_deref(), Some("Move Subject 1"));
+    assert!(moved(&d.core.world) && tt_core::marks::marks(&d.core.world).mark_in == Some(120), "the in point stays");
+    undo(&mut d.core.world);
+    assert!(moved(&d.core.world) && tt_core::marks::marks(&d.core.world).mark_in.is_none(), "the in point alone");
+    assert_eq!(undo(&mut d.core.world).as_deref(), Some("Move Subject 1"));
+    assert!(!moved(&d.core.world));
+}

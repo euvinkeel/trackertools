@@ -34,7 +34,7 @@ use bevy_ecs::world::EntityRef;
 use bevy_reflect::Reflect;
 
 use crate::app::{AppBuilder, Module, Set};
-use crate::history::{History, edit};
+use crate::history::{Gesture, History, edit, owning};
 use crate::meta::Class;
 use crate::op::{EvalCtx, Footprint, Inputs, Operator, OperatorKind, Output};
 use crate::selection::Selection;
@@ -467,7 +467,8 @@ struct Grab {
     /// Its members' motion on that frame and its keys, as they were at the press.
     pushed: [f64; 3],
     keys: Vec<OffsetKey>,
-    moved: bool,
+    /// Once it moved: its undo step, open until the release.
+    gesture: Option<Gesture>,
 }
 
 #[derive(Resource, Debug, Default)]
@@ -476,7 +477,7 @@ pub struct SubjectDrag(Option<Grab>);
 impl SubjectDrag {
     /// The subject being dragged and the frame of it taken hold of.
     pub fn grabbed(&self) -> Option<(Entity, FrameIndex)> {
-        self.0.as_ref().filter(|g| g.moved).map(|g| (g.subject, g.frame))
+        self.0.as_ref().filter(|g| g.gesture.is_some()).map(|g| (g.subject, g.frame))
     }
 }
 
@@ -484,11 +485,12 @@ impl SubjectDrag {
 /// the selected subject's path, and a drag bends its path there: a key on
 /// that frame where the pointer is, and keys at the reach's edges holding
 /// what was there ([`pinned`]); the wheel changes the reach as it goes. One
-/// undo step per drag. A press that doesn't move is a click (tool.rs).
+/// undo step per drag; undone or cancelled (Esc) while it goes on, it stops
+/// there. A press that doesn't move is a click (tool.rs).
 fn drag_subject(world: &mut World) {
     if world.resource::<ActiveTool>().0 != Tool::Select {
-        if world.resource_mut::<SubjectDrag>().0.take().is_some_and(|g| g.moved) {
-            world.resource_mut::<History>().end();
+        if let Some(g) = world.resource_mut::<SubjectDrag>().0.take().and_then(|g| g.gesture) {
+            world.resource_mut::<History>().end(g);
         }
         return;
     }
@@ -517,10 +519,14 @@ fn drag_subject(world: &mut World) {
             let map = map_at(world, view, f);
             let src = map.to_source(at);
             let keys = world.get::<Subject>(e).map(|s| s.offsets.clone()).unwrap_or_default();
-            world.resource_mut::<SubjectDrag>().0 = Some(Grab { subject: e, frame: f, map, from: at, hold: [v[0] - src[0], v[1] - src[1]], pushed: [v[8], v[9], v[10]], keys, moved: false });
+            world.resource_mut::<SubjectDrag>().0 = Some(Grab { subject: e, frame: f, map, from: at, hold: [v[0] - src[0], v[1] - src[1]], pushed: [v[8], v[9], v[10]], keys, gesture: None });
         }
     }
     let Some(g) = world.resource::<SubjectDrag>().0.clone() else { return };
+    if g.gesture.is_some_and(|id| !world.resource::<History>().is_open(id)) {
+        world.resource_mut::<SubjectDrag>().0 = None;
+        return;
+    }
     // While it's held, the views hold still (view::HoldViews): one following the
     // subject would otherwise move under the pointer, and the drag run away.
     let start = g.map.to_source(g.from);
@@ -531,16 +537,16 @@ fn drag_subject(world: &mut World) {
         world.resource_mut::<PointerFrame>().wheel_taken = true;
     }
     if let Some(now) = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover)
-        && (g.moved || (now[0] - g.from[0]).hypot(now[1] - g.from[1]) * scale >= CLICK_MOVE)
+        && (g.gesture.is_some() || (now[0] - g.from[0]).hypot(now[1] - g.from[1]) * scale >= CLICK_MOVE)
     {
         let e = g.subject;
-        if !g.moved {
+        let gesture = g.gesture.unwrap_or_else(|| {
             let name = world.get::<Name>(e).map_or("subject".to_string(), |n| n.to_string());
-            world.resource_mut::<History>().begin(format!("Move {name}"));
             world.resource_mut::<Selection>().select_only(e);
-            if let Some(d) = world.resource_mut::<SubjectDrag>().0.as_mut() {
-                d.moved = true;
-            }
+            world.resource_mut::<History>().begin(format!("Move {name}"))
+        });
+        if let Some(d) = world.resource_mut::<SubjectDrag>().0.as_mut() {
+            d.gesture = Some(gesture);
         }
         let src = g.map.to_source(now);
         let [x, y] = offset_to(g.pushed, [src[0] + g.hold[0], src[1] + g.hold[1]]);
@@ -549,11 +555,13 @@ fn drag_subject(world: &mut World) {
         let reach = world.resource::<SubjectReach>().seconds().map(|s| (s as f64 * fps).round() as FrameIndex);
         let keys = pinned(&g.keys, ease, OffsetKey { frame: g.frame, x: x as f32, y: y as f32, angle }, reach);
         if world.get::<Subject>(e).is_some_and(|s| s.offsets != keys) {
-            edit(world, "Move subject", |tx| tx.modify::<Subject>(e, |s| s.offsets = keys));
+            owning(world, gesture, |w| edit(w, "Move subject", |tx| tx.modify::<Subject>(e, |s| s.offsets = keys)));
         }
     }
-    if (p.released.is_some() || !p.down) && world.resource_mut::<SubjectDrag>().0.take().is_some_and(|g| g.moved) {
-        world.resource_mut::<History>().end();
+    if (p.released.is_some() || !p.down)
+        && let Some(g) = world.resource_mut::<SubjectDrag>().0.take().and_then(|g| g.gesture)
+    {
+        world.resource_mut::<History>().end(g);
     }
 }
 

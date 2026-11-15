@@ -6,7 +6,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_reflect::PartialReflect;
 use tt_core::capture::SketchDefaults;
-use tt_core::history::{History, edit};
+use tt_core::history::edit;
 use tt_core::meta::{Class, ComponentMetas};
 use tt_core::selection::Selection;
 use tt_core::sketch::SketchParams;
@@ -139,7 +139,7 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                 ui.label(egui::RichText::new("session (not undoable)").weak().small());
             }
             let r = reflect_ui::edit(ui, value.as_mut());
-            if r.changed || r.drag_started || r.drag_stopped {
+            if r.changed || r.drag_started || r.dragging || r.drag_stopped {
                 pending = Some((path.clone(), short.clone(), value, r, class));
             }
         });
@@ -154,18 +154,13 @@ fn components(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         }
         return;
     }
-    // A drag is one undo step: open a gesture on drag start, close it on release.
-    if r.drag_started {
-        world.resource_mut::<History>().begin(format!("Edit {short}"));
-    }
-    if r.changed {
-        edit(world, &format!("Edit {short}"), |tx| {
+    // A drag is one undo step.
+    let drag = tt_core::history::WidgetDrag { started: r.drag_started, dragging: r.dragging, changed: r.changed, stopped: r.drag_stopped };
+    tt_core::history::widget_edit(world, &format!("Edit {short}"), drag, |w| {
+        edit(w, &format!("Edit {short}"), |tx| {
             tx.set_reflected(e, &path, value.as_ref());
         });
-    }
-    if r.drag_stopped {
-        world.resource_mut::<History>().end();
-    }
+    });
 }
 
 /// A subject (tt_core::subject): its members, its own offset on the shown
@@ -229,7 +224,7 @@ fn subject_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     let keyed = subject.offsets.iter().any(|k| k.frame == here);
     let [x, y, a] = offset_at(&subject.offsets, here, subject.ease);
     let (mut x, mut y, mut a) = (x as f32, y as f32, a.to_degrees() as f32);
-    let (mut changed, mut started, mut stopped) = (false, false, false);
+    let mut key_drag = tt_core::history::WidgetDrag::default();
     ui.horizontal(|ui| {
         ui.label(if keyed { format!("Its key on frame {here}:") } else { format!("Its offset on frame {here}:") }).on_hover_text(
             "Where on the moving thing it sits (px, in its starting frame's directions, so it turns with the thing) and how much more it is turned. \
@@ -237,9 +232,10 @@ fn subject_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         );
         for (v, suffix, speed) in [(&mut x, " x", 0.5), (&mut y, " y", 0.5), (&mut a, "\u{b0}", 0.2)] {
             let r = ui.add(egui::DragValue::new(v).speed(speed).max_decimals(2).suffix(suffix));
-            changed |= r.changed();
-            started |= r.drag_started();
-            stopped |= r.drag_stopped();
+            key_drag.changed |= r.changed();
+            key_drag.started |= r.drag_started();
+            key_drag.dragging |= r.dragged();
+            key_drag.stopped |= r.drag_stopped();
         }
     });
     let (mut unkey, mut anchor) = (false, false);
@@ -270,14 +266,14 @@ fn subject_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     }
     // The whole path smoothed, and how it goes from key to key.
     let (mut smooth, mut ease) = (subject.smooth, subject.ease);
-    let (mut smooth_started, mut smooth_stopped) = (false, false);
+    let mut smooth_drag = tt_core::history::WidgetDrag::default();
     ui.horizontal(|ui| {
         ui.label("Smooth its path").on_hover_text(
             "Seconds of smoothing on its members' motion, over the whole path (0: none). Its keys stay exactly where they are. \
              An export's own smoothing comes on top of this.",
         );
         let r = ui.add(egui::Slider::new(&mut smooth, 0.0..=2.0).step_by(0.01).suffix(" s"));
-        (smooth_started, smooth_stopped) = (r.drag_started(), r.drag_stopped());
+        smooth_drag = tt_core::history::WidgetDrag { started: r.drag_started(), dragging: r.dragged(), changed: false, stopped: r.drag_stopped() };
     });
     ui.horizontal(|ui| {
         ui.label("Between keys");
@@ -286,26 +282,11 @@ fn subject_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     });
     ui.label(egui::RichText::new("Drag its path on the video to bend it there (the wheel while dragging: how far). Alt+click a key on the path to remove it.").weak().small());
     ui.separator();
-    if smooth_started {
-        world.resource_mut::<History>().begin(format!("Smooth {name}"));
-    }
-    if smooth != subject.smooth || ease != subject.ease {
-        edit(world, &format!("Smooth {name}"), |tx| {
-            tx.modify::<Subject>(e, |s| (s.smooth, s.ease) = (smooth.max(0.0), ease));
-        });
-    }
-    if smooth_stopped {
-        world.resource_mut::<History>().end();
-    }
-    if started {
-        world.resource_mut::<History>().begin(format!("Key {name}"));
-    }
-    if changed {
-        set_offset_key(world, e, OffsetKey { frame: here, x, y, angle: a });
-    }
-    if stopped {
-        world.resource_mut::<History>().end();
-    }
+    smooth_drag.changed = smooth != subject.smooth || ease != subject.ease;
+    tt_core::history::widget_edit(world, &format!("Smooth {name}"), smooth_drag, |w| {
+        edit(w, &format!("Smooth {name}"), |tx| tx.modify::<Subject>(e, |s| (s.smooth, s.ease) = (smooth.max(0.0), ease)));
+    });
+    tt_core::history::widget_edit(world, &format!("Key {name}"), key_drag, |w| set_offset_key(w, e, OffsetKey { frame: here, x, y, angle: a }));
     if unkey {
         remove_offset_key(world, e, here);
     }

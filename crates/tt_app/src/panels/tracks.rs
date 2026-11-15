@@ -585,15 +585,10 @@ fn setting_slider(ui: &mut egui::Ui, world: &mut World, e: Entity, value: f32, s
     ui.spacing_mut().slider_width = (ui.available_width() - 64.0).clamp(40.0, 160.0);
     let r = ui.add(slider(&mut v)).on_hover_text(tip);
     let label = format!("Edit {what}");
-    if r.drag_started() {
-        world.resource_mut::<tt_core::history::History>().begin(label.clone());
-    }
-    if r.changed() {
-        tt_core::history::edit(world, &label, |tx| tx.modify::<Tracker>(e, |t| set(t, v)));
-    }
-    if r.drag_stopped() {
-        world.resource_mut::<tt_core::history::History>().end();
-    }
+    let drag = tt_core::history::WidgetDrag { started: r.drag_started(), dragging: r.dragged(), changed: r.changed(), stopped: r.drag_stopped() };
+    tt_core::history::widget_edit(world, &label, drag, |w| {
+        tt_core::history::edit(w, &label, |tx| tx.modify::<Tracker>(e, |t| set(t, v)));
+    });
 }
 
 /// A cursor tracker's result on frame `f`: its score, and which pattern it

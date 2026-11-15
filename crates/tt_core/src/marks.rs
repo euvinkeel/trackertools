@@ -11,7 +11,7 @@ use std::ops::Range;
 use bevy_ecs::prelude::*;
 
 use crate::app::{AppBuilder, Module, Set};
-use crate::history::{History, edit};
+use crate::history::{WidgetDrag, edit, widget_edit};
 use crate::input::{Action, PendingActions};
 use crate::persist::ProjectMeta;
 use crate::time::FrameIndex;
@@ -80,13 +80,21 @@ pub fn set_marks(world: &mut World, new: Marks, label: &str) -> bool {
     })
 }
 
-/// Start dragging a mark on the timeline: its edits are one undo step until [`end_drag`].
+/// Start dragging a mark on the timeline: its moves ([`drag`]) are one undo
+/// step until [`end_drag`] (a widget's drag: `history::widget_edit`).
 pub fn begin_drag(world: &mut World, which: &str) {
-    world.resource_mut::<History>().begin(format!("Move {which} point"));
+    widget_edit(world, &format!("Move {which} point"), WidgetDrag { started: true, dragging: true, ..WidgetDrag::default() }, |_| {});
+}
+
+/// The marks as the drag has them now ([`set_marks`], in the drag's undo step).
+pub fn drag(world: &mut World, new: Marks, label: &str) {
+    widget_edit(world, label, WidgetDrag { dragging: true, changed: true, ..WidgetDrag::default() }, |w| {
+        set_marks(w, new, label);
+    });
 }
 
 pub fn end_drag(world: &mut World) {
-    world.resource_mut::<History>().end();
+    widget_edit(world, "Move", WidgetDrag { stopped: true, ..WidgetDrag::default() }, |_| {});
 }
 
 fn apply_mark_actions(world: &mut World) {

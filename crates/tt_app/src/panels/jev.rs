@@ -538,14 +538,9 @@ fn min_slider(ui: &mut egui::Ui, world: &mut World, e: Entity, min: f32) {
         let r = ui
             .add(egui::Slider::new(&mut v, 0.0..=1.0).step_by(0.01).fixed_decimals(2).text("box confidence"))
             .on_hover_text("Jev's boxes it is less sure of than this count as lost (red; left out of what follows the tracker). Moving it asks nothing again: the frames change at once");
-        if r.drag_started() {
-            world.resource_mut::<tt_core::history::History>().begin("Edit Jev's least confidence".to_string());
-        }
-        if r.changed() {
-            tt_core::history::edit(world, "Edit Jev's least confidence", |tx| tx.modify::<Tracker>(e, |t| t.jev.min_confidence = v));
-        }
-        if r.drag_stopped() {
-            world.resource_mut::<tt_core::history::History>().end();
-        }
+        let drag = tt_core::history::WidgetDrag { started: r.drag_started(), dragging: r.dragged(), changed: r.changed(), stopped: r.drag_stopped() };
+        tt_core::history::widget_edit(world, "Edit Jev's least confidence", drag, |w| {
+            tt_core::history::edit(w, "Edit Jev's least confidence", |tx| tx.modify::<Tracker>(e, |t| t.jev.min_confidence = v));
+        });
     });
 }

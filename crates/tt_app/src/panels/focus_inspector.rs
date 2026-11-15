@@ -10,7 +10,6 @@
 
 use bevy_ecs::prelude::*;
 use tt_core::focus::{FocusParams, focus_on, set_focus, spring};
-use tt_core::history::History;
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::FrameIndex;
 use tt_core::transport::Transport;
@@ -43,7 +42,7 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         .small(),
     );
     let mut next = p.clone();
-    let (mut started, mut stopped, mut seek, mut set_here) = (false, false, None, None);
+    let (mut drag, mut seek, mut set_here) = (tt_core::history::WidgetDrag::default(), None, None);
 
     // On the shown frame.
     let now = p.target_at(here);
@@ -106,22 +105,16 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         for (label, v, speed, range, suffix, tip) in rows {
             ui.label(label).on_hover_text(tip);
             let r = ui.add(egui::DragValue::new(v).speed(speed).range(range).suffix(suffix).max_decimals(2));
-            started |= r.drag_started();
-            stopped |= r.drag_stopped();
+            drag.started |= r.drag_started();
+            drag.dragging |= r.dragged();
+            drag.stopped |= r.drag_stopped();
             ui.end_row();
         }
     });
     move_graph(ui, &next, fps);
 
-    if started {
-        world.resource_mut::<History>().begin(format!("Edit {name}"));
-    }
-    if next != p {
-        set_focus(world, e, &format!("Edit {name}"), |q| *q = next);
-    }
-    if stopped && world.resource::<History>().in_gesture() {
-        world.resource_mut::<History>().end();
-    }
+    drag.changed = next != p;
+    tt_core::history::widget_edit(world, &format!("Edit {name}"), drag, |w| set_focus(w, e, &format!("Edit {name}"), |q| *q = next));
     if let Some(t) = set_here {
         focus_on(world, e, here, t);
     }

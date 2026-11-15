@@ -46,7 +46,7 @@ use std::ops::Range;
 use bevy_ecs::prelude::*;
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use tt_core::input::{Action, Keymap, PendingActions};
-use tt_core::marks::{Marks, marks, set_marks};
+use tt_core::marks::{Marks, marks};
 use tt_core::time::{FrameIndex, Rational, timecode};
 use tt_core::transport::{RATES, Transport};
 use tt_core::{AppBuilder, Class, Module};
@@ -371,7 +371,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             } else {
                 f
             };
-            tt_core::span::move_edge(world, e, edge, f.clamp(0, t.last_frame()));
+            tt_core::span::drag(world, e, edge, f.clamp(0, t.last_frame()));
             let what = if edge == Edge::First { "starts" } else { "ends" };
             response.clone().on_hover_text_at_pointer(format!("{what} at frame {}  ·  {}", f.clamp(0, t.last_frame()), timecode(f.clamp(0, t.last_frame()), t.fps)));
         } else {
@@ -533,7 +533,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                     (f, Marks { mark_out: Some(f), ..marked })
                 }
             };
-            set_marks(world, moved, &format!("Move {} point", end.name()));
+            tt_core::marks::drag(world, moved, &format!("Move {} point", end.name()));
             if f != t.frame() {
                 actions.push(Action::Seek(f));
             }

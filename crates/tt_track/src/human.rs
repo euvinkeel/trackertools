@@ -28,8 +28,8 @@ use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
-use tt_core::history::{History, Tx, edit, undo};
-use tt_core::input::{Action, KeysHeld, PendingActions};
+use tt_core::history::{Gesture, History, Tx, edit, owning};
+use tt_core::input::KeysHeld;
 use tt_core::op::{Inputs, Invalidations, Operator, Output};
 use tt_core::ranges::RangeSet;
 use tt_core::selection::Selection;
@@ -414,6 +414,8 @@ pub struct Stroke {
     pub tracker: Entity,
     pub erase: bool,
     pub last: Option<(FrameIndex, [f64; 2])>,
+    /// Its undo step, open while it is held.
+    pub gesture: Gesture,
 }
 
 /// The frames from `from` (exclusive) to `to` (inclusive), each with its
@@ -438,8 +440,8 @@ fn line(from: Option<(FrameIndex, [f64; 2])>, to: FrameIndex, q: [f64; 2]) -> Ve
 /// `Set::Tools`: the Draw tool (module docs).
 pub fn draw_tool(world: &mut World) {
     if world.resource::<ActiveTool>().0 != Tool::Draw {
-        if world.resource_mut::<DrawTool>().stroke.take().is_some() {
-            world.resource_mut::<History>().end();
+        if let Some(s) = world.resource_mut::<DrawTool>().stroke.take() {
+            world.resource_mut::<History>().end(s.gesture);
         }
         return;
     }
@@ -447,14 +449,9 @@ pub fn draw_tool(world: &mut World) {
     let frame = world.resource::<Transport>().frame();
     let mods = world.resource::<KeysHeld>().mods;
     let mut tool = world.resource::<DrawTool>().clone();
-    // Esc while holding: the hold never happened.
-    if tool.stroke.is_some() && !world.resource_mut::<PendingActions>().take(|a| a == Action::Cancel).is_empty() {
+    // Undone or cancelled (Esc: tt_core::tool) while held: it stops there.
+    if tool.stroke.is_some_and(|s| !world.resource::<History>().is_open(s.gesture)) {
         tool.stroke = None;
-        if world.resource_mut::<History>().end() {
-            undo(world);
-        }
-        *world.resource_mut::<DrawTool>() = tool;
-        return;
     }
     // The pointer is in the shown space's pixels; the human layer is in source pixels.
     let to_source = |world: &World, at: [f64; 2]| map_at(world, world.resource::<ActiveView>().0, frame).to_source(at);
@@ -469,18 +466,18 @@ pub fn draw_tool(world: &mut World) {
         match target {
             Some(t) => {
                 let name = world.get::<Name>(t).map_or("the tracker".to_string(), |n| n.to_string());
-                world.resource_mut::<History>().begin(if erase { format!("Erase {name}'s drawing") } else { format!("Draw {name}") });
-                tool.stroke = Some(Stroke { tracker: t, erase, last: None });
+                let gesture = world.resource_mut::<History>().begin(if erase { format!("Erase {name}'s drawing") } else { format!("Draw {name}") });
+                tool.stroke = Some(Stroke { tracker: t, erase, last: None, gesture });
             }
             None if erase => tool.refused = Some("Select a tracker to erase what was drawn on it (Alt+hold erases)".into()),
             None => {
                 let name = format!("Manual dot {}", manual_count(world) + 1);
-                world.resource_mut::<History>().begin(format!("Draw {name}"));
+                let gesture = world.resource_mut::<History>().begin(format!("Draw {name}"));
                 let mut made = None;
-                edit(world, &name, |tx| made = Some(spawn_manual_dot(tx, name.clone(), frame)));
+                owning(world, gesture, |w| edit(w, &name, |tx| made = Some(spawn_manual_dot(tx, name.clone(), frame))));
                 if let Some(t) = made {
                     world.resource_mut::<Selection>().select_only(t);
-                    tool.stroke = Some(Stroke { tracker: t, erase: false, last: None });
+                    tool.stroke = Some(Stroke { tracker: t, erase: false, last: None, gesture });
                 }
             }
         }
@@ -488,7 +485,7 @@ pub fn draw_tool(world: &mut World) {
             let src = to_source(world, at);
             let points: Vec<(FrameIndex, Option<[f64; 2]>)> = vec![(frame, (!s.erase).then_some(src))];
             let t = s.tracker;
-            edit(world, "Draw", |tx| write_drawn(tx, t, &points));
+            owning(world, s.gesture, |w| edit(w, "Draw", |tx| write_drawn(tx, t, &points)));
             s.last = Some((frame, src));
         }
     }
@@ -501,13 +498,13 @@ pub fn draw_tool(world: &mut World) {
             if s.last.is_none_or(|(f, q)| f != frame || (q[0] - src[0]).hypot(q[1] - src[1]) > 1e-3) {
                 let points: Vec<(FrameIndex, Option<[f64; 2]>)> = line(s.last, frame, src).into_iter().map(|(f, q)| (f, (!s.erase).then_some(q))).collect();
                 let t = s.tracker;
-                edit(world, "Draw", |tx| write_drawn(tx, t, &points));
+                owning(world, s.gesture, |w| edit(w, "Draw", |tx| write_drawn(tx, t, &points)));
                 s.last = Some((frame, src));
             }
         }
         if ended {
+            world.resource_mut::<History>().end(s.gesture);
             tool.stroke = None;
-            world.resource_mut::<History>().end();
         }
     }
     // While a stroke is held, the views hold still (tt_core::view::HoldViews): one

@@ -11,7 +11,14 @@
 //! - Signals: a copy-on-write snapshot (chunk pointers) taken before the first
 //!   write; undo swaps it back and invalidates exactly the chunks that differ.
 //! - Gestures: [`History::begin`] keeps one transaction open across frames so
-//!   a drag or a whole capture is a single undo step.
+//!   a drag is a single undo step. It has an owner: only edits its owner
+//!   makes as it ([`owning`]) join it. Another edit made meanwhile (a key
+//!   pressed during a drag) is its own step: the gesture so far, that edit,
+//!   then the rest of the gesture. Undo and redo end the open gesture first,
+//!   Esc cancels it ([`cancel`]: it never happened), and a new gesture ends
+//!   the one before; an owner whose gesture is no longer open
+//!   ([`History::is_open`]) stops. A widget's drag ([`widget_edit`]) renews
+//!   its gesture every frame it is drawn; one not drawn for a frame is ended.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,7 +64,11 @@ impl Transaction {
 pub struct History {
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
-    open: Option<Transaction>,
+    open: Option<Open>,
+    /// The last gesture's number.
+    gestures: u64,
+    /// A widget's drag ([`widget_edit`]): its gesture, and whether the widget was drawn since the last frame began.
+    widget: Option<(Gesture, bool)>,
     pub limit: usize,
     /// Bumped by every edit, undo and redo: "the document changed" (autosave).
     revision: u64,
@@ -65,9 +76,20 @@ pub struct History {
 
 impl Default for History {
     fn default() -> Self {
-        Self { undo: Vec::new(), redo: Vec::new(), open: None, limit: 500, revision: 0 }
+        Self { undo: Vec::new(), redo: Vec::new(), open: None, gestures: 0, widget: None, limit: 500, revision: 0 }
     }
 }
+
+/// An open gesture: its transaction so far, and whether its owner is editing now ([`owning`]).
+struct Open {
+    gesture: Gesture,
+    t: Transaction,
+    owner_editing: bool,
+}
+
+/// A gesture, as its owner holds it: to edit in it ([`owning`]) and end it ([`History::end`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gesture(u64);
 
 impl History {
     pub fn revision(&self) -> u64 {
@@ -82,8 +104,8 @@ impl History {
 
     /// Forget all history (a different document was loaded).
     pub fn clear(&mut self) {
-        let revision = self.revision;
-        *self = Self { revision, ..Self::default() };
+        let (revision, gestures) = (self.revision, self.gestures);
+        *self = Self { revision, gestures, ..Self::default() };
     }
 
     pub fn can_undo(&self) -> bool {
@@ -102,22 +124,36 @@ impl History {
         self.redo.last().map(|t| t.label.as_str())
     }
 
-    /// Start a gesture: edits until [`History::end`] form one undo step.
-    pub fn begin(&mut self, label: impl Into<String>) {
-        self.end();
-        self.open = Some(Transaction { label: label.into(), steps: Vec::new() });
+    /// Start a gesture (ending any other): its owner's edits ([`owning`])
+    /// until [`History::end`] form one undo step.
+    pub fn begin(&mut self, label: impl Into<String>) -> Gesture {
+        self.end_open();
+        self.gestures += 1;
+        let gesture = Gesture(self.gestures);
+        self.open = Some(Open { gesture, t: Transaction { label: label.into(), steps: Vec::new() }, owner_editing: false });
+        gesture
     }
 
-    /// Finish the open gesture (a no-op gesture leaves no undo step). True
-    /// if it left one.
-    pub fn end(&mut self) -> bool {
+    /// Finish `gesture` if it is still open (a no-op gesture leaves no undo
+    /// step). True if it left one.
+    pub fn end(&mut self, gesture: Gesture) -> bool {
+        self.is_open(gesture) && self.end_open()
+    }
+
+    /// Finish whatever gesture is open.
+    fn end_open(&mut self) -> bool {
         match self.open.take() {
-            Some(t) if !t.steps.is_empty() => {
-                self.push(t);
+            Some(o) if !o.t.steps.is_empty() => {
+                self.push(o.t);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Whether `gesture` is still open: not ended, undone or cancelled. Its owner stops when it isn't.
+    pub fn is_open(&self, gesture: Gesture) -> bool {
+        self.open.as_ref().is_some_and(|o| o.gesture == gesture)
     }
 
     pub fn in_gesture(&self) -> bool {
@@ -358,20 +394,106 @@ pub fn edit(world: &mut World, label: &str, f: impl FnOnce(&mut Tx<'_>)) -> bool
     }
     let mut history = world.resource_mut::<History>();
     history.revision += 1;
+    let t = Transaction { label: label.to_string(), steps };
     match &mut history.open {
-        Some(open) => open.steps.extend(steps),
-        None => {
-            let t = Transaction { label: label.to_string(), steps };
+        Some(open) if open.owner_editing => open.t.steps.extend(t.steps),
+        // Someone else's edit during a gesture: the gesture so far, this, then the gesture goes on.
+        Some(open) => {
+            let so_far = Transaction { label: open.t.label.clone(), steps: std::mem::take(&mut open.t.steps) };
+            history.push(so_far);
             history.push(t);
         }
+        None => history.push(t),
     }
     true
+}
+
+/// Run `f` as `gesture`'s owner: its edits join the gesture while it is open
+/// (once it is ended, undone or cancelled they are steps of their own; the
+/// owner checks [`History::is_open`] and stops).
+pub fn owning<R>(world: &mut World, gesture: Gesture, f: impl FnOnce(&mut World) -> R) -> R {
+    let set = |world: &mut World, on: bool| {
+        if let Some(o) = world.resource_mut::<History>().open.as_mut().filter(|o| o.gesture == gesture) {
+            o.owner_editing = on;
+        }
+    };
+    set(world, true);
+    let r = f(world);
+    set(world, false);
+    r
+}
+
+/// A single edit made of several (each its own [`edit`]): one undo step labelled `label`.
+pub fn compound<R>(world: &mut World, label: &str, f: impl FnOnce(&mut World) -> R) -> R {
+    let g = world.resource_mut::<History>().begin(label);
+    let r = owning(world, g, f);
+    world.resource_mut::<History>().end(g);
+    r
+}
+
+/// Esc during a gesture: it never happened (its edits so far are undone, and
+/// nothing goes on the redo list). True if one was open.
+pub fn cancel(world: &mut World) -> bool {
+    let Some(open) = world.resource_mut::<History>().open.take() else { return false };
+    open.t.undo(world);
+    world.resource_mut::<History>().revision += 1;
+    true
+}
+
+/// What a widget's drag did this frame (egui's response, in tt_core's words).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WidgetDrag {
+    pub started: bool,
+    /// Held (the widget is drawn and dragged this frame).
+    pub dragging: bool,
+    pub changed: bool,
+    pub stopped: bool,
+}
+
+/// A widget in a panel edited by a drag (a slider, a value, a mask brush):
+/// its drag is one undo step labelled `label`, and `edit_it` (run when it
+/// changed) edits in it; a change without a drag is a step of its own. A
+/// widget that stops being drawn mid-drag (its panel closed, its entity
+/// deselected) never says it stopped: its gesture ends a frame later.
+pub fn widget_edit(world: &mut World, label: &str, drag: WidgetDrag, edit_it: impl FnOnce(&mut World)) {
+    let mut history = world.resource_mut::<History>();
+    if drag.started {
+        let g = history.begin(label);
+        history.widget = Some((g, true));
+    }
+    let open = history.widget.filter(|(g, _)| history.is_open(*g)).map(|(g, _)| g);
+    if let (Some(w), true) = (history.widget.as_mut(), drag.dragging || drag.started) {
+        w.1 = true;
+    }
+    if drag.changed {
+        match open {
+            Some(g) => owning(world, g, edit_it),
+            None => edit_it(world),
+        }
+    }
+    if drag.stopped
+        && let Some((g, _)) = world.resource_mut::<History>().widget.take()
+    {
+        world.resource_mut::<History>().end(g);
+    }
+}
+
+/// `Set::Input`: a widget's drag whose widget wasn't drawn since the last frame ends ([`widget_edit`]).
+fn end_unseen_widget_drags(mut history: ResMut<History>) {
+    match history.widget {
+        Some((g, false)) => {
+            history.widget = None;
+            history.end(g);
+        }
+        Some((g, true)) => history.widget = Some((g, false)),
+        None => {}
+    }
 }
 
 pub fn undo(world: &mut World) -> Option<String> {
     let t = {
         let mut h = world.resource_mut::<History>();
-        h.end();
+        h.end_open();
         h.undo.pop()?
     };
     t.undo(world);
@@ -383,7 +505,12 @@ pub fn undo(world: &mut World) -> Option<String> {
 }
 
 pub fn redo(world: &mut World) -> Option<String> {
-    let t = world.resource_mut::<History>().redo.pop()?;
+    let t = {
+        let mut h = world.resource_mut::<History>();
+        // (A gesture with edits is a new step: nothing to redo after it.)
+        h.end_open();
+        h.redo.pop()?
+    };
     t.redo(world);
     let label = t.label.clone();
     let mut h = world.resource_mut::<History>();
@@ -406,6 +533,9 @@ pub struct HistoryModule;
 
 impl Module for HistoryModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<History>(Class::Session).init_resource::<History>().add_systems(apply_history_actions.in_set(Set::Intents));
+        app.declare::<History>(Class::Session)
+            .init_resource::<History>()
+            .add_systems(end_unseen_widget_drags.in_set(Set::Input))
+            .add_systems(apply_history_actions.in_set(Set::Intents));
     }
 }

@@ -14,6 +14,8 @@ use bevy_reflect::{PartialReflect, ReflectMut, ReflectRef, TypeInfo};
 pub struct Edited {
     pub changed: bool,
     pub drag_started: bool,
+    /// Held this frame (a drag in progress).
+    pub dragging: bool,
     pub drag_stopped: bool,
 }
 
@@ -21,6 +23,7 @@ impl Edited {
     fn merge(&mut self, r: &egui::Response) {
         self.changed |= r.changed();
         self.drag_started |= r.drag_started();
+        self.dragging |= r.dragged();
         self.drag_stopped |= r.drag_stopped();
     }
 

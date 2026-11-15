@@ -4,7 +4,7 @@
 
 use bevy_ecs::prelude::*;
 use egui::{Color32, Rect, Stroke, StrokeKind, TextureHandle, Vec2};
-use tt_core::history::{History, edit};
+use tt_core::history::edit;
 use tt_track::icons::{CursorIcons, Icon, IconFit, PackSize, packs};
 
 use crate::style;
@@ -105,19 +105,14 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                 let r = ui
                     .add(egui::Slider::new(&mut v, 0.2..=3.0).logarithmic(true).fixed_decimals(2).suffix("\u{d7}"))
                     .on_hover_text("Video px per icon px: the size the cursor has in the video (screen scaling, the recording's size)");
-                if r.drag_started() {
-                    world.resource_mut::<History>().begin("Edit cursor icon size");
-                }
-                if r.changed() {
+                let drag = tt_core::history::WidgetDrag { started: r.drag_started(), dragging: r.dragged(), changed: r.changed(), stopped: r.drag_stopped() };
+                tt_core::history::widget_edit(world, "Edit cursor icon size", drag, |w| {
                     let mut next = current.clone();
                     if let Some(s) = next.sizes.iter_mut().find(|s| &s.pack == pack) {
                         s.size = v;
                     }
-                    edit(world, "Edit cursor icon size", |tx| tx.insert(e, next));
-                }
-                if r.drag_stopped() {
-                    world.resource_mut::<History>().end();
-                }
+                    edit(w, "Edit cursor icon size", |tx| tx.insert(e, next));
+                });
             });
         }
         // What the tracker made of it.

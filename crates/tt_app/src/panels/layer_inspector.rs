@@ -10,7 +10,6 @@
 //! changes its fixed value, unless Auto-key is on. A drag is one undo step.
 
 use bevy_ecs::prelude::*;
-use tt_core::history::History;
 use tt_core::input::{Action, PendingActions};
 use tt_core::layer::{AutoKey, BlendMode, EndMode, LayerParams, Restack, SizeMode, has_angle, reattach, restack, set_params, target_of};
 use tt_core::time::FrameIndex;
@@ -24,7 +23,7 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     let here = world.resource::<Transport>().frame();
     let name = crate::panels::outliner::label(world, e);
     let mut next = p.clone();
-    let (mut started, mut stopped, mut seek, mut locate, mut attach_to, mut stack) = (false, false, None, false, None, None);
+    let (mut drag, mut seek, mut locate, mut attach_to, mut stack) = (tt_core::history::WidgetDrag::default(), None, false, None, None);
 
     // The file.
     let path = std::path::Path::new(&p.media);
@@ -101,8 +100,9 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     ui.horizontal(|ui| {
         ui.label("Smoothing").on_hover_text("Steadies how it follows (seconds; no lag): the tracking's jitter goes, the tracking itself stays as it is. 0: exactly as tracked.");
         let r = ui.add(egui::DragValue::new(&mut next.smoothing).range(0.0..=2.0).speed(0.005).suffix(" s").max_decimals(3));
-        started |= r.drag_started();
-        stopped |= r.drag_stopped();
+        drag.started |= r.drag_started();
+        drag.dragging |= r.dragged();
+        drag.stopped |= r.drag_stopped();
     });
     ui.horizontal(|ui| {
         ui.label("Blend").on_hover_text("How its colours mix with what's under it in exports. The preview here shows Normal.");
@@ -129,12 +129,14 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.horizontal(|ui| {
             ui.label("Starts at");
             let r = ui.add(egui::DragValue::new(&mut next.clip_in).range(0.0..=p.clip_duration.max(0.0)).speed(0.02).suffix(" s").max_decimals(2));
-            started |= r.drag_started();
-            stopped |= r.drag_stopped();
+            drag.started |= r.drag_started();
+            drag.dragging |= r.dragged();
+            drag.stopped |= r.drag_stopped();
             ui.label("Speed");
             let r = ui.add(egui::DragValue::new(&mut next.speed).range(0.05..=8.0).speed(0.01).prefix("\u{d7}").max_decimals(2));
-            started |= r.drag_started();
-            stopped |= r.drag_stopped();
+            drag.started |= r.drag_started();
+            drag.dragging |= r.dragged();
+            drag.stopped |= r.drag_stopped();
         });
         ui.horizontal(|ui| {
             ui.label("At its end");
@@ -188,13 +190,14 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             ui.label(label).on_hover_text(tips[i]);
             let mut v = a.at(here) as f64;
             // (A value outside the range, set on the video, stays as it is until edited here.)
-            let mut drag = egui::DragValue::new(&mut v).speed(*speed).suffix(*suffix).max_decimals(3);
+            let mut field = egui::DragValue::new(&mut v).speed(*speed).suffix(*suffix).max_decimals(3);
             if let Some(r) = range.clone() {
-                drag = drag.range(r).clamp_existing_to_range(false);
+                field = field.range(r).clamp_existing_to_range(false);
             }
-            let r = ui.add(drag);
-            started |= r.drag_started();
-            stopped |= r.drag_stopped();
+            let r = ui.add(field);
+            drag.started |= r.drag_started();
+            drag.dragging |= r.dragged();
+            drag.stopped |= r.drag_stopped();
             if r.changed() {
                 a.set(here, v as f32, auto);
             }
@@ -237,15 +240,8 @@ pub fn section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
             .small(),
     );
 
-    if started {
-        world.resource_mut::<History>().begin(format!("Edit {name}"));
-    }
-    if next != p {
-        set_params(world, e, &format!("Edit {name}"), |q| *q = next);
-    }
-    if stopped && world.resource::<History>().in_gesture() {
-        world.resource_mut::<History>().end();
-    }
+    drag.changed = next != p;
+    tt_core::history::widget_edit(world, &format!("Edit {name}"), drag, |w| set_params(w, e, &format!("Edit {name}"), |q| *q = next));
     if let Some(to) = stack {
         restack(world, e, to);
     }

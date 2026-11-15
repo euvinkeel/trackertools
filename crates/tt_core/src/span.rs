@@ -24,7 +24,7 @@ use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
 
 use crate::app::{AppBuilder, Module, Set};
-use crate::history::{History, edit};
+use crate::history::{WidgetDrag, edit, widget_edit};
 use crate::meta::Class;
 use crate::op::{Invalidations, OpRegistry, Operator, Output};
 use crate::signal::{Signal, SignalStore};
@@ -192,14 +192,22 @@ pub fn move_edge(world: &mut World, e: Entity, edge: Edge, frame: FrameIndex) ->
     set_span(world, e, span)
 }
 
-/// Start dragging an edge: the drag's edits are one undo step until [`end_drag`].
+/// Start dragging an edge on the timeline: its moves ([`drag`]) are one undo
+/// step until [`end_drag`] (a widget's drag: `history::widget_edit`).
 pub fn begin_drag(world: &mut World, e: Entity) {
     let name = world.get::<Name>(e).map_or_else(|| "item".to_string(), |n| n.to_string());
-    world.resource_mut::<History>().begin(format!("Trim {name}"));
+    widget_edit(world, &format!("Trim {name}"), WidgetDrag { started: true, dragging: true, ..WidgetDrag::default() }, |_| {});
+}
+
+/// The dragged edge on `frame` now ([`move_edge`], in the drag's undo step).
+pub fn drag(world: &mut World, e: Entity, edge: Edge, frame: FrameIndex) {
+    widget_edit(world, "Trim", WidgetDrag { dragging: true, changed: true, ..WidgetDrag::default() }, |w| {
+        move_edge(w, e, edge, frame);
+    });
 }
 
 pub fn end_drag(world: &mut World) {
-    world.resource_mut::<History>().end();
+    widget_edit(world, "Trim", WidgetDrag { stopped: true, ..WidgetDrag::default() }, |_| {});
 }
 
 /// A span changed (or went): what reads the entity re-derives, and a job

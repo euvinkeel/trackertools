@@ -494,3 +494,42 @@ fn cotracker_with_no_sketch_follows_the_sprite() {
     assert!(e[60] < 12.0, "max {}", e[60]);
     assert!(value(w, op, 600).is_some_and(|(v, _)| (v[0] as f64 - truth(600)[0]).abs() < 1e-3), "the reset point is exact (not aligned)");
 }
+
+/// Esc while holding the Draw tool: the hold never happened (the manual dot
+/// it started goes too), whichever of the tool switch and the Draw tool sees Esc first.
+#[test]
+fn esc_during_a_draw_stroke_cancels_it() {
+    let mut core = core(100);
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Draw;
+    pointer(&mut core, 1.0, [100.0, 100.0], true, true, false);
+    pointer(&mut core, 1.01, [110.0, 100.0], false, true, false);
+    assert!(core.world.resource::<History>().in_gesture());
+    core.world.resource_mut::<tt_core::input::PendingActions>().push(tt_core::input::Action::Cancel);
+    pointer(&mut core, 1.02, [120.0, 100.0], false, true, false);
+    pointer(&mut core, 1.03, [120.0, 100.0], false, false, true);
+    let w = &mut core.world;
+    assert!(!w.resource::<History>().can_undo(), "nothing to undo: the stroke never happened ({:?})", w.resource::<History>().undo_label());
+    let mut q = w.query_filtered::<&Tracker, bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
+    assert_eq!(q.iter(w).count(), 0, "no manual dot left");
+}
+
+/// Ctrl+Z in the middle of a Draw stroke undoes the stroke so far and ends
+/// it: moving on until the release draws nothing more (it used to go on
+/// writing into the manual dot the undo had just removed, an undo step a frame).
+#[test]
+fn undo_during_a_draw_stroke_ends_it() {
+    let mut core = core(100);
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Draw;
+    pointer(&mut core, 1.0, [100.0, 100.0], true, true, false);
+    pointer(&mut core, 1.01, [110.0, 100.0], false, true, false);
+    core.world.resource_mut::<tt_core::input::PendingActions>().push(tt_core::input::Action::Undo);
+    pointer(&mut core, 1.02, [120.0, 100.0], false, true, false);
+    for (i, x) in [130.0, 140.0, 150.0].into_iter().enumerate() {
+        core.world.resource_mut::<Transport>().seek(i as i64 + 1);
+        pointer(&mut core, 1.03 + i as f64 * 0.01, [x, 100.0], false, true, false);
+    }
+    pointer(&mut core, 1.1, [150.0, 100.0], false, false, true);
+    let h = core.world.resource::<History>();
+    assert!(!h.can_undo() && !h.in_gesture(), "nothing drawn after the undo: {:?}", h.undo_label());
+    assert_eq!(h.redo_label(), Some("Draw Manual dot 1"), "the stroke so far can be redone");
+}

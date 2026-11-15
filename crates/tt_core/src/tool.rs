@@ -106,15 +106,17 @@ fn detect_clicks(mut pointer: ResMut<PointerFrame>, mut tracker: ResMut<ClickTra
 }
 
 
-fn apply_tool_actions(mut actions: ResMut<PendingActions>, mut active: ResMut<ActiveTool>, live: Res<crate::capture::LiveCapture>) {
-    for a in actions.take(|a| matches!(a, Action::Tool(_))) {
+fn apply_tool_actions(world: &mut World) {
+    for a in world.resource_mut::<PendingActions>().take(|a| matches!(a, Action::Tool(_))) {
         if let Action::Tool(t) = a {
+            let mut active = world.resource_mut::<ActiveTool>();
             active.0 = if active.0 == t { Tool::Select } else { t };
         }
     }
-    // Esc with no gesture in progress leaves the tool (the capture takes its own Esc first).
-    if live.0.is_none() && !actions.take(|a| a == Action::Cancel).is_empty() {
-        active.0 = Tool::Select;
+    // Esc (a sketch stroke takes its own first): a drag in progress never
+    // happened (its owner sees its gesture gone and stops); with none, it leaves the tool.
+    if world.resource::<crate::capture::LiveCapture>().0.is_none() && !world.resource_mut::<PendingActions>().take(|a| a == Action::Cancel).is_empty() && !crate::history::cancel(world) {
+        world.resource_mut::<ActiveTool>().0 = Tool::Select;
     }
 }
 

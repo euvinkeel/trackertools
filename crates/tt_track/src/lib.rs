@@ -571,12 +571,13 @@ fn add_tracker_in(world: &mut World, guide: Option<Entity>, look: Look) -> Optio
     }
     let guide_name = guide.map_or("the whole frame".to_string(), |g| world.get::<Name>(g).map_or("box".to_string(), |n| n.to_string()));
     let name = format!("Tracker {}", tracker_count(world) + 1);
-    world.resource_mut::<History>().begin(format!("Track {guide_name}"));
-    let space = guide.and_then(|g| tracking_view(world, g));
-    let mut made = None;
-    edit(world, "Track", |tx| made = Some(spawn_tracker(tx, name, guide, look, space, true)));
-    world.resource_mut::<History>().end();
-    let tracker = made?;
+    // (The guide's view, made if it has none, and the tracker: one undo step.)
+    let tracker = tt_core::history::compound(world, &format!("Track {guide_name}"), |world| {
+        let space = guide.and_then(|g| tracking_view(world, g));
+        let mut made = None;
+        edit(world, "Track", |tx| made = Some(spawn_tracker(tx, name, guide, look, space, true)));
+        made
+    })?;
     world.resource_mut::<Selection>().select_only(tracker);
     Some(tracker)
 }
