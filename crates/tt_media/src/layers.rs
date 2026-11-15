@@ -355,6 +355,22 @@ pub fn draw_alpha(w: usize, h: usize, on: &[(&Overlay, Placed, &[u8])]) -> Vec<u
 /// `frames` of `index`'s video. A PNG sequence: `out` is a folder (made),
 /// its pictures named after it and numbered by grid frame.
 pub fn render_alpha(index: &VideoIndex, out: &Path, format: AlphaFormat, frames: Range<FrameIndex>, overlays: &[Overlay], progress: &AtomicUsize, cancel: &AtomicBool) -> Result<()> {
+    let (w, h) = (index.width as usize, index.height as usize);
+    render_rgba(index, out, format, frames, &|g| draw_alpha(w, h, &on_frame(overlays, g)), progress, cancel)
+}
+
+/// Encodes a picture a frame, `draw(g)` (straight RGBA, the video's size),
+/// in a transparent `format`, for grid frames `frames` of `index`'s video
+/// (the layers alone, a tracking target's marker).
+pub(crate) fn render_rgba(
+    index: &VideoIndex,
+    out: &Path,
+    format: AlphaFormat,
+    frames: Range<FrameIndex>,
+    draw: &dyn Fn(FrameIndex) -> Vec<u8>,
+    progress: &AtomicUsize,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let frames = within(index, frames)?;
     let (w, h) = (index.width as usize, index.height as usize);
     let mut cmd = command(&crate::ffmpeg::tool("ffmpeg", "FFMPEG"));
@@ -394,8 +410,7 @@ pub fn render_alpha(index: &VideoIndex, out: &Path, format: AlphaFormat, frames:
             if cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
-            let on = on_frame(overlays, g);
-            encoder.write(&draw_alpha(w, h, &on))?;
+            encoder.write(&draw(g))?;
             progress.store(k + 1, Ordering::Relaxed);
         }
         Ok(())

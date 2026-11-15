@@ -149,3 +149,25 @@ fn a_layer_moves_with_the_stabilized_picture() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The plain export (the top bar's Export, nothing added): the video as it
+/// is, every frame, its picture unchanged.
+#[test]
+fn with_nothing_on_top_it_is_the_video_as_it_is() {
+    let d = dir("plain");
+    let Some(clip) = grey(&d) else {
+        eprintln!("no ffmpeg: skipped");
+        return;
+    };
+    let index = VideoIndex::open(&clip).expect("indexes the clip");
+    let out = d.join("plain.mp4");
+    let (progress, cancel) = (AtomicUsize::new(0), AtomicBool::new(false));
+    render_over(&index, &out, Codec::H264, 0..FRAMES as FrameIndex, &[], &progress, &cancel).expect("renders");
+    let pictures = rgba(&out);
+    assert_eq!(pictures.len(), FRAMES, "every frame");
+    for (g, f) in pictures.iter().enumerate() {
+        let p = px(f, W / 2, H / 2);
+        assert!(p[..3].iter().all(|c| (120..=136).contains(c)), "frame {g}: the grey as it was: {p:?}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

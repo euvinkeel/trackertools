@@ -27,7 +27,8 @@ use bevy_ecs::prelude::*;
 use egui::{Color32, Stroke, Vec2};
 use tt_core::input::{Action, PendingActions};
 use tt_core::time::FrameIndex;
-use tt_media::render::{Codec, invert, nv12_preview, render_marker, render_warped_with};
+use tt_media::layers::AlphaFormat;
+use tt_media::render::{Codec, MarkerOn, invert, nv12_preview, render_marker, render_warped_with};
 use tt_track::export::{Framing, Smoothing, StabilizerDefaults, Steady, follow, follow_path, follower_at, good_points, hides_the_edges, rendered_map, stabilize, stabilize_path, subject_path, zoom_to_fill};
 
 use crate::media::{Media, StatusLine, Which};
@@ -115,6 +116,8 @@ struct Request {
     /// The source video (the default name is made from it).
     source: PathBuf,
     codec: Codec,
+    /// A tracking target on transparency, in this format (else on black, in `codec`).
+    transparent: Option<AlphaFormat>,
     /// The whole video, even with in and out points marked.
     whole: bool,
     /// The zoom that hides the black edges ([`Request::fill_zoom`]).
@@ -252,7 +255,7 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
         _ => Vec::new(),
     };
     let codec = if kind == Kind::Stabilized { Codec::ProRes422Hq } else { Codec::H264 };
-    let path = default_path(&index.path, kind, &name, codec);
+    let path = default_path(&index.path, kind, &name, codec.extension());
     let w = &mut *world.resource_mut::<ExportWindow>();
     w.done = None;
     w.preview.shows = None;
@@ -270,6 +273,7 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
         points,
         source: video_path,
         codec,
+        transparent: None,
         whole: false,
         zoom: None,
         path,
@@ -278,17 +282,16 @@ pub fn open(world: &mut World, kind: Kind, source: Source) {
     });
 }
 
-/// Next to the source: "<video> - stabilized (<what>).mov"; never an existing file.
-fn default_path(source: &Path, kind: Kind, name: &str, codec: Codec) -> PathBuf {
+/// Next to the source: "<video> - stabilized (<what>).mov" (`ext`; none: a
+/// folder of pictures); never an existing file.
+fn default_path(source: &Path, kind: Kind, name: &str, ext: &str) -> PathBuf {
     let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into());
     let what = if kind == Kind::Stabilized { "stabilized" } else { "tracking target" };
     let name: String = name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
     let base = format!("{stem} - {what} ({name})");
     let dir = source.parent().map(Path::to_path_buf).unwrap_or_default();
-    (1..)
-        .map(|n| dir.join(if n == 1 { format!("{base}.{}", codec.extension()) } else { format!("{base} {n}.{}", codec.extension()) }))
-        .find(|p| !p.exists())
-        .expect("a free name")
+    let dot = if ext.is_empty() { String::new() } else { format!(".{ext}") };
+    (1..).map(|n| dir.join(if n == 1 { format!("{base}{dot}") } else { format!("{base} {n}{dot}") })).find(|p| !p.exists()).expect("a free name")
 }
 
 /// Render `frames` of the source as `r` says, framed by `framing` (stabilized), on a thread of its own;
@@ -301,6 +304,7 @@ fn start(world: &World, r: &Request, frames: Range<FrameIndex>, framing: Framing
     let (progress, cancel) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
     let (done, stop) = (progress.clone(), cancel.clone());
     let (keys, out, codec, kind) = (r.keys.clone(), r.path.clone(), r.codec, r.kind);
+    let marker_on = r.transparent.map_or(MarkerOn::Black(codec), MarkerOn::Transparent);
     // The marker: about a 24th of the picture's height across its half.
     let half = (size[0].min(size[1]) / 24.0).clamp(16.0, 120.0);
     let handle = std::thread::spawn(move || {
@@ -311,7 +315,7 @@ fn start(world: &World, r: &Request, frames: Range<FrameIndex>, framing: Framing
                     render_warped_with(&index, &out, codec, frames.clone(), &|g| rendered_map(&keys, size, framing, g), overlays, &done, &stop)
                 })
             }
-            Kind::Target => render_marker(&index, &out, codec, frames, &|g| follower_at(&keys, size, g), half, &done, &stop),
+            Kind::Target => render_marker(&index, &out, marker_on, frames, &|g| follower_at(&keys, size, g), half, &done, &stop),
         };
         made.map(|()| out).map_err(|e| format!("{e:#}"))
     });
@@ -532,9 +536,10 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                     )
                 }
                 Kind::Target => format!(
-                    "A video the size of {}, as long as the frames you export: on black, a marker that moves (and turns) with {}. \
+                    "A video the size of {}, as long as the frames you export: on black (or on transparency), a marker that moves (and turns) with {}. \
                      In your editor, put it on a track above the footage, lined up with those frames, and point the editor's own tracker at the marker's middle, where its squares cross \
-                     (two-point or planar trackers can use the small square beside it for the turn). Attach your text to that track, then hide this layer.",
+                     (two-point or planar trackers can use the small square beside it for the turn). Attach your text to that track, then hide this layer. \
+                     On transparency, the footage shows around the marker, so you can see it line up.",
                     r.video, r.name
                 ),
             };
@@ -556,15 +561,37 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                         }
                     });
                     ui.end_row();
+                    let before = (r.codec, r.transparent);
+                    if r.kind == Kind::Target {
+                        ui.label("Background");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut r.transparent, None, "Black");
+                            if ui.radio(r.transparent.is_some(), "Transparent").on_hover_text("Only the marker: lay it over the footage in your editor").clicked() && r.transparent.is_none() {
+                                r.transparent = Some(AlphaFormat::default());
+                            }
+                        });
+                        ui.end_row();
+                    }
                     ui.label("Format");
-                    let before = r.codec;
-                    egui::ComboBox::from_id_salt("export-codec").selected_text(r.codec.label()).width(300.0).show_ui(ui, |ui| {
-                        for c in Codec::ALL {
-                            ui.selectable_value(&mut r.codec, c, c.label());
+                    match r.transparent.as_mut() {
+                        Some(alpha) => {
+                            egui::ComboBox::from_id_salt("export-alpha").selected_text(alpha.label()).width(300.0).show_ui(ui, |ui| {
+                                for f in AlphaFormat::ALL {
+                                    ui.selectable_value(alpha, f, f.label());
+                                }
+                            });
                         }
-                    });
-                    if r.codec != before {
-                        r.path = if r.default_path { default_path(&r.source, r.kind, &r.name, r.codec) } else { r.path.with_extension(r.codec.extension()) };
+                        None => {
+                            egui::ComboBox::from_id_salt("export-codec").selected_text(r.codec.label()).width(300.0).show_ui(ui, |ui| {
+                                for c in Codec::ALL {
+                                    ui.selectable_value(&mut r.codec, c, c.label());
+                                }
+                            });
+                        }
+                    }
+                    if (r.codec, r.transparent) != before {
+                        let ext = r.transparent.map_or(r.codec.extension(), AlphaFormat::extension);
+                        r.path = if r.default_path { default_path(&r.source, r.kind, &r.name, ext) } else { r.path.with_extension(ext) };
                     }
                     ui.end_row();
                     // How the motion is used (remembered; the right-click menu's Fusion copies use it too).
@@ -684,7 +711,12 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                         ui.label(egui::RichText::new(r.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).monospace())
                             .on_hover_text(r.path.display().to_string());
                         if ui.button("Change\u{2026}").clicked() {
-                            let mut dialog = rfd::FileDialog::new().add_filter(r.codec.extension(), &[r.codec.extension()]).set_file_name(r.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                            let ext = r.transparent.map_or(r.codec.extension(), AlphaFormat::extension);
+                            let mut dialog = rfd::FileDialog::new().set_file_name(r.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                            // (A PNG sequence is a folder: no extension to filter by.)
+                            if !ext.is_empty() {
+                                dialog = dialog.add_filter(ext, &[ext]);
+                            }
                             if let Some(dir) = r.path.parent() {
                                 dialog = dialog.set_directory(dir);
                             }

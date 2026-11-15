@@ -140,7 +140,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         if layer.is_some()
             && ui.button("Export layers\u{2026}").on_hover_text("The video with the layers on top, the layers alone on transparency, or their motion as JSON").clicked()
         {
-            crate::panels::layer_export::open(world);
+            crate::panels::layer_export::open(world, crate::panels::layer_export::What::Over);
             ui.close();
         }
         if let Some(l) = layer {

@@ -368,7 +368,7 @@ fn export_a_saved_projects_stabilizer() {
         let start = Instant::now();
         let made = if follower {
             let half = (size[0].min(size[1]) / 24.0).clamp(16.0, 120.0);
-            render_marker(&footage, Path::new(&render), codec, frames.clone(), &|g| tt_track::export::follower_at(keys, size, g), half, &done, &stop)
+            render_marker(&footage, Path::new(&render), tt_media::render::MarkerOn::Black(codec), frames.clone(), &|g| tt_track::export::follower_at(keys, size, g), half, &done, &stop)
         } else {
             render_warped(&footage, Path::new(&render), codec, frames.clone(), &|g| tt_track::export::key_at(keys, g).map_or(IDENTITY, |k| tt_track::export::stabilizer_map(&k, size, 1.0)), &done, &stop)
         };

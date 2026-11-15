@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use tt_media::VideoIndex;
-use tt_media::render::{Codec, IDENTITY, render_marker, render_warped};
+use tt_media::render::{Codec, IDENTITY, MarkerOn, render_marker, render_warped};
 
 const W: usize = 160;
 const H: usize = 96;
@@ -80,13 +80,41 @@ fn a_tracking_target_is_a_marker_where_it_is_told() {
     let out = dir.join("render_target.mp4");
     let (done, cancel) = (AtomicUsize::new(0), AtomicBool::new(false));
     let at = |g: i64| Some(([50.0 + g as f64, 48.0], 0.0));
-    render_marker(&index, &out, Codec::H264, 0..index.frame_count(), &at, 12.0, &done, &cancel).expect("renders");
+    render_marker(&index, &out, MarkerOn::Black(Codec::H264), 0..index.frame_count(), &at, 12.0, &done, &cancel).expect("renders");
     let after = frames(&out);
     assert_eq!(after.len(), FRAMES);
     for (g, f) in after.iter().enumerate() {
         // Its top-left quadrant (light) is up and left of the given centre, the top-right (dark) up and right.
         let x = 50 + g;
         assert!(f[42 * W + x - 6] > 200 && f[42 * W + x + 6] < 60, "frame {g}");
+    }
+}
+
+/// On transparency (ProRes 4444): the marker alone, its dark squares as
+/// opaque as its light ones, nothing around it.
+#[test]
+fn a_tracking_target_on_transparency_is_the_marker_alone() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let Some(clip) = make_clip(&dir, "render_target_alpha_source") else {
+        eprintln!("skipped: no ffmpeg");
+        return;
+    };
+    let index = VideoIndex::open(&clip).expect("the clip opens");
+    let out = dir.join("render_target_alpha.mov");
+    let (done, cancel) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let at = |g: i64| Some(([50.0 + g as f64, 48.0], 0.0));
+    let on = MarkerOn::Transparent(tt_media::layers::AlphaFormat::ProRes4444);
+    render_marker(&index, &out, on, 0..index.frame_count(), &at, 12.0, &done, &cancel).expect("renders");
+    let rgba = Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-i"]).arg(&out).args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"]).output().expect("ffmpeg reads it").stdout;
+    let pictures: Vec<&[u8]> = rgba.chunks(W * H * 4).collect();
+    assert_eq!(pictures.len(), FRAMES);
+    let px = |f: &[u8], x: usize, y: usize| -> [u8; 4] { std::array::from_fn(|c| f[(y * W + x) * 4 + c]) };
+    for (g, f) in pictures.iter().enumerate() {
+        let x = 50 + g;
+        let (light, dark, clear) = (px(f, x - 6, 42), px(f, x + 6, 42), px(f, 2, 2));
+        assert!(light[3] > 240 && light[0] > 200, "frame {g}: the light quadrant, white and opaque: {light:?}");
+        assert!(dark[3] > 240 && dark[0] < 60, "frame {g}: the dark quadrant, black and opaque: {dark:?}");
+        assert!(clear[3] < 16, "frame {g}: clear away from it: {clear:?}");
     }
 }
 
@@ -147,7 +175,7 @@ fn a_range_renders_just_those_frames_and_their_sound() {
     // A tracking target over a range: as many frames, the marker where it is on those frames.
     let target = dir.join("render_range_target.mp4");
     let done = AtomicUsize::new(0);
-    render_marker(&index, &target, Codec::H264, 12..20, &|g: i64| Some(([50.0 + g as f64, 48.0], 0.0)), 12.0, &done, &cancel).expect("renders");
+    render_marker(&index, &target, MarkerOn::Black(Codec::H264), 12..20, &|g: i64| Some(([50.0 + g as f64, 48.0], 0.0)), 12.0, &done, &cancel).expect("renders");
     let after = frames(&target);
     assert_eq!(after.len(), 8);
     for (k, f) in after.iter().enumerate() {

@@ -1,12 +1,17 @@
 //! Exporting layers (tt_core::layer, tt_media::layers), and the motion of
 //! anything tracked as data:
 //!
-//! - **The Export layers window** (right-click a layer): the video with the
-//!   layers on top (ProRes, DNxHR, H.264, with its sound), or the layers
-//!   alone on transparency (ProRes 4444, a PNG sequence, WebM), the size,
-//!   frame rate and frames of the video, from the in point to the out point
-//!   or the whole video; or the motion data as JSON. The layers are read at
-//!   their own size for it, on a thread of its own.
+//! - **The Export window** (the top bar's Export menu, or right-click a
+//!   layer) *(on request: "export entire video without zooms or pans … just
+//!   the original video plus whatever we added on top … a regular export";
+//!   "above but without the underlying video … a transparent overlay")*: the
+//!   video as it is, with the layers on top (ProRes, DNxHR, H.264, with its
+//!   sound; with no layers, just the video), or the layers alone on
+//!   transparency (ProRes 4444, a PNG sequence, WebM), at the video's size
+//!   and frame rate (no zoom, no pan: a view only changes what the viewport
+//!   shows), from the in point to the out point or the whole video; or the
+//!   motion data as JSON. The layers are read at their own size for it, on
+//!   a thread of its own.
 //! - **Motion data (JSON)** ([`motion_json`]): per frame, each layer's
 //!   placement (its anchor's point, angle, scale, opacity, clip time and its
 //!   picture's corners) and each tracked thing's point, box, angle (a
@@ -35,10 +40,14 @@ use tt_media::render::Codec;
 use crate::media::{Media, StatusLine};
 use crate::style;
 
+/// What the Export window makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum What {
+pub enum What {
+    /// The video as it is, with what was added on top.
     Over,
+    /// What was added, alone, on transparency.
     Alpha,
+    /// The motion as data.
     Json,
 }
 
@@ -92,8 +101,8 @@ fn default_path(source: &Path, what: What, codec: Codec, alpha: AlphaFormat) -> 
     (1..).map(|n| dir.join(name(n))).find(|p| !p.exists()).expect("a free name")
 }
 
-/// Open the window with every layer in it.
-pub fn open(world: &mut World) {
+/// Open the window making `what`, with every layer in it.
+pub fn open(world: &mut World, what: What) {
     let Some(source) = world.get_resource::<Media>().map(|m| m.index().path.clone()) else {
         world.resource_mut::<StatusLine>().0 = Some(("Open a video first".into(), true));
         return;
@@ -102,7 +111,7 @@ pub fn open(world: &mut World) {
     let (codec, alpha) = (Codec::ProRes422Hq, AlphaFormat::ProRes4444);
     let mut x = world.resource_mut::<LayerExport>();
     x.done = None;
-    x.setup = Some(Setup { what: What::Over, layers, codec, alpha, whole: false, path: default_path(&source, What::Over, codec, alpha), default_path: true });
+    x.setup = Some(Setup { what, layers, codec, alpha, whole: false, path: default_path(&source, what, codec, alpha), default_path: true });
 }
 
 /// Whether any of `layers` (or what it follows) still has frames to work
@@ -154,12 +163,12 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
     let waiting = x.setup.as_ref().is_some_and(|s| pending(world, &s.layers.iter().filter(|(_, _, on)| *on).map(|(e, _, _)| *e).collect::<Vec<_>>()));
     let range = frames(world, x.setup.as_ref().is_some_and(|s| s.whole)).unwrap_or(0..0);
     let fps = world.resource::<tt_core::transport::Transport>().fps.as_f64();
-    egui::Window::new("Export layers").collapsible(false).resizable(false).default_width(440.0).open(&mut open).show(ctx, |ui| {
+    egui::Window::new("Export").collapsible(false).resizable(false).default_width(440.0).open(&mut open).show(ctx, |ui| {
         let s = x.setup.as_mut().expect("open");
         ui.add_enabled_ui(!busy, |ui| {
             let before = (s.what, s.codec, s.alpha);
-            ui.radio_value(&mut s.what, What::Over, "The video with the layers on top");
-            ui.radio_value(&mut s.what, What::Alpha, "The layers alone, on transparency (to put over the video in your editor)");
+            ui.radio_value(&mut s.what, What::Over, "The video as it is, with what you added on top (no zoom or pan)");
+            ui.radio_value(&mut s.what, What::Alpha, "Only what you added, on transparency (to put over the video in your editor)");
             ui.radio_value(&mut s.what, What::Json, "The motion as data (JSON): every layer and what it follows, frame by frame");
             ui.add_space(4.0);
             match s.what {
@@ -185,7 +194,8 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
             ui.add_space(4.0);
             ui.label("Layers (bottom first):");
             if s.layers.is_empty() {
-                ui.label(egui::RichText::new("No layers yet: right-click a sketch, tracker or subject, then Attach a picture, GIF or clip.").color(style::MUTED));
+                let then = if s.what == What::Over { " This exports the video as it is." } else { "" };
+                ui.label(egui::RichText::new(format!("No layers yet: right-click a sketch, tracker or subject, then Attach a picture, GIF or clip.{then}")).color(style::MUTED));
             }
             for (_, name, on) in &mut s.layers {
                 ui.checkbox(on, name.as_str());
@@ -241,7 +251,8 @@ pub fn ui(ctx: &egui::Context, world: &mut World) {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
             None => {
-                if ui.add_enabled(chosen > 0 && !range.is_empty(), egui::Button::new(if s.what == What::Json { "Save" } else { "Export" })).clicked() {
+                // (The video alone needs no layer.)
+                if ui.add_enabled((chosen > 0 || s.what == What::Over) && !range.is_empty(), egui::Button::new(if s.what == What::Json { "Save" } else { "Export" })).clicked() {
                     go = true;
                 }
             }

@@ -191,7 +191,7 @@ impl Scene {
                         // its export started (frames 560–620, to TT_SCENE_OUT; with
                         // TT_SCENE_ALPHA, alone on transparency).
                         if self.mode == "layer-export" || self.mode == "layer-render" {
-                            crate::panels::layer_export::open(world);
+                            crate::panels::layer_export::open(world, crate::panels::layer_export::What::Over);
                         }
 
                     }

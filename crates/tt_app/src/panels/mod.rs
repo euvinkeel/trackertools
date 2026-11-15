@@ -204,6 +204,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut report_problem = false;
     let mut open_doctor = false;
     let mut project_action = None;
+    let mut export = None;
     let tracking = tracks::summary(world);
     let kind = world.resource::<tt_track::NewTrackers>().method;
     let cotracker = tt_track::job::cotracker_availability();
@@ -229,6 +230,20 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 let i = m.index();
                 ui.label(egui::RichText::new(shortened(&m.name, 32)).strong()).on_hover_text(i.path.display().to_string());
                 project_action = project_menu(ui, world, &i.path);
+                ui.menu_button("Export \u{23f7}", |ui| {
+                    use layer_export::What;
+                    for (what, text, tip) in [
+                        (What::Over, "Video as you see it\u{2026}", "The whole video at its own size (no zoom or pan), with the pictures, GIFs and clips you attached on top, and its sound"),
+                        (What::Alpha, "Only what you added, on transparency\u{2026}", "The pictures, GIFs and clips you attached, alone on a transparent background: an overlay for your editor"),
+                        (What::Json, "Motion data (JSON)\u{2026}", "Every layer and what it follows, frame by frame"),
+                    ] {
+                        if ui.button(text).on_hover_text(tip).clicked() {
+                            export = Some(what);
+                            ui.close();
+                        }
+                    }
+                    ui.label(egui::RichText::new("A stabilized video or a tracking target: right-click a tracker, sketch or subject").color(style::MUTED).small());
+                });
                 // (Short: the top bar holds the tools too. The codec and the exact rate on hover.)
                 ui.label(egui::RichText::new(format!("{}×{} \u{b7} {:.2} fps", i.width, i.height, i.fps.as_f64())).color(style::MUTED))
                     .on_hover_text(format!("{} \u{b7} {} frames @ {:.3} fps", i.codec, i.frame_count(), i.fps.as_f64()));
@@ -390,6 +405,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     }
     if let Some(a) = project_action {
         run_project_action(world, a);
+    }
+    if let Some(what) = export {
+        layer_export::open(world, what);
     }
     if report_problem {
         let mut doctor = world.resource_mut::<crate::setup::Doctor>();
