@@ -233,7 +233,7 @@ Ranked by impact: (1) document or exported data wrong or lost, (2) a crash, hang
 - **Evidence:** reasoning from `file:line` (egui reports `drag_stopped` only for widgets it draws); the mechanism is tested by `a_widget_drag_that_is_no_longer_drawn_ends`. Not reproduced through the GUI. Status: confirmed by reading.
 - **Fix:** widget drags renew their gesture every frame they are drawn (`widget_edit`); one not drawn for a frame is ended in `Set::Input`.
 
-### I5. A seek outside the action handler left the shuttle running while paused. **Fixed**
+### I5. A seek outside the action handler left the shuttle running while paused. **Fixed** (`2168d92`)
 - **Impact:** 4. After Shift+I or Shift+O during J/L shuttling, the next Space played backward at up to 8×. Opening another video carried the shuttle's speed and direction over.
 - **Breaks:** A9 (`shuttle` ⇒ playing; paused ⇒ forward).
 - **Evidence:** `a_direct_seek_ends_the_shuttle` gave `(paused, reverse, 4×, shuttle set)` on the old code.
