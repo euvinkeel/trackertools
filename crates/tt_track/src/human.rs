@@ -471,7 +471,8 @@ pub fn draw_tool(world: &mut World) {
             }
             None if erase => tool.refused = Some("Select a tracker to erase what was drawn on it (Alt+hold erases)".into()),
             None => {
-                let name = format!("Manual dot {}", manual_count(world) + 1);
+                let n = manual_count(world);
+                let name = tt_core::commands::new_name(world, "Manual dot", n);
                 let gesture = world.resource_mut::<History>().begin(format!("Draw {name}"));
                 let mut made = None;
                 owning(world, gesture, |w| edit(w, &name, |tx| made = Some(spawn_manual_dot(tx, name.clone(), frame))));

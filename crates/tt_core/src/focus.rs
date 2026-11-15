@@ -233,7 +233,7 @@ pub fn make_focus(world: &mut World, target: Entity, frame: FrameIndex) -> Entit
     };
     let mut p = FocusParams::default();
     p.set(frame, target);
-    let name = format!("SpringFocus {n}");
+    let name = crate::commands::new_name(world, "SpringFocus", n - 1);
     let mut made = None;
     edit(world, &format!("Make {name}"), |tx| {
         let out = tx.create_signal(FOCUS_CHANNELS);

@@ -336,7 +336,7 @@ pub fn make_subject(world: &mut World, members: &[Entity], anchor: FrameIndex) -
         let mut q = world.query::<&Operator>();
         q.iter(world).filter(|o| o.kind == "subject").count()
     };
-    let name = format!("Subject {}", count + 1);
+    let name = crate::commands::new_name(world, "Subject", count);
     // Its box: the size of the members' boxes on the anchor frame (a point's: the default).
     let store = world.resource::<SignalStore>();
     let half = members

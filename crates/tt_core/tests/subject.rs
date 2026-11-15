@@ -364,3 +364,17 @@ fn an_edit_during_a_drag_is_its_own_undo_step() {
     assert_eq!(undo(&mut d.core.world).as_deref(), Some("Move Subject 1"));
     assert!(!moved(&d.core.world));
 }
+
+/// A new subject never takes the name of one still there (they were named by
+/// how many there were: after a delete, the next repeated a live one's name).
+#[test]
+fn new_subjects_never_repeat_a_live_name() {
+    let mut d = Driver::new();
+    let (a, b) = two_points(&mut d);
+    let s1 = make_subject(&mut d.core.world, &[a], 0).expect("a subject");
+    let s2 = make_subject(&mut d.core.world, &[b], 0).expect("a subject");
+    tt_core::commands::delete(&mut d.core.world, &[s1]);
+    let s3 = make_subject(&mut d.core.world, &[a, b], 0).expect("a subject");
+    let name = |e| d.core.world.get::<Name>(e).expect("named").to_string();
+    assert_eq!((name(s2), name(s3)), ("Subject 2".to_string(), "Subject 3".to_string()));
+}

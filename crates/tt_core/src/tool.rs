@@ -152,7 +152,11 @@ fn select_on_click(world: &mut World) {
     let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
     // On the selected subject's path (subject.rs bends it with a drag): a click
     // keeps it selected; Alt+click takes out the key drawn nearest the click.
-    if let Some(s) = world.resource::<crate::selection::Selection>().primary().filter(|e| crate::subject::is_subject(world, *e))
+    // (A layer's picture there, not selected, still takes the click: below.)
+    let src = crate::view::map_at(world, view, frame).to_source(pos);
+    let layer = crate::layer::pick_layer(world, frame, src).filter(|l| !world.resource::<crate::selection::Selection>().is_selected(*l));
+    if layer.is_none()
+        && let Some(s) = world.resource::<crate::selection::Selection>().primary().filter(|e| crate::subject::is_subject(world, *e))
         && crate::subject::path_frame(world, s, view, frame, pos, grab).is_some()
     {
         if world.resource::<crate::input::KeysHeld>().mods.alt {
@@ -172,16 +176,14 @@ fn select_on_click(world: &mut World) {
         }
         return;
     }
-    // The pointer is in the shown space's pixels; sketches live in source pixels.
-    let pos = crate::view::map_at(world, view, frame).to_source(pos);
+    // (The pointer is in the shown space's pixels; sketches live in source pixels: `src`.)
     // A layer's picture first (it covers what it's attached to), unless it is
     // selected already: then what's under it, so a second click reaches that.
-    let layer = crate::layer::pick_layer(world, frame, pos).filter(|l| !world.resource::<crate::selection::Selection>().is_selected(*l));
     let picked = layer
-        .or_else(|| crate::subject::pick_subject(world, frame, pos, grab))
-        .or_else(|| pick_tracker(world, frame, pos, grab))
-        .or_else(|| crate::focus::pick_focus(world, frame, pos, grab))
-        .or_else(|| crate::sketch::pick_sketch(world, frame, pos));
+        .or_else(|| crate::subject::pick_subject(world, frame, src, grab))
+        .or_else(|| pick_tracker(world, frame, src, grab))
+        .or_else(|| crate::focus::pick_focus(world, frame, src, grab))
+        .or_else(|| crate::sketch::pick_sketch(world, frame, src));
     let mut sel = world.resource_mut::<crate::selection::Selection>();
     match picked {
         Some(e) => sel.select_only(e),

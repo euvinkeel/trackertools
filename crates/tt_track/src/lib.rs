@@ -570,7 +570,8 @@ fn add_tracker_in(world: &mut World, guide: Option<Entity>, look: Look) -> Optio
         return None;
     }
     let guide_name = guide.map_or("the whole frame".to_string(), |g| world.get::<Name>(g).map_or("box".to_string(), |n| n.to_string()));
-    let name = format!("Tracker {}", tracker_count(world) + 1);
+    let n = tracker_count(world);
+    let name = tt_core::commands::new_name(world, "Tracker", n);
     // (The guide's view, made if it has none, and the tracker: one undo step.)
     let tracker = tt_core::history::compound(world, &format!("Track {guide_name}"), |world| {
         let space = guide.and_then(|g| tracking_view(world, g));
@@ -721,7 +722,8 @@ pub fn add_tracker(world: &mut World, guide: Entity, frame: FrameIndex, space: O
     let anchor = anchor_in(world, Some(guide), frame)?;
     let look = look_from_guide(world, guide, anchor)?;
     let guide_name = world.get::<Name>(guide).map_or("box".to_string(), |n| n.to_string());
-    let name = format!("Tracker {}", tracker_count(world) + 1);
+    let n = tracker_count(world);
+    let name = tt_core::commands::new_name(world, "Tracker", n);
     let mut made = None;
     edit(world, &format!("Track {guide_name}"), |tx| made = Some(spawn_tracker(tx, name, Some(guide), look, space, false)));
     let tracker = made?;
@@ -783,7 +785,8 @@ fn apply_track_actions(world: &mut World) {
         (_, []) => "Re-seed tracker".to_string(),
         _ => "Track".to_string(),
     };
-    let first = tracker_count(world) + 1;
+    let n = tracker_count(world);
+    let names = tt_core::commands::new_names(world, "Tracker", n, guides.len());
     let mut made = Vec::new();
     edit(world, &label, |tx| {
         for (e, a, l) in reseed {
@@ -795,8 +798,8 @@ fn apply_track_actions(world: &mut World) {
                 i.0.insert(at, item);
             });
         }
-        for (i, (g, look)) in guides.into_iter().enumerate() {
-            made.push(spawn_tracker(tx, format!("Tracker {}", first + i), Some(g), look, space, false));
+        for ((g, look), name) in guides.into_iter().zip(names) {
+            made.push(spawn_tracker(tx, name, Some(g), look, space, false));
         }
     });
     if !made.is_empty() {

@@ -172,6 +172,24 @@ pub(crate) fn numbered(taken: &[String], prefix: &str, from: usize) -> String {
     (from..).map(|i| format!("{prefix} {i}")).find(|n| !taken.iter().any(|t| t == n)).expect("some name is free")
 }
 
+/// A new `prefix n` no live entity has: `n` from `count + 1` (how many
+/// there are) on, so the numbers go up and never repeat a name in use.
+pub fn new_name(world: &mut World, prefix: &str, count: usize) -> String {
+    new_names(world, prefix, count, 1).remove(0)
+}
+
+/// `k` new names at once ([`new_name`]), none like another.
+pub fn new_names(world: &mut World, prefix: &str, count: usize, k: usize) -> Vec<String> {
+    let mut taken = live_names(world);
+    (0..k)
+        .map(|i| {
+            let name = numbered(&taken, prefix, count + 1 + i);
+            taken.push(name.clone());
+            name
+        })
+        .collect()
+}
+
 /// The names of all live entities.
 pub(crate) fn live_names(world: &mut World) -> Vec<String> {
     world.query::<&Name>().iter(world).map(|n| n.to_string()).collect()
