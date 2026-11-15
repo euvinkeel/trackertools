@@ -97,7 +97,7 @@ fn project_menu(ui: &mut egui::Ui, world: &World, video: &std::path::Path) -> Op
     }
     let name = current.as_deref().map_or_else(|| "none".to_string(), |p| project_name(video, p));
     let mut action = None;
-    ui.menu_button(format!("Project: {name} \u{23f7}"), |ui| {
+    let button = ui.menu_button(format!("Project: {} \u{23f7}", shortened(&name, 24)), |ui| {
         ui.label(egui::RichText::new("This video's projects").color(style::MUTED).small());
         for p in &list {
             let open = current.as_deref() == Some(p.as_path());
@@ -132,7 +132,21 @@ fn project_menu(ui: &mut egui::Ui, world: &World, video: &std::path::Path) -> Op
             ui.close();
         }
     });
+    button.response.on_hover_text(current.as_deref().map_or(name, |p| p.display().to_string()));
     action
+}
+
+/// `text` cut to at most `max` characters, the middle replaced by "…" (a
+/// file's name keeps its start and its extension), so a long name can't push
+/// the top bar's buttons off the window.
+fn shortened(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let tail = (max - 1) / 3;
+    let head = max - 1 - tail;
+    format!("{}\u{2026}{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
 }
 
 fn run_project_action(world: &mut World, action: ProjectAction) {
@@ -213,7 +227,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         match world.get_resource::<Media>() {
             Some(m) => {
                 let i = m.index();
-                ui.label(egui::RichText::new(&m.name).strong());
+                ui.label(egui::RichText::new(shortened(&m.name, 32)).strong()).on_hover_text(i.path.display().to_string());
                 project_action = project_menu(ui, world, &i.path);
                 // (Short: the top bar holds the tools too. The codec and the exact rate on hover.)
                 ui.label(egui::RichText::new(format!("{}×{} \u{b7} {:.2} fps", i.width, i.height, i.fps.as_f64())).color(style::MUTED))
@@ -433,5 +447,17 @@ impl egui_tiles::Behavior<Pane> for Behavior<'_> {
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
         egui_tiles::SimplificationOptions { all_panes_must_have_tabs: true, ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn long_names_are_cut_in_the_middle() {
+        assert_eq!(super::shortened("clip.mp4", 32), "clip.mp4");
+        let long = "2026-11-14 gameplay recording, the long take with the boss fight.mp4";
+        let short = super::shortened(long, 32);
+        assert_eq!(short.chars().count(), 32);
+        assert!(short.starts_with("2026-11-14 gameplay") && short.ends_with("fight.mp4") && short.contains('\u{2026}'), "{short}");
     }
 }
