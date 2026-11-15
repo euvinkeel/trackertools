@@ -15,6 +15,7 @@ pub mod input;
 pub mod layer;
 pub mod marks;
 pub mod meta;
+pub mod off;
 pub mod op;
 pub mod persist;
 pub mod ranges;
@@ -48,6 +49,7 @@ impl Module for CoreModules {
             .add_module(focus::FocusModule)
             .add_module(layer::LayerModule)
             .add_module(span::SpanModule)
+            .add_module(off::OffModule)
             .add_module(tool::ToolModule)
             .add_module(capture::CaptureModule)
             .add_module(autospeed::AutoSpeedModule)

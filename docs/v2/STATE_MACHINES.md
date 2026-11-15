@@ -184,6 +184,7 @@ Before 2026-11-15 the same order was implicit: each drag system called the other
 
 - **Selection** (session, snapshotted by every transaction). It can hold disabled entities after an undo. Consumers filter with `get_entity` or `Disabled` checks; entity handles carry a generation, so a stale handle finds nothing after a project switch.
 - **Active view** (session): a deleted view hands the viewport to its nearest live ancestor (`prune_active_view`).
+- **Off keys** (`tt_core::off::Off`, document): on any tracker or sketch, *on → off from frame f → on again from g*, as sorted keys with no redundant ones. A tracker's output is flagged OFF there (`tt_track::human::compose`); a sketch gives no point to subjects or exports there (`subject::points_of`). Changing them re-derives what reads the entity (`off_changed`).
 - **Lifetimes** (`Span`, document) and **in/out marks** (`ProjectMeta`, document): edited by timeline drags as widget gestures (A2), by menu commands, and by `I` / `O` keys. **Invariant:** in ≤ out (marking one past the other clears the other).
 
 ### A11. Projects and autosave (`tt_app::project`, `tt_core::persist`)

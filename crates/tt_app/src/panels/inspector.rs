@@ -46,6 +46,8 @@ fn entity_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         super::layer_inspector::section(ui, world, e);
     }
     if world.get::<SketchParams>(e).is_some() {
+        // (Off: it carries no subject there; it still frames its view and guides its trackers.)
+        ui.horizontal_wrapped(|ui| super::tracks::off_row(ui, world, e));
         sketch_color(ui, world, e);
         sketch_presets(ui, world, e);
     }

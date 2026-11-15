@@ -935,6 +935,35 @@ fn lanes(
         for (b, state, alive) in &bars {
             painter.rect_filled(*b, 1.5, color.gamma_multiply(alpha(*alive, *state)));
         }
+        // Where it is switched off (a tracker, a sketch): hatched over its lane.
+        if let Some(o) = world.get::<tt_core::off::Off>(e).filter(|o| o.any_off()) {
+            let lo = scale.start.floor() as FrameIndex;
+            let hi = (scale.start + scale.span).ceil() as FrameIndex + 1;
+            for r in o.off_ranges(lo, hi) {
+                let (x0, x1) = (scale.x(r.start as f64).max(scale.rect.min.x), scale.x(r.end as f64).min(scale.rect.max.x));
+                if x1 <= x0 {
+                    continue;
+                }
+                let band = Rect::from_x_y_ranges(x0..=x1, y + 1.0..=y + 17.0);
+                painter.rect_filled(band, 0.0, egui::Color32::from_black_alpha(110));
+                let hatch = Stroke::new(1.0, style::MUTED.gamma_multiply(0.7));
+                let mut x = x0 - 16.0;
+                while x < x1 {
+                    let (a, b) = (Pos2::new(x, band.bottom()), Pos2::new(x + 16.0, band.top()));
+                    // (Clipped to the band.)
+                    let clip = |p: Pos2, q: Pos2| -> Option<(Pos2, Pos2)> {
+                        let t0 = ((x0 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
+                        let t1 = ((x1 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
+                        (t1 > t0).then(|| (p + (q - p) * t0, p + (q - p) * t1))
+                    };
+                    if let Some((a, b)) = clip(a, b) {
+                        painter.line_segment([a, b], hatch);
+                    }
+                    x += 6.0;
+                }
+                painter.text(Pos2::new(x0 + 3.0, y + 2.0), egui::Align2::LEFT_TOP, "off", egui::FontId::proportional(9.0), style::TEXT.gamma_multiply(0.8));
+            }
+        }
         if kind == LaneKind::Tracker {
             // … what was drawn by hand, a layer over them (a manual dot: all of it).
             if let Some(h) = tt_track::human::human_signal(world, e) {
@@ -987,35 +1016,6 @@ fn lanes(
                         x += 8.0;
                     }
                     hits.moving = true;
-                }
-            }
-            // Where it is switched off: hatched over its lane.
-            if let Some(o) = world.get::<tt_track::off::TrackerOff>(e).filter(|o| o.any_off()) {
-                let lo = scale.start.floor() as FrameIndex;
-                let hi = (scale.start + scale.span).ceil() as FrameIndex + 1;
-                for r in o.off_ranges(lo, hi) {
-                    let (x0, x1) = (scale.x(r.start as f64).max(scale.rect.min.x), scale.x(r.end as f64).min(scale.rect.max.x));
-                    if x1 <= x0 {
-                        continue;
-                    }
-                    let band = Rect::from_x_y_ranges(x0..=x1, y + 1.0..=y + 17.0);
-                    painter.rect_filled(band, 0.0, egui::Color32::from_black_alpha(110));
-                    let hatch = Stroke::new(1.0, style::MUTED.gamma_multiply(0.7));
-                    let mut x = x0 - 16.0;
-                    while x < x1 {
-                        let (a, b) = (Pos2::new(x, band.bottom()), Pos2::new(x + 16.0, band.top()));
-                        // (Clipped to the band.)
-                        let clip = |p: Pos2, q: Pos2| -> Option<(Pos2, Pos2)> {
-                            let t0 = ((x0 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
-                            let t1 = ((x1 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
-                            (t1 > t0).then(|| (p + (q - p) * t0, p + (q - p) * t1))
-                        };
-                        if let Some((a, b)) = clip(a, b) {
-                            painter.line_segment([a, b], hatch);
-                        }
-                        x += 6.0;
-                    }
-                    painter.text(Pos2::new(x0 + 3.0, y + 2.0), egui::Align2::LEFT_TOP, "off", egui::FontId::proportional(9.0), style::TEXT.gamma_multiply(0.8));
                 }
             }
             // Its looks (white squares; a cursor tracker's in their pattern's colour) or a CoTracker's reset points (white diamonds), on their frames.

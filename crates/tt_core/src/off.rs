@@ -1,38 +1,49 @@
-//! Switching a tracker off (DESIGN §6.5) (on request: "enable or disable a
-//! tracker easily … marked as disabled if they go off the rails and then can
-//! come back again when you know they're good, and at that point other
-//! trackers would contribute/take over if they are enabled"):
+//! Switching a tracker or a sketch off (DESIGN §6.5) (on request: "enable
+//! or disable a tracker easily … marked as disabled if they go off the rails
+//! and then can come back again when you know they're good, and at that
+//! point other trackers would contribute/take over if they are enabled";
+//! then: "if a sketch is used in a subject it should be disablable/enablable
+//! like other trackers too … if I only want it to contribute in parts of the
+//! timeline"):
 //!
-//! - A tracker's **off keys** ([`TrackerOff`]): from each key's frame on, it
-//!   is off or on again; before the first, on. They are part of the
-//!   document (saved, undone).
-//! - Where it is off, its output frames carry the [`crate::OFF`] flag
-//!   (`human::compose`): what reads trackers' flags leaves them out there, as
-//!   it does lost frames: a subject goes on with its other members, an
-//!   export's points without it. Its results stay as they are (switching it
-//!   on again shows them again): nothing is tracked again.
-//! - **H** switches the selected trackers off from the playhead on (or on
-//!   again, where they are off); **Shift+H** off everywhere (or on
-//!   everywhere, where any of it is off). The Inspector has the same, the
-//!   timeline hatches where a tracker is off, and the video draws it grey there.
+//! - **Off keys** ([`Off`]): from each key's frame on, it is off or on
+//!   again; before the first, on. They are part of the document (saved, undone).
+//! - Where a **tracker** is off, its output frames carry the OFF flag
+//!   (`tt_track::human::compose`): what reads trackers' flags leaves them out
+//!   there, as it does lost frames.
+//! - Where a **sketch** is off, it has no point for what it carries: a
+//!   subject goes on with its other members, an export's points without it
+//!   (`subject::points_of`). It still frames its view and guides its trackers
+//!   (its box is still where the subject is).
+//! - Either way its results stay as they are: switched on again, they count again.
+//! - **H** switches the selected trackers and sketches off from the playhead
+//!   on (or on again, where they are off); **Shift+H** off everywhere (or on
+//!   everywhere, where any of it is off). The Inspector and the right-click
+//!   menu have the same, and the timeline hatches where they are off.
 
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
-use tt_core::history::edit;
-use tt_core::input::{Action, PendingActions};
-use tt_core::selection::Selection;
-use tt_core::time::FrameIndex;
-use tt_core::transport::Transport;
 
-use crate::is_tracker;
+use crate::app::{AppBuilder, Module, Set};
+use crate::history::edit;
+use crate::input::{Action, PendingActions};
+use crate::meta::Class;
+use crate::op::{Invalidations, Operator};
+use crate::selection::Selection;
+use crate::time::FrameIndex;
+use crate::transport::Transport;
 
-/// A tracker's off keys: `(frame, off)`, sorted by frame: from that frame on
-/// it is off (true) or on (false). None or empty: on everywhere.
+/// Off keys: `(frame, off)`, sorted by frame: from that frame on it is off
+/// (true) or on (false). None or empty: on everywhere. (Saved under the name
+/// it had when only trackers could be switched off, so projects from then
+/// keep theirs.)
 #[derive(Component, Reflect, Clone, Debug, Default, PartialEq)]
 #[reflect(Component)]
-pub struct TrackerOff(pub Vec<(FrameIndex, bool)>);
+#[type_path = "tt_track::off"]
+#[type_name = "TrackerOff"]
+pub struct Off(pub Vec<(FrameIndex, bool)>);
 
-impl TrackerOff {
+impl Off {
     /// Off on frame `f`.
     pub fn is_off(&self, f: FrameIndex) -> bool {
         self.0.iter().rev().find(|(k, _)| *k <= f).is_some_and(|(_, off)| *off)
@@ -81,9 +92,17 @@ impl TrackerOff {
     }
 }
 
-/// Whether `tracker` is off on frame `f`.
+/// Whether a tracker or a sketch can be switched off: what it is (a stroke: its sketch).
+pub fn switchable(world: &mut World, e: Entity) -> Option<Entity> {
+    if world.get::<Operator>(e).is_some_and(|o| o.kind == "track") {
+        return Some(e);
+    }
+    crate::sketch::sketch_of(world, e)
+}
+
+/// Whether `tracker` (or a sketch) is off on frame `f`.
 pub fn is_off(world: &World, tracker: Entity, f: FrameIndex) -> bool {
-    world.get::<TrackerOff>(tracker).is_some_and(|o| o.is_off(f))
+    world.get::<Off>(tracker).is_some_and(|o| o.is_off(f))
 }
 
 /// Switch `trackers` off from frame `f` on, or on again (`off` false), one undo step.
@@ -91,7 +110,7 @@ pub fn switch_from(world: &mut World, trackers: &[Entity], f: FrameIndex, off: b
     let what = if off { "Switch off" } else { "Switch on" };
     edit(world, what, |tx| {
         for t in trackers {
-            let mut keys = tx.world().get::<TrackerOff>(*t).cloned().unwrap_or_default();
+            let mut keys = tx.world().get::<Off>(*t).cloned().unwrap_or_default();
             keys.set_from(f, off);
             tx.insert(*t, keys);
         }
@@ -103,18 +122,23 @@ pub fn switch_everywhere(world: &mut World, trackers: &[Entity], off: bool) {
     let what = if off { "Switch off everywhere" } else { "Switch on everywhere" };
     edit(world, what, |tx| {
         for t in trackers {
-            tx.insert(*t, TrackerOff(if off { vec![(FrameIndex::MIN, true)] } else { Vec::new() }));
+            tx.insert(*t, Off(if off { vec![(FrameIndex::MIN, true)] } else { Vec::new() }));
         }
     });
 }
 
-/// `Set::Intents`: H and Shift+H on the selected trackers (module docs).
-pub fn switch_actions(world: &mut World) {
+/// `Set::Intents`: H and Shift+H on the selected trackers and sketches (module docs).
+fn switch_actions(world: &mut World) {
     let asked = world.resource_mut::<PendingActions>().take(|a| matches!(a, Action::SwitchTracker | Action::SwitchTrackerEverywhere));
     if asked.is_empty() {
         return;
     }
-    let selected: Vec<Entity> = world.resource::<Selection>().entities.iter().copied().filter(|e| is_tracker(world, *e)).collect();
+    let mut selected: Vec<Entity> = Vec::new();
+    for e in world.resource::<Selection>().entities.clone() {
+        if let Some(s) = switchable(world, e).filter(|s| !selected.contains(s)) {
+            selected.push(s);
+        }
+    }
     if selected.is_empty() {
         return;
     }
@@ -127,11 +151,29 @@ pub fn switch_actions(world: &mut World) {
                 switch_from(world, &selected, f, off);
             }
             Action::SwitchTrackerEverywhere => {
-                let off = !selected.iter().any(|t| world.get::<TrackerOff>(*t).is_some_and(TrackerOff::any_off));
+                let off = !selected.iter().any(|t| world.get::<Off>(*t).is_some_and(Off::any_off));
                 switch_everywhere(world, &selected, off);
             }
             _ => {}
         }
+    }
+}
+
+/// A sketch's off keys changed: what reads it (subjects, exports) looks
+/// again. (A tracker's go through its output's flags: `tt_track::human`.)
+fn off_changed(changed: Query<Entity, Changed<Off>>, mut removed: RemovedComponents<Off>, mut inv: ResMut<Invalidations>, t: Res<Transport>) {
+    for e in changed.iter().chain(removed.read()) {
+        inv.output_changed(e, 0..t.frame_count);
+    }
+}
+
+pub struct OffModule;
+
+impl Module for OffModule {
+    fn build(&self, app: &mut AppBuilder) {
+        app.component::<Off>(Class::Document)
+            .add_systems(switch_actions.in_set(Set::Intents))
+            .add_systems(off_changed.in_set(Set::Invalidate).before(crate::op::propagate));
     }
 }
 
@@ -141,7 +183,7 @@ mod tests {
 
     #[test]
     fn keys_say_where_it_is_off() {
-        let mut o = TrackerOff::default();
+        let mut o = Off::default();
         assert!(!o.is_off(0));
         o.set_from(100, true);
         o.set_from(150, false);

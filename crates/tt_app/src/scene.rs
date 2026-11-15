@@ -401,8 +401,8 @@ fn rest(world: &mut World, sketch: Entity) -> Option<Entity> {
     if std::env::var("TT_SCENE_DEMO").is_ok_and(|m| m == "off")
         && let Some(g) = guided
     {
-        tt_track::off::switch_from(world, &[g], 610, true);
-        tt_track::off::switch_from(world, &[g], 640, false);
+        tt_core::off::switch_from(world, &[g], 610, true);
+        tt_core::off::switch_from(world, &[g], 640, false);
         world.resource_mut::<tt_core::selection::Selection>().select_only(g);
         return subject;
     }

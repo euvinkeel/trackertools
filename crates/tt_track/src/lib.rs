@@ -35,7 +35,6 @@ pub mod image;
 pub mod job;
 pub mod look;
 pub mod ncc;
-pub mod off;
 pub mod runner;
 pub mod template;
 pub mod tool;
@@ -863,7 +862,6 @@ impl Module for TrackModule {
             .component::<TrackRun>(Class::Document)
             .component::<human::AutoOutput>(Class::Document)
             .component::<human::HumanLayer>(Class::Document)
-            .component::<off::TrackerOff>(Class::Document)
             .component::<icons::CursorIcons>(Class::Document)
             .declare::<runner::PaintPoints>(Class::Derived)
             .declare::<runner::CursorShapes>(Class::Derived)
@@ -897,7 +895,7 @@ impl Module for TrackModule {
             .declare::<runner::TrackJobs>(Class::Derived)
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
-            .add_systems((apply_track_actions, look_changed, off::switch_actions).in_set(Set::Intents))
+            .add_systems((apply_track_actions, look_changed).in_set(Set::Intents))
             .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
     }

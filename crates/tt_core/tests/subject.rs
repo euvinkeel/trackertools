@@ -378,3 +378,46 @@ fn new_subjects_never_repeat_a_live_name() {
     let name = |e| d.core.world.get::<Name>(e).expect("named").to_string();
     assert_eq!((name(s2), name(s3)), ("Subject 2".to_string(), "Subject 3".to_string()));
 }
+
+/// H on a sketch in a subject: from the playhead on it carries the subject
+/// no more (the subject goes on with its other member), the sketch's own
+/// data stays as it was, and undo brings it back. Off keys are saved under
+/// the name they had when only trackers had them, so older projects keep theirs.
+#[test]
+fn a_sketch_switched_off_stops_carrying_its_subject_there() {
+    use bevy_reflect::TypePath;
+    use common::circle;
+    use tt_core::input::Action;
+    use tt_core::selection::Selection;
+    let mut d = Driver::new();
+    d.frame(circle, PRESS);
+    d.frame(circle, common::Input { action: Some(Action::TogglePlay), ..HOLD });
+    d.frames(500, circle, HOLD);
+    d.frame(circle, common::Input { action: Some(Action::TogglePlay), ..HOLD });
+    d.frames(60, circle, HOLD);
+    d.frame(circle, UP);
+    let sketch = d.sketches()[0];
+    let (lo, hi) = tt_core::span::natural_span(&d.core.world, sketch).expect("recorded");
+    let (a, _) = two_points(&mut d);
+    let s = make_subject(&mut d.core.world, &[a, sketch], lo).expect("a subject");
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let sketch_before = d.value(sketch, hi);
+    let mid = (lo + hi) / 2;
+    d.core.world.resource_mut::<Transport>().seek(mid);
+    d.core.world.resource_mut::<Selection>().select_only(sketch);
+    d.frame(|_| [0.0, 0.0], common::Input { action: Some(Action::SwitchTracker), ..UP });
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let x = |w: &World, f: i64| value_at(w, s, f).expect("a value");
+    for f in mid + 1..=hi {
+        let (p, q) = (x(&d.core.world, f - 1), x(&d.core.world, f));
+        assert!((q[0] - p[0] - 2.0).abs() < 1e-3 && (q[1] - p[1]).abs() < 1e-3, "frame {f}: only A's motion: {p:?} -> {q:?}");
+    }
+    assert_eq!(d.value(sketch, hi), sketch_before, "the sketch's own data is as it was");
+    assert!(tt_core::off::is_off(&d.core.world, sketch, hi) && !tt_core::off::is_off(&d.core.world, sketch, mid - 1));
+    undo(&mut d.core.world);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    assert!(!tt_core::off::is_off(&d.core.world, sketch, hi), "undone");
+    let moved = (mid + 1..=hi).any(|f| (x(&d.core.world, f)[1] - x(&d.core.world, f - 1)[1]).abs() > 1e-3);
+    assert!(moved, "the sketch carries it again (its circle moves it up and down)");
+    assert_eq!(tt_core::off::Off::type_path(), "tt_track::off::TrackerOff", "saved as before");
+}

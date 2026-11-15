@@ -80,6 +80,8 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         } else {
             own.gamma_multiply(0.75)
         };
+        // Switched off here (H): grey, as a tracker that is off.
+        let color = if editing != Some(*e) && tt_core::off::is_off(world, *e, frame) { style::MUTED } else { color };
         if editing == Some(*e) || (lit.contains(e) && live.is_none()) {
             path(painter, map, frame, |f| value(f).map(|v| to_canvas(f, v)).map(|v| [v[0], v[1]]), color);
         }

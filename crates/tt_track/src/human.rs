@@ -72,7 +72,7 @@ pub struct Composed {
     output: u64,
     manual: bool,
     /// Where it was switched off (`off`).
-    off: Option<crate::off::TrackerOff>,
+    off: Option<tt_core::off::Off>,
     /// A Jev tracker's least box confidence (its bits): below, a frame is lost.
     min: Option<u32>,
 }
@@ -132,7 +132,7 @@ fn default_half(world: &World, tracker: Entity) -> [f32; 2] {
 
 /// One frame of the output from the layers: the drawn point (valid), else
 /// the automatic result as it is, else nothing.
-fn composed(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2], off: Option<&crate::off::TrackerOff>, min: Option<f32>) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
+fn composed(f: FrameIndex, auto: Option<&Signal>, human: Option<&Signal>, half: [f32; 2], off: Option<&tt_core::off::Off>, min: Option<f32>) -> Option<([f32; TRACK_CHANNELS], FrameState)> {
     let (mut v, state) = layered(f, auto, human, half)?;
     // A Jev tracker's box Jev was less sure of (its score: the confidence) than asked: lost. (A drawn frame scores 1.)
     if let Some(m) = min
@@ -177,7 +177,7 @@ pub fn compose(world: &mut World, tracker: Entity) {
     let (Some(out), Some(auto)) = (world.get::<Output>(tracker).map(|o| o.0), world.get::<AutoOutput>(tracker).map(|a| a.0)) else { return };
     let manual = is_manual(world, tracker);
     let half = default_half(world, tracker);
-    let off = world.get::<crate::off::TrackerOff>(tracker).cloned().filter(|o| !o.0.is_empty());
+    let off = world.get::<tt_core::off::Off>(tracker).cloned().filter(|o| !o.0.is_empty());
     let min = world.get::<Tracker>(tracker).filter(|t| t.method == Method::Jev).map(|t| t.jev.min_confidence);
     let min_bits = min.map(f32::to_bits);
     let (a, h) = {

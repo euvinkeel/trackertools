@@ -10,7 +10,7 @@ use tt_core::transport::Transport;
 use tt_core::{AppBuilder, Core, CoreModules};
 use tt_track::TrackModule;
 use tt_track::human::{spawn_manual_dot, write_drawn};
-use tt_track::off::{TrackerOff, switch_everywhere, switch_from};
+use tt_core::off::{Off, switch_everywhere, switch_from};
 
 fn core() -> Core {
     let mut app = AppBuilder::new();
@@ -77,6 +77,6 @@ fn a_tracker_switched_off_leaves_the_subject_to_the_others() {
     assert!((0..60).all(|f| flags(&core, a, f) == tt_track::OFF));
     switch_everywhere(&mut core.world, &[a], false);
     core.run_pre_ui();
-    assert_eq!(core.world.get::<TrackerOff>(a).map(|o| o.0.len()), Some(0));
+    assert_eq!(core.world.get::<Off>(a).map(|o| o.0.len()), Some(0));
     assert_eq!(flags(&core, a, 30), 0);
 }

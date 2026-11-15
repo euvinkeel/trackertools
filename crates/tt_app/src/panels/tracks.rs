@@ -1032,29 +1032,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         if ui.button("Re-seed here").on_hover_text(reseed_tip).clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }
-        // Switched off from here on (or on again): subjects and exports use the others there.
-        let here = world.resource::<Transport>().frame();
-        let off = tt_track::off::is_off(world, e, here);
-        let chord = |a: Action| world.resource::<tt_core::input::Keymap>().chord_for(a).map(|c| format!(" ({c})")).unwrap_or_default();
-        let (text, tip) = if off {
-            ("Switch on from here", "It counts again from this frame on (in subjects and exports).")
-        } else {
-            ("Switch off from here", "From this frame on it doesn't count: subjects and exports go on with the others, as where it is lost. Its results stay. Switch it on again where it is good.")
-        };
-        let key = chord(Action::SwitchTracker);
-        if ui.button(text).on_hover_text(format!("{tip}{key}")).clicked() {
-            tt_track::off::switch_from(world, &[e], here, !off);
-        }
-        if let Some(o) = world.get::<tt_track::off::TrackerOff>(e).filter(|o| o.any_off()) {
-            let stretches = o.off_ranges(FrameIndex::MIN, FrameIndex::MAX);
-            let words: Vec<String> = stretches.iter().map(|r| match (r.start == FrameIndex::MIN, r.end == FrameIndex::MAX) {
-                (true, true) => "everywhere".to_string(),
-                (true, false) => format!("before {}", r.end),
-                (false, true) => format!("from {}", r.start),
-                (false, false) => format!("{}\u{2013}{}", r.start, r.end - 1),
-            }).collect();
-            ui.label(egui::RichText::new(format!("off: {}", words.join(", "))).color(style::MUTED).small());
-        }
+        off_row(ui, world, e);
     });
     for (s, forward) in [(status.forward, true), (status.backward, false)] {
         let Some(s) = s else { continue };
@@ -1064,4 +1042,33 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.add(egui::ProgressBar::new(done.clamp(0.0, 1.0)).text(side_line(&s, forward, Some(method))));
     }
     let _ = name;
+}
+
+/// Switching a tracker or a sketch off from the playhead on (or on again),
+/// and where it is off now (`tt_core::off`): its row in the Inspector.
+pub fn off_row(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    let here = world.resource::<Transport>().frame();
+    let off = tt_core::off::is_off(world, e, here);
+    let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::SwitchTracker).map(|c| format!(" ({c})")).unwrap_or_default();
+    let (text, tip) = if off {
+        ("Switch on from here", "It counts again from this frame on (in subjects and exports).")
+    } else {
+        ("Switch off from here", "From this frame on it doesn't count: subjects and exports go on with the others. Nothing is deleted. Switch it on again where it is good.")
+    };
+    if ui.button(text).on_hover_text(format!("{tip}{chord}")).clicked() {
+        tt_core::off::switch_from(world, &[e], here, !off);
+    }
+    if let Some(o) = world.get::<tt_core::off::Off>(e).filter(|o| o.any_off()) {
+        let words: Vec<String> = o
+            .off_ranges(FrameIndex::MIN, FrameIndex::MAX)
+            .iter()
+            .map(|r| match (r.start == FrameIndex::MIN, r.end == FrameIndex::MAX) {
+                (true, true) => "everywhere".to_string(),
+                (true, false) => format!("before {}", r.end),
+                (false, true) => format!("from {}", r.start),
+                (false, false) => format!("{}\u{2013}{}", r.start, r.end - 1),
+            })
+            .collect();
+        ui.label(egui::RichText::new(format!("off: {}", words.join(", "))).color(style::MUTED).small());
+    }
 }

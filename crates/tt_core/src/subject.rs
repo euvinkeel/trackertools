@@ -125,14 +125,16 @@ pub fn can_be_member(world: &World, e: Entity) -> bool {
 }
 
 /// A producer's point on each frame it has a good one: inside its span, not
-/// flagged (a tracker's lost or outside, channel 7), finite. Source px, y down.
+/// flagged (a tracker's lost, outside or off, channel 7), not switched off
+/// (a sketch's off keys, `crate::off`), finite. Source px, y down.
 pub fn points_of(world: &World, e: Entity) -> Vec<(FrameIndex, [f64; 2])> {
     let Some(sig) = crate::span::output(world, e) else { return Vec::new() };
     let Some((lo, hi)) = sig.present_hull() else { return Vec::new() };
+    let off = world.get::<crate::off::Off>(e).filter(|o| o.any_off());
     (lo..=hi)
         .filter_map(|f| {
             let v = sig.get(f)?;
-            let good = v.get(7).is_none_or(|flags| *flags == 0.0) && v[0].is_finite() && v[1].is_finite();
+            let good = v.get(7).is_none_or(|flags| *flags == 0.0) && off.is_none_or(|o| !o.is_off(f)) && v[0].is_finite() && v[1].is_finite();
             good.then(|| (f, [v[0] as f64, v[1] as f64]))
         })
         .collect()

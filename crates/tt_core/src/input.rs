@@ -57,9 +57,9 @@ pub enum Action {
     Rename,
     /// Track the selected sketches from the playhead (re-seed selected trackers there).
     Track,
-    /// Switch the selected trackers off from the playhead on (or on again there).
+    /// Switch the selected trackers and sketches off from the playhead on (or on again there).
     SwitchTracker,
-    /// Switch the selected trackers off everywhere (or on everywhere).
+    /// Switch the selected trackers and sketches off everywhere (or on everywhere).
     SwitchTrackerEverywhere,
     /// Scrubbing snaps the playhead to the edges of timeline objects, or stops snapping.
     ToggleSnap,
