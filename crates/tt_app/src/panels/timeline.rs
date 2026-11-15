@@ -82,6 +82,13 @@ pub struct TimelineView {
 #[derive(Resource, Debug, Default)]
 pub struct TimelineFolds(pub std::collections::HashSet<Entity>);
 
+/// The timeline shows views' lanes (off by default) *(on request: "what is a
+/// 'Sketch _ view' thing doing in the timeline … it just pads up the
+/// timeline … could we hide those?")*: a view's lane only trims the view's
+/// lifetime apart from what it follows. The header's "views" shows them.
+#[derive(Resource, Debug, Default)]
+pub struct ViewLanes(pub bool);
+
 pub struct TimelineModule;
 
 impl Module for TimelineModule {
@@ -90,6 +97,8 @@ impl Module for TimelineModule {
             .declare::<TimelineUi>(Class::Derived)
             .declare::<TimelineFolds>(Class::Session)
             .init_resource::<TimelineFolds>()
+            .declare::<ViewLanes>(Class::Session)
+            .init_resource::<ViewLanes>()
             .init_resource::<TimelineView>()
             .init_resource::<TimelineUi>();
     }
@@ -123,6 +132,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let marked = marks(world);
     let mut actions = Vec::new();
     let mut fit = false;
+    let mut views = world.resource::<ViewLanes>().0;
 
     ui.horizontal(|ui| {
         let button = |ui: &mut egui::Ui, actions: &mut Vec<Action>, text: &str, action: Action, what: &str| {
@@ -171,6 +181,10 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         {
             actions.push(Action::ToggleSnap);
         }
+        ui.toggle_value(&mut views, "views").on_hover_text(
+            "Show a lane for each view (what Tab enters: the camera that follows a sketch, tracker or subject), under what it follows. \
+             Only needed to trim a view's lifetime apart from what it follows.",
+        );
         ui.separator();
         button(ui, &mut actions, "In", Action::MarkIn, "Mark the in point here: the first frame an export renders");
         button(ui, &mut actions, "Out", Action::MarkOut, "Mark the out point here: the last frame an export renders");
@@ -204,6 +218,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         });
     });
 
+    world.resource_mut::<ViewLanes>().0 = views;
     let height = ui.available_height().max(44.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -662,9 +677,10 @@ pub enum LaneKind {
 
 /// The lanes, top to bottom, in the outliner's order (`crate::tree`: each
 /// thing under what it was made relative to), each followed by its view's
-/// lane (one level in) when it has one.
+/// lane (one level in) when it has one and views' lanes are shown ([`ViewLanes`]).
 pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
     use crate::tree::Node;
+    let views = world.get_resource::<ViewLanes>().is_some_and(|v| v.0);
     let mut out = Vec::new();
     for (e, depth, node) in crate::tree::tree(world) {
         let kind = match node {
@@ -675,7 +691,7 @@ pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
             Node::Layer => LaneKind::Layer,
         };
         out.push((e, depth, kind));
-        if let Some(v) = tt_core::view::view_of(world, e).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
+        if let Some(v) = tt_core::view::view_of(world, e).filter(|v| views && world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
             out.push((v, depth + 1, LaneKind::View));
         }
     }
@@ -1404,6 +1420,17 @@ mod tests {
         undo(&mut world);
         assert_eq!(world.get::<Span>(sketch), None, "one undo takes the whole drag back");
         assert!(!world.resource::<History>().can_undo());
+    }
+
+    /// A sketch's view has no lane of its own unless the header's "views" is on.
+    #[test]
+    fn views_lanes_are_hidden_unless_asked_for() {
+        let (mut world, sketch) = setup();
+        let view = tt_core::view::ensure_view(&mut world, sketch);
+        let kinds = |world: &mut World| lane_list(world).into_iter().map(|(e, _, k)| (e, k)).collect::<Vec<_>>();
+        assert_eq!(kinds(&mut world), vec![(sketch, LaneKind::Sketch)], "the sketch alone");
+        world.resource_mut::<ViewLanes>().0 = true;
+        assert_eq!(kinds(&mut world), vec![(sketch, LaneKind::Sketch), (view, LaneKind::View)], "its view under it");
     }
 
     /// A lane with lanes under it folds like a comment thread: a click on
