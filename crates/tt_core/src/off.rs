@@ -33,6 +33,10 @@ use crate::selection::Selection;
 use crate::time::FrameIndex;
 use crate::transport::Transport;
 
+/// A tracker output's flag (channel 7) for a frame where it is switched off
+/// (`tt_track::OFF`): what reads trackers leaves it out there, whatever else it reads.
+pub const OFF_FLAG: u32 = 4;
+
 /// Off keys: `(frame, off)`, sorted by frame: from that frame on it is off
 /// (true) or on (false). None or empty: on everywhere. (Saved under the name
 /// it had when only trackers could be switched off, so projects from then

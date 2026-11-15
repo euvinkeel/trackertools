@@ -117,10 +117,10 @@ impl Default for Framing {
 }
 
 /// One tracker's point on each frame it has a good one (source pixels, y
-/// down); for any other box producer (a sketch), its point on every frame it
-/// has one (they have no flags).
+/// down: not lost, outside or off); for any other box producer (a sketch),
+/// its point on every frame it has one and isn't switched off.
 pub fn good_points(world: &World, tracker: Entity) -> Vec<(FrameIndex, [f64; 2])> {
-    tt_core::subject::points_of(world, tracker)
+    tt_core::subject::points_of(world, tracker, false)
 }
 
 /// A subject's path (tt_core::subject), its final data: on each frame it

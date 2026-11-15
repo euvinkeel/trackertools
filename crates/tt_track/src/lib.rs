@@ -62,8 +62,9 @@ pub const TRACK_CHANNELS: usize = 8;
 pub const LOST: u32 = 1;
 /// Flag: the point left the guide's box (the rough pass says the subject isn't there).
 pub const OUTSIDE: u32 = 2;
-/// Flag: the tracker is switched off on this frame (`off`): left out, as a lost frame is.
-pub const OFF: u32 = 4;
+/// Flag: the tracker is switched off on this frame (`tt_core::off`): left out
+/// (subjects take lost and outside frames; only this leaves a tracker out of them).
+pub const OFF: u32 = tt_core::off::OFF_FLAG;
 
 /// A new cursor tracker's `min_score`: it searches the whole frame, so only a close match counts.
 pub const CURSOR_MIN_SCORE: f32 = 0.8;

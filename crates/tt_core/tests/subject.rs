@@ -421,3 +421,43 @@ fn a_sketch_switched_off_stops_carrying_its_subject_there() {
     assert!(moved, "the sketch carries it again (its circle moves it up and down)");
     assert_eq!(tt_core::off::Off::type_path(), "tt_track::off::TrackerOff", "saved as before");
 }
+
+/// A tracker's red frames (lost, outside its sketch's box) still carry its
+/// subject; only frames where it is switched off leave it out. Exports' points
+/// leave out both.
+#[test]
+fn red_frames_still_carry_a_subject_and_only_off_frames_leave_it_out() {
+    use tt_core::subject::points_of;
+    let mut d = Driver::new();
+    let w = &mut d.core.world;
+    // A still at x = 100; B moving 3 px a frame from x = 400, lost (flag 1) on 100–149, off (flag 4) on 200–249.
+    let track = |w: &mut World, name: &str, at: &dyn Fn(i64) -> ([f64; 2], f32)| {
+        let sig = w.resource_mut::<SignalStore>().create(8);
+        {
+            let mut store = w.resource_mut::<SignalStore>();
+            let s = store.get_mut(sig).expect("created");
+            for f in 0..300 {
+                let ([x, y], flags) = at(f);
+                s.set(f, &[x as f32, y as f32, x as f32 - 5.0, y as f32 - 5.0, x as f32 + 5.0, y as f32 + 5.0, 0.9, flags]);
+            }
+        }
+        w.spawn((Name::new(name.to_string()), Output(sig))).id()
+    };
+    let a = track(w, "A", &|_| ([100.0, 300.0], 0.0));
+    let flags = |f: i64| if (100..150).contains(&f) { 1.0 } else if (200..250).contains(&f) { 4.0 } else { 0.0 };
+    let b = track(w, "B", &|f| ([400.0 + 3.0 * f as f64, 300.0], flags(f)));
+    let s = make_subject(&mut d.core.world, &[a, b], 0).expect("a subject");
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let w = &d.core.world;
+    let step = |f: i64| value_at(w, s, f).expect("a value")[0] - value_at(w, s, f - 1).expect("a value")[0];
+    // Two members, one moving 3 px a frame: the subject moves their mean, 1.5 px a frame, lost frames too.
+    for f in (1..100).chain(101..150).chain(151..200) {
+        assert!((step(f) - 1.5).abs() < 1e-3, "frame {f}: {}", step(f));
+    }
+    // Switched off: only A carries it there, and A stands still.
+    for f in 201..250 {
+        assert!(step(f).abs() < 1e-3, "frame {f}, B off: {}", step(f));
+    }
+    assert_eq!(points_of(w, b, true).len(), 250, "a subject's: all but the 50 off frames");
+    assert_eq!(points_of(w, b, false).len(), 200, "an export's: neither lost nor off");
+}

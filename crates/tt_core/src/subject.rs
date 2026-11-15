@@ -5,11 +5,12 @@
 //! **The pushed position** (from v1). A subject is not the mean of its
 //! members' points: that jumps whenever one comes or goes. It starts at their
 //! mean on its anchor frame; from there, both ways, it moves frame by frame
-//! with the members that have a good point on both neighbouring frames: by
+//! with the members that have a point on both neighbouring frames: by
 //! their mean shift and, with `turn` and two or more of them, by their turn,
 //! which carries it about their centre (a least-squares rigid fit). Members
-//! coming or going, lost or outside (a tracker's flags, channel 7), change
-//! only how many are averaged; a frame where none moves holds it still.
+//! coming or going, or switched off (`crate::off`), change only how many are
+//! averaged; a frame where none moves holds it still. A tracker's lost or
+//! outside frames (red) still carry it: switching it off is how to leave it out.
 //! While the same members carry it, its steps add up to exactly their own
 //! motion (the sum telescopes), so it doesn't drift; where they change, a
 //! step's error can stay, and an offset key puts it right.
@@ -124,17 +125,25 @@ pub fn can_be_member(world: &World, e: Entity) -> bool {
     world.get::<Output>(e).is_some() && world.get::<Operator>(e).is_none_or(|o| o.kind != "frame")
 }
 
-/// A producer's point on each frame it has a good one: inside its span, not
-/// flagged (a tracker's lost, outside or off, channel 7), not switched off
-/// (a sketch's off keys, `crate::off`), finite. Source px, y down.
-pub fn points_of(world: &World, e: Entity) -> Vec<(FrameIndex, [f64; 2])> {
+/// A producer's point on each frame it has one to give: inside its span,
+/// not switched off (a tracker's OFF flag, channel 7; a sketch's off keys,
+/// `crate::off`), finite, and, unless `red_counts`, not flagged at all (a
+/// tracker's lost or outside frames, drawn red). Source px, y down.
+///
+/// Subjects take red frames (`red_counts`) *(on request: "if I haven't
+/// disabled a red region it means I still find it satisfactory … red areas
+/// should not be disqualifying for subject-contribution")*: switching a
+/// tracker off is how to leave it out. Exports' points don't.
+pub fn points_of(world: &World, e: Entity, red_counts: bool) -> Vec<(FrameIndex, [f64; 2])> {
     let Some(sig) = crate::span::output(world, e) else { return Vec::new() };
     let Some((lo, hi)) = sig.present_hull() else { return Vec::new() };
     let off = world.get::<crate::off::Off>(e).filter(|o| o.any_off());
     (lo..=hi)
         .filter_map(|f| {
             let v = sig.get(f)?;
-            let good = v.get(7).is_none_or(|flags| *flags == 0.0) && off.is_none_or(|o| !o.is_off(f)) && v[0].is_finite() && v[1].is_finite();
+            let flags = v.get(7).map_or(0, |f| *f as u32);
+            let allowed = if red_counts { flags & crate::off::OFF_FLAG == 0 } else { flags == 0 };
+            let good = allowed && off.is_none_or(|o| !o.is_off(f)) && v[0].is_finite() && v[1].is_finite();
             good.then(|| (f, [v[0] as f64, v[1] as f64]))
         })
         .collect()
@@ -297,7 +306,7 @@ impl OperatorKind for SubjectKind {
     fn evaluate(&self, ctx: &EvalCtx<'_>, range: std::ops::Range<FrameIndex>, out: &mut Signal) -> anyhow::Result<()> {
         out.clear(range.clone());
         let Some(subject) = ctx.params::<Subject>() else { return Ok(()) };
-        let members: Vec<_> = members_of(ctx.world, ctx.entity).into_iter().map(|m| points_of(ctx.world, m)).collect();
+        let members: Vec<_> = members_of(ctx.world, ctx.entity).into_iter().map(|m| points_of(ctx.world, m, true)).collect();
         let [hw, hh] = subject.half.map(|v| v.max(1.0) as f64);
         let fps = ctx.world.get_resource::<Transport>().map_or(60.0, |t| t.fps.as_f64());
         for (f, pushed, [x, y, a]) in path(&members, subject, fps).into_iter().filter(|(f, ..)| range.contains(f)) {

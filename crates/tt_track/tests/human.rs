@@ -92,7 +92,7 @@ fn drawn_frames_are_the_output_there_and_erasing_brings_the_results_back() {
     assert_eq!(auto_value(w, op, 30).map(|v| v[0]), Some(130.0), "drawing never touches the automatic results");
     assert_eq!(drawn_at(w, op, 29), Some([300.0, 229.0]));
     // Consumers see it: a subject's points, the stabilizer's.
-    assert!(tt_core::subject::points_of(w, op).contains(&(30, [300.0, 230.0])), "drawn frames count as good points");
+    assert!(tt_core::subject::points_of(w, op, true).contains(&(30, [300.0, 230.0])), "drawn frames count as good points");
 
     // Erase one frame: its result shows again (stale, as it is).
     assert!(erase_drawn(&mut core.world, op, Some(30..31)));

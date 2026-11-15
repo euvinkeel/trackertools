@@ -201,9 +201,9 @@ fn subject_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
                 select = Some(*m);
             }
             // Whether it carries the subject on this frame (a good point here).
-            if tt_core::subject::points_of(world, *m).binary_search_by_key(&here, |(f, _)| *f).is_err() {
+            if tt_core::subject::points_of(world, *m, true).binary_search_by_key(&here, |(f, _)| *f).is_err() {
                 ui.label(egui::RichText::new("no point here").color(crate::style::MUTED).small())
-                    .on_hover_text("Lost, off, outside its lifetime or not tracked on this frame: the others carry the subject here");
+                    .on_hover_text("Switched off, outside its lifetime or not tracked on this frame: the others carry the subject here");
             }
             if crate::icons::cross_button(ui, &format!("Take it out of {name}")).clicked() {
                 take_out = Some(*m);
