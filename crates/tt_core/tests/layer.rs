@@ -271,3 +271,34 @@ fn trims_presses_new_layers_and_long_turns() {
     let turned = d.core.world.get::<LayerParams>(c).unwrap().rotation.at(100);
     assert!((turned - 270.0).abs() < 1.0, "three quarters, the way it went: {turned}");
 }
+
+/// One press, one owner, in the order `tool::route_press` documents: the
+/// selected layer, the selected subject's point, the top layer, any
+/// subject's point, the selected subject's path.
+#[test]
+fn a_press_goes_to_one_thing_in_a_fixed_order() {
+    use tt_core::tool::{Press, PressOn};
+    let mut d = Driver::new();
+    let (s, l) = layered(&mut d);
+    d.core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    d.core.world.resource_mut::<Transport>().seek(100);
+    d.frames(2, |_| [0.0, 0.0], UP);
+    let press_at = |d: &mut Driver, selected: Option<Entity>, at: [f64; 2]| {
+        match selected {
+            Some(e) => d.core.world.resource_mut::<Selection>().select_only(e),
+            None => d.core.world.resource_mut::<Selection>().clear(),
+        }
+        d.frame(move |_| at, PRESS);
+        let on = d.core.world.resource::<Press>().0;
+        d.frame(move |_| at, UP);
+        d.frames(2, |_| [0.0, 0.0], UP);
+        on
+    };
+    // The subject's point on frame 100 is under the layer's picture.
+    assert_eq!(press_at(&mut d, None, [300.0, 300.0]), Some(PressOn::Layer(l, tt_core::layer::Handle::Body)), "the top layer before any subject");
+    assert_eq!(press_at(&mut d, Some(s), [300.0, 300.0]), Some(PressOn::Subject(s, 100)), "the selected subject before a layer over it");
+    assert_eq!(press_at(&mut d, Some(l), [300.0, 300.0]), Some(PressOn::Layer(l, tt_core::layer::Handle::Body)), "the selected layer first");
+    // Frame 150's point (2 px a frame from 300): only on the selected subject's path.
+    assert_eq!(press_at(&mut d, Some(s), [400.0, 300.0]), Some(PressOn::Subject(s, 150)), "the selected subject's path");
+    assert_eq!(press_at(&mut d, None, [400.0, 300.0]), Some(PressOn::Nothing), "nothing, with it not selected");
+}

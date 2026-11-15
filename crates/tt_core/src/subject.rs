@@ -495,32 +495,19 @@ fn drag_subject(world: &mut World) {
         return;
     }
     let p = world.resource::<PointerFrame>().clone();
-    let frame = world.resource::<Transport>().frame();
     let fps = world.resource::<Transport>().fps.as_f64();
-    let view = world.resource::<ActiveView>().0;
     let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
+    // A press `tool::route_press` gave a subject: its point, or the selected one's path on frame `f`.
     if let Some(t) = p.pressed
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
+        && let Some(crate::tool::PressOn::Subject(e, f)) = world.resource::<crate::tool::Press>().0
+        && let Some(v) = value_at(world, e, f)
     {
-        let map = map_at(world, view, frame);
+        // (The path is drawn through each frame's framing: the grabbed frame's is the one to drag in.)
+        let map = map_at(world, world.resource::<ActiveView>().0, f);
         let src = map.to_source(at);
-        // The subject whose point is under the press, else the selected one's path there.
-        // (A layer's picture over the point takes the press, unless this subject is selected.)
-        let grabbed = match crate::layer::press_on_layer(world, frame, src, map.a / scale) {
-            Some(_) => None,
-            None => pick_subject(world, frame, src, 12.0 / scale * map.a).map(|e| (e, frame)).or_else(|| {
-                let s = world.resource::<Selection>().primary().filter(|e| is_subject(world, *e))?;
-                Some((s, path_frame(world, s, view, frame, at, 12.0 / scale)?))
-            }),
-        };
-        if let Some((e, f)) = grabbed
-            && let Some(v) = value_at(world, e, f)
-        {
-            let map = map_at(world, view, f);
-            let src = map.to_source(at);
-            let keys = world.get::<Subject>(e).map(|s| s.offsets.clone()).unwrap_or_default();
-            world.resource_mut::<SubjectDrag>().0 = Some(Grab { subject: e, frame: f, map, from: at, hold: [v[0] - src[0], v[1] - src[1]], pushed: [v[8], v[9], v[10]], keys, gesture: None });
-        }
+        let keys = world.get::<Subject>(e).map(|s| s.offsets.clone()).unwrap_or_default();
+        world.resource_mut::<SubjectDrag>().0 = Some(Grab { subject: e, frame: f, map, from: at, hold: [v[0] - src[0], v[1] - src[1]], pushed: [v[8], v[9], v[10]], keys, gesture: None });
     }
     let Some(g) = world.resource::<SubjectDrag>().0.clone() else { return };
     if g.gesture.is_some_and(|id| !world.resource::<History>().is_open(id)) {

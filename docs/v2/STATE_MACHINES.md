@@ -20,7 +20,7 @@ Not a state machine of its own, but the order every other machine relies on.
 
 | Phase | Runs | Writes |
 |---|---|---|
-| `Set::Input` | click detection, pointer trail, ending widget drags not drawn last frame | `PointerFrame.click`, `PointerTrail`, `History.widget` |
+| `Set::Input` | click detection, then press routing (`route_press`), pointer trail, ending widget drags not drawn last frame | `PointerFrame.click`, `Press`, `PointerTrail`, `History.widget` |
 | `Set::Transport` | transport actions, then the playhead advance | `Transport` |
 | `Set::Tools` | the tools (see A3); **no order between modules' systems** | gestures, document edits |
 | `Set::Intents` | key and button actions (history, views, marks, tracks, off switches) | document edits, `ActiveView`, `Selection` |
@@ -81,20 +81,22 @@ Not a state machine of its own, but the order every other machine relies on.
 | any | Esc, no sketch stroke, no gesture open | Select |
 | any | Esc, a gesture open | unchanged; the gesture is cancelled (A2) |
 
-**A press in the Select tool.** Systems in `Set::Tools` each decide whether a press is theirs. The precedence is implicit, by each system checking the others' pick functions.
+**A press.** `tool::route_press` (`Set::Input`) decides once, when a press lands, what it is on (`Press`, a `PressOn`): the first of these under it. The layer drag, the subject drag and the click act on its answer and do no hit tests of their own.
 
-| Press lands on | Taken by | Click (no move) | Drag |
-|---|---|---|---|
-| a layer's picture, not selected | layer drag | selects the layer | moves, scales, turns it |
-| the selected layer | layer drag (handles) | | |
-| a subject's point (playhead frame) | subject drag | selects it | bends its path there (A4) |
-| the selected subject's drawn path | subject drag | keeps it selected; Alt removes the nearest key | bends its path there |
-| a tracker's point, a SpringFocus, a sketch's box | nothing (click only) | selects it | nothing |
-| empty | nothing | clears the selection | nothing |
+| Order | Press lands on | `PressOn` | Click (no move) | Drag (Select tool) |
+|---|---|---|---|---|
+| 1 | the selected layer (handles or picture) | `Layer(l, handle)` | keeps it; a click reaches what's below it | moves, scales, turns it |
+| 2 | the selected subject's point (playhead frame) | `Subject(s, frame)` | keeps it | bends its path there (A4) |
+| 3 | the top layer's picture | `Layer(l, Body)` | selects the layer | moves it |
+| 4 | any subject's point | `Subject(s, frame)` | selects it | bends its path there |
+| 5 | the selected subject's drawn path | `Subject(s, f)` | keeps it; Alt removes the nearest key | bends its path at f |
+| 6 | anything else | `Nothing` | selects the tracker, SpringFocus or sketch under it, else clears | nothing |
+
+Before 2026-11-15 the same order was implicit: each drag system called the others' pick functions (`layer::press_on_layer`, now gone).
 
 **Per-press machine** (the same shape in every drag tool): *Idle → Pressed (grab recorded) → Dragging (gesture open, from the first move beyond 4 screen points) → Idle* on release, tool change, or the gesture closing under it (undo, Esc, another gesture). Pressed → Idle without a move is a click.
 
-**Invariant:** a press has at most one owner. It holds today because each drag system checks `press_on_layer` and the subject pick before taking a press, not because of a router (see Part C).
+**Invariant:** a press has exactly one owner, `Press`; tested by `a_press_goes_to_one_thing_in_a_fixed_order`. A new drag tool adds a `PressOn` variant and a line in `route_press`, and touches no other tool.
 
 ### A4. A subject (`tt_core::subject`)
 
@@ -257,7 +259,7 @@ Ranked by impact: (1) document or exported data wrong or lost, (2) a crash, hang
 
 - **S1. Undo of a stroke's target during a live sketch stroke.** Handled: the stroke starts a new sketch (A8). Listed only to record that it was checked.
 - **S2. A disabled (undone) entity re-enabled by redo after a project switch.** History is cleared on load, so nothing can redo into the new document. Checked; no issue.
-- **S3. Press precedence depends on each drag system calling the others' pick functions** (A3). No wrong owner was found, but adding a fourth drag tool means editing three systems. This is architectural, not a bug; see Part C.
+- **S3. Press precedence depended on each drag system calling the others' pick functions** (A3). No wrong owner was found. Done after all, on request: one router (Part C).
 
 ---
 
@@ -266,7 +268,7 @@ Ranked by impact: (1) document or exported data wrong or lost, (2) a crash, hang
 ### What would a principal architect rewrite before starting?
 
 1. **Gesture ownership.** *Done in this pass.* The undo history had one global "open transaction" slot that anyone could fill, end or join. Every drag tool re-implemented begin and end around it, and none could tell when its gesture had been closed under it. I1 to I4 were all symptoms of that one gap. A `Gesture` handle with an owner, plus one place that handles undo, redo, Esc and widgets disappearing, removed the whole class. It also deleted the Draw tool's own Esc code and several `in_gesture()` guesses in the panels.
-2. **Press routing.** *Recommended, not done.* Six systems read `PointerFrame` and each decides whether a press is its own by calling the others' pick functions (`subject.rs`, `layer.rs`, `tool.rs`, `capture.rs`, `tt_track::tool`, `human.rs`). One router in `Set::Input` that hit-tests in a declared order and hands the press to one owner would make the precedence in A3 explicit, and the "no order between modules" rule (A1) moot for presses. This is larger than any bug found, so it waits for a yes.
+2. **Press routing.** *Done 2026-11-15, on request.* The Select tool's drags each decided whether a press was theirs by calling the others' pick functions (`layer::press_on_layer` asked about the selected subject; the subject drag asked `press_on_layer`; the click asked both). `tool::route_press` now hit-tests once, in `Set::Input`, in the order in A3, and the drags and the click read its answer. The precedence is written in one place, and the "no order between modules" rule (A1) no longer matters for presses. The other tools (Sketch, Track, Draw) are already separated by the active tool and don't need it.
 
 ### What higher-level abstraction would make the problem disappear?
 
@@ -275,4 +277,4 @@ Ranked by impact: (1) document or exported data wrong or lost, (2) a crash, hang
 - **Operator kinds as types, not strings** (recommended). 54 string comparisons in 22 files (`o.kind == "subject"`). A typo there gives silent misbehaviour, not a compile error. A marker component per kind (`With<SubjectOp>`) would also make the queries cheaper.
 - **One keyed-value type** (recommended). `OffsetKey` (subjects), `layer::Key` (`Animated`), `FocusKey` and `TrackerOff` each re-implement sorted insert, lookup and interpolation. A generic `Keys<T>` with its interpolation modes (Phase 1 added `Ease` to one of them) would give every keyed thing pins, easing and reach for free.
 
-None of the recommended items fixes a confirmed bug, so none was done without agreement.
+None of the recommended items fixes a confirmed bug, so none was done without agreement. (Press routing was agreed and done; the other three are still recommendations.)

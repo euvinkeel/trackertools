@@ -481,25 +481,6 @@ pub fn handle_at(world: &World, e: Entity, f: FrameIndex, src: [f64; 2], grab: f
 pub const HANDLE_REACH: f64 = 8.0;
 pub const POINT_REACH: f64 = 12.0;
 
-/// Which layer a Select-tool press at `src` (source px) on frame `f` takes,
-/// and by what, if any: the selected layer when the press is on it or its
-/// handles; none when the selected subject's point is under it (the
-/// subject's drag takes it); else the top layer under it. `px`: source
-/// pixels per screen point (the reaches are in points). The subject's drag
-/// asks the same question, so one press never moves both.
-pub fn press_on_layer(world: &mut World, f: FrameIndex, src: [f64; 2], px: f64) -> Option<(Entity, Handle)> {
-    if let Some(p) = world.resource::<Selection>().primary() {
-        if is_layer(world, p) {
-            if let Some(h) = handle_at(world, p, f, src, HANDLE_REACH * px) {
-                return Some((p, h));
-            }
-        } else if crate::subject::pick_subject(world, f, src, POINT_REACH * px) == Some(p) {
-            return None;
-        }
-    }
-    pick_layer(world, f, src).map(|e| (e, Handle::Body))
-}
-
 /// Attach a new layer showing `params.media` to `target`, as one undo step;
 /// it is selected. Its scale starts so the picture is about as tall as the
 /// target's box on `frame` (or its own size when the box isn't known).
@@ -707,12 +688,13 @@ fn drag_layer(world: &mut World) {
     let map = map_at(world, world.resource::<ActiveView>().0, frame);
     let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
     let alt = world.get_resource::<crate::input::KeysHeld>().is_some_and(|k| k.mods.alt);
+    // A press `tool::route_press` gave a layer.
     if let Some(t) = p.pressed
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
+        && let Some(crate::tool::PressOn::Layer(e, handle)) = world.resource::<crate::tool::Press>().0
     {
         let src = map.to_source(at);
-        if let Some((e, handle)) = press_on_layer(world, frame, src, map.a / scale)
-            && let (Some(q), Some(pl)) = (world.get::<LayerParams>(e).cloned(), placed_at(world, e, frame))
+        if let (Some(q), Some(pl)) = (world.get::<LayerParams>(e).cloned(), placed_at(world, e, frame))
         {
             let selected = world.resource::<Selection>().primary() == Some(e);
             let doing = match handle {

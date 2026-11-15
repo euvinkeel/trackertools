@@ -1,7 +1,8 @@
 #!/bin/bash
 # Makes "trackertools dev.app" in ~/Applications: a Dock-friendly way to run
 # this checkout's newest code. Each time it opens, it
-#   1. pulls main (only when the checkout is on main with nothing uncommitted),
+#   1. pulls the branch the checkout is on (only with nothing uncommitted, and
+#      when the branch is on GitHub),
 #   2. builds it (cargo build --release: seconds when little changed),
 #   3. starts it, from inside the app (so the Dock shows one icon).
 # A build that takes more than a moment shows a notification; a failed one
@@ -40,7 +41,7 @@ PLIST
 
 cat > "$app/Contents/MacOS/launch" <<LAUNCH
 #!/bin/bash
-# trackertools dev: pull main, build, start (made by scripts/mac_dev_app.sh).
+# trackertools dev: pull the checked-out branch, build, start (made by scripts/mac_dev_app.sh).
 REPO="$repo"
 LAUNCH
 cat >> "$app/Contents/MacOS/launch" <<'LAUNCH'
@@ -58,10 +59,12 @@ cd "$REPO" 2>/dev/null || { alert "The source folder is not there: $REPO. Run sc
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 {
   echo "=== $(date '+%Y-%m-%d %H:%M:%S')"
-  if [ "$branch" = main ] && [ -z "$(git status --porcelain --untracked-files=no)" ]; then
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "(uncommitted changes: building what is here, no pull)"
+  elif git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
     git pull --ff-only --quiet || echo "(git pull failed: building what is here)"
   else
-    echo "(on $branch, or uncommitted changes: building what is here, no pull)"
+    echo "($branch is not on GitHub: building what is here, no pull)"
   fi
   echo "building $(git log -1 --format='%h %s') on $branch"
 } >> "$LOG" 2>&1

@@ -2,7 +2,7 @@
 
 Written 2026-11-15 on branch `jev-hardening` at `c941a1a`. This is the working plan for one request, in three phases. It is written to be picked up cold, by the user reviewing it or by Claude after a context compaction.
 
-**Status: done 2026-11-15 (all three phases). Open: the recommended refactors in STATE_MACHINES.md Part C, and Shift+click membership (D6 option 3), each waiting for a yes.** Answers: D1 pins, D2 yes (local by default), D3 not now, D4/D5/D8 as recommended, D6 entry points 1 and 2 first (Shift+click later), D7 everything on one `dev` branch (only `main` and `dev` left).
+**Status: done 2026-11-15 (all three phases, and press routing from Part C). Not now, by the user's choice: Shift+click membership (D6 option 3) and the other three Part C items.** Answers: D1 pins, D2 yes (local by default), D3 not now, D4/D5/D8 as recommended, D6 entry points 1 and 2 first (Shift+click later), D7 everything on one `dev` branch (only `main` and `dev` left).
 
 **To resume after a compaction:** read section 9 (progress log) first, then the phase it points at. Section 3 is the map of the code this plan relies on.
 
@@ -281,4 +281,6 @@ Update this as work proceeds. One line per step: date, what, result.
 
 - 2026-11-15: Phases 2 and 3. Leads L1-L3 confirmed with failing tests (L1 on the Draw tool was a panic); I4 (a widget gesture left open, holding autosave) found by reading. Fixed with gesture ownership (`f7993ee`): `Gesture` handles, `owning`, `compound`, `cancel` (Esc in one place), `widget_edit` with a per-frame lease. L5 names fixed with `commands::new_name(s)` (`81b7461`), with a Phase 1 slip (a layer under a subject's path) fixed alongside. I5 found: a direct seek left the shuttle running while paused; one `Transport::stop`. `docs/v2/STATE_MACHINES.md` written (12 machines, issues I1-I8, architecture answers). Tests: 340 passed, 0 failed, 10 ignored; clippy clean. L6 and L7 became recommendations (STATE_MACHINES Part C), not changes: no confirmed bug behind them.
 
-**Next step:** none planned. Waiting for the user on Part C's recommendations.
+- 2026-11-15: The user's answers: Shift+click membership not now; press routing yes (the rest of Part C not now); the dock launcher pulls the checked-out branch; a PR from dev to main. Done: `tool::route_press` (`Press`, `PressOn`), `layer::press_on_layer` gone, test `a_press_goes_to_one_thing_in_a_fixed_order`; `scripts/mac_dev_app.sh` pulls any branch with an upstream (and the app regenerated). Tests: 341 passed, 0 failed, 10 ignored; clippy clean.
+
+**Next step:** none. The PR from `dev` to `main` is open for the user to merge.
