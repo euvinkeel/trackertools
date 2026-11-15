@@ -75,6 +75,8 @@ pub enum Action {
     GoToOut,
     /// A cursor tracker's pattern a brush teaches (0 = the first: key 1; key 0 is the tenth).
     Pattern(u8),
+    /// The Track tool making paint trackers (or back to Select if it already does).
+    PaintTool,
 }
 
 /// A key on the keyboard, independent of any UI toolkit.
@@ -165,6 +167,8 @@ impl Default for Keymap {
                 (b(Key::Letter('h'), Mods::SHIFT, false), SwitchTrackerEverywhere),
                 // M: draw a tracker's point by hand (a manual dot, or over a tracker's results).
                 (b(Key::Letter('m'), Mods::NONE, false), Tool(crate::tool::Tool::Draw)),
+                // P: brush a paint tracker.
+                (b(Key::Letter('p'), Mods::NONE, false), PaintTool),
                 (b(Key::Letter('n'), Mods::NONE, false), ToggleSnap),
                 // In and out points, as in DaVinci Resolve.
                 (b(Key::Letter('i'), Mods::NONE, false), MarkIn),
@@ -294,6 +298,15 @@ mod tests {
         assert_eq!(k.lookup(Key::Letter('q'), Mods::NONE, false), Some(Action::SlowerPlayback));
         assert_eq!(k.lookup(Key::Letter('e'), Mods::NONE, false), Some(Action::FasterPlayback));
         assert_eq!(k.chord_for(Action::FasterPlayback).as_deref(), Some("E"), "E is the one shown");
+    }
+
+    #[test]
+    fn every_chord_is_bound_once() {
+        let k = Keymap::default();
+        for (i, (b, a)) in k.bindings.iter().enumerate() {
+            assert!(k.bindings[..i].iter().all(|(o, _)| (o.key, o.mods) != (b.key, b.mods)), "{} is bound twice (again to {a:?})", b.chord());
+        }
+        assert_eq!(k.lookup(Key::Letter('p'), Mods::NONE, false), Some(Action::PaintTool));
     }
 
     #[test]

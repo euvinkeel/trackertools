@@ -34,8 +34,9 @@ use crate::style;
 pub const LIVE: Color32 = style::LIVE;
 /// Subjects (tt_core::subject).
 pub const SUBJECT: Color32 = style::SUBJECT;
-/// Frames of path drawn either side of the playhead for the selected sketch.
-const PATH_FRAMES: FrameIndex = 90;
+/// Frames of path drawn either side of the playhead for the selected sketch
+/// or subject (a subject's path is taken hold of over the same frames).
+const PATH_FRAMES: FrameIndex = tt_core::subject::PATH_FRAMES;
 
 /// Sketches live in source pixels; `view` is the space shown (None = the
 /// source): every frame's value goes through that view as it framed that frame.
@@ -96,7 +97,9 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     }
 
     super::tracks::draw(painter, map, world, &trackers, frame, &space);
-    subjects(painter, map, world, &subject_list, &picked, frame, &space);
+    // (In the Select tool, the selected subject's path under the pointer lights up: a drag bends it there.)
+    let hover = response.hover_pos().filter(|_| tool == Tool::Select).map(|p| map.to_canvas(p));
+    subjects(painter, map, world, &subject_list, &picked, frame, view, hover, &space);
     focuses(painter, map, world, &picked, frame, &space);
 
     if let Some(live) = live {
@@ -203,8 +206,22 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
 /// the way it faces, and its name. The selected one also shows its path, its
 /// members joined to it, and (when an offset moves it from there) where its
 /// members' motion alone puts it, dashed.
+///
+/// The selected one's keys are pins on its path (filled dots). In the Select
+/// tool, the frame of its path under the pointer shows (a drag bends the
+/// path there), and while a drag bends it, the stretch it reaches.
 #[allow(clippy::too_many_arguments)]
-fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(Entity, tt_core::signal::SignalId)], picked: &[Entity], frame: FrameIndex, space: &dyn Fn(FrameIndex) -> SpaceMap) {
+fn subjects(
+    painter: &Painter,
+    map: &ViewportMapping,
+    world: &World,
+    list: &[(Entity, tt_core::signal::SignalId)],
+    picked: &[Entity],
+    frame: FrameIndex,
+    view: Option<Entity>,
+    hover: Option<[f64; 2]>,
+    space: &dyn Fn(FrameIndex) -> SpaceMap,
+) {
     let store = world.resource::<SignalStore>();
     // A source point on frame f, in the shown space's pixels.
     let shown = |f: FrameIndex, x: f32, y: f32| {
@@ -219,6 +236,7 @@ fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         let color = if selected { SUBJECT } else { SUBJECT.gamma_multiply(0.6) };
         if selected {
             path(painter, map, frame, |f| value(f).map(|v| shown(f, v[0], v[1])), color);
+            pins(painter, map, world, *e, frame, view, hover, &|f| value(f).map(|v| map.to_screen(shown(f, v[0], v[1]))), color);
         }
         let Some(v) = value(frame) else { continue };
         let p = map.to_screen(shown(frame, v[0], v[1]));
@@ -243,6 +261,44 @@ fn subjects(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             painter.text(p + Vec2::new(r + 4.0, -r - 2.0), Align2::LEFT_BOTTOM, name.as_str(), FontId::proportional(12.0), color);
         }
     }
+}
+
+/// The selected subject's keys on its path, what a press would take hold
+/// of, the stretch a drag bends, and how (`tt_core::subject`'s drag).
+#[allow(clippy::too_many_arguments)]
+fn pins(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, frame: FrameIndex, view: Option<Entity>, hover: Option<[f64; 2]>, at: &dyn Fn(FrameIndex) -> Option<Pos2>, color: Color32) {
+    use tt_core::subject::{SubjectDrag, SubjectReach, path_frame};
+    let window = frame - PATH_FRAMES..=frame + PATH_FRAMES;
+    for k in world.get::<tt_core::subject::Subject>(e).map(|s| s.offsets.clone()).unwrap_or_default().iter().filter(|k| window.contains(&k.frame)) {
+        if let Some(p) = at(k.frame) {
+            painter.circle_filled(p, 4.5, Color32::from_black_alpha(160));
+            painter.circle_filled(p, 3.0, color);
+        }
+    }
+    let reach = world.resource::<SubjectReach>().seconds();
+    let reach_text = reach.map_or("the whole path".to_string(), |s| format!("\u{b1}{s:.2} s"));
+    let fps = world.resource::<Transport>().fps.as_f64();
+    let (spot, text) = match world.resource::<SubjectDrag>().grabbed().filter(|(s, _)| *s == e) {
+        // Dragging: the stretch it bends, thicker.
+        Some((_, f)) => {
+            let r = reach.map_or(PATH_FRAMES, |s| (s as f64 * fps).round() as FrameIndex);
+            let run: Vec<Pos2> = (f - r..=f + r).filter(|g| window.contains(g)).filter_map(at).collect();
+            painter.add(Shape::line(run, Stroke::new(3.0, color.gamma_multiply(0.6))));
+            (Some(f), format!("Bending its path on frame {f}, reach {reach_text} \u{b7} the wheel: reach \u{b7} let go to keep it"))
+        }
+        None => match hover.and_then(|h| path_frame(world, e, view, frame, h, 12.0 / map.points_per_canvas())) {
+            Some(f) => (Some(f), format!("Frame {f} \u{b7} drag: bend its path here (reach {reach_text}; the wheel while dragging changes it) \u{b7} Alt+click a pin: remove it")),
+            None => return,
+        },
+    };
+    if let Some(p) = spot.and_then(at) {
+        painter.circle_stroke(p, 7.0, Stroke::new(1.0, Color32::from_black_alpha(160)));
+        painter.circle_stroke(p, 6.0, Stroke::new(1.5, color));
+    }
+    let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), style::TEXT);
+    let r = Align2::CENTER_BOTTOM.anchor_size(map.panel.center_bottom() - Vec2::new(0.0, 28.0), galley.size()).expand(7.0);
+    painter.rect_filled(r, 5.0, Color32::from_black_alpha(190));
+    painter.galley(r.min + Vec2::splat(7.0), galley, style::TEXT);
 }
 
 /// A source point in the shown space's pixels, through `m`.

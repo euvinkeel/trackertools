@@ -248,6 +248,14 @@ impl Default for NewTrackers {
     }
 }
 
+/// A kind's button in the top bar, or its key: the Track tool making
+/// `method`'s trackers, or back to Select if it already does.
+pub fn toggle_track_kind(world: &mut World, method: Method) {
+    let on = world.resource::<tt_core::tool::ActiveTool>().0 == tt_core::tool::Tool::Track && world.resource::<NewTrackers>().method == method;
+    world.resource_mut::<NewTrackers>().method = method;
+    world.resource_mut::<tt_core::tool::ActiveTool>().0 = if on { tt_core::tool::Tool::Select } else { tt_core::tool::Tool::Track };
+}
+
 /// Which copy of the video a tracker reads.
 #[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Rendition {
@@ -888,5 +896,29 @@ impl Module for TrackModule {
             .add_systems((apply_track_actions, look_changed, off::switch_actions).in_set(Set::Intents))
             .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tt_core::tool::{ActiveTool, Tool};
+
+    /// A kind's button or key: the Track tool with it on, then off; another kind switches kinds, keeping the tool.
+    #[test]
+    fn a_kind_toggles_the_track_tool_and_switches_kinds() {
+        let mut w = World::new();
+        w.init_resource::<ActiveTool>();
+        w.init_resource::<NewTrackers>();
+        let state = |w: &World| (w.resource::<ActiveTool>().0, w.resource::<NewTrackers>().method);
+        toggle_track_kind(&mut w, Method::Paint);
+        assert_eq!(state(&w), (Tool::Track, Method::Paint));
+        toggle_track_kind(&mut w, Method::Template);
+        assert_eq!(state(&w), (Tool::Track, Method::Template), "another kind: the tool stays on");
+        toggle_track_kind(&mut w, Method::Template);
+        assert_eq!(state(&w).0, Tool::Select, "the same kind again: off");
+        w.resource_mut::<ActiveTool>().0 = Tool::Draw;
+        toggle_track_kind(&mut w, Method::Paint);
+        assert_eq!(state(&w), (Tool::Track, Method::Paint), "from another tool: on");
     }
 }

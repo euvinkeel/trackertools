@@ -232,6 +232,22 @@ pub fn extent(world: &World) -> Range<FrameIndex> {
     0..world.get_resource::<Transport>().map_or(0, |t| t.frame_count)
 }
 
+/// Whether `op` reads `producer`, directly or through its inputs' inputs
+/// (an edge from `producer` to `op` would make a cycle).
+pub fn reads(world: &World, op: Entity, producer: Entity) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut todo = vec![op];
+    while let Some(e) = todo.pop() {
+        if e == producer {
+            return true;
+        }
+        if seen.insert(e) {
+            todo.extend(world.get::<Inputs>(e).into_iter().flat_map(|i| i.0.iter().map(|(_, p)| *p)));
+        }
+    }
+    false
+}
+
 /// Spawn an operator of a registered kind with its output signal.
 pub fn spawn_op(world: &mut World, kind: &str, inputs: Vec<(&str, Entity)>, params: impl Bundle) -> Entity {
     let k = world.resource::<OpRegistry>().get(kind).unwrap_or_else(|| panic!("operator kind {kind} not registered"));

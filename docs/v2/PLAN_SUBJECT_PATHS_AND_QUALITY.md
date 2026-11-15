@@ -2,7 +2,7 @@
 
 Written 2026-11-15 on branch `jev-hardening` at `c941a1a`. This is the working plan for one request, in three phases. It is written to be picked up cold, by the user reviewing it or by Claude after a context compaction.
 
-**Status: plan only. No source file has been changed.** Nothing starts until the user has answered the decisions in section 2.
+**Status: approved 2026-11-15. Phase 1 done; Phase 2 next.** Answers: D1 pins, D2 yes (local by default), D3 not now, D4/D5/D8 as recommended, D6 entry points 1 and 2 first (Shift+click later), D7 everything on one `dev` branch (only `main` and `dev` left).
 
 **To resume after a compaction:** read section 9 (progress log) first, then the phase it points at. Section 3 is the map of the code this plan relies on.
 
@@ -275,6 +275,8 @@ Run from the repository root.
 
 Update this as work proceeds. One line per step: date, what, result.
 
-- 2026-11-15: Read the design document, the keymap, subjects and their UI, the undo history, the operator graph, the tools, and the outlines of the tracker runner and the app shell. Baseline tests run: 317 passed, 0 failed, 10 ignored. Plan written. **Waiting for the user's answers to section 2.**
+- 2026-11-15: Read the design document, the keymap, subjects and their UI, the undo history, the operator graph, the tools, and the outlines of the tracker runner and the app shell. Baseline tests run: 317 passed, 0 failed, 10 ignored. Plan written.
+- 2026-11-15: Approved. `dev` made from `origin/try` (main + jev-hardening + video-formats); local `jev-hardening`, `jev-tracker`, `macos-cursor-icons` deleted (all merged). Remote cleanup and push left for the end.
+- 2026-11-15: Phase 1 done. 1.1 `P` (`Action::PaintTool`, `tt_track::toggle_track_kind`, shared with the top bar; `setup::paint_tool` opens the doctor without CoTracker). 1.2 Inspector member list + Add member; right-click Add to / Take out of a subject; `subject::can_join` + `op::reads` refuse cycles (lead L4 fixed). 1.3 `Subject::smooth`, `subject::path`. 1.4 `Subject::ease`, `subject::pinned`, `path_frame`, `SubjectReach`, the drag rewritten (`Grab`), Alt+click removes a pin, a click on the path keeps the selection; overlay pins/hover/reach/hint. `TT_SCENE_DEMO=subject TT_SCENE_SHOT=name` screenshots it (checked by eye). Tests: 331 passed (14 new), 0 failed; clippy clean. Shift+click membership (D6 option 3) not done.
 
-**Next step:** on approval, Phase 1 step 1.1.
+**Next step:** Phase 2, writing `docs/v2/STATE_MACHINES.md`.

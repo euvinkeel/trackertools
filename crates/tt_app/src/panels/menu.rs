@@ -301,6 +301,30 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             tt_core::subject::make_subject(world, &points, here);
             ui.close();
         }
+        // Into or out of a subject that exists, without selecting it too.
+        let all: Vec<Entity> = crate::tree::tree(world).into_iter().filter(|(_, _, k)| *k == crate::tree::Node::Subject).map(|(s, _, _)| s).collect();
+        let joins: Vec<Entity> = all.iter().copied().filter(|s| points.iter().any(|p| tt_core::subject::can_join(world, *s, *p))).collect();
+        let has: Vec<Entity> = all.iter().copied().filter(|s| tt_core::subject::members_of(world, *s).iter().any(|m| points.contains(m))).collect();
+        if !joins.is_empty() {
+            ui.menu_button(format!("Add {them} to a subject"), |ui| {
+                for s in joins {
+                    if ui.button(name_of(world, s)).clicked() {
+                        tt_core::subject::add_members(world, s, &points);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        if !has.is_empty() {
+            ui.menu_button(format!("Take {them} out of a subject"), |ui| {
+                for s in has {
+                    if ui.button(name_of(world, s)).clicked() {
+                        tt_core::subject::remove_members(world, s, &points);
+                        ui.close();
+                    }
+                }
+            });
+        }
         ui.separator();
     }
     if let [subject] = subjects[..] {
@@ -320,7 +344,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
                 world.resource_mut::<Selection>().entities = members.clone();
                 ui.close();
             }
-            let offsets = world.get::<tt_core::subject::Subject>(subject).map(|s| s.offsets.clone()).unwrap_or_default();
+            let (offsets, ease) = world.get::<tt_core::subject::Subject>(subject).map(|s| (s.offsets.clone(), s.ease)).unwrap_or_default();
             if offsets.iter().any(|k| k.frame == here) {
                 if ui.button(format!("Remove its key on frame {here}")).clicked() {
                     tt_core::subject::remove_offset_key(world, subject, here);
@@ -331,7 +355,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
                 .on_hover_text("Pins where it is on this frame, so keys made elsewhere don't move it here (a drag keys it too)")
                 .clicked()
             {
-                let [x, y, a] = tt_core::subject::offset_at(&offsets, here);
+                let [x, y, a] = tt_core::subject::offset_at(&offsets, here, ease);
                 tt_core::subject::set_offset_key(world, subject, tt_core::subject::OffsetKey { frame: here, x: x as f32, y: y as f32, angle: a.to_degrees() as f32 });
                 ui.close();
             }

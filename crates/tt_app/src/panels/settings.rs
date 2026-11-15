@@ -636,5 +636,6 @@ fn describe(action: Action) -> &'static str {
         GoToIn => "Go to the in point",
         GoToOut => "Go to the out point",
         Pattern(_) => "Cursor tracker: the pattern the brush teaches (Shift+brush: a new one)",
+        PaintTool => "Paint tool on/off: brush over what to follow (a paint tracker, CoTracker on many points)",
     }
 }

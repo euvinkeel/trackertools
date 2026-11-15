@@ -145,10 +145,33 @@ fn select_on_click(world: &mut World) {
         return;
     }
     let frame = world.resource::<crate::transport::Transport>().frame();
-    // The pointer is in the shown space's pixels; sketches live in source pixels.
-    let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);
+    let view = world.resource::<crate::view::ActiveView>().0;
     let scale = world.resource::<PointerFrame>().scale;
     let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
+    // On the selected subject's path (subject.rs bends it with a drag): a click
+    // keeps it selected; Alt+click takes out the key drawn nearest the click.
+    if let Some(s) = world.resource::<crate::selection::Selection>().primary().filter(|e| crate::subject::is_subject(world, *e))
+        && crate::subject::path_frame(world, s, view, frame, pos, grab).is_some()
+    {
+        if world.resource::<crate::input::KeysHeld>().mods.alt {
+            let keys = world.get::<crate::subject::Subject>(s).map(|p| p.offsets.clone()).unwrap_or_default();
+            let near = keys
+                .iter()
+                .filter_map(|k| {
+                    let v = crate::subject::value_at(world, s, k.frame)?;
+                    let p = crate::view::map_at(world, view, k.frame).from_source([v[0], v[1]]);
+                    Some((k.frame, (p[0] - pos[0]).hypot(p[1] - pos[1])))
+                })
+                .filter(|(_, d)| *d <= grab)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((f, _)) = near {
+                crate::subject::remove_offset_key(world, s, f);
+            }
+        }
+        return;
+    }
+    // The pointer is in the shown space's pixels; sketches live in source pixels.
+    let pos = crate::view::map_at(world, view, frame).to_source(pos);
     // A layer's picture first (it covers what it's attached to), unless it is
     // selected already: then what's under it, so a second click reaches that.
     let layer = crate::layer::pick_layer(world, frame, pos).filter(|l| !world.resource::<crate::selection::Selection>().is_selected(*l));

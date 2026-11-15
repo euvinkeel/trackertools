@@ -40,6 +40,8 @@ pub struct Scene {
     pub tab: Option<egui::Pos2>,
     /// `=layer-render`: its export started.
     rendering: bool,
+    /// A screenshot to take now (`TT_SCENE_SHOT`), by name.
+    pub shot: Option<String>,
 }
 
 impl Scene {
@@ -47,7 +49,7 @@ impl Scene {
         let mode = std::env::var("TT_SCENE_DEMO").ok()?;
         // (The Settings tab in the default layout of a 1600 × 950 window; TT_SCENE_TAB=x,y for another.)
         let tab = std::env::var("TT_SCENE_TAB").ok().and_then(|s| s.split_once(',').and_then(|(x, y)| Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))));
-        Some(Self { sketch: None, subject: None, mode, after: None, opened: None, dragged: 0, inject: Vec::new(), tab: tab.or(Some(egui::pos2(1427.0, 35.0))), rendering: false })
+        Some(Self { sketch: None, subject: None, mode, after: None, opened: None, dragged: 0, inject: Vec::new(), tab: tab.or(Some(egui::pos2(1427.0, 35.0))), rendering: false, shot: None })
     }
 
     /// One app frame (the video is open). True: done.
@@ -117,6 +119,20 @@ impl Scene {
                     Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -40.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move },
                 ]);
             }
+            // `=subject`: the pointer over the subject's path on frame 655 (its frame shows, and what a drag does).
+            if *n >= 5
+                && self.mode == "subject"
+                && let Some(sub) = world.resource::<tt_core::selection::Selection>().primary()
+                && let Some(v) = tt_core::subject::value_at(world, sub, 655)
+            {
+                let m = world.resource::<crate::panels::viewport::ViewportMapping>();
+                let view = world.resource::<tt_core::view::ActiveView>().0;
+                self.inject.push(Event::PointerMoved(m.to_screen(tt_core::view::map_at(world, view, 655).from_source([v[0], v[1]]))));
+            }
+            // `TT_SCENE_SHOT=name`: a screenshot of it (in the data folder's `screens`), then it closes.
+            if *n == 35 {
+                self.shot = std::env::var("TT_SCENE_SHOT").ok();
+            }
             // (`=cursor` keeps the pointer there.)
             return *n > 45 && self.mode != "cursor";
         }
@@ -133,6 +149,17 @@ impl Scene {
                 if ready {
                     self.subject = rest(world, s);
                     self.after = Some(0);
+                    // `=subject`: the subject selected in the Select tool, its path bent by a pin
+                    // on frame 645 (reach 0.35 s), smoothed 0.1 s; the pointer then over its path.
+                    if self.mode == "subject"
+                        && let Some(sub) = self.subject
+                    {
+                        use tt_core::subject::{OffsetKey, Subject, pinned};
+                        let keys = world.get::<Subject>(sub).map(|s| pinned(&s.offsets, s.ease, OffsetKey { frame: 645, x: 0.0, y: -40.0, angle: 0.0 }, Some(21))).unwrap_or_default();
+                        edit(world, "Scene: bend the subject", |tx| tx.modify::<Subject>(sub, |s| (s.offsets, s.smooth) = (keys, 0.1)));
+                        world.resource_mut::<tt_core::selection::Selection>().select_only(sub);
+                        world.resource_mut::<tt_core::tool::ActiveTool>().0 = tt_core::tool::Tool::Select;
+                    }
                     // `=focus`: a SpringFocus on the subject, moving over to the tracker
                     // selected on frame 600 (the playhead is at 625: mid-move), selected.
                     if self.mode == "focus"

@@ -313,9 +313,10 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 open_doctor |= r.on_hover_text(format!("{why} Click {}. The doctor shows what it needs and sets it up.", text.trim_start_matches("⌖ "))).clicked();
                 continue;
             }
+            let chord = if method == tt_track::Method::Paint { world.resource::<tt_core::input::Keymap>().chord_for(Action::PaintTool).unwrap_or_default() } else { track_chord.clone() };
             let r = r
                 .on_hover_text(format!(
-                    "Track tool ({track_chord}) making a {}: {what}\n\
+                    "Track tool ({chord}) making a {}: {what}\n\
                      \u{2022} template tracker: drag a rectangle around what to follow (its pattern, a look), or click a point (the dashed box's size; Ctrl+wheel sizes it)\n\
                      \u{2022} CoTracker: click the pixel to follow (a reset point)\n\
                      \u{2022} inside a sketch's box it searches there; elsewhere, the whole frame\n\
@@ -326,10 +327,6 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 ));
             if r.clicked() {
                 track_kind = Some(method);
-                // The other kind while the tool is on: switch kinds, keep the tool.
-                if !tracking_tool || kind == method {
-                    history_action = Some(Action::Tool(Tool::Track));
-                }
             }
         }
         let drawing = world.resource::<ActiveTool>().0 == Tool::Draw;
@@ -388,8 +385,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     if open_doctor {
         world.resource_mut::<crate::setup::Doctor>().show();
     }
+    // (The other kind while the tool is on: switch kinds, keep the tool.)
     if let Some(method) = track_kind {
-        world.resource_mut::<tt_track::NewTrackers>().method = method;
+        tt_track::toggle_track_kind(world, method);
     }
     if let Some(a) = history_action {
         world.resource_mut::<PendingActions>().push(a);
