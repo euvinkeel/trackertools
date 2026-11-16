@@ -209,6 +209,10 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         if let Some(k) = kind {
             line(&run, k);
         }
+        // The selected tracker's: its edges by the shown frame's point glow (overlay::glow).
+        if lit {
+            super::overlay::glow(painter, frame, &|f| at(f).map(|(p, _)| p), found);
+        }
 
         // Its looks or reset points: small marks along the path, in full on their own frame.
         if lit {

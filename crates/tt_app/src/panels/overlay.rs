@@ -84,6 +84,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         let color = if editing != Some(*e) && tt_core::off::is_off(world, *e, frame) { style::MUTED } else { color };
         if editing == Some(*e) || (lit.contains(e) && live.is_none()) {
             path(painter, map, frame, |f| value(f).map(|v| to_canvas(f, v)).map(|v| [v[0], v[1]]), color);
+            glow(painter, frame, &|f| value(f).map(|v| to_canvas(f, v)).map(|v| map.to_screen([v[0], v[1]])), color);
         }
         let Some(v) = value(frame) else { continue };
         let stale = editing != Some(*e) && sig.state(frame) == FrameState::Stale;
@@ -107,6 +108,7 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
     if let Some(live) = live {
         if live.target.is_none() {
             path(painter, map, frame, |f| live.preview_at(f).map(|b| to_canvas(f, b)).map(|b| [b[0], b[1]]), LIVE);
+            glow(painter, frame, &|f| live.preview_at(f).map(|b| to_canvas(f, b)).map(|b| map.to_screen([b[0], b[1]])), LIVE);
             if let Some(b) = live.preview_at(frame) {
                 animate |= ants;
                 region(painter, map, to_canvas(frame, b), LIVE, false, true, if ants { Outline::Ants(now) } else { Outline::Halo });
@@ -237,8 +239,13 @@ fn subjects(
         let selected = picked.contains(e);
         let color = if selected { SUBJECT } else { SUBJECT.gamma_multiply(0.6) };
         if selected {
+            // The point taken hold of (dragging), else under the pointer, else the shown frame's: its edges glow.
+            let grabbed = world.resource::<tt_core::subject::SubjectDrag>().grabbed().filter(|(s, _)| s == e).map(|(_, f)| f);
+            let hovered = hover.filter(|_| grabbed.is_none()).and_then(|h| tt_core::subject::path_frame(world, *e, view, frame, h, 12.0 / map.points_per_canvas()));
+            let at = |f: FrameIndex| value(f).map(|v| map.to_screen(shown(f, v[0], v[1])));
             path(painter, map, frame, |f| value(f).map(|v| shown(f, v[0], v[1])), color);
-            pins(painter, map, world, *e, frame, view, hover, &|f| value(f).map(|v| map.to_screen(shown(f, v[0], v[1]))), color);
+            glow(painter, grabbed.or(hovered).unwrap_or(frame), &at, color);
+            pins(painter, map, world, *e, frame, grabbed, hovered, &at, color);
         }
         let Some(v) = value(frame) else { continue };
         let p = map.to_screen(shown(frame, v[0], v[1]));
@@ -268,8 +275,8 @@ fn subjects(
 /// The selected subject's keys on its path, what a press would take hold
 /// of, the stretch a drag bends, and how (`tt_core::subject`'s drag).
 #[allow(clippy::too_many_arguments)]
-fn pins(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, frame: FrameIndex, view: Option<Entity>, hover: Option<[f64; 2]>, at: &dyn Fn(FrameIndex) -> Option<Pos2>, color: Color32) {
-    use tt_core::subject::{SubjectDrag, SubjectReach, path_frame};
+fn pins(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, frame: FrameIndex, grabbed: Option<FrameIndex>, hovered: Option<FrameIndex>, at: &dyn Fn(FrameIndex) -> Option<Pos2>, color: Color32) {
+    use tt_core::subject::SubjectReach;
     let window = frame - PATH_FRAMES..=frame + PATH_FRAMES;
     for k in world.get::<tt_core::subject::Subject>(e).map(|s| s.offsets.clone()).unwrap_or_default().iter().filter(|k| window.contains(&k.frame)) {
         if let Some(p) = at(k.frame) {
@@ -280,15 +287,15 @@ fn pins(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, fram
     let reach = world.resource::<SubjectReach>().seconds();
     let reach_text = reach.map_or("the whole path".to_string(), |s| format!("\u{b1}{s:.2} s"));
     let fps = world.resource::<Transport>().fps.as_f64();
-    let (spot, text) = match world.resource::<SubjectDrag>().grabbed().filter(|(s, _)| *s == e) {
+    let (spot, text) = match grabbed {
         // Dragging: the stretch it bends, thicker.
-        Some((_, f)) => {
+        Some(f) => {
             let r = reach.map_or(PATH_FRAMES, |s| (s as f64 * fps).round() as FrameIndex);
             let run: Vec<Pos2> = (f - r..=f + r).filter(|g| window.contains(g)).filter_map(at).collect();
             painter.add(Shape::line(run, Stroke::new(3.0, color.gamma_multiply(0.6))));
             (Some(f), format!("Bending its path on frame {f}, reach {reach_text} \u{b7} the wheel: reach \u{b7} let go to keep it"))
         }
-        None => match hover.and_then(|h| path_frame(world, e, view, frame, h, 12.0 / map.points_per_canvas())) {
+        None => match hovered {
             Some(f) => (Some(f), format!("Frame {f} \u{b7} drag: bend its path here (reach {reach_text}; the wheel while dragging changes it) \u{b7} Alt+click a pin: remove it")),
             None => return,
         },
@@ -323,6 +330,7 @@ fn focuses(painter: &Painter, map: &ViewportMapping, world: &World, picked: &[En
         let to = |f: FrameIndex, v: &[f32]| space(f).box_from_source(std::array::from_fn(|c| v[c] as f64));
         if selected {
             path(painter, map, frame, |f| sig.get(f).map(|v| to(f, v)).map(|b| [b[0], b[1]]), color);
+            glow(painter, frame, &|f| sig.get(f).map(|v| to(f, v)).map(|b| map.to_screen([b[0], b[1]])), color);
         }
         let Some(v) = sig.get(frame) else { continue };
         let b = to(frame, v);
@@ -483,6 +491,32 @@ pub fn dim_outside(painter: &Painter, map: &ViewportMapping, world: &World, fram
     painter.rect_filled(r, 4.0, Color32::from_black_alpha(170));
     painter.galley(r.min + Vec2::splat(5.0), galley, style::TEXT);
     painter.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+}
+
+/// Frames either side of a path's chosen point over which its edges glow (`glow`'s falloff).
+const GLOW_FRAMES: f64 = 4.0;
+
+/// A path's edges next to its chosen point `focus` (the frame a press takes
+/// hold of, else the shown one), drawn over it brighter and up to 1.5 px
+/// thicker, falling off over a few frames each way, and the point itself
+/// lit: points near it in time stand out from points that only overlap it
+/// on screen *(on request: "a brighter and slightly … thicker line starting
+/// from the point we have selected … like a glowing vertex and its nearby
+/// edges")*. `at`: a frame's point on screen.
+pub(super) fn glow(painter: &Painter, focus: FrameIndex, at: &dyn Fn(FrameIndex) -> Option<Pos2>, color: Color32) {
+    let reach = (3.0 * GLOW_FRAMES) as FrameIndex;
+    // (Toward white as it nears the point, fully opaque.)
+    let lit = |w: f32| Color32::from_rgb(color.r(), color.g(), color.b()).lerp_to_gamma(Color32::WHITE, 0.55 * w);
+    for f in focus - reach + 1..=focus + reach {
+        let (Some(a), Some(b)) = (at(f - 1), at(f)) else { continue };
+        let d = (f as f64 - 0.5 - focus as f64) / GLOW_FRAMES;
+        let w = (-d * d).exp() as f32;
+        painter.line_segment([a, b], Stroke::new(1.0 + 1.5 * w, lit(w)));
+    }
+    if let Some(p) = at(focus) {
+        painter.circle_filled(p, 3.5, Color32::from_black_alpha(150));
+        painter.circle_filled(p, 2.5, lit(1.0));
+    }
 }
 
 /// The point's path around the playhead: behind solid, ahead faint; gaps break it.
