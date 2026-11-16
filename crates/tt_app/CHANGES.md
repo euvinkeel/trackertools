@@ -1,4 +1,23 @@
 ## Not released yet
+- Subjects: drag the selected subject's path anywhere on the video to bend it there. Only the frames near it move; the wheel while dragging sets how far (its last step moves the whole path). The pins you make show on the path; Alt+click a pin removes it. New subjects ease in and out of their pins.
+- Subjects: Smooth its path (Inspector) smooths the subject's motion over the whole path. Your pins stay where you put them.
+- Subjects: the Inspector lists the members, each with a button to take it out, and Add member. Right-click a tracker or sketch: Add to a subject, Take out of a subject.
+- Subjects use a tracker's red (lost) frames too. To leave a tracker out somewhere, switch it off there (H).
+- Sketches switch off and on with H, as trackers do. Where a sketch is off, it does not move its subjects.
+- Manual dots: drag the selected dot's path to bend it, as a subject's.
+- Right-click any sketch, tracker, subject or SpringFocus: Bake into a manual dot. The dot keeps that path, and does not change when the original does.
+- SpringFocus: Always on the spring. It follows its target on the spring all the time, like a camera on a spring.
+- Paint trackers: P turns on the paint tool. Dots per paint is a setting in the Inspector. New paint trackers track dots along your strokes, so you see where each dot is. Alt+brush on a paint erases it; between paints, it cuts the dots you brush over until the next paint. The hint says what Alt does.
+- New trackers go on the whole video, unless a sketch is selected. This works for every kind, paint and TAPNext too.
+- Top bar > Export: the video as you see it, with what you attached on top, or only what you attached, on transparency.
+- Tracking target video: a transparent background, to put over the footage in your editor.
+- Timeline: fold a lane's lanes like comment threads (its triangle, or the line beside them). Lanes for views are hidden; "views" in the timeline's header shows them.
+- On a selected path, the point at the playhead (or under the pointer) and the path near it are brighter.
+- A long video name no longer pushes the top bar's buttons off the window.
+- Fixed: Ctrl+Z while drawing a new manual dot closed trackertools.
+- Fixed: Ctrl+Z or Esc during a drag now stops the drag. A key you press during a drag is its own undo step.
+- Fixed: after Shift+I or Shift+O while shuttling with J or L, playback went on backward or fast.
+- Fixed: a new tracker, subject, SpringFocus or manual dot could get the same name as one that is still there.
 - Open ProRes videos (ProRes LT, 422, HQ, 4444, Proxy) and MKV videos. The Open dialog shows MKV files.
 - Template trackers: add the cursors on this computer (Windows' own, a Roblox install's) in the Inspector, under Cursor icons. The tracker matches each as one more look, so it keeps following the cursor when it turns into one of them. Each pack's size is found from the looks, or set by hand. Add only the pack your video shows.
 - In a narrow window, the top bar wraps onto a second line and the Inspector's rows wrap, instead of running off the edge.
