@@ -533,7 +533,7 @@ fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world
             format!("TRACK \u{b7} {name} waits: Back, Both or Forward in the Inspector tracks it \u{b7} drag where it missed: a new look \u{b7} Shift+drag: a new tracker \u{b7} T/Esc exits")
         }
         (Some(_), _, _) => format!("TRACK \u{b7} drag around the subject where {name} missed it: a new look, pinned here \u{b7} Shift+drag: a new tracker \u{b7} T/Esc exits"),
-        _ if point => format!("NEW {kind} \u{b7} click the pixel to follow (inside a sketch it searches there; elsewhere the whole frame) \u{b7} T/Esc exits"),
+        _ if point => format!("NEW {kind} \u{b7} click the pixel to follow (on the whole video; select a sketch first to track inside it) \u{b7} T/Esc exits"),
         _ => format!("NEW {kind} \u{b7} drag around what to follow (its pattern) \u{b7} click: a point, the dashed box's size (Ctrl+wheel) \u{b7} T/Esc exits"),
     };
     hint(painter, map, text, TRACK, tool.refused.as_ref());

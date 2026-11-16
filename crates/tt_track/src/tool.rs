@@ -35,14 +35,17 @@
 //! New template looks get their mask painted automatically ([`crate::look::LookDefaults`]).
 //!
 //! The guide (search region and motion prior) is the selected sketch (or
-//! the selected tracker's guide), else the smallest sketch whose box holds
-//! the pattern on this frame; with none there, the tracker has no guide and
-//! searches the whole frame.
+//! the sketch of a selected stroke, or the selected tracker's guide); with
+//! nothing like that selected, the tracker has no guide: it is on the video
+//! itself (the root) and searches the whole frame *(changed on request: "add
+//! trackers like TAPNext or paint without a sketch so the root is basically
+//! just the normal video"; a press inside a sketch's box used to put the
+//! tracker in that sketch)*.
 
 use bevy_ecs::prelude::*;
 use tt_core::input::KeysHeld;
 use tt_core::selection::Selection;
-use tt_core::sketch::{pick_sketch, sketch_of};
+use tt_core::sketch::sketch_of;
 use tt_core::time::FrameIndex;
 use tt_core::tool::{ActiveTool, CLICK_MOVE, PointerFrame, Tool};
 use tt_core::transport::Transport;
@@ -414,11 +417,8 @@ fn place(world: &mut World, look: Look, new: bool, reseed: Option<Entity>) -> Re
         return Ok(());
     }
     let look = if method_for(world, true) == Method::Template { auto_masked(world, look) } else { look };
-    let guide = match primary.and_then(|e| sketch_of(world, e).or_else(|| guide_of(world, e))) {
-        Some(s) => Some(s),
-        None => pick_sketch(world, look.frame, look.center()),
-    };
-    match guide {
+    // In the sketch selected (or the selected tracker's); else on the video itself.
+    match primary.and_then(|e| sketch_of(world, e).or_else(|| guide_of(world, e))) {
         Some(g) => add_tracker_with_look(world, g, look).map(|_| ()).ok_or_else(|| "That sketch has no frames to track in".to_string()),
         // No sketch here: the tracker searches the whole frame.
         None => add_unguided_tracker(world, look).map(|_| ()).ok_or_else(|| "There is no video to track in".to_string()),

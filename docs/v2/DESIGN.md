@@ -290,7 +290,7 @@ A tracker is defined by what the user shows it. State stays flat, and every part
 - **drag** a rectangle on the video: a new tracker with that look on the shown frame;
 - **click**: a point tracker with the brush-sized pattern (a dashed box shows it, 28 pt by default; Ctrl+wheel sizes it, the plain wheel zooms as always);
 - with a **tracker selected**, a drag or click **patches** it: another look, on this frame, where the subject really is (the path is pinned there; a new icon is learned too). `Shift` makes a new tracker instead. *(Changed after hands-on use: "my workflow is to just kinda patch wherever it seems to miss".)*
-- the guide is the selected sketch (or the selected tracker's guide), else the smallest sketch whose box holds the rectangle's centre on this frame, else none: the tracker searches the whole frame (§6.3, trackers with no sketch);
+- the guide is the selected sketch (or the selected tracker's guide); with none selected, none: the tracker is on the video itself and searches the whole frame (§6.3, trackers with no sketch) *(changed on request: "add trackers like TAPNext or paint without a sketch so the root is basically just the normal video"; a press inside a sketch's box used to put the tracker in that sketch)*. Any kind of tracker works there: template, CoTracker, paint, cursor, TAPNext;
 - a **CoTracker** follows a pixel: a press makes a point where it is let go (a new CoTracker, or with one selected its reset point on that frame, moved if it has one there; §6.4);
 - the tracker works in the guide's own view (created if needed), so the pattern is cut and matched where the subject sits still.
 

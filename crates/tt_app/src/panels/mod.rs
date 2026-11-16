@@ -348,7 +348,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                     "Track tool ({chord}) making a {}: {what}\n\
                      \u{2022} template tracker: drag a rectangle around what to follow (its pattern, a look), or click a point (the dashed box's size; Ctrl+wheel sizes it)\n\
                      \u{2022} CoTracker: click the pixel to follow (a reset point)\n\
-                     \u{2022} inside a sketch's box it searches there; elsewhere, the whole frame\n\
+                     \u{2022} with a sketch selected, it searches inside that sketch's box; with none selected, the whole video\n\
                      \u{2022} a new tracker waits: Back, Both or Forward in the Inspector (or its right-click menu) tracks it; Pause stops it\n\
                      \u{2022} with a tracker selected: where it missed, another look (a CoTracker: a reset point); Shift: a new tracker\n\
                      \u{2022} select a look (Outliner, Inspector) to paint which of its pixels are the subject",

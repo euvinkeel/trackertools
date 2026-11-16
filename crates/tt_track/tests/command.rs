@@ -153,10 +153,15 @@ fn the_track_tool_patches_the_selected_tracker_with_auto_masked_looks() {
     core.world.resource_mut::<Transport>().seek(100);
     core.run_pre_ui();
 
-    // Nothing selected: a drag inside the sketch makes a tracker there, its look masked.
+    // Nothing selected: a drag, even inside the sketch's box, makes a tracker on the video itself (no sketch).
+    drag(&mut core, [95.0, 95.0], [105.0, 105.0], false);
+    let root = core.world.resource::<Selection>().primary().expect("the new tracker is selected");
+    assert!(is_tracker(&core.world, root) && guide_of(&core.world, root).is_none(), "on the root");
+    // The sketch selected: a drag makes a tracker in it, its look masked.
+    core.world.resource_mut::<Selection>().select_only(a);
     drag(&mut core, [95.0, 95.0], [105.0, 105.0], false);
     let t = core.world.resource::<Selection>().primary().expect("the new tracker is selected");
-    assert!(is_tracker(&core.world, t) && guide_of(&core.world, t) == Some(a));
+    assert!(is_tracker(&core.world, t) && guide_of(&core.world, t) == Some(a), "in the sketch selected");
     let first = looks_of(&core.world, t)[0];
     assert!(core.world.get::<Look>(first).expect("look").painted().is_some(), "masked automatically");
 
@@ -166,14 +171,16 @@ fn the_track_tool_patches_the_selected_tracker_with_auto_masked_looks() {
     drag(&mut core, [96.0, 96.0], [106.0, 106.0], false);
     let looks = looks_of(&core.world, t);
     assert_eq!(looks.len(), 2, "a patch, not a new tracker");
-    assert_eq!(live_trackers(&mut core).len(), 1);
+    assert_eq!(live_trackers(&mut core).len(), 2);
     let patch = core.world.get::<Look>(looks[1]).expect("look");
     assert_eq!((patch.frame, patch.center()), (130, [101.0, 101.0]));
     assert!(patch.painted().is_some());
 
     // Shift: a new tracker instead (on the same guide).
     drag(&mut core, [96.0, 96.0], [106.0, 106.0], true);
-    assert_eq!(live_trackers(&mut core).len(), 2);
+    assert_eq!(live_trackers(&mut core).len(), 3);
+    let shifted = core.world.resource::<Selection>().primary().expect("selected");
+    assert_eq!(guide_of(&core.world, shifted), Some(a), "in the same sketch as the tracker selected");
 
     // The setting off: looks stay unpainted (centre-weighted).
     core.world.resource_mut::<tt_track::look::LookDefaults>().auto_mask = false;

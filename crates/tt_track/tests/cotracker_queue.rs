@@ -624,6 +624,43 @@ fn cutting_dots_tracks_again_from_the_paint_before_and_marks_them() {
     quiet(&mut core);
 }
 
+/// Paint and TAPNext trackers with no sketch (on request: "add trackers like
+/// TAPNext or paint without a sketch so the root is basically just the normal
+/// video"): their guide is the whole frame; they run over their span and
+/// start where they were put.
+#[test]
+fn paint_and_tapnext_trackers_track_the_whole_video_without_a_sketch() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, _)) = setup(TrackRun::Both) else { return };
+    for method in [Method::Paint, Method::TapNext] {
+        core.world.resource_mut::<NewTrackers>().method = method;
+        let look = if method == Method::Paint {
+            let path = [truth(600), [truth(600)[0] + 6.0, truth(600)[1] + 2.0]];
+            let (c, h, mask) = tt_track::tool::paint_look(&path, 6.0);
+            let mut look = Look::new(600, c, h);
+            (look.mask, look.dots) = (mask, tt_track::tool::stroke_dots(&path, 2.0));
+            look
+        } else {
+            Look::new(600, truth(600), [10.5, 10.5])
+        };
+        let op = tt_track::add_unguided_tracker(&mut core.world, look.clone()).expect("tracker");
+        set_span(&mut core.world, op, Span::new(590, 615));
+        run(&mut core, &[op], |_| {});
+        let w = &core.world;
+        assert!(tt_track::guide_of(w, op).is_none(), "{method:?}: on the root, no sketch");
+        assert!(w.get::<OpError>(op).is_none(), "{method:?}: {:?}", w.get::<OpError>(op));
+        assert_eq!(coverage(w, op), Some(590..616), "{method:?}: both ways over its span");
+        let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+        // (The fake answers each point where it started in the model's picture: on the root that picture
+        // is the whole, still frame, so it can't show motion. The real model does: human.rs's
+        // `cotracker_with_no_sketch_follows_the_sprite`.)
+        let v = sig.get(600).expect("the anchor's result");
+        let start = if method == Method::Paint { tt_track::job::paint::centre(&look.spec(true)) } else { look.center() };
+        assert!((v[0] as f64 - start[0]).hypot(v[1] as f64 - start[1]) < 1e-3, "{method:?}: starts where it was put: {v:?} vs {start:?}");
+    }
+    quiet(&mut core);
+}
+
 /// A reset point added between two others re-tracks only from the one
 /// before it to the one after it (on request: "limit recomputation from
 /// when paints/reset points have actually changed, and their immediate
