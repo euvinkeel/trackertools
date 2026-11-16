@@ -90,7 +90,8 @@ Not a state machine of its own, but the order every other machine relies on.
 | 3 | the top layer's picture | `Layer(l, Body)` | selects the layer | moves it |
 | 4 | any subject's point | `Subject(s, frame)` | selects it | bends its path there |
 | 5 | the selected subject's drawn path | `Subject(s, f)` | keeps it; Alt removes the nearest key | bends its path at f |
-| 6 | anything else | `Nothing` | selects the tracker, SpringFocus or sketch under it, else clears | nothing |
+| 6 | the selected manual dot's drawn path (`BendablePath`) | `Path(d, f)` | keeps it | bends its drawn points there (`human::bend_drawn`) |
+| 7 | anything else | `Nothing` | selects the tracker, SpringFocus or sketch under it, else clears | nothing |
 
 Before 2026-11-15 the same order was implicit: each drag system called the others' pick functions (`layer::press_on_layer`, now gone).
 

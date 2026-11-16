@@ -99,9 +99,21 @@ pub fn draw(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world: 
         region(painter, map, to_canvas(frame, v), color, stale, editing == Some(*e) && live.is_some_and(|l| l.preview_at(frame).is_some()), outline);
     }
 
-    super::tracks::draw(painter, map, world, &trackers, frame, &space);
-    // (In the Select tool, the selected subject's path under the pointer lights up: a drag bends it there.)
+    // (In the Select tool, the selected subject's or manual dot's path under the pointer lights up: a drag bends it there.)
     let hover = response.hover_pos().filter(|_| tool == Tool::Select).map(|p| map.to_canvas(p));
+    // The selected manual dot's path: the point being bent, else under the pointer.
+    let bend = picked.last().copied().filter(|e| world.get::<tt_core::tool::BendablePath>(*e).is_some()).and_then(|d| {
+        let grabbed = world.resource::<tt_track::human::BendDrag>().grabbed().filter(|(g, _)| *g == d).map(|(_, f)| f);
+        let hovered = hover.filter(|_| grabbed.is_none()).and_then(|h| tt_core::subject::path_frame(world, d, view, frame, h, 12.0 / map.points_per_canvas()));
+        Some((d, grabbed, hovered, grabbed.or(hovered)?))
+    });
+    super::tracks::draw(painter, map, world, &trackers, frame, &space, bend.map(|(d, _, _, f)| (d, f)));
+    if let Some((d, grabbed, hovered, _)) = bend
+        && let Some(sig) = tt_core::span::output(world, d)
+    {
+        let at = |f: FrameIndex| sig.get(f).map(|v| map.to_screen(shown_from_source(&space(f), [v[0] as f64, v[1] as f64])));
+        pins(painter, map, world, d, frame, grabbed, hovered, &at, style::HAND);
+    }
     subjects(painter, map, world, &subject_list, &picked, frame, view, hover, &space);
     focuses(painter, map, world, &picked, frame, &space);
 
@@ -272,8 +284,9 @@ fn subjects(
     }
 }
 
-/// The selected subject's keys on its path, what a press would take hold
-/// of, the stretch a drag bends, and how (`tt_core::subject`'s drag).
+/// The selected subject's keys on its path (a manual dot has none), what a
+/// press would take hold of, the stretch a drag bends, and how
+/// (`tt_core::subject`'s drag; a manual dot's: `tt_track::human::bend_drawn`).
 #[allow(clippy::too_many_arguments)]
 fn pins(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, frame: FrameIndex, grabbed: Option<FrameIndex>, hovered: Option<FrameIndex>, at: &dyn Fn(FrameIndex) -> Option<Pos2>, color: Color32) {
     use tt_core::subject::SubjectReach;
@@ -296,7 +309,10 @@ fn pins(painter: &Painter, map: &ViewportMapping, world: &World, e: Entity, fram
             (Some(f), format!("Bending its path on frame {f}, reach {reach_text} \u{b7} the wheel: reach \u{b7} let go to keep it"))
         }
         None => match hovered {
-            Some(f) => (Some(f), format!("Frame {f} \u{b7} drag: bend its path here (reach {reach_text}; the wheel while dragging changes it) \u{b7} Alt+click a pin: remove it")),
+            Some(f) => {
+                let pins = if tt_core::subject::is_subject(world, e) { " \u{b7} Alt+click a pin: remove it" } else { "" };
+                (Some(f), format!("Frame {f} \u{b7} drag: bend its path here (reach {reach_text}; the wheel while dragging changes it){pins}"))
+            }
             None => return,
         },
     };

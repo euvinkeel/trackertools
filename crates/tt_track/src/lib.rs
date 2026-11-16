@@ -906,6 +906,8 @@ impl Module for TrackModule {
             .declare::<PausedOnOpen>(Class::Derived)
             .declare::<human::DrawTool>(Class::Derived)
             .init_resource::<human::DrawTool>()
+            .declare::<human::BendDrag>(Class::Derived)
+            .init_resource::<human::BendDrag>()
             .declare::<NewTrackers>(Class::Session)
             .init_resource::<NewTrackers>()
             .declare::<tool::TrackTool>(Class::Session)
@@ -932,7 +934,8 @@ impl Module for TrackModule {
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
             .add_systems((apply_track_actions, look_changed, cuts_changed).in_set(Set::Intents))
-            .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
+            .add_systems((tool::track_tool, human::draw_tool, human::bend_drawn).in_set(Set::Tools))
+            .add_systems(human::mark_bendable.in_set(Set::Prepare))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
     }
 }
