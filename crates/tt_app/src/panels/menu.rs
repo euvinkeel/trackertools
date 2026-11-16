@@ -334,6 +334,26 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         }
         ui.separator();
     }
+    // Bake: each into a manual dot of its own (a path drawn on every frame it has a point).
+    let mut bakeable: Vec<Entity> = Vec::new();
+    for e in &selection {
+        let p = if tt_track::is_tracker(world, *e) || tt_core::subject::is_subject(world, *e) || tt_core::focus::is_focus(world, *e) { Some(*e) } else { sketch_of(world, *e) };
+        if let Some(p) = p.filter(|p| !bakeable.contains(p)) {
+            bakeable.push(p);
+        }
+    }
+    if !bakeable.is_empty() {
+        let text = if bakeable.len() == 1 { "Bake into a manual dot".to_string() } else { format!("Bake these {} into manual dots", bakeable.len()) };
+        if ui
+            .button(text)
+            .on_hover_text("A manual dot drawn where it is on every frame (in its lifetime, not where it is switched off): its path on its own, which stays as it is when what it came from changes. Edit it with the Draw tool (M).")
+            .clicked()
+        {
+            tt_track::human::bake(world, &bakeable);
+            ui.close();
+        }
+        ui.separator();
+    }
     if let [subject] = subjects[..] {
         let name = name_of(world, subject);
         let members = tt_core::subject::members_of(world, subject);

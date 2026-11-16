@@ -533,3 +533,41 @@ fn undo_during_a_draw_stroke_ends_it() {
     assert!(!h.can_undo() && !h.in_gesture(), "nothing drawn after the undo: {:?}", h.undo_label());
     assert_eq!(h.redo_label(), Some("Draw Manual dot 1"), "the stroke so far can be redone");
 }
+
+/// Baking a tracker, then a subject, into manual dots: drawn on every frame
+/// each has a point (a lost frame too; not where the tracker is off), its own
+/// from then on (editing the tracker after changes nothing in it), and one undo.
+#[test]
+fn baking_makes_a_manual_dot_of_the_path_on_its_own() {
+    let mut core = core(100);
+    let op = tracker_with_results(&mut core);
+    tt_core::off::switch_from(&mut core.world, &[op], 40, true);
+    core.run_pre_ui();
+    let made = tt_track::human::bake(&mut core.world, &[op]);
+    let [dot] = made[..] else { panic!("one dot: {made:?}") };
+    core.run_pre_ui();
+    let w = &core.world;
+    assert!(tt_track::human::is_manual(w, dot));
+    assert!(w.get::<bevy_ecs::name::Name>(dot).is_some_and(|n| n.as_str().ends_with(" baked")), "named after what it came from");
+    assert_eq!(drawn_at(w, dot, 10), Some([110.0, 50.0]), "where it was");
+    assert_eq!(drawn_at(w, dot, 30), Some([130.0, 50.0]), "a lost (red) frame too");
+    assert_eq!(drawn_at(w, dot, 45), None, "not where it is switched off");
+    assert_eq!(w.resource::<Selection>().entities, vec![dot], "selected");
+    // Its own: drawing over the tracker afterwards leaves the baked path as it was.
+    edit(&mut core.world, "Draw", |tx| write_drawn(tx, op, &[(10, Some([500.0, 500.0]))]));
+    core.run_pre_ui();
+    assert_eq!(drawn_at(&core.world, dot, 10), Some([110.0, 50.0]));
+    // A subject of the tracker: its path.
+    let s = tt_core::subject::make_subject(&mut core.world, &[op], 0).expect("a subject");
+    core.run_pre_ui();
+    let [baked] = tt_track::human::bake(&mut core.world, &[s])[..] else { panic!("one dot") };
+    core.run_pre_ui();
+    let w = &core.world;
+    for f in [0, 20, 39] {
+        let v = tt_core::subject::value_at(w, s, f).expect("the subject's value");
+        assert_eq!(drawn_at(w, baked, f), Some([v[0], v[1]]), "frame {f}");
+    }
+    // One undo takes the baked subject's dot back.
+    undo(&mut core.world);
+    assert!(core.world.get::<bevy_ecs::entity_disabling::Disabled>(baked).is_some());
+}

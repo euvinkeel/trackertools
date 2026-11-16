@@ -374,6 +374,41 @@ pub fn merge_dots(world: &mut World, dots: &[Entity], tracker: Entity) -> Option
     Some(n)
 }
 
+/// Bake `things` (sketches, trackers, subjects, SpringFocuses: anything with
+/// a point a frame) each into a manual dot of its own *(on request: "bake any
+/// object … into its own Manual Path … a baked path essentially on its
+/// own")*: drawn on every frame it has a point (in its lifetime, not where it
+/// is switched off; a tracker's red frames too, as subjects take them), and
+/// nothing else, so it changes no more when what it came from does. Named
+/// "<name> baked". One undo step; the dots are selected. Returns them.
+pub fn bake(world: &mut World, things: &[Entity]) -> Vec<Entity> {
+    let mut taken: Vec<String> = world.query::<&Name>().iter(world).map(|n| n.to_string()).collect();
+    let mut planned = Vec::new();
+    for e in things {
+        let points = tt_core::subject::points_of(world, *e, true);
+        if points.is_empty() {
+            continue;
+        }
+        let base = format!("{} baked", world.get::<Name>(*e).map_or("it".to_string(), |n| n.to_string()));
+        let name = std::iter::once(base.clone()).chain((2..).map(|n| format!("{base} {n}"))).find(|n| !taken.contains(n)).expect("a free name");
+        taken.push(name.clone());
+        planned.push((name, points));
+    }
+    let mut made = Vec::new();
+    let label = if planned.len() == 1 { format!("Bake {}", planned[0].0.trim_end_matches(" baked")) } else { format!("Bake {} paths", planned.len()) };
+    edit(world, &label, |tx| {
+        for (name, points) in &planned {
+            let d = spawn_manual_dot(tx, name.clone(), points[0].0);
+            write_drawn(tx, d, &points.iter().map(|(f, p)| (*f, Some(*p))).collect::<Vec<_>>());
+            made.push(d);
+        }
+    });
+    if !made.is_empty() {
+        world.resource_mut::<Selection>().entities = made.clone();
+    }
+    made
+}
+
 fn manual_count(world: &mut World) -> usize {
     let mut q = world.query::<&Tracker>();
     q.iter(world).filter(|t| t.method == Method::Manual).count()
