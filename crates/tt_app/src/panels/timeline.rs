@@ -46,7 +46,7 @@ use std::ops::Range;
 use bevy_ecs::prelude::*;
 use egui::{Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use tt_core::input::{Action, Keymap, PendingActions};
-use tt_core::marks::{Marks, marks, set_marks};
+use tt_core::marks::{Marks, marks};
 use tt_core::time::{FrameIndex, Rational, timecode};
 use tt_core::transport::{RATES, Transport};
 use tt_core::{AppBuilder, Class, Module};
@@ -75,12 +75,30 @@ pub struct TimelineView {
     pub lane_scroll: f32,
 }
 
+/// Lanes folded shut on the timeline: what is under them in the tree is
+/// hidden (a fold triangle beside a lane, or a click on the line down its
+/// lanes, as comment threads fold; on request: "collapse stuff like a hacker
+/// news comment hierarchical collapse … so I can tidy the view up").
+#[derive(Resource, Debug, Default)]
+pub struct TimelineFolds(pub std::collections::HashSet<Entity>);
+
+/// The timeline shows views' lanes (off by default) *(on request: "what is a
+/// 'Sketch _ view' thing doing in the timeline … it just pads up the
+/// timeline … could we hide those?")*: a view's lane only trims the view's
+/// lifetime apart from what it follows. The header's "views" shows them.
+#[derive(Resource, Debug, Default)]
+pub struct ViewLanes(pub bool);
+
 pub struct TimelineModule;
 
 impl Module for TimelineModule {
     fn build(&self, app: &mut AppBuilder) {
         app.declare::<TimelineView>(Class::Session)
             .declare::<TimelineUi>(Class::Derived)
+            .declare::<TimelineFolds>(Class::Session)
+            .init_resource::<TimelineFolds>()
+            .declare::<ViewLanes>(Class::Session)
+            .init_resource::<ViewLanes>()
             .init_resource::<TimelineView>()
             .init_resource::<TimelineUi>();
     }
@@ -114,6 +132,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
     let marked = marks(world);
     let mut actions = Vec::new();
     let mut fit = false;
+    let mut views = world.resource::<ViewLanes>().0;
 
     ui.horizontal(|ui| {
         let button = |ui: &mut egui::Ui, actions: &mut Vec<Action>, text: &str, action: Action, what: &str| {
@@ -162,6 +181,10 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         {
             actions.push(Action::ToggleSnap);
         }
+        ui.toggle_value(&mut views, "views").on_hover_text(
+            "Show a lane for each view (what Tab enters: the camera that follows a sketch, tracker or subject), under what it follows. \
+             Only needed to trim a view's lifetime apart from what it follows.",
+        );
         ui.separator();
         button(ui, &mut actions, "In", Action::MarkIn, "Mark the in point here: the first frame an export renders");
         button(ui, &mut actions, "Out", Action::MarkOut, "Mark the out point here: the last frame an export renders");
@@ -195,6 +218,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         });
     });
 
+    world.resource_mut::<ViewLanes>().0 = views;
     let height = ui.available_height().max(44.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -323,10 +347,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         if fitted { TimelineView { lane_scroll, ..TimelineView::default() } } else { TimelineView { start, span: Some(span), lane_scroll } };
 
     ui_state.lanes_area = Some(lanes_area);
+    ui_state.fold_controls = hits.folds.clone();
     let in_lanes = origin.is_some_and(|o| rows.contains(o));
     ui_state.hover_edge = response.hover_pos().filter(|p| lanes_area.contains(*p)).and_then(|p| hits.edge_at(p));
     if ui_state.hover_edge.is_some() || ui_state.edge.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    if response.hover_pos().is_some_and(|p| hits.folds.iter().any(|(_, r)| r.contains(p))) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if in_lanes
         && response.drag_started_by(egui::PointerButton::Primary)
@@ -371,7 +399,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
             } else {
                 f
             };
-            tt_core::span::move_edge(world, e, edge, f.clamp(0, t.last_frame()));
+            tt_core::span::drag(world, e, edge, f.clamp(0, t.last_frame()));
             let what = if edge == Edge::First { "starts" } else { "ends" };
             response.clone().on_hover_text_at_pointer(format!("{what} at frame {}  ·  {}", f.clamp(0, t.last_frame()), timecode(f.clamp(0, t.last_frame()), t.fps)));
         } else {
@@ -460,7 +488,14 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
         && let Some(pos) = response.interact_pointer_pos()
     {
         let under = hits.at(pos);
-        if response.double_clicked() {
+        let fold = hits.folds.iter().find(|(_, r)| r.contains(pos)).map(|(e, _)| *e);
+        if let Some(e) = fold.filter(|_| response.clicked() || response.double_clicked()) {
+            // A fold triangle or a thread's line: fold or unfold it (the selection stays).
+            let mut folds = world.resource_mut::<TimelineFolds>();
+            if !folds.0.remove(&e) {
+                folds.0.insert(e);
+            }
+        } else if response.double_clicked() {
             // Double-click a lane: into the view that follows it.
             if let Some(e) = under.and_then(|e| tt_core::view::followable(world, e)) {
                 world.resource_mut::<Selection>().select_only(e);
@@ -533,7 +568,7 @@ pub fn ui(ui: &mut egui::Ui, world: &mut World) {
                     (f, Marks { mark_out: Some(f), ..marked })
                 }
             };
-            set_marks(world, moved, &format!("Move {} point", end.name()));
+            tt_core::marks::drag(world, moved, &format!("Move {} point", end.name()));
             if f != t.frame() {
                 actions.push(Action::Seek(f));
             }
@@ -642,9 +677,10 @@ pub enum LaneKind {
 
 /// The lanes, top to bottom, in the outliner's order (`crate::tree`: each
 /// thing under what it was made relative to), each followed by its view's
-/// lane (one level in) when it has one.
+/// lane (one level in) when it has one and views' lanes are shown ([`ViewLanes`]).
 pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
     use crate::tree::Node;
+    let views = world.get_resource::<ViewLanes>().is_some_and(|v| v.0);
     let mut out = Vec::new();
     for (e, depth, node) in crate::tree::tree(world) {
         let kind = match node {
@@ -655,7 +691,7 @@ pub fn lane_list(world: &mut World) -> Vec<(Entity, usize, LaneKind)> {
             Node::Layer => LaneKind::Layer,
         };
         out.push((e, depth, kind));
-        if let Some(v) = tt_core::view::view_of(world, e).filter(|v| world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
+        if let Some(v) = tt_core::view::view_of(world, e).filter(|v| views && world.get::<bevy_ecs::entity_disabling::Disabled>(*v).is_none()) {
             out.push((v, depth + 1, LaneKind::View));
         }
     }
@@ -673,6 +709,8 @@ struct Hits {
     ticks: Vec<(Entity, Rect)>,
     /// `(entity, which end, its x, its lane)`: the ends of lifetimes, to drag.
     edges: Vec<(Entity, Edge, f32, Rect)>,
+    /// `(lane, where a click folds or unfolds it)`: its triangle and the line down its lanes.
+    folds: Vec<(Entity, Rect)>,
     /// The box being dragged, as drawn this frame.
     marquee: Option<Rect>,
     /// A spinner turns: keep repainting.
@@ -778,7 +816,22 @@ fn lanes(
     time: f64,
 ) -> Hits {
     use crate::icons::{self, Activity, Glyph};
-    let tree = lane_list(world);
+    // The lanes shown: none under a folded one. `under`: how many lanes each one's subtree has (shown or not).
+    let (tree, under) = {
+        let all = lane_list(world);
+        let folded = &world.resource::<TimelineFolds>().0;
+        let (mut tree, mut under) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < all.len() {
+            let (e, depth, _) = all[i];
+            let n = all[i + 1..].iter().take_while(|(_, d, _)| *d > depth).count();
+            tree.push(all[i]);
+            under.push(n);
+            i += if folded.contains(&e) { n + 1 } else { 1 };
+        }
+        (tree, under)
+    };
+    let folded = world.resource::<TimelineFolds>().0.clone();
     let colors = crate::colors::Colors::new(world);
     let selection = world.resource::<Selection>().clone();
     let store = world.resource::<SignalStore>();
@@ -881,8 +934,31 @@ fn lanes(
         let own = colors.of(world, e, glyph);
         let method = world.get::<tt_track::Tracker>(e).map(|t| t.method);
         let manual = method == Some(tt_track::Method::Manual);
-        // The name column: indent, (a tracker's) spinner, icon, name.
-        let mut x = gutter.min.x + 6.0 + depth as f32 * 10.0;
+        // The name column: indent, fold triangle, (a tracker's) spinner, icon, name.
+        let fold_x = gutter.min.x + 7.0 + depth as f32 * 10.0;
+        let mut x = fold_x + 7.0;
+        if under[i] > 0 {
+            let shut = folded.contains(&e);
+            let toggle = Rect::from_center_size(Pos2::new(fold_x, y + LANE_H / 2.0), Vec2::splat(11.0));
+            let lit = hover.is_some_and(|p| toggle.contains(p));
+            let c = if lit { style::TEXT } else { style::MUTED };
+            let (cx, cy) = (fold_x, y + LANE_H / 2.0);
+            let tri = if shut {
+                vec![Pos2::new(cx - 2.0, cy - 4.0), Pos2::new(cx + 3.0, cy), Pos2::new(cx - 2.0, cy + 4.0)]
+            } else {
+                vec![Pos2::new(cx - 4.0, cy - 2.0), Pos2::new(cx + 4.0, cy - 2.0), Pos2::new(cx, cy + 3.0)]
+            };
+            painter.add(egui::Shape::convex_polygon(tri, c, Stroke::NONE));
+            hits.folds.push((e, toggle));
+            // Open: a line down its lanes, as a comment thread has; a click on it folds them.
+            let shown = tree[i + 1..].iter().take_while(|(_, d, _)| *d > depth).count();
+            if !shut && shown > 0 {
+                let line = Rect::from_x_y_ranges(fold_x - 3.5..=fold_x + 3.5, y + LANE_H..=y + (shown + 1) as f32 * LANE_H - 3.0);
+                let lit = hover.is_some_and(|p| line.contains(p));
+                painter.line_segment([line.center_top(), line.center_bottom()], Stroke::new(if lit { 2.0 } else { 1.0 }, if lit { style::TEXT } else { style::RULER }));
+                hits.folds.push((e, line));
+            }
+        }
         if kind == LaneKind::Tracker && !manual {
             let a = Activity::of(world, e);
             hits.moving |= a.moving();
@@ -892,6 +968,8 @@ fn lanes(
         icons::paint_in(&painter, Rect::from_center_size(Pos2::new(x + 6.0, y + LANE_H / 2.0), Vec2::splat(12.0)), glyph, selected, own);
         x += 16.0;
         let name = world.get::<Name>(e).map_or("item".into(), |n| n.to_string());
+        // Folded: how many lanes it hides.
+        let name = if folded.contains(&e) && under[i] > 0 { format!("{name}  +{}", under[i]) } else { name };
         let galley = painter.layout_no_wrap(name, FontId::proportional(11.0), egui::Color32::PLACEHOLDER);
         let label = Rect::from_min_max(Pos2::new(x - 1.0, y + 1.0), Pos2::new((x + galley.size().x + 2.0).min(gutter.max.x - 2.0), y + LANE_H - 1.0));
         let span = span_of(world, e);
@@ -934,6 +1012,35 @@ fn lanes(
         let mut hit_bars: Vec<Rect> = bars.iter().map(|(b, _, _)| *b).collect();
         for (b, state, alive) in &bars {
             painter.rect_filled(*b, 1.5, color.gamma_multiply(alpha(*alive, *state)));
+        }
+        // Where it is switched off (a tracker, a sketch): hatched over its lane.
+        if let Some(o) = world.get::<tt_core::off::Off>(e).filter(|o| o.any_off()) {
+            let lo = scale.start.floor() as FrameIndex;
+            let hi = (scale.start + scale.span).ceil() as FrameIndex + 1;
+            for r in o.off_ranges(lo, hi) {
+                let (x0, x1) = (scale.x(r.start as f64).max(scale.rect.min.x), scale.x(r.end as f64).min(scale.rect.max.x));
+                if x1 <= x0 {
+                    continue;
+                }
+                let band = Rect::from_x_y_ranges(x0..=x1, y + 1.0..=y + 17.0);
+                painter.rect_filled(band, 0.0, egui::Color32::from_black_alpha(110));
+                let hatch = Stroke::new(1.0, style::MUTED.gamma_multiply(0.7));
+                let mut x = x0 - 16.0;
+                while x < x1 {
+                    let (a, b) = (Pos2::new(x, band.bottom()), Pos2::new(x + 16.0, band.top()));
+                    // (Clipped to the band.)
+                    let clip = |p: Pos2, q: Pos2| -> Option<(Pos2, Pos2)> {
+                        let t0 = ((x0 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
+                        let t1 = ((x1 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
+                        (t1 > t0).then(|| (p + (q - p) * t0, p + (q - p) * t1))
+                    };
+                    if let Some((a, b)) = clip(a, b) {
+                        painter.line_segment([a, b], hatch);
+                    }
+                    x += 6.0;
+                }
+                painter.text(Pos2::new(x0 + 3.0, y + 2.0), egui::Align2::LEFT_TOP, "off", egui::FontId::proportional(9.0), style::TEXT.gamma_multiply(0.8));
+            }
         }
         if kind == LaneKind::Tracker {
             // … what was drawn by hand, a layer over them (a manual dot: all of it).
@@ -987,35 +1094,6 @@ fn lanes(
                         x += 8.0;
                     }
                     hits.moving = true;
-                }
-            }
-            // Where it is switched off: hatched over its lane.
-            if let Some(o) = world.get::<tt_track::off::TrackerOff>(e).filter(|o| o.any_off()) {
-                let lo = scale.start.floor() as FrameIndex;
-                let hi = (scale.start + scale.span).ceil() as FrameIndex + 1;
-                for r in o.off_ranges(lo, hi) {
-                    let (x0, x1) = (scale.x(r.start as f64).max(scale.rect.min.x), scale.x(r.end as f64).min(scale.rect.max.x));
-                    if x1 <= x0 {
-                        continue;
-                    }
-                    let band = Rect::from_x_y_ranges(x0..=x1, y + 1.0..=y + 17.0);
-                    painter.rect_filled(band, 0.0, egui::Color32::from_black_alpha(110));
-                    let hatch = Stroke::new(1.0, style::MUTED.gamma_multiply(0.7));
-                    let mut x = x0 - 16.0;
-                    while x < x1 {
-                        let (a, b) = (Pos2::new(x, band.bottom()), Pos2::new(x + 16.0, band.top()));
-                        // (Clipped to the band.)
-                        let clip = |p: Pos2, q: Pos2| -> Option<(Pos2, Pos2)> {
-                            let t0 = ((x0 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
-                            let t1 = ((x1 - p.x) / (q.x - p.x)).clamp(0.0, 1.0);
-                            (t1 > t0).then(|| (p + (q - p) * t0, p + (q - p) * t1))
-                        };
-                        if let Some((a, b)) = clip(a, b) {
-                            painter.line_segment([a, b], hatch);
-                        }
-                        x += 6.0;
-                    }
-                    painter.text(Pos2::new(x0 + 3.0, y + 2.0), egui::Align2::LEFT_TOP, "off", egui::FontId::proportional(9.0), style::TEXT.gamma_multiply(0.8));
                 }
             }
             // Its looks (white squares; a cursor tracker's in their pattern's colour) or a CoTracker's reset points (white diamonds), on their frames.
@@ -1189,6 +1267,8 @@ pub struct TimelineUi {
     live: bool,
     /// Where the lanes were drawn (the demo aims at it).
     pub lanes_area: Option<Rect>,
+    /// Where a click folds or unfolds a lane, as drawn last (tests aim at them).
+    pub fold_controls: Vec<(Entity, Rect)>,
 }
 
 /// An in or out point (`tt_core::marks`), as a handle on the ruler.
@@ -1340,6 +1420,66 @@ mod tests {
         undo(&mut world);
         assert_eq!(world.get::<Span>(sketch), None, "one undo takes the whole drag back");
         assert!(!world.resource::<History>().can_undo());
+    }
+
+    /// A sketch's view has no lane of its own unless the header's "views" is on.
+    #[test]
+    fn views_lanes_are_hidden_unless_asked_for() {
+        let (mut world, sketch) = setup();
+        let view = tt_core::view::ensure_view(&mut world, sketch);
+        let kinds = |world: &mut World| lane_list(world).into_iter().map(|(e, _, k)| (e, k)).collect::<Vec<_>>();
+        assert_eq!(kinds(&mut world), vec![(sketch, LaneKind::Sketch)], "the sketch alone");
+        world.resource_mut::<ViewLanes>().0 = true;
+        assert_eq!(kinds(&mut world), vec![(sketch, LaneKind::Sketch), (view, LaneKind::View)], "its view under it");
+    }
+
+    /// A lane with lanes under it folds like a comment thread: a click on
+    /// its triangle or on the line down its lanes hides them (and says how
+    /// many), the selection stays as it was; a click on the triangle again
+    /// brings them back.
+    #[test]
+    fn a_lane_folds_its_lanes_away_like_a_thread() {
+        let (mut world, sketch) = setup();
+        let (out, auto) = {
+            let mut store = world.resource_mut::<SignalStore>();
+            (store.create(tt_track::TRACK_CHANNELS), store.create(tt_track::TRACK_CHANNELS))
+        };
+        // A tracker guided by the sketch: its lane is under the sketch's.
+        world.spawn((
+            Name::new("Tracker 1"),
+            Operator { kind: "track".into() },
+            tt_core::op::Inputs(vec![("guide".into(), sketch)]),
+            Output(out),
+            tt_track::human::AutoOutput(auto),
+            tt_track::Tracker::at(200),
+            tt_track::runner::TrackBook::default(),
+        ));
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut world, Vec::new());
+        frame(&ctx, &mut world, Vec::new());
+        let controls = |w: &World| w.resource::<TimelineUi>().fold_controls.clone();
+        assert_eq!(controls(&world).len(), 2, "the sketch's triangle and the line down its lanes");
+        let click = |ctx: &egui::Context, world: &mut World, at: Pos2| {
+            frame(ctx, world, vec![Event::PointerMoved(at)]);
+            frame(ctx, world, vec![button(at, true)]);
+            frame(ctx, world, vec![button(at, false)]);
+            frame(ctx, world, Vec::new());
+        };
+        // The line (the taller of the two): folds.
+        let line = controls(&world).into_iter().max_by(|a, b| a.1.height().total_cmp(&b.1.height())).expect("the line").1;
+        click(&ctx, &mut world, line.center());
+        assert!(world.resource::<TimelineFolds>().0.contains(&sketch), "folded");
+        assert!(world.resource::<Selection>().entities.is_empty(), "a fold isn't a selection");
+        assert_eq!(controls(&world).len(), 1, "folded: no line, only its triangle");
+        // Where the tracker's lane was, there is nothing to select now.
+        let lanes = world.resource::<TimelineUi>().lanes_area.expect("lanes drawn");
+        click(&ctx, &mut world, Pos2::new(lanes.min.x + 0.4 * lanes.width(), lanes.min.y + 1.5 * LANE_H));
+        assert!(world.resource::<Selection>().entities.is_empty(), "its lanes are hidden");
+        // The triangle: unfolds.
+        let triangle = controls(&world)[0].1;
+        click(&ctx, &mut world, triangle.center());
+        assert!(!world.resource::<TimelineFolds>().0.contains(&sketch), "unfolded");
+        assert_eq!(controls(&world).len(), 2);
     }
 
     /// Dragging a manual dot's frames onto a tracker's lane merges it in:

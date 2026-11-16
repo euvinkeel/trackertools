@@ -124,19 +124,25 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         let span = tt_core::span::span_of(world, e);
         let screen = |f: FrameIndex, x: f32, y: f32| map.to_screen(space(f).from_source([x as f64, y as f64]));
         // A paint tracker's points: dots on this frame (its colour: in the cohort; faded red: they
-        // don't make it to the next paint), and with the setting, their paths.
+        // don't make it to the next paint; a grey cross: cut here), and with the setting, their paths.
         if let Some(points) = world.get::<tt_track::runner::PaintPoints>(e).filter(|_| method == Method::Paint) {
             let lost = style::LOST.gamma_multiply(0.75 * fade);
             if lit && world.resource::<crate::panels::viewport::PointerView>().paint_paths {
-                let mut paths: std::collections::BTreeMap<u32, Vec<(Pos2, bool)>> = Default::default();
+                let mut paths: std::collections::BTreeMap<tt_track::job::paint::DotId, Vec<(Pos2, bool, bool)>> = Default::default();
                 for (f, marks) in points.0.range(frame - reach..=frame + reach) {
                     for m in marks {
-                        paths.entry(m.id).or_default().push((screen(*f, m.at[0], m.at[1]), m.kept));
+                        paths.entry(m.id).or_default().push((screen(*f, m.at[0], m.at[1]), m.kept, m.cut));
                     }
                 }
                 for run in paths.values() {
                     for w in run.windows(2) {
-                        let c = if w[1].1 { found.gamma_multiply(0.45 * fade) } else { lost.gamma_multiply(0.6) };
+                        let c = if w[1].2 {
+                            style::MUTED.gamma_multiply(0.5 * fade)
+                        } else if w[1].1 {
+                            found.gamma_multiply(0.45 * fade)
+                        } else {
+                            lost.gamma_multiply(0.6)
+                        };
                         painter.line_segment([w[0].0, w[1].0], Stroke::new(1.0, c));
                     }
                 }
@@ -144,7 +150,11 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
             for m in points.0.get(&frame).into_iter().flatten() {
                 let p = screen(frame, m.at[0], m.at[1]);
                 let c = if m.kept { found.gamma_multiply(fade) } else { lost };
-                if m.seen {
+                if m.cut {
+                    let (r, s) = (if lit { 2.5 } else { 1.8 }, Stroke::new(1.2, style::MUTED.gamma_multiply(fade)));
+                    painter.line_segment([p - Vec2::splat(r), p + Vec2::splat(r)], s);
+                    painter.line_segment([p + Vec2::new(-r, r), p + Vec2::new(r, -r)], s);
+                } else if m.seen {
                     painter.circle_filled(p, if lit { 2.5 } else { 1.8 }, c);
                 } else {
                     painter.circle_stroke(p, if lit { 2.5 } else { 1.8 }, Stroke::new(1.0, c));
@@ -198,6 +208,10 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         }
         if let Some(k) = kind {
             line(&run, k);
+        }
+        // The selected tracker's: its edges by the shown frame's point glow (overlay::glow).
+        if lit {
+            super::overlay::glow(painter, frame, &|f| at(f).map(|(p, _)| p), found);
         }
 
         // Its looks or reset points: small marks along the path, in full on their own frame.
@@ -410,7 +424,10 @@ fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world
     // A paint tracker: the brush, and the stroke so far.
     let new_tracker = tool.drag.map_or(shift && cursor.is_none(), |d| d.2);
     if tt_track::tool::method_for(world, new_tracker).paints() {
+        // Alt: the brush erases (a red ring).
+        let alt = ui.input(|i| i.modifiers.alt);
         let colour = match pattern {
+            _ if alt => LOST,
             Some(p) => super::patterns::colour(p),
             None => TRACK,
         };
@@ -445,7 +462,19 @@ fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world
             hint(painter, map, text, super::patterns::colour(p), tool.refused.as_ref());
             return;
         }
-        let selected = world_ref.resource::<Selection>().primary().filter(|e| is_tracker(world_ref, *e)).filter(|e| world_ref.get::<Tracker>(*e).is_some_and(|t| t.method == Method::Paint));
+        let selected = tt_track::tool::paint_tracker(world_ref).filter(|e| world_ref.get::<Tracker>(*e).is_some_and(|t| t.method == Method::Paint));
+        // Its dots on a paint here: where each one is, before anything is tracked.
+        let frame = world_ref.resource::<tt_core::transport::Transport>().frame();
+        let paint_here = selected.and_then(|t| tt_track::look::looks_of(world_ref, t).into_iter().find(|l| world_ref.get::<Look>(*l).is_some_and(|k| k.frame == frame)));
+        if let (Some(t), Some(l)) = (selected, paint_here) {
+            let (n, strokes) = world_ref.get::<Tracker>(t).map_or((48, true), |p| (p.paint_dots as usize, p.dots_on_strokes));
+            let shown = tt_core::view::map_at(world_ref, world_ref.resource::<tt_core::view::ActiveView>().0, frame);
+            for d in world_ref.get::<Look>(l).map(|k| tt_track::job::paint::dots(&k.spec(true), n, strokes)).unwrap_or_default() {
+                let p = map.to_screen(shown.from_source(d));
+                painter.circle_filled(p, 3.0, Color32::from_black_alpha(170));
+                painter.circle_filled(p, 2.0, style::PIN);
+            }
+        }
         if world_ref.resource::<NewTrackers>().method == Method::Cursor && selected.is_none() {
             let text = "NEW CURSOR TRACKER \u{b7} brush loosely over the mouse cursor (pattern 1) \u{b7} Ctrl+wheel: brush size \u{b7} T/Esc exits".to_string();
             hint(painter, map, text, super::patterns::colour(0), tool.refused.as_ref());
@@ -454,11 +483,21 @@ fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world
         let text = match selected.filter(|_| !shift) {
             Some(e) => {
                 let name = world_ref.get::<Name>(e).map_or("the tracker".to_string(), |n| n.to_string());
-                format!("PAINT \u{b7} brush over {name}'s subject on this frame: a reset paint (points not on it are left out from here) \u{b7} Ctrl+wheel: brush size \u{b7} Shift: a new tracker \u{b7} T/Esc exits")
+                match (alt, paint_here) {
+                    (true, Some(_)) => format!("ERASE \u{b7} brush over {name}'s paint on this frame: takes out what you brush (its area and its dots) \u{b7} let go of Alt to paint"),
+                    (true, None) => {
+                        let next = tt_track::look::looks_of(world_ref, e).iter().filter_map(|l| world_ref.get::<Look>(*l)).map(|l| l.frame).filter(|g| *g > frame).min();
+                        let until = next.map_or("the end".to_string(), |g| format!("its next paint (frame {g})"));
+                        format!("CUT DOTS \u{b7} brush over {name}'s dots: they stop counting from here to {until} (a grey cross) \u{b7} Ctrl+Z brings them back")
+                    }
+                    (false, _) => format!(
+                        "PAINT \u{b7} brush over {name}'s subject on this frame: a reset paint (dots not on it are left out from here) \u{b7} hold Alt: erase on a paint, cut dots between paints \u{b7} Ctrl+wheel: brush size \u{b7} Shift: a new tracker \u{b7} T/Esc exits"
+                    ),
+                }
             }
-            None => "NEW PAINT TRACKER \u{b7} hold and brush over what to follow \u{b7} Ctrl+wheel: brush size \u{b7} T/Esc exits".to_string(),
+            None => "NEW PAINT TRACKER \u{b7} hold and brush over what to follow (a dot every brush radius along your stroke) \u{b7} Alt+brush: erase \u{b7} Ctrl+wheel: brush size \u{b7} T/Esc exits".to_string(),
         };
-        hint(painter, map, text, TRACK, tool.refused.as_ref());
+        hint(painter, map, text, if alt { LOST } else { TRACK }, tool.refused.as_ref());
         return;
     }
     let dashed_rect = |r: Rect, c: Color32| {
@@ -498,7 +537,7 @@ fn track_tool(ui: &egui::Ui, painter: &Painter, response: &egui::Response, world
             format!("TRACK \u{b7} {name} waits: Back, Both or Forward in the Inspector tracks it \u{b7} drag where it missed: a new look \u{b7} Shift+drag: a new tracker \u{b7} T/Esc exits")
         }
         (Some(_), _, _) => format!("TRACK \u{b7} drag around the subject where {name} missed it: a new look, pinned here \u{b7} Shift+drag: a new tracker \u{b7} T/Esc exits"),
-        _ if point => format!("NEW {kind} \u{b7} click the pixel to follow (inside a sketch it searches there; elsewhere the whole frame) \u{b7} T/Esc exits"),
+        _ if point => format!("NEW {kind} \u{b7} click the pixel to follow (on the whole video; select a sketch first to track inside it) \u{b7} T/Esc exits"),
         _ => format!("NEW {kind} \u{b7} drag around what to follow (its pattern) \u{b7} click: a point, the dashed box's size (Ctrl+wheel) \u{b7} T/Esc exits"),
     };
     hint(painter, map, text, TRACK, tool.refused.as_ref());
@@ -585,15 +624,10 @@ fn setting_slider(ui: &mut egui::Ui, world: &mut World, e: Entity, value: f32, s
     ui.spacing_mut().slider_width = (ui.available_width() - 64.0).clamp(40.0, 160.0);
     let r = ui.add(slider(&mut v)).on_hover_text(tip);
     let label = format!("Edit {what}");
-    if r.drag_started() {
-        world.resource_mut::<tt_core::history::History>().begin(label.clone());
-    }
-    if r.changed() {
-        tt_core::history::edit(world, &label, |tx| tx.modify::<Tracker>(e, |t| set(t, v)));
-    }
-    if r.drag_stopped() {
-        world.resource_mut::<tt_core::history::History>().end();
-    }
+    let drag = tt_core::history::WidgetDrag { started: r.drag_started(), dragging: r.dragged(), changed: r.changed(), stopped: r.drag_stopped() };
+    tt_core::history::widget_edit(world, &label, drag, |w| {
+        tt_core::history::edit(w, &label, |tx| tx.modify::<Tracker>(e, |t| set(t, v)));
+    });
 }
 
 /// A cursor tracker's result on frame `f`: its score, and which pattern it
@@ -972,6 +1006,47 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
     }
     // Its looks (select one to paint its mask), or a CoTracker's reset points.
     let looks = if method == Method::Cursor { Vec::new() } else { looks_of(world, e) };
+    // A paint tracker: how many dots (CoTracker points) a paint gives.
+    if method == Method::Paint {
+        ui.horizontal(|ui| {
+            ui.label("Dots per paint");
+            let n = world.get::<Tracker>(e).map_or(48, |t| t.paint_dots) as f32;
+            setting_slider(
+                ui,
+                world,
+                e,
+                n,
+                |v| egui::Slider::new(v, 4.0..=256.0).logarithmic(true).step_by(1.0),
+                [
+                    "dots per paint",
+                    "The most CoTracker points one paint gives, spread evenly over what you painted. More hold on better when part of the subject is hidden; fewer track a little faster. Changing it tracks again.",
+                ],
+                |t, v| t.paint_dots = v.round() as u32,
+            );
+        });
+        // Where its dots come from, and the dots cut for a stretch.
+        let strokes = world.get::<Tracker>(e).is_some_and(|t| t.dots_on_strokes);
+        let mut pick = strokes;
+        ui.horizontal(|ui| {
+            ui.label("Dots");
+            ui.radio_value(&mut pick, true, "along your strokes").on_hover_text("A dot every brush radius along each stroke you paint: exactly where you brushed (shown on the paint's frame)");
+            ui.radio_value(&mut pick, false, "spread over the paint").on_hover_text("Spread evenly over everything painted");
+        });
+        if pick != strokes {
+            tt_core::history::edit(world, "Dots of a paint", |tx| tx.modify::<Tracker>(e, |t| t.dots_on_strokes = pick));
+        }
+        let cut = world.get::<tt_track::DotCuts>(e).map_or(0, |c| c.0.len());
+        if cut > 0 {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{cut} dot cut{} (grey crosses): left out from where they were cut to the next paint", if cut == 1 { "" } else { "s" })).color(style::MUTED).small());
+                if ui.small_button("Clear cuts").on_hover_text("They count again everywhere (it tracks again where they were cut)").clicked() {
+                    tt_core::history::edit(world, "Clear cut dots", |tx| tx.remove::<tt_track::DotCuts>(e));
+                }
+            });
+        } else {
+            ui.label(egui::RichText::new("Alt+brush between paints cuts the dots you brush over, from there to the next paint.").color(style::MUTED).small());
+        }
+    }
     let mut remove = None;
     let here = world.resource::<Transport>().frame();
     ui.horizontal_wrapped(|ui| {
@@ -1037,29 +1112,7 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         if ui.button("Re-seed here").on_hover_text(reseed_tip).clicked() {
             world.resource_mut::<PendingActions>().push(Action::Track);
         }
-        // Switched off from here on (or on again): subjects and exports use the others there.
-        let here = world.resource::<Transport>().frame();
-        let off = tt_track::off::is_off(world, e, here);
-        let chord = |a: Action| world.resource::<tt_core::input::Keymap>().chord_for(a).map(|c| format!(" ({c})")).unwrap_or_default();
-        let (text, tip) = if off {
-            ("Switch on from here", "It counts again from this frame on (in subjects and exports).")
-        } else {
-            ("Switch off from here", "From this frame on it doesn't count: subjects and exports go on with the others, as where it is lost. Its results stay. Switch it on again where it is good.")
-        };
-        let key = chord(Action::SwitchTracker);
-        if ui.button(text).on_hover_text(format!("{tip}{key}")).clicked() {
-            tt_track::off::switch_from(world, &[e], here, !off);
-        }
-        if let Some(o) = world.get::<tt_track::off::TrackerOff>(e).filter(|o| o.any_off()) {
-            let stretches = o.off_ranges(FrameIndex::MIN, FrameIndex::MAX);
-            let words: Vec<String> = stretches.iter().map(|r| match (r.start == FrameIndex::MIN, r.end == FrameIndex::MAX) {
-                (true, true) => "everywhere".to_string(),
-                (true, false) => format!("before {}", r.end),
-                (false, true) => format!("from {}", r.start),
-                (false, false) => format!("{}\u{2013}{}", r.start, r.end - 1),
-            }).collect();
-            ui.label(egui::RichText::new(format!("off: {}", words.join(", "))).color(style::MUTED).small());
-        }
+        off_row(ui, world, e);
     });
     for (s, forward) in [(status.forward, true), (status.backward, false)] {
         let Some(s) = s else { continue };
@@ -1069,4 +1122,33 @@ fn tracker_section(ui: &mut egui::Ui, world: &mut World, e: Entity) {
         ui.add(egui::ProgressBar::new(done.clamp(0.0, 1.0)).text(side_line(&s, forward, Some(method))));
     }
     let _ = name;
+}
+
+/// Switching a tracker or a sketch off from the playhead on (or on again),
+/// and where it is off now (`tt_core::off`): its row in the Inspector.
+pub fn off_row(ui: &mut egui::Ui, world: &mut World, e: Entity) {
+    let here = world.resource::<Transport>().frame();
+    let off = tt_core::off::is_off(world, e, here);
+    let chord = world.resource::<tt_core::input::Keymap>().chord_for(Action::SwitchTracker).map(|c| format!(" ({c})")).unwrap_or_default();
+    let (text, tip) = if off {
+        ("Switch on from here", "It counts again from this frame on (in subjects and exports).")
+    } else {
+        ("Switch off from here", "From this frame on it doesn't count: subjects and exports go on with the others. Nothing is deleted. Switch it on again where it is good.")
+    };
+    if ui.button(text).on_hover_text(format!("{tip}{chord}")).clicked() {
+        tt_core::off::switch_from(world, &[e], here, !off);
+    }
+    if let Some(o) = world.get::<tt_core::off::Off>(e).filter(|o| o.any_off()) {
+        let words: Vec<String> = o
+            .off_ranges(FrameIndex::MIN, FrameIndex::MAX)
+            .iter()
+            .map(|r| match (r.start == FrameIndex::MIN, r.end == FrameIndex::MAX) {
+                (true, true) => "everywhere".to_string(),
+                (true, false) => format!("before {}", r.end),
+                (false, true) => format!("from {}", r.start),
+                (false, false) => format!("{}\u{2013}{}", r.start, r.end - 1),
+            })
+            .collect();
+        ui.label(egui::RichText::new(format!("off: {}", words.join(", "))).color(style::MUTED).small());
+    }
 }

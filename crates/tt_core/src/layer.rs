@@ -39,7 +39,7 @@ use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
 
 use crate::app::{AppBuilder, Module, Set};
-use crate::history::{History, edit};
+use crate::history::{Gesture, History, edit};
 use crate::meta::Class;
 use crate::op::{EvalCtx, Footprint, Inputs, Operator, OperatorKind, Output};
 use crate::selection::Selection;
@@ -481,25 +481,6 @@ pub fn handle_at(world: &World, e: Entity, f: FrameIndex, src: [f64; 2], grab: f
 pub const HANDLE_REACH: f64 = 8.0;
 pub const POINT_REACH: f64 = 12.0;
 
-/// Which layer a Select-tool press at `src` (source px) on frame `f` takes,
-/// and by what, if any: the selected layer when the press is on it or its
-/// handles; none when the selected subject's point is under it (the
-/// subject's drag takes it); else the top layer under it. `px`: source
-/// pixels per screen point (the reaches are in points). The subject's drag
-/// asks the same question, so one press never moves both.
-pub fn press_on_layer(world: &mut World, f: FrameIndex, src: [f64; 2], px: f64) -> Option<(Entity, Handle)> {
-    if let Some(p) = world.resource::<Selection>().primary() {
-        if is_layer(world, p) {
-            if let Some(h) = handle_at(world, p, f, src, HANDLE_REACH * px) {
-                return Some((p, h));
-            }
-        } else if crate::subject::pick_subject(world, f, src, POINT_REACH * px) == Some(p) {
-            return None;
-        }
-    }
-    pick_layer(world, f, src).map(|e| (e, Handle::Body))
-}
-
 /// Attach a new layer showing `params.media` to `target`, as one undo step;
 /// it is selected. Its scale starts so the picture is about as tall as the
 /// target's box on `frame` (or its own size when the box isn't known).
@@ -685,7 +666,8 @@ struct Grab {
     placed: Placed,
     /// The target's own turn then (the offset is in its turned frame).
     turn: f64,
-    moved: bool,
+    /// Once it moved: its undo step, open until the release.
+    gesture: Option<Gesture>,
 }
 
 #[derive(Resource, Debug, Default)]
@@ -696,8 +678,8 @@ struct LayerDrag(Option<Grab>);
 /// move is a click, which selects it (tool.rs).
 fn drag_layer(world: &mut World) {
     if world.resource::<ActiveTool>().0 != Tool::Select {
-        if world.resource_mut::<LayerDrag>().0.take().is_some_and(|d| d.moved) {
-            world.resource_mut::<History>().end();
+        if let Some(g) = world.resource_mut::<LayerDrag>().0.take().and_then(|d| d.gesture) {
+            world.resource_mut::<History>().end(g);
         }
         return;
     }
@@ -706,12 +688,13 @@ fn drag_layer(world: &mut World) {
     let map = map_at(world, world.resource::<ActiveView>().0, frame);
     let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
     let alt = world.get_resource::<crate::input::KeysHeld>().is_some_and(|k| k.mods.alt);
+    // A press `tool::route_press` gave a layer.
     if let Some(t) = p.pressed
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
+        && let Some(crate::tool::PressOn::Layer(e, handle)) = world.resource::<crate::tool::Press>().0
     {
         let src = map.to_source(at);
-        if let Some((e, handle)) = press_on_layer(world, frame, src, map.a / scale)
-            && let (Some(q), Some(pl)) = (world.get::<LayerParams>(e).cloned(), placed_at(world, e, frame))
+        if let (Some(q), Some(pl)) = (world.get::<LayerParams>(e).cloned(), placed_at(world, e, frame))
         {
             let selected = world.resource::<Selection>().primary() == Some(e);
             let doing = match handle {
@@ -730,11 +713,16 @@ fn drag_layer(world: &mut World) {
                 rotation: q.rotation.at(frame),
                 placed: pl,
                 turn: pl.angle - (q.rotation.at(frame) as f64).to_radians(),
-                moved: false,
+                gesture: None,
             });
         }
     }
     let Some(g) = world.resource::<LayerDrag>().0 else { return };
+    // Undone or cancelled (Esc) while it goes on: it stops there.
+    if g.gesture.is_some_and(|id| !world.resource::<History>().is_open(id)) {
+        world.resource_mut::<LayerDrag>().0 = None;
+        return;
+    }
     let e = g.layer;
     // While it's held, the views hold still (a view following the layer's target needn't move, but one nested in it might).
     crate::view::HoldViews::ask(world, Some(g.placed.at));
@@ -743,8 +731,8 @@ fn drag_layer(world: &mut World) {
         let src = map.to_source(now);
         let (dx, dy) = (src[0] - g.from[0], src[1] - g.from[1]);
         let far = dx.hypot(dy) * scale / map.a.max(1e-9) >= CLICK_MOVE;
-        if g.moved || far {
-            if !g.moved {
+        if g.gesture.is_some() || far {
+            if g.gesture.is_none() {
                 let name = world.get::<Name>(e).map_or("layer".to_string(), |n| n.to_string());
                 let what = match g.doing {
                     Doing::Move => "Move",
@@ -752,9 +740,9 @@ fn drag_layer(world: &mut World) {
                     Doing::Rotate(..) => "Turn",
                     Doing::Anchor => "Move the anchor of",
                 };
-                world.resource_mut::<History>().begin(format!("{what} {name}"));
+                let gesture = world.resource_mut::<History>().begin(format!("{what} {name}"));
                 world.resource_mut::<Selection>().select_only(e);
-                world.resource_mut::<LayerDrag>().0 = Some(Grab { moved: true, ..g });
+                world.resource_mut::<LayerDrag>().0 = Some(Grab { gesture: Some(gesture), ..g });
             }
             // A move in source px, in the target's own turned frame (the offset's).
             let local = |dx: f64, dy: f64| {
@@ -775,33 +763,36 @@ fn drag_layer(world: &mut World) {
                 }
             }
             let size = world.get::<LayerParams>(e).map_or([1.0, 1.0], |q| q.media_size);
-            set_params(world, e, "Edit", |q| match doing {
-                Doing::Move => {
-                    let [lx, ly] = local(dx, dy);
-                    q.offset_x.set(f, g.offset[0] + lx as f32, key);
-                    q.offset_y.set(f, g.offset[1] + ly as f32, key);
-                }
-                Doing::Scale(d0) => {
-                    let d = (src[0] - g.placed.at[0]).hypot(src[1] - g.placed.at[1]);
-                    q.scale.set(f, (g.scale as f64 * d / d0).max(1e-4) as f32, key);
-                }
-                Doing::Rotate(_, total) => {
-                    q.rotation.set(f, g.rotation + total.to_degrees() as f32, key);
-                }
-                Doing::Anchor => {
-                    // The picture's point under the pointer (as it was) becomes the anchor; it stays put.
-                    let m = g.placed.from_source(size, src);
-                    q.anchor_x.set(f, (m[0] / size[0].max(1e-6) as f64) as f32, key);
-                    q.anchor_y.set(f, (m[1] / size[1].max(1e-6) as f64) as f32, key);
-                    let [lx, ly] = local(src[0] - g.placed.at[0], src[1] - g.placed.at[1]);
-                    q.offset_x.set(f, g.offset[0] + lx as f32, key);
-                    q.offset_y.set(f, g.offset[1] + ly as f32, key);
-                }
+            let gesture = world.resource::<LayerDrag>().0.and_then(|d| d.gesture).expect("began above");
+            crate::history::owning(world, gesture, |world| {
+                set_params(world, e, "Edit", |q| match doing {
+                    Doing::Move => {
+                        let [lx, ly] = local(dx, dy);
+                        q.offset_x.set(f, g.offset[0] + lx as f32, key);
+                        q.offset_y.set(f, g.offset[1] + ly as f32, key);
+                    }
+                    Doing::Scale(d0) => {
+                        let d = (src[0] - g.placed.at[0]).hypot(src[1] - g.placed.at[1]);
+                        q.scale.set(f, (g.scale as f64 * d / d0).max(1e-4) as f32, key);
+                    }
+                    Doing::Rotate(_, total) => {
+                        q.rotation.set(f, g.rotation + total.to_degrees() as f32, key);
+                    }
+                    Doing::Anchor => {
+                        // The picture's point under the pointer (as it was) becomes the anchor; it stays put.
+                        let m = g.placed.from_source(size, src);
+                        q.anchor_x.set(f, (m[0] / size[0].max(1e-6) as f64) as f32, key);
+                        q.anchor_y.set(f, (m[1] / size[1].max(1e-6) as f64) as f32, key);
+                        let [lx, ly] = local(src[0] - g.placed.at[0], src[1] - g.placed.at[1]);
+                        q.offset_x.set(f, g.offset[0] + lx as f32, key);
+                        q.offset_y.set(f, g.offset[1] + ly as f32, key);
+                    }
+                })
             });
         }
     }
-    if ended && world.resource_mut::<LayerDrag>().0.take().is_some_and(|d| d.moved) {
-        world.resource_mut::<History>().end();
+    if ended && let Some(g) = world.resource_mut::<LayerDrag>().0.take().and_then(|d| d.gesture) {
+        world.resource_mut::<History>().end(g);
     }
 }
 

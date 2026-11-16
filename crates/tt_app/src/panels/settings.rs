@@ -627,8 +627,8 @@ fn describe(action: Action) -> &'static str {
         SelectAll => "Select all sketches",
         Rename => "Rename the selection",
         Track => "Track the selected sketch from here (on a tracker: re-seed it here)",
-        SwitchTracker => "Switch the selected trackers off from here (or on again): where off, subjects and exports use the others",
-        SwitchTrackerEverywhere => "Switch the selected trackers off everywhere (or on everywhere)",
+        SwitchTracker => "Switch the selected trackers and sketches off from here (or on again): where off, subjects and exports use the others",
+        SwitchTrackerEverywhere => "Switch the selected trackers and sketches off everywhere (or on everywhere)",
         ToggleSnap => "Snap the playhead to the start and end of things on the timeline while scrubbing (Ctrl inverts)",
         MarkIn => "Mark the in point here: the first frame an export renders",
         MarkOut => "Mark the out point here: the last frame an export renders",
@@ -636,5 +636,6 @@ fn describe(action: Action) -> &'static str {
         GoToIn => "Go to the in point",
         GoToOut => "Go to the out point",
         Pattern(_) => "Cursor tracker: the pattern the brush teaches (Shift+brush: a new one)",
+        PaintTool => "Paint tool on/off: brush over what to follow (a paint tracker, CoTracker on many points)",
     }
 }

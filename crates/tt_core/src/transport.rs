@@ -66,8 +66,18 @@ impl Transport {
 
     /// Jump to a frame (clamped). Pauses, like every explicit seek.
     pub fn seek(&mut self, f: FrameIndex) {
-        self.playing = false;
+        self.stop();
         self.playhead = f.clamp(0, self.last_frame()) as f64;
+    }
+
+    /// Pause. Every stop goes through here: the shuttle ends, and the rate
+    /// set before it and forward come back.
+    pub fn stop(&mut self) {
+        self.playing = false;
+        self.reverse = false;
+        if let Some(r) = self.shuttle.take() {
+            self.rate = r;
+        }
     }
 
     pub fn step(&mut self, delta: FrameIndex) {
@@ -79,10 +89,14 @@ impl Transport {
         if !self.has_media() {
             return;
         }
-        if !self.playing && self.frame() >= self.last_frame() {
+        if self.playing {
+            self.stop();
+            return;
+        }
+        if self.frame() >= self.last_frame() {
             self.playhead = 0.0; // replay from the start
         }
-        self.playing = !self.playing;
+        self.playing = true;
     }
 
     /// Shuttle forward (L) or backward (J): see the module docs.
@@ -103,16 +117,6 @@ impl Transport {
         }
         self.reverse = !forward;
         self.playing = true;
-    }
-
-    /// Stopped: the shuttle ends; the rate set before it and forward come back.
-    fn settle(&mut self) {
-        if !self.playing {
-            self.reverse = false;
-            if let Some(r) = self.shuttle.take() {
-                self.rate = r;
-            }
-        }
     }
 
     /// The next rate in [`RATES`] up or down from the current one (which auto
@@ -139,8 +143,7 @@ impl Transport {
                 self.playhead = self.playhead.rem_euclid(end);
             } else {
                 self.playhead = if self.reverse { 0.0 } else { self.last_frame() as f64 };
-                self.playing = false;
-                self.settle();
+                self.stop();
             }
         }
     }
@@ -179,7 +182,6 @@ fn apply_transport_actions(mut actions: ResMut<PendingActions>, mut t: ResMut<Tr
             ShuttleBackward => t.shuttle(false),
             _ => {}
         }
-        t.settle();
     }
 }
 
@@ -288,6 +290,24 @@ mod tests {
         // L while plain playback runs speeds it up (from at least 1×).
         assert_eq!(press(Action::ShuttleForward), (true, false, 1.0));
         assert_eq!(press(Action::StepForward), (false, false, 0.25), "a step pauses, which ends the shuttle too");
+    }
+
+    /// Every stop ends the shuttle, also a seek made directly (Shift+I goes to
+    /// the in point that way): it used to stay backward at the shuttle's speed,
+    /// so the next play ran backward at 4×.
+    #[test]
+    fn a_direct_seek_ends_the_shuttle() {
+        let mut t = transport(600);
+        t.rate = 0.25;
+        t.seek(300);
+        for _ in 0..3 {
+            t.shuttle(false);
+        }
+        assert_eq!((t.playing, t.reverse, t.rate), (true, true, 4.0));
+        t.seek(100);
+        assert_eq!((t.playing, t.reverse, t.rate, t.shuttle), (false, false, 0.25, None));
+        t.toggle_play();
+        assert_eq!((t.playing, t.reverse, t.rate), (true, false, 0.25), "plays forward at your rate");
     }
 
     #[test]

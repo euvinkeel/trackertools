@@ -301,8 +301,16 @@ impl eframe::App for Shell {
             && self.core.world.get_resource::<tt_track::runner::Footage>().is_some()
         {
             ctx.request_repaint();
-            if scene.drive(&mut self.core.world) {
+            save_screenshots(ctx);
+            let done = scene.drive(&mut self.core.world);
+            if let Some(name) = scene.shot.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(name)));
+            }
+            if done {
                 self.scene = None;
+                if std::env::var_os("TT_SCENE_SHOT").is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
 

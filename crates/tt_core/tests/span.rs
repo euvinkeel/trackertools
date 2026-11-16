@@ -9,7 +9,7 @@ use tt_core::input::Action;
 use tt_core::op::Output;
 use tt_core::persist::{load, save};
 use tt_core::signal::{Signal, SignalStore};
-use tt_core::span::{Edge, Span, begin_drag, end_drag, live_span, move_edge, natural_span, output, set_span, span_of};
+use tt_core::span::{Edge, Span, begin_drag, drag, end_drag, live_span, move_edge, natural_span, output, set_span, span_of};
 use tt_core::view::{ensure_view, map_at};
 
 mod common;
@@ -86,7 +86,7 @@ fn a_drag_is_one_undo_step() {
     let steps = d.core.world.resource::<History>().undo_label().map(str::to_string);
     begin_drag(&mut d.core.world, sketch);
     for f in (hi - 40..hi).rev() {
-        move_edge(&mut d.core.world, sketch, Edge::Last, f);
+        drag(&mut d.core.world, sketch, Edge::Last, f);
         d.frame(still(0.0, 0.0), UP);
     }
     end_drag(&mut d.core.world);

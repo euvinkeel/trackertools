@@ -99,7 +99,7 @@ fn open_dialog(mut actions: ResMut<PendingActions>, mut request: ResMut<OpenRequ
     }
     // A native dialog blocks this frame until it closes, as expected.
     if let Some(path) =
-        rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "m4v"]).add_filter("All files", &["*"]).pick_file()
+        rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "m4v", "mkv"]).add_filter("All files", &["*"]).pick_file()
     {
         request.0 = Some(path);
     }
@@ -140,8 +140,8 @@ fn open_requested(world: &mut World) {
         let mut tr = world.resource_mut::<Transport>();
         tr.fps = index.fps;
         tr.frame_count = index.frame_count();
-        tr.playhead = 0.0;
-        tr.playing = false;
+        // (A shuttle running on the last video ends: its rate and direction don't carry over.)
+        tr.seek(0);
     }
 
     let proxy = if median_gop <= PROXY_WHEN_GOP_OVER {

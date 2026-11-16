@@ -97,7 +97,7 @@ fn project_menu(ui: &mut egui::Ui, world: &World, video: &std::path::Path) -> Op
     }
     let name = current.as_deref().map_or_else(|| "none".to_string(), |p| project_name(video, p));
     let mut action = None;
-    ui.menu_button(format!("Project: {name} \u{23f7}"), |ui| {
+    let button = ui.menu_button(format!("Project: {} \u{23f7}", shortened(&name, 24)), |ui| {
         ui.label(egui::RichText::new("This video's projects").color(style::MUTED).small());
         for p in &list {
             let open = current.as_deref() == Some(p.as_path());
@@ -132,7 +132,21 @@ fn project_menu(ui: &mut egui::Ui, world: &World, video: &std::path::Path) -> Op
             ui.close();
         }
     });
+    button.response.on_hover_text(current.as_deref().map_or(name, |p| p.display().to_string()));
     action
+}
+
+/// `text` cut to at most `max` characters, the middle replaced by "…" (a
+/// file's name keeps its start and its extension), so a long name can't push
+/// the top bar's buttons off the window.
+fn shortened(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let tail = (max - 1) / 3;
+    let head = max - 1 - tail;
+    format!("{}\u{2026}{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
 }
 
 fn run_project_action(world: &mut World, action: ProjectAction) {
@@ -190,6 +204,7 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     let mut report_problem = false;
     let mut open_doctor = false;
     let mut project_action = None;
+    let mut export = None;
     let tracking = tracks::summary(world);
     let kind = world.resource::<tt_track::NewTrackers>().method;
     let cotracker = tt_track::job::cotracker_availability();
@@ -213,8 +228,22 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
         match world.get_resource::<Media>() {
             Some(m) => {
                 let i = m.index();
-                ui.label(egui::RichText::new(&m.name).strong());
+                ui.label(egui::RichText::new(shortened(&m.name, 32)).strong()).on_hover_text(i.path.display().to_string());
                 project_action = project_menu(ui, world, &i.path);
+                ui.menu_button("Export \u{23f7}", |ui| {
+                    use layer_export::What;
+                    for (what, text, tip) in [
+                        (What::Over, "Video as you see it\u{2026}", "The whole video at its own size (no zoom or pan), with the pictures, GIFs and clips you attached on top, and its sound"),
+                        (What::Alpha, "Only what you added, on transparency\u{2026}", "The pictures, GIFs and clips you attached, alone on a transparent background: an overlay for your editor"),
+                        (What::Json, "Motion data (JSON)\u{2026}", "Every layer and what it follows, frame by frame"),
+                    ] {
+                        if ui.button(text).on_hover_text(tip).clicked() {
+                            export = Some(what);
+                            ui.close();
+                        }
+                    }
+                    ui.label(egui::RichText::new("A stabilized video or a tracking target: right-click a tracker, sketch or subject").color(style::MUTED).small());
+                });
                 // (Short: the top bar holds the tools too. The codec and the exact rate on hover.)
                 ui.label(egui::RichText::new(format!("{}×{} \u{b7} {:.2} fps", i.width, i.height, i.fps.as_f64())).color(style::MUTED))
                     .on_hover_text(format!("{} \u{b7} {} frames @ {:.3} fps", i.codec, i.frame_count(), i.fps.as_f64()));
@@ -313,12 +342,13 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 open_doctor |= r.on_hover_text(format!("{why} Click {}. The doctor shows what it needs and sets it up.", text.trim_start_matches("⌖ "))).clicked();
                 continue;
             }
+            let chord = if method == tt_track::Method::Paint { world.resource::<tt_core::input::Keymap>().chord_for(Action::PaintTool).unwrap_or_default() } else { track_chord.clone() };
             let r = r
                 .on_hover_text(format!(
-                    "Track tool ({track_chord}) making a {}: {what}\n\
+                    "Track tool ({chord}) making a {}: {what}\n\
                      \u{2022} template tracker: drag a rectangle around what to follow (its pattern, a look), or click a point (the dashed box's size; Ctrl+wheel sizes it)\n\
                      \u{2022} CoTracker: click the pixel to follow (a reset point)\n\
-                     \u{2022} inside a sketch's box it searches there; elsewhere, the whole frame\n\
+                     \u{2022} with a sketch selected, it searches inside that sketch's box; with none selected, the whole video\n\
                      \u{2022} a new tracker waits: Back, Both or Forward in the Inspector (or its right-click menu) tracks it; Pause stops it\n\
                      \u{2022} with a tracker selected: where it missed, another look (a CoTracker: a reset point); Shift: a new tracker\n\
                      \u{2022} select a look (Outliner, Inspector) to paint which of its pixels are the subject",
@@ -326,10 +356,6 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
                 ));
             if r.clicked() {
                 track_kind = Some(method);
-                // The other kind while the tool is on: switch kinds, keep the tool.
-                if !tracking_tool || kind == method {
-                    history_action = Some(Action::Tool(Tool::Track));
-                }
             }
         }
         let drawing = world.resource::<ActiveTool>().0 == Tool::Draw;
@@ -380,6 +406,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     if let Some(a) = project_action {
         run_project_action(world, a);
     }
+    if let Some(what) = export {
+        layer_export::open(world, what);
+    }
     if report_problem {
         let mut doctor = world.resource_mut::<crate::setup::Doctor>();
         (doctor.open, doctor.last_run_failed) = (true, false);
@@ -388,8 +417,9 @@ fn top_bar(ui: &mut egui::Ui, world: &mut World) {
     if open_doctor {
         world.resource_mut::<crate::setup::Doctor>().show();
     }
+    // (The other kind while the tool is on: switch kinds, keep the tool.)
     if let Some(method) = track_kind {
-        world.resource_mut::<tt_track::NewTrackers>().method = method;
+        tt_track::toggle_track_kind(world, method);
     }
     if let Some(a) = history_action {
         world.resource_mut::<PendingActions>().push(a);
@@ -435,5 +465,17 @@ impl egui_tiles::Behavior<Pane> for Behavior<'_> {
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
         egui_tiles::SimplificationOptions { all_panes_must_have_tabs: true, ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn long_names_are_cut_in_the_middle() {
+        assert_eq!(super::shortened("clip.mp4", 32), "clip.mp4");
+        let long = "2026-11-14 gameplay recording, the long take with the boss fight.mp4";
+        let short = super::shortened(long, 32);
+        assert_eq!(short.chars().count(), 32);
+        assert!(short.starts_with("2026-11-14 gameplay") && short.ends_with("fight.mp4") && short.contains('\u{2026}'), "{short}");
     }
 }

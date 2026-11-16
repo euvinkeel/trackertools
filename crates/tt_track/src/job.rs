@@ -65,6 +65,8 @@ pub struct LookSpec {
     pub mask: Option<Vec<u8>>,
     /// A cursor tracker's paint: the pattern it teaches.
     pub pattern: u32,
+    /// A paint's dots along its strokes (source px; `paint::dots`).
+    pub dots: Vec<[f64; 2]>,
 }
 
 /// The look on frame `f` that counts there (a painted one first), if any.
@@ -180,6 +182,12 @@ pub struct JobSpec {
     pub icon_sizes: Vec<(String, f64)>,
     /// A Jev tracker's own settings.
     pub jev: crate::JevSettings,
+    /// A paint tracker: the most points one paint gives.
+    pub paint_dots: usize,
+    /// A paint tracker: its paints' dots along their strokes (else spread over them).
+    pub dots_on_strokes: bool,
+    /// A paint tracker: dots left out of the fit on some frames.
+    pub cuts: Arc<Vec<paint::DotCut>>,
 }
 
 /// What a job is doing.
@@ -274,12 +282,14 @@ pub enum Msg {
 /// One of a paint tracker's points on a frame (`paint::Mark`, in source px).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointMark {
-    pub id: u32,
+    pub id: paint::DotId,
     pub at: [f32; 2],
     /// The model saw it there.
     pub seen: bool,
     /// It makes it to the next paint (in the cohort).
     pub kept: bool,
+    /// Cut here: in no fit (`paint::DotCut`).
+    pub cut: bool,
 }
 
 /// Counted in each of its counters until the thread exits (cancelled jobs

@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use bevy_ecs::prelude::*;
 use bevy_reflect::Reflect;
-use tt_core::history::{History, edit, redo, undo};
+use tt_core::history::{History, cancel, edit, owning, redo, undo};
 use tt_core::op::{EvalBudget, EvalCtx, Footprint, OperatorKind, Output, spawn_op};
 use tt_core::signal::{Signal, SignalStore};
 use tt_core::time::FrameIndex;
@@ -182,15 +182,83 @@ fn reflected_edits_are_undoable_and_recompute() {
 fn gesture_is_one_undo_step() {
     let mut c = core();
     let e = c.world.spawn(Val(0)).id();
-    c.world.resource_mut::<History>().begin("drag");
+    let g = c.world.resource_mut::<History>().begin("drag");
     for i in 1..=30 {
-        edit(&mut c.world, "move", |tx| tx.modify::<Val>(e, |v| v.0 = i));
+        owning(&mut c.world, g, |w| edit(w, "move", |tx| tx.modify::<Val>(e, |v| v.0 = i)));
     }
-    c.world.resource_mut::<History>().end();
+    c.world.resource_mut::<History>().end(g);
     assert_eq!(c.world.resource::<History>().undo_label(), Some("drag"));
     undo(&mut c.world);
     assert_eq!(c.world.get::<Val>(e), Some(&Val(0)));
     assert!(!c.world.resource::<History>().can_undo());
+}
+
+/// Someone else's edit during a gesture (a key pressed mid-drag) is its own
+/// step: the gesture so far, the edit, then the rest of the gesture.
+#[test]
+fn an_edit_from_elsewhere_splits_a_gesture() {
+    let mut c = core();
+    let (e, other) = (c.world.spawn(Val(0)).id(), c.world.spawn(Val(0)).id());
+    let g = c.world.resource_mut::<History>().begin("drag");
+    owning(&mut c.world, g, |w| edit(w, "move", |tx| tx.modify::<Val>(e, |v| v.0 = 1)));
+    edit(&mut c.world, "key", |tx| tx.modify::<Val>(other, |v| v.0 = 7));
+    assert!(c.world.resource::<History>().is_open(g), "the gesture goes on");
+    owning(&mut c.world, g, |w| edit(w, "move", |tx| tx.modify::<Val>(e, |v| v.0 = 2)));
+    c.world.resource_mut::<History>().end(g);
+    let labels: Vec<String> = std::iter::from_fn(|| undo(&mut c.world)).collect();
+    assert_eq!(labels, ["drag", "key", "drag"]);
+    assert_eq!((c.world.get::<Val>(e), c.world.get::<Val>(other)), (Some(&Val(0)), Some(&Val(0))));
+}
+
+/// Esc during a gesture: it never happened, and there is nothing to redo.
+/// Undo during one ends it, and its owner can tell.
+#[test]
+fn cancel_and_undo_close_the_gesture() {
+    let mut c = core();
+    let e = c.world.spawn(Val(0)).id();
+    let g = c.world.resource_mut::<History>().begin("drag");
+    owning(&mut c.world, g, |w| edit(w, "move", |tx| tx.modify::<Val>(e, |v| v.0 = 5)));
+    assert!(cancel(&mut c.world));
+    assert_eq!(c.world.get::<Val>(e), Some(&Val(0)));
+    let h = c.world.resource::<History>();
+    assert!(!h.is_open(g) && !h.can_undo() && !h.can_redo());
+    let g = c.world.resource_mut::<History>().begin("drag");
+    owning(&mut c.world, g, |w| edit(w, "move", |tx| tx.modify::<Val>(e, |v| v.0 = 5)));
+    assert_eq!(undo(&mut c.world).as_deref(), Some("drag"));
+    assert!(!c.world.resource::<History>().is_open(g), "its owner stops");
+    // After that, its edits are steps of their own (not into a gesture that is gone).
+    owning(&mut c.world, g, |w| edit(w, "late", |tx| tx.modify::<Val>(e, |v| v.0 = 9)));
+    assert_eq!(c.world.resource::<History>().undo_label(), Some("late"));
+    // A new gesture ends the one before.
+    let a = c.world.resource_mut::<History>().begin("a");
+    let b = c.world.resource_mut::<History>().begin("b");
+    assert!(!c.world.resource::<History>().is_open(a) && c.world.resource::<History>().is_open(b));
+}
+
+/// A widget's drag whose widget stops being drawn (its panel's entity
+/// deselected mid-drag) never says it stopped: its gesture ends a frame later,
+/// instead of holding autosave and the trackers off until something else ends it.
+#[test]
+fn a_widget_drag_that_is_no_longer_drawn_ends() {
+    use tt_core::history::{WidgetDrag, widget_edit};
+    let mut c = core();
+    let e = c.world.spawn(Val(0)).id();
+    let set = |c: &mut Core, d: WidgetDrag, v: i32| widget_edit(&mut c.world, "slide", d, |w| {
+        edit(w, "slide", |tx| tx.modify::<Val>(e, |x| x.0 = v));
+    });
+    set(&mut c, WidgetDrag { started: true, dragging: true, changed: true, ..WidgetDrag::default() }, 1);
+    c.run_pre_ui();
+    set(&mut c, WidgetDrag { dragging: true, changed: true, ..WidgetDrag::default() }, 2);
+    c.run_pre_ui();
+    assert!(c.world.resource::<History>().in_gesture(), "drawn each frame: still dragging");
+    // Not drawn for a frame.
+    c.run_pre_ui();
+    c.run_pre_ui();
+    let h = c.world.resource::<History>();
+    assert!(!h.in_gesture(), "ended");
+    assert_eq!(h.undo_label(), Some("slide"));
+    undo(&mut c.world);
+    assert_eq!(c.world.get::<Val>(e), Some(&Val(0)), "one step");
 }
 
 /// Snapshot of everything the random edits touch.

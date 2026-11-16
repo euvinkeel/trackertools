@@ -5,11 +5,12 @@
 //! **The pushed position** (from v1). A subject is not the mean of its
 //! members' points: that jumps whenever one comes or goes. It starts at their
 //! mean on its anchor frame; from there, both ways, it moves frame by frame
-//! with the members that have a good point on both neighbouring frames: by
+//! with the members that have a point on both neighbouring frames: by
 //! their mean shift and, with `turn` and two or more of them, by their turn,
 //! which carries it about their centre (a least-squares rigid fit). Members
-//! coming or going, lost or outside (a tracker's flags, channel 7), change
-//! only how many are averaged; a frame where none moves holds it still.
+//! coming or going, or switched off (`crate::off`), change only how many are
+//! averaged; a frame where none moves holds it still. A tracker's lost or
+//! outside frames (red) still carry it: switching it off is how to leave it out.
 //! While the same members carry it, its steps add up to exactly their own
 //! motion (the sum telescopes), so it doesn't drift; where they change, a
 //! step's error can stay, and an offset key puts it right.
@@ -34,7 +35,7 @@ use bevy_ecs::world::EntityRef;
 use bevy_reflect::Reflect;
 
 use crate::app::{AppBuilder, Module, Set};
-use crate::history::{History, edit};
+use crate::history::{Gesture, History, edit, owning};
 use crate::meta::Class;
 use crate::op::{EvalCtx, Footprint, Inputs, Operator, OperatorKind, Output};
 use crate::selection::Selection;
@@ -61,12 +62,31 @@ pub struct Subject {
     pub half: [f32; 2],
     /// Its own transform over time: where on the moving thing it is, keyed.
     pub offsets: Vec<OffsetKey>,
+    /// Seconds (video time) of smoothing on its members' motion, over the
+    /// whole path (0: none). Its keys go on top, so a key stays exactly
+    /// where it was put.
+    #[reflect(default)]
+    pub smooth: f32,
+    /// How its offset goes from one key to the next.
+    #[reflect(default)]
+    pub ease: Ease,
 }
 
 impl Default for Subject {
     fn default() -> Self {
-        Self { anchor: 0, turn: true, half: [48.0, 48.0], offsets: Vec::new() }
+        Self { anchor: 0, turn: true, half: [48.0, 48.0], offsets: Vec::new(), smooth: 0.0, ease: Ease::Smooth }
     }
+}
+
+/// How a subject's offset goes from one key to the next.
+#[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Ease {
+    /// In a straight line (subjects made before pins on the path existed).
+    #[default]
+    Linear,
+    /// Easing out of one key and into the next: no corner at a key, never
+    /// past one, and each stretch depends on its two keys alone. New subjects.
+    Smooth,
 }
 
 /// A key of a subject's own transform: on `frame`, its point is (`x`, `y`)
@@ -105,15 +125,25 @@ pub fn can_be_member(world: &World, e: Entity) -> bool {
     world.get::<Output>(e).is_some() && world.get::<Operator>(e).is_none_or(|o| o.kind != "frame")
 }
 
-/// A producer's point on each frame it has a good one: inside its span, not
-/// flagged (a tracker's lost or outside, channel 7), finite. Source px, y down.
-pub fn points_of(world: &World, e: Entity) -> Vec<(FrameIndex, [f64; 2])> {
+/// A producer's point on each frame it has one to give: inside its span,
+/// not switched off (a tracker's OFF flag, channel 7; a sketch's off keys,
+/// `crate::off`), finite, and, unless `red_counts`, not flagged at all (a
+/// tracker's lost or outside frames, drawn red). Source px, y down.
+///
+/// Subjects take red frames (`red_counts`) *(on request: "if I haven't
+/// disabled a red region it means I still find it satisfactory … red areas
+/// should not be disqualifying for subject-contribution")*: switching a
+/// tracker off is how to leave it out. Exports' points don't.
+pub fn points_of(world: &World, e: Entity, red_counts: bool) -> Vec<(FrameIndex, [f64; 2])> {
     let Some(sig) = crate::span::output(world, e) else { return Vec::new() };
     let Some((lo, hi)) = sig.present_hull() else { return Vec::new() };
+    let off = world.get::<crate::off::Off>(e).filter(|o| o.any_off());
     (lo..=hi)
         .filter_map(|f| {
             let v = sig.get(f)?;
-            let good = v.get(7).is_none_or(|flags| *flags == 0.0) && v[0].is_finite() && v[1].is_finite();
+            let flags = v.get(7).map_or(0, |f| *f as u32);
+            let allowed = if red_counts { flags & crate::off::OFF_FLAG == 0 } else { flags == 0 };
+            let good = allowed && off.is_none_or(|o| !o.is_off(f)) && v[0].is_finite() && v[1].is_finite();
             good.then(|| (f, [v[0] as f64, v[1] as f64]))
         })
         .collect()
@@ -181,9 +211,54 @@ pub fn push(members: &[Vec<(FrameIndex, [f64; 2])>], anchor: FrameIndex, turn: b
     path
 }
 
-/// The offset on frame `f`: `[x, y, angle (radians)]`, linear between keys,
-/// held beyond them, 0 without any. `keys` are in frame order.
-pub fn offset_at(keys: &[OffsetKey], f: FrameIndex) -> [f64; 3] {
+/// The subject's path on every frame its members cover: `(frame, pushed,
+/// placed)`, each `[x, y, angle]`. Pushed: its members' motion ([`push`]),
+/// smoothed over `subject.smooth` seconds; placed: that with its own offset
+/// keys on top ([`place`]).
+pub fn path(members: &[Vec<(FrameIndex, [f64; 2])>], subject: &Subject, fps: f64) -> Vec<(FrameIndex, [f64; 3], [f64; 3])> {
+    let pushed = push(members, subject.anchor, subject.turn);
+    // (Every frame from the first to the last is in it: one series per channel.)
+    let sigma = subject.smooth.max(0.0) as f64 * fps;
+    let smooth = |c: usize| crate::sketch::gauss_trend(&pushed.values().map(|v| v[c]).collect::<Vec<_>>(), sigma);
+    let [x, y, a] = [smooth(0), smooth(1), smooth(2)];
+    pushed
+        .keys()
+        .enumerate()
+        .map(|(i, f)| {
+            let p = [x[i], y[i], a[i]];
+            (*f, p, place(p, offset_at(&subject.offsets, *f, subject.ease)))
+        })
+        .collect()
+}
+
+/// The keys after a drag sets the offset on `key.frame` to `key`, bending
+/// the path only within `reach` frames of it (None: as far as the keys on
+/// either side): `keys` (as they were when the drag began) with `key` in
+/// them and, on each side with no other key within the reach, a key at its
+/// edge holding the offset that was there.
+pub fn pinned(keys: &[OffsetKey], ease: Ease, key: OffsetKey, reach: Option<FrameIndex>) -> Vec<OffsetKey> {
+    let mut out = keys.to_vec();
+    let mut put = |k: OffsetKey| {
+        let i = out.partition_point(|o| o.frame < k.frame);
+        match out.get_mut(i).filter(|o| o.frame == k.frame) {
+            Some(o) => *o = k,
+            None => out.insert(i, k),
+        }
+    };
+    let f = key.frame;
+    for edge in reach.map(|r| [f - r.max(1), f + r.max(1)]).into_iter().flatten() {
+        if !keys.iter().any(|k| k.frame != f && (edge.min(f)..=edge.max(f)).contains(&k.frame)) {
+            let [x, y, a] = offset_at(keys, edge, ease);
+            put(OffsetKey { frame: edge, x: x as f32, y: y as f32, angle: a.to_degrees() as f32 });
+        }
+    }
+    put(key);
+    out
+}
+
+/// The offset on frame `f`: `[x, y, angle (radians)]`, from key to key as
+/// `ease` says, held beyond them, 0 without any. `keys` are in frame order.
+pub fn offset_at(keys: &[OffsetKey], f: FrameIndex, ease: Ease) -> [f64; 3] {
     let v = |k: &OffsetKey| [k.x as f64, k.y as f64, (k.angle as f64).to_radians()];
     let (Some(first), Some(last)) = (keys.first(), keys.last()) else { return [0.0; 3] };
     if f <= first.frame {
@@ -195,6 +270,7 @@ pub fn offset_at(keys: &[OffsetKey], f: FrameIndex) -> [f64; 3] {
     let i = keys.partition_point(|k| k.frame <= f);
     let (a, b) = (&keys[i - 1], &keys[i]);
     let u = (f - a.frame) as f64 / (b.frame - a.frame) as f64;
+    let u = if ease == Ease::Smooth { u * u * (3.0 - 2.0 * u) } else { u };
     let (va, vb) = (v(a), v(b));
     std::array::from_fn(|c| va[c] + (vb[c] - va[c]) * u)
 }
@@ -230,11 +306,11 @@ impl OperatorKind for SubjectKind {
     fn evaluate(&self, ctx: &EvalCtx<'_>, range: std::ops::Range<FrameIndex>, out: &mut Signal) -> anyhow::Result<()> {
         out.clear(range.clone());
         let Some(subject) = ctx.params::<Subject>() else { return Ok(()) };
-        let members: Vec<_> = members_of(ctx.world, ctx.entity).into_iter().map(|m| points_of(ctx.world, m)).collect();
+        let members: Vec<_> = members_of(ctx.world, ctx.entity).into_iter().map(|m| points_of(ctx.world, m, true)).collect();
         let [hw, hh] = subject.half.map(|v| v.max(1.0) as f64);
-        for (f, pushed) in push(&members, subject.anchor, subject.turn).range(range) {
-            let [x, y, a] = place(*pushed, offset_at(&subject.offsets, *f));
-            out.set(*f, &[x, y, x - hw, y - hh, x + hw, y + hh, a, 0.0, pushed[0], pushed[1], pushed[2]].map(|v| v as f32));
+        let fps = ctx.world.get_resource::<Transport>().map_or(60.0, |t| t.fps.as_f64());
+        for (f, pushed, [x, y, a]) in path(&members, subject, fps).into_iter().filter(|(f, ..)| range.contains(f)) {
+            out.set(f, &[x, y, x - hw, y - hh, x + hw, y + hh, a, 0.0, pushed[0], pushed[1], pushed[2]].map(|v| v as f32));
         }
         Ok(())
     }
@@ -271,7 +347,7 @@ pub fn make_subject(world: &mut World, members: &[Entity], anchor: FrameIndex) -
         let mut q = world.query::<&Operator>();
         q.iter(world).filter(|o| o.kind == "subject").count()
     };
-    let name = format!("Subject {}", count + 1);
+    let name = crate::commands::new_name(world, "Subject", count);
     // Its box: the size of the members' boxes on the anchor frame (a point's: the default).
     let store = world.resource::<SignalStore>();
     let half = members
@@ -291,10 +367,21 @@ pub fn make_subject(world: &mut World, members: &[Entity], anchor: FrameIndex) -
     Some(s)
 }
 
+/// Whether `e` can join `subject`: it can be a member, isn't one yet, and
+/// doesn't read the subject itself (a tracker in a view following it, a
+/// subject it is in): that would be a cycle.
+pub fn can_join(world: &World, subject: Entity, e: Entity) -> bool {
+    can_be_member(world, e) && !members_of(world, subject).contains(&e) && !crate::op::reads(world, e, subject)
+}
+
 /// Add `members` to `subject` (one undo step); returns how many were new.
 pub fn add_members(world: &mut World, subject: Entity, members: &[Entity]) -> usize {
-    let have = members_of(world, subject);
-    let new: Vec<Entity> = members.iter().copied().filter(|e| *e != subject && !have.contains(e) && can_be_member(world, *e)).collect();
+    let mut new: Vec<Entity> = Vec::new();
+    for e in members.iter().copied().filter(|e| can_join(world, subject, *e)) {
+        if !new.contains(&e) {
+            new.push(e);
+        }
+    }
     if new.is_empty() {
         return 0;
     }
@@ -336,71 +423,143 @@ pub fn remove_offset_key(world: &mut World, subject: Entity, frame: FrameIndex) 
     }
 }
 
-/// The Select tool's drag of a subject: `(subject, where the press took hold
-/// of it relative to its point (source px), the frame, moved yet)`.
-#[derive(Resource, Debug, Default)]
-struct SubjectDrag(Option<(Entity, [f64; 2], FrameIndex, bool)>);
+/// Frames either side of the playhead the selected subject's path is drawn
+/// over, and can be taken hold of.
+pub const PATH_FRAMES: FrameIndex = 90;
 
-/// Where the dragged subject was when its drag began (source px).
-#[derive(Resource, Debug, Default)]
-struct SubjectDragFrom(Option<[f64; 2]>);
+/// How far a drag on a subject's path bends it, in seconds of video, from
+/// least to most; past the last, the whole path (as far as its other keys).
+pub const REACHES: [f32; 9] = [0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
 
-/// `Set::Tools`: in the Select tool, a press on a subject's point and a drag
-/// moves it: its offset is keyed on the shown frame (one undo step per drag).
-/// A press that doesn't move is a click, which selects it (tool.rs).
+/// The reach a drag on a subject's path has: wheel notches into
+/// [`REACHES`] (the wheel while dragging turns it), remembered for the next drag.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct SubjectReach(pub f32);
+
+impl Default for SubjectReach {
+    fn default() -> Self {
+        Self(3.0)
+    }
+}
+
+impl SubjectReach {
+    /// In seconds; None: the whole path.
+    pub fn seconds(self) -> Option<f32> {
+        REACHES.get(self.0.round().max(0.0) as usize).copied()
+    }
+}
+
+/// The frame of `subject`'s drawn path whose point is nearest `at` (the
+/// shown space's pixels, `view`'s), within `radius` of them: each frame's
+/// point through the view's framing on that frame, as the path is drawn,
+/// over [`PATH_FRAMES`] either side of `frame`. Ties go to the frame nearer `frame`.
+pub fn path_frame(world: &World, subject: Entity, view: Option<Entity>, frame: FrameIndex, at: [f64; 2], radius: f64) -> Option<FrameIndex> {
+    (frame - PATH_FRAMES..=frame + PATH_FRAMES)
+        .filter_map(|f| {
+            let v = value_at(world, subject, f)?;
+            let p = map_at(world, view, f).from_source([v[0], v[1]]);
+            let d = (p[0] - at[0]).hypot(p[1] - at[1]);
+            (d <= radius).then_some((f, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1).then((a.0 - frame).abs().cmp(&(b.0 - frame).abs())))
+        .map(|(f, _)| f)
+}
+
+/// The Select tool's drag of a subject, from the press on.
+#[derive(Clone, Debug)]
+struct Grab {
+    subject: Entity,
+    /// The frame taken hold of, and the shown space's framing on it (the path is drawn through it).
+    frame: FrameIndex,
+    map: crate::view::SpaceMap,
+    /// The press (shown px), and from it to the subject's point on that frame (source px).
+    from: [f64; 2],
+    hold: [f64; 2],
+    /// Its members' motion on that frame and its keys, as they were at the press.
+    pushed: [f64; 3],
+    keys: Vec<OffsetKey>,
+    /// Once it moved: its undo step, open until the release.
+    gesture: Option<Gesture>,
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct SubjectDrag(Option<Grab>);
+
+impl SubjectDrag {
+    /// The subject being dragged and the frame of it taken hold of.
+    pub fn grabbed(&self) -> Option<(Entity, FrameIndex)> {
+        self.0.as_ref().filter(|g| g.gesture.is_some()).map(|g| (g.subject, g.frame))
+    }
+}
+
+/// `Set::Tools`: in the Select tool, a press on a subject's point, or on
+/// the selected subject's path, and a drag bends its path there: a key on
+/// that frame where the pointer is, and keys at the reach's edges holding
+/// what was there ([`pinned`]); the wheel changes the reach as it goes. One
+/// undo step per drag; undone or cancelled (Esc) while it goes on, it stops
+/// there. A press that doesn't move is a click (tool.rs).
 fn drag_subject(world: &mut World) {
     if world.resource::<ActiveTool>().0 != Tool::Select {
-        if world.resource_mut::<SubjectDrag>().0.take().is_some_and(|d| d.3) {
-            world.resource_mut::<History>().end();
+        if let Some(g) = world.resource_mut::<SubjectDrag>().0.take().and_then(|g| g.gesture) {
+            world.resource_mut::<History>().end(g);
         }
         return;
     }
     let p = world.resource::<PointerFrame>().clone();
-    let frame = world.resource::<Transport>().frame();
-    let map = map_at(world, world.resource::<ActiveView>().0, frame);
+    let fps = world.resource::<Transport>().fps.as_f64();
     let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
+    // A press `tool::route_press` gave a subject: its point, or the selected one's path on frame `f`.
     if let Some(t) = p.pressed
         && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
+        && let Some(crate::tool::PressOn::Subject(e, f)) = world.resource::<crate::tool::Press>().0
+        && let Some(v) = value_at(world, e, f)
     {
+        // (The path is drawn through each frame's framing: the grabbed frame's is the one to drag in.)
+        let map = map_at(world, world.resource::<ActiveView>().0, f);
         let src = map.to_source(at);
-        let grab = (12.0 / scale) * map.a;
-        // (A layer's picture over the point takes the press, unless this subject is selected.)
-        if crate::layer::press_on_layer(world, frame, src, map.a / scale).is_none()
-            && let Some(e) = pick_subject(world, frame, src, grab)
-            && let Some(v) = value_at(world, e, frame)
-        {
-            world.resource_mut::<SubjectDrag>().0 = Some((e, [v[0] - src[0], v[1] - src[1]], frame, false));
-            world.resource_mut::<SubjectDragFrom>().0 = Some([v[0], v[1]]);
-        }
+        let keys = world.get::<Subject>(e).map(|s| s.offsets.clone()).unwrap_or_default();
+        world.resource_mut::<SubjectDrag>().0 = Some(Grab { subject: e, frame: f, map, from: at, hold: [v[0] - src[0], v[1] - src[1]], pushed: [v[8], v[9], v[10]], keys, gesture: None });
     }
-    let Some((e, hold, f, moved)) = world.resource::<SubjectDrag>().0 else { return };
+    let Some(g) = world.resource::<SubjectDrag>().0.clone() else { return };
+    if g.gesture.is_some_and(|id| !world.resource::<History>().is_open(id)) {
+        world.resource_mut::<SubjectDrag>().0 = None;
+        return;
+    }
     // While it's held, the views hold still (view::HoldViews): one following the
     // subject would otherwise move under the pointer, and the drag run away.
-    let start = world.resource::<SubjectDragFrom>().0;
-    crate::view::HoldViews::ask(world, start);
-    let ended = p.released.is_some() || !p.down;
-    if let Some(now) = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover) {
-        let src = map.to_source(now);
-        let at = [src[0] + hold[0], src[1] + hold[1]];
-        let start = value_at(world, e, f);
-        let far = start.is_some_and(|v| (v[0] - at[0]).hypot(v[1] - at[1]) * scale / map.a.max(1e-9) >= CLICK_MOVE);
-        if (moved || far)
-            && let Some(v) = start
-        {
-            if !moved {
-                let name = world.get::<Name>(e).map_or("subject".to_string(), |n| n.to_string());
-                world.resource_mut::<History>().begin(format!("Move {name}"));
-                world.resource_mut::<Selection>().select_only(e);
-                world.resource_mut::<SubjectDrag>().0 = Some((e, hold, f, true));
-            }
-            let pushed = [v[8], v[9], v[10]];
-            let [x, y] = offset_to(pushed, at);
-            let angle = world.get::<Subject>(e).map_or(0.0, |s| offset_at(&s.offsets, f)[2].to_degrees() as f32);
-            set_offset_key(world, e, OffsetKey { frame: f, x: x as f32, y: y as f32, angle });
+    let start = g.map.to_source(g.from);
+    crate::view::HoldViews::ask(world, Some([start[0] + g.hold[0], start[1] + g.hold[1]]));
+    if p.wheel != 0.0 {
+        let mut reach = world.resource_mut::<SubjectReach>();
+        reach.0 = (reach.0 + p.wheel).clamp(0.0, REACHES.len() as f32);
+        world.resource_mut::<PointerFrame>().wheel_taken = true;
+    }
+    if let Some(now) = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover)
+        && (g.gesture.is_some() || (now[0] - g.from[0]).hypot(now[1] - g.from[1]) * scale >= CLICK_MOVE)
+    {
+        let e = g.subject;
+        let gesture = g.gesture.unwrap_or_else(|| {
+            let name = world.get::<Name>(e).map_or("subject".to_string(), |n| n.to_string());
+            world.resource_mut::<Selection>().select_only(e);
+            world.resource_mut::<History>().begin(format!("Move {name}"))
+        });
+        if let Some(d) = world.resource_mut::<SubjectDrag>().0.as_mut() {
+            d.gesture = Some(gesture);
+        }
+        let src = g.map.to_source(now);
+        let [x, y] = offset_to(g.pushed, [src[0] + g.hold[0], src[1] + g.hold[1]]);
+        let ease = world.get::<Subject>(e).map_or(Ease::Smooth, |s| s.ease);
+        let angle = offset_at(&g.keys, g.frame, ease)[2].to_degrees() as f32;
+        let reach = world.resource::<SubjectReach>().seconds().map(|s| (s as f64 * fps).round() as FrameIndex);
+        let keys = pinned(&g.keys, ease, OffsetKey { frame: g.frame, x: x as f32, y: y as f32, angle }, reach);
+        if world.get::<Subject>(e).is_some_and(|s| s.offsets != keys) {
+            owning(world, gesture, |w| edit(w, "Move subject", |tx| tx.modify::<Subject>(e, |s| s.offsets = keys)));
         }
     }
-    if ended && world.resource_mut::<SubjectDrag>().0.take().is_some_and(|d| d.3) {
-        world.resource_mut::<History>().end();
+    if (p.released.is_some() || !p.down)
+        && let Some(g) = world.resource_mut::<SubjectDrag>().0.take().and_then(|g| g.gesture)
+    {
+        world.resource_mut::<History>().end(g);
     }
 }
 
@@ -408,12 +567,14 @@ pub struct SubjectModule;
 
 impl Module for SubjectModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<SubjectDragFrom>(Class::Derived).init_resource::<SubjectDragFrom>();
         app.operator(SubjectKind)
             .operator_params::<Subject>()
             .register_type::<OffsetKey>()
+            .register_type::<Ease>()
             .declare::<SubjectDrag>(Class::Derived)
             .init_resource::<SubjectDrag>()
+            .declare::<SubjectReach>(Class::Session)
+            .init_resource::<SubjectReach>()
             .add_systems(drag_subject.in_set(Set::Tools));
     }
 }
@@ -457,7 +618,7 @@ mod tests {
         // An offset of 50 px along the thing's own x axis, keyed on the anchor frame.
         let keys = [OffsetKey { frame: 0, x: 50.0, y: 0.0, angle: 10.0 }];
         for f in -20..40 {
-            let p = place(path[&f], offset_at(&keys, f));
+            let p = place(path[&f], offset_at(&keys, f, Ease::Linear));
             let want = on(centre(f), turn(f), [50.0, 0.0]);
             assert!((p[0] - want[0]).hypot(p[1] - want[1]) < 1e-6, "frame {f}: {p:?} vs {want:?}");
             assert!((p[2] - turn(f) - 10f64.to_radians()).abs() < 1e-9, "frame {f}: angle {}", p[2]);
@@ -469,11 +630,11 @@ mod tests {
     #[test]
     fn offset_keys_are_linear_between_and_held_beyond() {
         let keys = [OffsetKey { frame: 10, x: 0.0, y: 0.0, angle: 0.0 }, OffsetKey { frame: 20, x: 10.0, y: -4.0, angle: 30.0 }];
-        assert_eq!(offset_at(&keys, 0), [0.0, 0.0, 0.0]);
-        let mid = offset_at(&keys, 15);
+        assert_eq!(offset_at(&keys, 0, Ease::Linear), [0.0, 0.0, 0.0]);
+        let mid = offset_at(&keys, 15, Ease::Linear);
         assert!((mid[0] - 5.0).abs() < 1e-9 && (mid[1] + 2.0).abs() < 1e-9 && (mid[2] - 15f64.to_radians()).abs() < 1e-9);
-        assert_eq!(offset_at(&keys, 99)[0], 10.0);
-        assert_eq!(offset_at(&[], 5), [0.0; 3]);
+        assert_eq!(offset_at(&keys, 99, Ease::Linear)[0], 10.0);
+        assert_eq!(offset_at(&[], 5, Ease::Linear), [0.0; 3]);
         // `offset_to` is `place`'s inverse.
         let pushed = [100.0, 50.0, 0.3];
         let o = offset_to(pushed, [130.0, 70.0]);
@@ -490,5 +651,59 @@ mod tests {
         // Frames 10–19 hold: no step there has a member on both frames.
         assert_eq!(path[&12], path[&9]);
         assert!((path[&25][0] - path[&20][0] - 5.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn key(frame: FrameIndex, x: f32) -> OffsetKey {
+        OffsetKey { frame, x, y: 0.0, angle: 0.0 }
+    }
+
+    #[test]
+    fn a_pin_holds_what_was_there_at_its_reach_unless_a_key_is_nearer() {
+        let frames = |k: &[OffsetKey]| k.iter().map(|k| (k.frame, k.x)).collect::<Vec<_>>();
+        // No keys: guards on both sides, holding 0.
+        assert_eq!(frames(&pinned(&[], Ease::Smooth, key(50, 9.0), Some(10))), vec![(40, 0.0), (50, 9.0), (60, 0.0)]);
+        // A key within the reach on the left bounds it there; on the right a guard holds the key's value (held beyond it).
+        assert_eq!(frames(&pinned(&[key(45, 4.0)], Ease::Smooth, key(50, 9.0), Some(10))), vec![(45, 4.0), (50, 9.0), (60, 4.0)]);
+        // A key on the frame itself is replaced; no reach: no guards.
+        assert_eq!(frames(&pinned(&[key(50, 1.0), key(90, 2.0)], Ease::Linear, key(50, 9.0), None)), vec![(50, 9.0), (90, 2.0)]);
+        // Between two keys (linear), the guard takes the line's value there, so outside the reach nothing changes.
+        let keys = [key(0, 0.0), key(100, 100.0)];
+        let after = pinned(&keys, Ease::Linear, key(50, 80.0), Some(10));
+        for f in (0..40).chain(61..100) {
+            assert!((offset_at(&after, f, Ease::Linear)[0] - offset_at(&keys, f, Ease::Linear)[0]).abs() < 1e-4, "frame {f}");
+        }
+    }
+
+    #[test]
+    fn smooth_keys_have_no_corner_and_never_overshoot() {
+        let keys = [key(0, 0.0), key(10, 10.0), key(20, 0.0)];
+        let x = |f: FrameIndex| offset_at(&keys, f, Ease::Smooth)[0];
+        assert!((0..=20).all(|f| (0.0..=10.0).contains(&x(f))));
+        // Flat into and out of each key: the steps beside a key are small, the middle ones big.
+        assert!(x(1) - x(0) < 0.3 && x(10) - x(9) < 0.3 && x(6) - x(5) > 1.4);
+        assert_eq!((x(10), x(30), x(-5)), (10.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn smoothing_the_path_smooths_the_members_motion_and_keeps_keys_exact() {
+        // A point moving 2 px a frame with ±3 px of jitter.
+        let jitter = |f: i64| if f % 2 == 0 { 3.0 } else { -3.0 };
+        let members = vec![(0..300).map(|f| (f, [100.0 + 2.0 * f as f64, 50.0 + jitter(f)])).collect::<Vec<_>>()];
+        let rough = Subject { anchor: 0, ..Subject::default() };
+        let same: Vec<_> = path(&members, &rough, 60.0);
+        let pushed = push(&members, 0, true);
+        assert!(same.iter().all(|(f, p, q)| *p == pushed[f] && q == p), "smooth 0: the members' motion as it is");
+        let smooth = Subject { smooth: 0.25, offsets: vec![OffsetKey { frame: 150, x: 0.0, y: 10.0, angle: 0.0 }], ..rough };
+        let out = path(&members, &smooth, 60.0);
+        let shake = |p: &[(FrameIndex, [f64; 3], [f64; 3])]| p.windows(3).map(|w| (w[0].1[1] - 2.0 * w[1].1[1] + w[2].1[1]).abs()).fold(0.0, f64::max);
+        assert!(shake(&out) < 0.05 * shake(&same), "{} vs {}", shake(&out), shake(&same));
+        // The ends aren't pulled (the motion is a line there), and the key's offset sits exactly on the smoothed motion.
+        assert!((out[0].1[0] - 100.0).abs() < 0.5 && (out[299].1[0] - 698.0).abs() < 0.5, "{:?} {:?}", out[0].1, out[299].1);
+        assert_eq!(out[150].2[1], out[150].1[1] + 10.0);
     }
 }

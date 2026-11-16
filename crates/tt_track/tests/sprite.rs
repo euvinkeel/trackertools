@@ -496,10 +496,10 @@ fn display_settings_keep_jobs_and_a_drag_replans_once() {
     }
 
     // A drag on `search`: an edit every frame inside one gesture.
-    core.world.resource_mut::<History>().begin("Edit Tracker");
+    let gesture = core.world.resource_mut::<History>().begin("Edit Tracker");
     let at = status(&core.world, op).forward.expect("forward").at;
     for i in 0..20 {
-        edit(&mut core.world, "Edit Tracker", |tx| tx.modify::<Tracker>(op, |t| t.search = 1.0 + 0.02 * i as f32));
+        tt_core::history::owning(&mut core.world, gesture, |w| edit(w, "Edit Tracker", |tx| tx.modify::<Tracker>(op, |t| t.search = 1.0 + 0.02 * i as f32)));
         core.run_pre_ui();
         let st = status(&core.world, op).forward.expect("forward");
         assert!(st.from == from && st.at >= at, "no restart mid-drag");
@@ -507,7 +507,7 @@ fn display_settings_keep_jobs_and_a_drag_replans_once() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(core.world.resource::<TrackJobs>().active(), "the host keeps running frames while a re-plan waits");
-    core.world.resource_mut::<History>().end();
+    core.world.resource_mut::<History>().end(gesture);
     core.run_pre_ui();
     let st = status(&core.world, op).forward.expect("restarted");
     assert!(st.at < at, "the drag's final value re-tracks: at {} (was {at})", st.at);

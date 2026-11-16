@@ -106,15 +106,17 @@ fn detect_clicks(mut pointer: ResMut<PointerFrame>, mut tracker: ResMut<ClickTra
 }
 
 
-fn apply_tool_actions(mut actions: ResMut<PendingActions>, mut active: ResMut<ActiveTool>, live: Res<crate::capture::LiveCapture>) {
-    for a in actions.take(|a| matches!(a, Action::Tool(_))) {
+fn apply_tool_actions(world: &mut World) {
+    for a in world.resource_mut::<PendingActions>().take(|a| matches!(a, Action::Tool(_))) {
         if let Action::Tool(t) = a {
+            let mut active = world.resource_mut::<ActiveTool>();
             active.0 = if active.0 == t { Tool::Select } else { t };
         }
     }
-    // Esc with no gesture in progress leaves the tool (the capture takes its own Esc first).
-    if live.0.is_none() && !actions.take(|a| a == Action::Cancel).is_empty() {
-        active.0 = Tool::Select;
+    // Esc (a sketch stroke takes its own first): a drag in progress never
+    // happened (its owner sees its gesture gone and stops); with none, it leaves the tool.
+    if world.resource::<crate::capture::LiveCapture>().0.is_none() && !world.resource_mut::<PendingActions>().take(|a| a == Action::Cancel).is_empty() && !crate::history::cancel(world) {
+        world.resource_mut::<ActiveTool>().0 = Tool::Select;
     }
 }
 
@@ -135,9 +137,73 @@ pub fn pick_tracker(world: &mut World, frame: crate::time::FrameIndex, pos: [f64
         .map(|(e, _)| e)
 }
 
-/// A click (in any tool) selects the layer whose picture is under it (when
-/// it isn't selected yet), else the subject whose point is, else the tracker
-/// whose point is, else the sketch whose region is, or clears the selection.
+/// What a press is on, decided once where it lands ([`route_press`]). The
+/// Select tool's drags (`layer.rs`, `subject.rs`) and the click
+/// ([`select_on_click`]) act on this; none of them hit-tests on its own, so
+/// one press never moves two things.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PressOn {
+    /// A layer's picture, or the selected layer's handles.
+    Layer(Entity, crate::layer::Handle),
+    /// A subject's point on the shown frame, or the selected subject's drawn path on this frame.
+    Subject(Entity, crate::time::FrameIndex),
+    /// Nothing a drag takes: a click selects what is under it.
+    Nothing,
+}
+
+/// The last press (kept until the next one: its click reads it on the release).
+#[derive(Resource, Debug, Default)]
+pub struct Press(pub Option<PressOn>);
+
+/// `Set::Input`: a press lands on the first of these under it, in this order:
+/// 1. the selected layer (its handles or its picture);
+/// 2. the selected subject's point on the shown frame;
+/// 3. the top layer's picture;
+/// 4. any subject's point on the shown frame;
+/// 5. the selected subject's drawn path (the frame of it under the press);
+///
+/// else nothing. Reaches are in screen points ([`crate::layer::HANDLE_REACH`], [`crate::layer::POINT_REACH`]).
+fn route_press(world: &mut World) {
+    use crate::layer::{HANDLE_REACH, Handle, POINT_REACH, handle_at, is_layer, pick_layer};
+    use crate::subject::{is_subject, path_frame, pick_subject};
+    let p = world.resource::<PointerFrame>();
+    let Some(at) = p.pressed.and_then(|t| p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)) else { return };
+    let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
+    let frame = world.resource::<crate::transport::Transport>().frame();
+    let view = world.resource::<crate::view::ActiveView>().0;
+    let map = crate::view::map_at(world, view, frame);
+    let (src, px) = (map.to_source(at), map.a / scale);
+    let selected = world.resource::<crate::selection::Selection>().primary();
+    let on = 'on: {
+        if let Some(l) = selected.filter(|e| is_layer(world, *e))
+            && let Some(h) = handle_at(world, l, frame, src, HANDLE_REACH * px)
+        {
+            break 'on PressOn::Layer(l, h);
+        }
+        let subject = pick_subject(world, frame, src, POINT_REACH * px);
+        if let Some(s) = subject.filter(|s| Some(*s) == selected) {
+            break 'on PressOn::Subject(s, frame);
+        }
+        if let Some(l) = pick_layer(world, frame, src) {
+            break 'on PressOn::Layer(l, Handle::Body);
+        }
+        if let Some(s) = subject {
+            break 'on PressOn::Subject(s, frame);
+        }
+        match selected.filter(|e| is_subject(world, *e)).and_then(|s| Some((s, path_frame(world, s, view, frame, at, POINT_REACH / scale)?))) {
+            Some((s, f)) => PressOn::Subject(s, f),
+            None => PressOn::Nothing,
+        }
+    };
+    world.resource_mut::<Press>().0 = Some(on);
+}
+
+/// A click (in any tool but Track and Draw), by what its press was on
+/// ([`route_press`]): a layer not selected yet is selected; the selected
+/// subject (its point or its path) stays selected, and Alt+click takes out
+/// its key drawn nearest the click; else the subject, tracker, SpringFocus
+/// or sketch under it is selected (a selected layer's picture lets the click
+/// reach what is below it), or nothing is.
 fn select_on_click(world: &mut World) {
     let Some(pos) = world.resource::<PointerFrame>().click else { return };
     // In the Track tool a click places a tracker; in the Draw tool it draws.
@@ -145,18 +211,43 @@ fn select_on_click(world: &mut World) {
         return;
     }
     let frame = world.resource::<crate::transport::Transport>().frame();
-    // The pointer is in the shown space's pixels; sketches live in source pixels.
-    let pos = crate::view::map_at(world, world.resource::<crate::view::ActiveView>().0, frame).to_source(pos);
+    let view = world.resource::<crate::view::ActiveView>().0;
     let scale = world.resource::<PointerFrame>().scale;
-    let grab = 12.0 / if scale > 0.0 { scale } else { 1.0 };
-    // A layer's picture first (it covers what it's attached to), unless it is
-    // selected already: then what's under it, so a second click reaches that.
-    let layer = crate::layer::pick_layer(world, frame, pos).filter(|l| !world.resource::<crate::selection::Selection>().is_selected(*l));
-    let picked = layer
-        .or_else(|| crate::subject::pick_subject(world, frame, pos, grab))
-        .or_else(|| pick_tracker(world, frame, pos, grab))
-        .or_else(|| crate::focus::pick_focus(world, frame, pos, grab))
-        .or_else(|| crate::sketch::pick_sketch(world, frame, pos));
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let map = crate::view::map_at(world, view, frame);
+    let selected = world.resource::<crate::selection::Selection>().primary();
+    match world.resource::<Press>().0 {
+        Some(PressOn::Layer(l, _)) if Some(l) != selected => {
+            world.resource_mut::<crate::selection::Selection>().select_only(l);
+            return;
+        }
+        Some(PressOn::Subject(s, _)) if Some(s) == selected => {
+            if world.resource::<crate::input::KeysHeld>().mods.alt {
+                let reach = crate::layer::POINT_REACH / scale;
+                let keys = world.get::<crate::subject::Subject>(s).map(|p| p.offsets.clone()).unwrap_or_default();
+                let near = keys
+                    .iter()
+                    .filter_map(|k| {
+                        let v = crate::subject::value_at(world, s, k.frame)?;
+                        let p = crate::view::map_at(world, view, k.frame).from_source([v[0], v[1]]);
+                        Some((k.frame, (p[0] - pos[0]).hypot(p[1] - pos[1])))
+                    })
+                    .filter(|(_, d)| *d <= reach)
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((f, _)) = near {
+                    crate::subject::remove_offset_key(world, s, f);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+    // The pointer is in the shown space's pixels; what's picked lives in source pixels.
+    let (src, grab) = (map.to_source(pos), crate::layer::POINT_REACH * map.a / scale);
+    let picked = crate::subject::pick_subject(world, frame, src, grab)
+        .or_else(|| pick_tracker(world, frame, src, grab))
+        .or_else(|| crate::focus::pick_focus(world, frame, src, grab))
+        .or_else(|| crate::sketch::pick_sketch(world, frame, src));
     let mut sel = world.resource_mut::<crate::selection::Selection>();
     match picked {
         Some(e) => sel.select_only(e),
@@ -176,7 +267,9 @@ impl Module for ToolModule {
             .init_resource::<PointerFrame>()
             .init_resource::<ClickTracker>()
             .init_resource::<PointerTrail>()
-            .add_systems((detect_clicks, keep_trail).in_set(Set::Input))
+            .declare::<Press>(Class::Derived)
+            .init_resource::<Press>()
+            .add_systems(((detect_clicks, route_press).chain(), keep_trail).in_set(Set::Input))
             .add_systems((apply_tool_actions, crate::capture::sketch_tool, select_on_click).chain().in_set(Set::Tools));
     }
 }

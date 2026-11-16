@@ -35,7 +35,6 @@ pub mod image;
 pub mod job;
 pub mod look;
 pub mod ncc;
-pub mod off;
 pub mod runner;
 pub mod template;
 pub mod tool;
@@ -63,8 +62,9 @@ pub const TRACK_CHANNELS: usize = 8;
 pub const LOST: u32 = 1;
 /// Flag: the point left the guide's box (the rough pass says the subject isn't there).
 pub const OUTSIDE: u32 = 2;
-/// Flag: the tracker is switched off on this frame (`off`): left out, as a lost frame is.
-pub const OFF: u32 = 4;
+/// Flag: the tracker is switched off on this frame (`tt_core::off`): left out
+/// (subjects take lost and outside frames; only this leaves a tracker out of them).
+pub const OFF: u32 = tt_core::off::OFF_FLAG;
 
 /// A new cursor tracker's `min_score`: it searches the whole frame, so only a close match counts.
 pub const CURSOR_MIN_SCORE: f32 = 0.8;
@@ -248,6 +248,14 @@ impl Default for NewTrackers {
     }
 }
 
+/// A kind's button in the top bar, or its key: the Track tool making
+/// `method`'s trackers, or back to Select if it already does.
+pub fn toggle_track_kind(world: &mut World, method: Method) {
+    let on = world.resource::<tt_core::tool::ActiveTool>().0 == tt_core::tool::Tool::Track && world.resource::<NewTrackers>().method == method;
+    world.resource_mut::<NewTrackers>().method = method;
+    world.resource_mut::<tt_core::tool::ActiveTool>().0 = if on { tt_core::tool::Tool::Select } else { tt_core::tool::Tool::Track };
+}
+
 /// Which copy of the video a tracker reads.
 #[derive(Reflect, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Rendition {
@@ -302,6 +310,25 @@ pub struct Tracker {
     /// A Jev tracker's own settings (`job::jev`).
     #[reflect(default)]
     pub jev: JevSettings,
+    /// A paint tracker: the most dots (CoTracker points) one paint gives,
+    /// spread evenly over what was painted (`job::paint`).
+    #[reflect(default = "paint_dots")]
+    pub paint_dots: u32,
+    /// A paint tracker: its paints' dots are the ones their strokes laid
+    /// down (new paint trackers), not spread over what they painted (`job::paint::dots`).
+    #[reflect(default)]
+    pub dots_on_strokes: bool,
+}
+
+/// A paint tracker's dots cut for a stretch (`job::paint::DotCut`): Alt+brush
+/// over its dots on a frame between paints cuts them from there to the next
+/// paint. Document state (saved, undone); clearing them tracks again.
+#[derive(Component, Reflect, Clone, Debug, Default, PartialEq)]
+#[reflect(Component)]
+pub struct DotCuts(pub Vec<job::paint::DotCut>);
+
+fn paint_dots() -> u32 {
+    job::paint::POINTS_PER_PAINT as u32
 }
 
 /// A Jev tracker's settings (`Method::Jev`, `job::jev`).
@@ -426,6 +453,8 @@ impl Tracker {
             centred: centred(),
             pattern_scores: Vec::new(),
             jev: JevSettings::default(),
+            paint_dots: paint_dots(),
+            dots_on_strokes: true,
         }
     }
 
@@ -562,13 +591,15 @@ fn add_tracker_in(world: &mut World, guide: Option<Entity>, look: Look) -> Optio
         return None;
     }
     let guide_name = guide.map_or("the whole frame".to_string(), |g| world.get::<Name>(g).map_or("box".to_string(), |n| n.to_string()));
-    let name = format!("Tracker {}", tracker_count(world) + 1);
-    world.resource_mut::<History>().begin(format!("Track {guide_name}"));
-    let space = guide.and_then(|g| tracking_view(world, g));
-    let mut made = None;
-    edit(world, "Track", |tx| made = Some(spawn_tracker(tx, name, guide, look, space, true)));
-    world.resource_mut::<History>().end();
-    let tracker = made?;
+    let n = tracker_count(world);
+    let name = tt_core::commands::new_name(world, "Tracker", n);
+    // (The guide's view, made if it has none, and the tracker: one undo step.)
+    let tracker = tt_core::history::compound(world, &format!("Track {guide_name}"), |world| {
+        let space = guide.and_then(|g| tracking_view(world, g));
+        let mut made = None;
+        edit(world, "Track", |tx| made = Some(spawn_tracker(tx, name, guide, look, space, true)));
+        made
+    })?;
     world.resource_mut::<Selection>().select_only(tracker);
     Some(tracker)
 }
@@ -712,7 +743,8 @@ pub fn add_tracker(world: &mut World, guide: Entity, frame: FrameIndex, space: O
     let anchor = anchor_in(world, Some(guide), frame)?;
     let look = look_from_guide(world, guide, anchor)?;
     let guide_name = world.get::<Name>(guide).map_or("box".to_string(), |n| n.to_string());
-    let name = format!("Tracker {}", tracker_count(world) + 1);
+    let n = tracker_count(world);
+    let name = tt_core::commands::new_name(world, "Tracker", n);
     let mut made = None;
     edit(world, &format!("Track {guide_name}"), |tx| made = Some(spawn_tracker(tx, name, Some(guide), look, space, false)));
     let tracker = made?;
@@ -774,7 +806,8 @@ fn apply_track_actions(world: &mut World) {
         (_, []) => "Re-seed tracker".to_string(),
         _ => "Track".to_string(),
     };
-    let first = tracker_count(world) + 1;
+    let n = tracker_count(world);
+    let names = tt_core::commands::new_names(world, "Tracker", n, guides.len());
     let mut made = Vec::new();
     edit(world, &label, |tx| {
         for (e, a, l) in reseed {
@@ -786,8 +819,8 @@ fn apply_track_actions(world: &mut World) {
                 i.0.insert(at, item);
             });
         }
-        for (i, (g, look)) in guides.into_iter().enumerate() {
-            made.push(spawn_tracker(tx, format!("Tracker {}", first + i), Some(g), look, space, false));
+        for ((g, look), name) in guides.into_iter().zip(names) {
+            made.push(spawn_tracker(tx, name, Some(g), look, space, false));
         }
     });
     if !made.is_empty() {
@@ -833,6 +866,14 @@ pub fn track_from(world: &mut World, trackers: &[Entity], f: FrameIndex, run: Tr
     (trackers.len(), reseed.len())
 }
 
+/// Dots cut or uncut (an undo can take the component away): the tracker
+/// plans again, and tracks again from the paint before what changed (`runner::Plan::touched`).
+fn cuts_changed(changed: Query<Entity, Changed<DotCuts>>, mut removed: RemovedComponents<DotCuts>, mut inv: ResMut<tt_core::op::Invalidations>, t: Res<Transport>) {
+    for e in changed.iter().chain(removed.read()) {
+        inv.recompute(e, 0..t.frame_count);
+    }
+}
+
 /// A look edited (moved, resized, its mask painted): its trackers re-track.
 fn look_changed(changed: Query<Entity, Changed<Look>>, mut inv: ResMut<tt_core::op::Invalidations>, t: Res<Transport>) {
     for e in &changed {
@@ -851,8 +892,13 @@ impl Module for TrackModule {
             .component::<TrackRun>(Class::Document)
             .component::<human::AutoOutput>(Class::Document)
             .component::<human::HumanLayer>(Class::Document)
-            .component::<off::TrackerOff>(Class::Document)
             .component::<icons::CursorIcons>(Class::Document)
+            .component::<DotCuts>(Class::Document)
+            .register_type::<job::paint::DotCut>()
+            .register_type::<job::paint::DotId>()
+            .register_type::<Vec<job::paint::DotCut>>()
+            .register_type::<[f32; 2]>()
+            .register_type::<Vec<[f32; 2]>>()
             .declare::<runner::PaintPoints>(Class::Derived)
             .declare::<runner::CursorShapes>(Class::Derived)
             .declare::<icons::IconFit>(Class::Derived)
@@ -885,8 +931,32 @@ impl Module for TrackModule {
             .declare::<runner::TrackJobs>(Class::Derived)
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
-            .add_systems((apply_track_actions, look_changed, off::switch_actions).in_set(Set::Intents))
+            .add_systems((apply_track_actions, look_changed, cuts_changed).in_set(Set::Intents))
             .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tt_core::tool::{ActiveTool, Tool};
+
+    /// A kind's button or key: the Track tool with it on, then off; another kind switches kinds, keeping the tool.
+    #[test]
+    fn a_kind_toggles_the_track_tool_and_switches_kinds() {
+        let mut w = World::new();
+        w.init_resource::<ActiveTool>();
+        w.init_resource::<NewTrackers>();
+        let state = |w: &World| (w.resource::<ActiveTool>().0, w.resource::<NewTrackers>().method);
+        toggle_track_kind(&mut w, Method::Paint);
+        assert_eq!(state(&w), (Tool::Track, Method::Paint));
+        toggle_track_kind(&mut w, Method::Template);
+        assert_eq!(state(&w), (Tool::Track, Method::Template), "another kind: the tool stays on");
+        toggle_track_kind(&mut w, Method::Template);
+        assert_eq!(state(&w).0, Tool::Select, "the same kind again: off");
+        w.resource_mut::<ActiveTool>().0 = Tool::Draw;
+        toggle_track_kind(&mut w, Method::Paint);
+        assert_eq!(state(&w), (Tool::Track, Method::Paint), "from another tool: on");
     }
 }

@@ -35,12 +35,23 @@
 //! - **Each frame's points** come out too ([`Mark`]): where each cohort
 //!   point was, whether the model saw it, and whether it makes it to the
 //!   next paint (the app draws them: kept, or faded red).
+//! - **Dots along the strokes** *(on request: "just allow me to paint dots
+//!   directly with some brush logic, and I can know exactly where a dot
+//!   is")*: a paint keeps the dots its strokes laid down (one a brush radius
+//!   along each stroke, `Look::dots`); a tracker set to use them
+//!   (`Tracker::dots_on_strokes`, new paint trackers) tracks those, at most
+//!   its dots per paint, instead of dots spread over the painted area ([`dots`]).
+//! - **Each dot has a name** ([`DotId`]: its paint's frame and its number
+//!   there), the same in every job, so it can be **cut** for a stretch
+//!   ([`DotCut`], on request: "erase a dot in the middle of its path … to cut
+//!   them off, but only those chunks"; "from here to next paint"): where cut,
+//!   it counts in no fit (as where the model doesn't see it) and is marked so.
 
 use super::LookSpec;
 use tt_core::time::FrameIndex;
 use tt_core::view::SpaceMap;
 
-/// The most points one paint gives.
+/// The most points one paint gives, unless its tracker says otherwise (`Tracker::paint_dots`).
 pub const POINTS_PER_PAINT: usize = 48;
 /// A mask cell counts as painted from this value (0–255).
 const PAINTED: u8 = 96;
@@ -49,6 +60,31 @@ const PAINTED: u8 = 96;
 pub type Pair = ([f64; 2], [f64; 2]);
 /// A cohort point on a paint's frame: its query, its place in the reference, where it is (view px).
 type Held = (usize, [f64; 2], [f64; 2]);
+
+/// A dot, by the paint that seeded it (its frame) and its number among that frame's dots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, bevy_reflect::Reflect)]
+pub struct DotId {
+    pub paint: FrameIndex,
+    pub k: u32,
+}
+
+/// A cohort dot on a paint's frame: its name, its place in the reference (view px), and where it is.
+pub type CohortDot = (DotId, [f64; 2], [f64; 2]);
+
+/// A dot left out of the fit on frames `from..to` (from where it was cut to the next paint).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bevy_reflect::Reflect)]
+pub struct DotCut {
+    pub dot: DotId,
+    pub from: FrameIndex,
+    pub to: FrameIndex,
+}
+
+impl DotCut {
+    /// Whether it leaves `dot` out on frame `f`.
+    pub fn cuts(&self, dot: DotId, f: FrameIndex) -> bool {
+        self.dot == dot && (self.from..self.to).contains(&f)
+    }
+}
 
 /// A similarity: `p' = [a·x − b·y + tx, b·x + a·y + ty]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -180,6 +216,19 @@ pub fn sample(look: &LookSpec, most: usize) -> Vec<[f64; 2]> {
     (0..most).map(|i| cells[((i as f64 + 0.5) * step) as usize]).collect()
 }
 
+/// A paint's dots (source px), at most `most`: the dots its strokes laid
+/// down, with `on_strokes` and if it has any, else spread over what it painted.
+pub fn dots(look: &LookSpec, most: usize, on_strokes: bool) -> Vec<[f64; 2]> {
+    if !on_strokes || look.dots.is_empty() {
+        return sample(look, most);
+    }
+    if look.dots.len() <= most {
+        return look.dots.clone();
+    }
+    let step = look.dots.len() as f64 / most.max(1) as f64;
+    (0..most).map(|i| look.dots[((i as f64 + 0.5) * step) as usize]).collect()
+}
+
 /// Whether source point `p` is on a paint (on a painted cell, or next to one).
 pub fn on(look: &LookSpec, p: [f64; 2]) -> bool {
     let Some((mask, n)) = look.mask.as_ref().and_then(|m| Some((m, mask_side(m)?))) else {
@@ -205,14 +254,16 @@ pub struct PaintState {
     /// The tracked point in the reference (view px), and the box's half-size at scale 1.
     pub target: [f64; 2],
     pub half: [f64; 2],
-    /// The cohort: each point's place in the reference (view px), and where it is on `frame` (source px).
-    pub points: Vec<([f64; 2], [f64; 2])>,
+    /// The cohort: each point's name, its place in the reference (view px), and where it is on `frame` (source px).
+    pub points: Vec<CohortDot>,
 }
 
 /// One query of a paint job: the stream frame it starts on (its paint's).
 #[derive(Clone, Debug)]
 pub struct PaintQuery {
     pub i: usize,
+    /// Which dot it is.
+    pub id: DotId,
     /// Where it is in the reference (view px of the stream's first frame),
     /// once its paint's frame is fitted.
     pub reference: Option<[f64; 2]>,
@@ -221,14 +272,16 @@ pub struct PaintQuery {
 /// One cohort point on one frame, for the app to draw.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mark {
-    /// Which point (its query's number in the job).
-    pub id: u32,
+    /// Which dot.
+    pub id: DotId,
     /// Where the model put it (view px).
     pub at: [f64; 2],
     /// The model saw it there (score at least `min_score`).
     pub seen: bool,
     /// It makes it to the next paint (in the cohort); false: it doesn't (faded red).
     pub kept: bool,
+    /// Cut here ([`DotCut`]): in no fit.
+    pub cut: bool,
 }
 
 /// A frame's result: the tracked point (view px), its score, lost, the
@@ -273,6 +326,8 @@ pub struct PaintFit {
     states: Vec<(FrameIndex, Similarity, Vec<Held>)>,
     /// Resumed: the stream's first frame comes out too (it may be one to redo).
     resumed: bool,
+    /// Dots left out of the fit on some frames.
+    pub cuts: Vec<DotCut>,
 }
 
 impl PaintFit {
@@ -280,7 +335,7 @@ impl PaintFit {
     /// cohort's points are the first queries (`state.points.len()` of them,
     /// on frame 0, placed already), then the paints after it.
     pub fn resume(state: &PaintState, mut queries: Vec<PaintQuery>, paints: Vec<(usize, LookSpec)>, min_score: f64, slack: f64) -> Self {
-        for (q, (r, _)) in queries.iter_mut().zip(&state.points) {
+        for (q, (_, r, _)) in queries.iter_mut().zip(&state.points) {
             q.reference = Some(*r);
         }
         let mut fit = Self::new(queries, paints, state.target, state.half, min_score, slack);
@@ -291,15 +346,16 @@ impl PaintFit {
 
     /// The states on the paints passed since the last call: (frame, motion,
     /// the cohort as (reference, view px)).
-    pub fn take_states(&mut self) -> Vec<(FrameIndex, Similarity, Vec<Pair>)> {
-        std::mem::take(&mut self.states).into_iter().map(|(f, m, pts)| (f, m, pts.into_iter().map(|(_, r, p)| (r, p)).collect())).collect()
+    pub fn take_states(&mut self) -> Vec<(FrameIndex, Similarity, Vec<CohortDot>)> {
+        let states = std::mem::take(&mut self.states);
+        states.into_iter().map(|(f, m, pts)| (f, m, pts.into_iter().map(|(k, r, p)| (self.queries[k].id, r, p)).collect())).collect()
     }
     /// `paints`: (stream index, paint) on the stream; the queries, each with its
     /// paint's stream index; `min_score`; outliers' least distance (view px).
     pub fn new(queries: Vec<PaintQuery>, mut paints: Vec<(usize, LookSpec)>, target: [f64; 2], half: [f64; 2], min_score: f64, slack: f64) -> Self {
         paints.sort_by_key(|(i, _)| *i);
         let alive = vec![false; queries.len()];
-        Self { queries, paints, motion: Similarity::IDENTITY, target, half, alive, next: None, held: Vec::new(), min_score, slack, states: Vec::new(), resumed: false }
+        Self { queries, paints, motion: Similarity::IDENTITY, target, half, alive, next: None, held: Vec::new(), min_score, slack, states: Vec::new(), resumed: false, cuts: Vec::new() }
     }
 
     fn next_paint_after(&self, i: usize) -> Option<usize> {
@@ -384,7 +440,8 @@ impl PaintFit {
     /// One frame fitted from the cohort `members` (those it marks kept; the
     /// other points alive at the stretch's start are marked not kept).
     fn fit(&mut self, i: usize, f: FrameIndex, pts: &Points, members: &[bool], open: bool) -> FrameOut {
-        let seen = |k: usize| pts.get(k).copied().flatten().filter(|(_, s)| *s >= self.min_score).map(|(p, _)| p);
+        let cut = |k: usize| self.cuts.iter().any(|c| c.cuts(self.queries[k].id, f));
+        let seen = |k: usize| pts.get(k).copied().flatten().filter(|(_, s)| *s >= self.min_score && !cut(k)).map(|(p, _)| p);
         let pairs: Vec<(usize, Pair)> = (0..self.queries.len()).filter(|k| members[*k]).filter_map(|k| Some((k, (self.queries[k].reference?, seen(k)?)))).collect();
         let only: Vec<Pair> = pairs.iter().map(|(_, p)| *p).collect();
         let fitted = Similarity::fit_robust(&only, &self.motion, self.slack);
@@ -400,7 +457,7 @@ impl PaintFit {
         // Its points: the cohort's (kept), and those alive at the stretch's start that don't make it.
         let marks = (0..self.queries.len())
             .filter(|k| self.queries[*k].i <= i && (members[*k] || (!open && self.alive[*k])))
-            .filter_map(|k| pts.get(k).copied().flatten().map(|(p, s)| Mark { id: k as u32, at: p, seen: s >= self.min_score, kept: members[k] }))
+            .filter_map(|k| pts.get(k).copied().flatten().map(|(p, s)| Mark { id: self.queries[k].id, at: p, seen: s >= self.min_score, kept: members[k], cut: cut(k) }))
             .collect();
         let given = i == 0 && !self.resumed;
         FrameOut { i, f, at: self.motion.apply(self.target), score: if given { 1.0 } else { score as f32 }, lost: inliers == 0 && !given, scale: self.motion.scale(), marks }
@@ -423,7 +480,7 @@ mod tests {
                 }
             }
         }
-        LookSpec { frame: 0, center, half: [half, half], mask: Some(mask), pattern: 0 }
+        LookSpec { frame: 0, center, half: [half, half], mask: Some(mask), pattern: 0, dots: Vec::new() }
     }
 
     #[test]
@@ -483,7 +540,7 @@ mod tests {
         let mut start = Vec::new();
         for (i, l) in &paints {
             for p in sample(l, 20) {
-                queries.push(PaintQuery { i: *i, reference: None });
+                queries.push(PaintQuery { i: *i, reference: None, id: DotId { paint: *i as FrameIndex, k: queries.len() as u32 } });
                 start.push(if *i == 30 { p } else { motion(*i as i64).invert(p) });
             }
         }
@@ -525,9 +582,9 @@ mod tests {
             assert!(!o.lost, "frame {f}");
         }
         // The points that slid off: shown as not kept in 0–10 (and never in the cohort), gone after.
-        assert!(got[&3].marks.iter().filter(|m| m.id < 3).all(|m| !m.kept));
-        assert!(got[&3].marks.iter().filter(|m| m.id >= 3 && m.id < 20).all(|m| m.kept));
-        assert!(got[&15].marks.iter().all(|m| m.id >= 3), "after their stretch they are gone");
+        assert!(got[&3].marks.iter().filter(|m| m.id.k < 3).all(|m| !m.kept));
+        assert!(got[&3].marks.iter().filter(|m| m.id.k >= 3 && m.id.k < 20).all(|m| m.kept));
+        assert!(got[&15].marks.iter().all(|m| m.id.k >= 3), "after their stretch they are gone");
         // 20–30: nothing reaches the far paint: lost, the motion held; then it starts again there.
         assert!((21..30).all(|f| got[&f].lost), "a stretch nothing made it through is lost");
         assert!(dist(got[&30].at, centre(&far)) < 0.5 && !got[&30].lost);
@@ -546,7 +603,7 @@ mod tests {
         let mut later = painted([300.0, 100.0], 20.0);
         later.frame = 50;
         let pts = sample(&first, 10);
-        let queries: Vec<PaintQuery> = pts.iter().map(|_| PaintQuery { i: 0, reference: None }).collect();
+        let queries: Vec<PaintQuery> = pts.iter().enumerate().map(|(k, _)| PaintQuery { i: 0, reference: None, id: DotId { paint: 0, k: k as u32 } }).collect();
         let mut fit = PaintFit::new(queries, vec![(0, first.clone()), (50, later)], centre(&first), [10.0, 10.0], 0.6, 1.0);
         for f in 0..5usize {
             let points: Points = pts.iter().map(|p| Some(([p[0] + f as f64, p[1]], 0.9))).collect();
@@ -556,4 +613,43 @@ mod tests {
         assert_eq!(out.len(), 5);
         assert!(dist(out[4].at, [centre(&first)[0] + 4.0, centre(&first)[1]]) < 1e-6);
     }
+
+    /// A dot cut on frames 5..10 counts in no fit there (the motion follows
+    /// the other dot alone), is marked cut, and counts again after.
+    #[test]
+    fn a_cut_dot_counts_in_no_fit_where_it_is_cut() {
+        let map = SpaceMap::identity(&tt_core::view::SourceSize { width: 1920.0, height: 1080.0 });
+        let first = painted([100.0, 100.0], 20.0);
+        let (a, b) = ([90.0, 100.0], [110.0, 100.0]);
+        let id = |k: u32| DotId { paint: 0, k };
+        let queries = vec![PaintQuery { i: 0, reference: None, id: id(0) }, PaintQuery { i: 0, reference: None, id: id(1) }];
+        let mut fit = PaintFit::new(queries, vec![(0, first.clone())], [100.0, 100.0], [10.0, 10.0], 0.6, 1.0);
+        fit.cuts = vec![DotCut { dot: id(1), from: 5, to: 10 }];
+        // Both move 1 px a frame right; from frame 5 on, the second also slides 6 px a frame down.
+        let mut out = Vec::new();
+        for f in 0..13usize {
+            let slide = if f >= 5 { 6.0 * (f - 4) as f64 } else { 0.0 };
+            let points: Points = vec![Some(([a[0] + f as f64, a[1]], 0.9)), Some(([b[0] + f as f64, b[1] + slide], 0.9))];
+            out.extend(fit.frame(f, f as FrameIndex, &map, points));
+        }
+        assert_eq!(out.len(), 13);
+        for o in &out[5..10] {
+            assert!(dist(o.at, [100.0 + o.f as f64, 100.0]) < 1e-6, "frame {}: with the first dot alone: {:?}", o.f, o.at);
+            assert!(o.marks.iter().any(|m| m.id == id(1) && m.cut) && o.marks.iter().any(|m| m.id == id(0) && !m.cut));
+        }
+        assert!(out[11].marks.iter().all(|m| !m.cut), "after the cut it counts again");
+        assert!(dist(out[11].at, [111.0, 100.0]) > 1.0, "and pulls the fit with it");
+    }
+
+    #[test]
+    fn a_paint_tracks_its_strokes_dots_when_asked() {
+        let mut look = painted([100.0, 100.0], 20.0);
+        look.dots = (0..10).map(|k| [90.0 + 2.0 * k as f64, 100.0]).collect();
+        assert_eq!(dots(&look, 48, true), look.dots, "its own dots");
+        assert_eq!(dots(&look, 4, true).len(), 4, "at most its dots per paint, evenly");
+        assert_eq!(dots(&look, 48, false), sample(&look, 48), "spread over the paint");
+        let bare = painted([100.0, 100.0], 20.0);
+        assert_eq!(dots(&bare, 48, true), sample(&bare, 48), "a paint from before dots: spread");
+    }
+
 }

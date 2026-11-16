@@ -92,7 +92,7 @@ fn drawn_frames_are_the_output_there_and_erasing_brings_the_results_back() {
     assert_eq!(auto_value(w, op, 30).map(|v| v[0]), Some(130.0), "drawing never touches the automatic results");
     assert_eq!(drawn_at(w, op, 29), Some([300.0, 229.0]));
     // Consumers see it: a subject's points, the stabilizer's.
-    assert!(tt_core::subject::points_of(w, op).contains(&(30, [300.0, 230.0])), "drawn frames count as good points");
+    assert!(tt_core::subject::points_of(w, op, true).contains(&(30, [300.0, 230.0])), "drawn frames count as good points");
 
     // Erase one frame: its result shows again (stale, as it is).
     assert!(erase_drawn(&mut core.world, op, Some(30..31)));
@@ -493,4 +493,81 @@ fn cotracker_with_no_sketch_follows_the_sprite() {
     assert!(e[30] < 4.0, "median {}", e[30]);
     assert!(e[60] < 12.0, "max {}", e[60]);
     assert!(value(w, op, 600).is_some_and(|(v, _)| (v[0] as f64 - truth(600)[0]).abs() < 1e-3), "the reset point is exact (not aligned)");
+}
+
+/// Esc while holding the Draw tool: the hold never happened (the manual dot
+/// it started goes too), whichever of the tool switch and the Draw tool sees Esc first.
+#[test]
+fn esc_during_a_draw_stroke_cancels_it() {
+    let mut core = core(100);
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Draw;
+    pointer(&mut core, 1.0, [100.0, 100.0], true, true, false);
+    pointer(&mut core, 1.01, [110.0, 100.0], false, true, false);
+    assert!(core.world.resource::<History>().in_gesture());
+    core.world.resource_mut::<tt_core::input::PendingActions>().push(tt_core::input::Action::Cancel);
+    pointer(&mut core, 1.02, [120.0, 100.0], false, true, false);
+    pointer(&mut core, 1.03, [120.0, 100.0], false, false, true);
+    let w = &mut core.world;
+    assert!(!w.resource::<History>().can_undo(), "nothing to undo: the stroke never happened ({:?})", w.resource::<History>().undo_label());
+    let mut q = w.query_filtered::<&Tracker, bevy_ecs::query::Without<bevy_ecs::entity_disabling::Disabled>>();
+    assert_eq!(q.iter(w).count(), 0, "no manual dot left");
+}
+
+/// Ctrl+Z in the middle of a Draw stroke undoes the stroke so far and ends
+/// it: moving on until the release draws nothing more (it used to go on
+/// writing into the manual dot the undo had just removed, an undo step a frame).
+#[test]
+fn undo_during_a_draw_stroke_ends_it() {
+    let mut core = core(100);
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Draw;
+    pointer(&mut core, 1.0, [100.0, 100.0], true, true, false);
+    pointer(&mut core, 1.01, [110.0, 100.0], false, true, false);
+    core.world.resource_mut::<tt_core::input::PendingActions>().push(tt_core::input::Action::Undo);
+    pointer(&mut core, 1.02, [120.0, 100.0], false, true, false);
+    for (i, x) in [130.0, 140.0, 150.0].into_iter().enumerate() {
+        core.world.resource_mut::<Transport>().seek(i as i64 + 1);
+        pointer(&mut core, 1.03 + i as f64 * 0.01, [x, 100.0], false, true, false);
+    }
+    pointer(&mut core, 1.1, [150.0, 100.0], false, false, true);
+    let h = core.world.resource::<History>();
+    assert!(!h.can_undo() && !h.in_gesture(), "nothing drawn after the undo: {:?}", h.undo_label());
+    assert_eq!(h.redo_label(), Some("Draw Manual dot 1"), "the stroke so far can be redone");
+}
+
+/// Baking a tracker, then a subject, into manual dots: drawn on every frame
+/// each has a point (a lost frame too; not where the tracker is off), its own
+/// from then on (editing the tracker after changes nothing in it), and one undo.
+#[test]
+fn baking_makes_a_manual_dot_of_the_path_on_its_own() {
+    let mut core = core(100);
+    let op = tracker_with_results(&mut core);
+    tt_core::off::switch_from(&mut core.world, &[op], 40, true);
+    core.run_pre_ui();
+    let made = tt_track::human::bake(&mut core.world, &[op]);
+    let [dot] = made[..] else { panic!("one dot: {made:?}") };
+    core.run_pre_ui();
+    let w = &core.world;
+    assert!(tt_track::human::is_manual(w, dot));
+    assert!(w.get::<bevy_ecs::name::Name>(dot).is_some_and(|n| n.as_str().ends_with(" baked")), "named after what it came from");
+    assert_eq!(drawn_at(w, dot, 10), Some([110.0, 50.0]), "where it was");
+    assert_eq!(drawn_at(w, dot, 30), Some([130.0, 50.0]), "a lost (red) frame too");
+    assert_eq!(drawn_at(w, dot, 45), None, "not where it is switched off");
+    assert_eq!(w.resource::<Selection>().entities, vec![dot], "selected");
+    // Its own: drawing over the tracker afterwards leaves the baked path as it was.
+    edit(&mut core.world, "Draw", |tx| write_drawn(tx, op, &[(10, Some([500.0, 500.0]))]));
+    core.run_pre_ui();
+    assert_eq!(drawn_at(&core.world, dot, 10), Some([110.0, 50.0]));
+    // A subject of the tracker: its path.
+    let s = tt_core::subject::make_subject(&mut core.world, &[op], 0).expect("a subject");
+    core.run_pre_ui();
+    let [baked] = tt_track::human::bake(&mut core.world, &[s])[..] else { panic!("one dot") };
+    core.run_pre_ui();
+    let w = &core.world;
+    for f in [0, 20, 39] {
+        let v = tt_core::subject::value_at(w, s, f).expect("the subject's value");
+        assert_eq!(drawn_at(w, baked, f), Some([v[0], v[1]]), "frame {f}");
+    }
+    // One undo takes the baked subject's dot back.
+    undo(&mut core.world);
+    assert!(core.world.get::<bevy_ecs::entity_disabling::Disabled>(baked).is_some());
 }

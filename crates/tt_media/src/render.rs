@@ -427,38 +427,63 @@ pub fn render_warped_with(
     }
 }
 
+/// What a tracking target is rendered on: black, in a video `Codec`, or
+/// transparency, in a transparent format (to lay over footage in an editor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerOn {
+    Black(Codec),
+    Transparent(crate::layers::AlphaFormat),
+}
+
 /// Renders a tracking target the size of `index`'s video over its grid
-/// frames `frames`: on black, a marker where `at(g)` says (its centre in
-/// source px, its turn in radians, clockwise on screen), `half` px from its
-/// centre to its side: a white-bordered checker (its crossing is what
-/// trackers lock onto) and a smaller one beside it on its own x axis (for
-/// rotation). No `at`: black.
+/// frames `frames`: a marker where `at(g)` says (its centre in source px,
+/// its turn in radians, clockwise on screen), `half` px from its centre to
+/// its side: a white-bordered checker (its crossing is what trackers lock
+/// onto) and a smaller one beside it on its own x axis (for rotation), on
+/// black or on transparency (`on`). No `at`: nothing but the background.
 #[allow(clippy::too_many_arguments)]
 pub fn render_marker(
     index: &VideoIndex,
     out: &Path,
-    codec: Codec,
+    on: MarkerOn,
     frames: Range<FrameIndex>,
     at: &(dyn Fn(FrameIndex) -> Option<([f64; 2], f64)> + Sync),
     half: f64,
     progress: &AtomicUsize,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let frames = within(index, frames)?;
     let (w, h) = (index.width as usize, index.height as usize);
+    // Each frame's marker: its brightness on black and how much of each pixel it covers.
+    let draw = |g: FrameIndex| {
+        let (mut y, mut cover) = (vec![0u8; w * h], vec![0u8; w * h]);
+        if let Some((c, angle)) = at(g) {
+            draw_marker(&mut y, &mut cover, w, h, c, angle, half);
+        }
+        (y, cover)
+    };
+    let codec = match on {
+        // (Straight colour: the marker's own brightness where it covers anything, so its edges don't darken.)
+        MarkerOn::Transparent(format) => {
+            let rgba = |g: FrameIndex| {
+                let (y, cover) = draw(g);
+                y.iter().zip(&cover).flat_map(|(y, a)| {
+                    let v = if *a == 0 { 0 } else { (*y as u32 * 255 / *a as u32).min(255) as u8 };
+                    [v, v, v, *a]
+                }).collect()
+            };
+            return crate::layers::render_rgba(index, out, format, frames, &rgba, progress, cancel);
+        }
+        MarkerOn::Black(codec) => codec,
+    };
+    let frames = within(index, frames)?;
     let tags = [("-color_range".to_string(), "pc".to_string())];
     let mut encoder = Encoder::start(index, out, codec, "gray", &tags, None)?;
-    let mut frame = vec![0u8; w * h];
     let result = (|| -> Result<()> {
         for (k, g) in frames.clone().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
-            frame.fill(0);
-            if let Some((c, angle)) = at(g) {
-                draw_marker(&mut frame, w, h, c, angle, half);
-            }
-            encoder.write(&frame)?;
+            encoder.write(&draw(g).0)?;
             progress.store(k + 1, Ordering::Relaxed);
         }
         Ok(())
@@ -521,34 +546,36 @@ fn sample(get: &impl Fn(usize) -> f32, w: usize, h: usize, x: f64, y: f64) -> Op
 
 /// The marker (see [`render_marker`]), anti-aliased (4 × 4 samples a pixel),
 /// drawn into an 8-bit luma plane.
-fn draw_marker(y: &mut [u8], w: usize, h: usize, centre: [f64; 2], angle: f64, half: f64) {
+fn draw_marker(y: &mut [u8], cover: &mut [u8], w: usize, h: usize, centre: [f64; 2], angle: f64, half: f64) {
     let (s, c) = angle.sin_cos();
     let beside = [centre[0] + c * 3.0 * half, centre[1] + s * 3.0 * half];
     for (at, size) in [(centre, half), (beside, half / 2.0)] {
         let border = (size / 6.0).max(1.5);
         // Inside: the checker's light quadrants (top left and bottom right, in its own turn) and the border.
-        let lit = |px: f64, py: f64| {
+        // (Covered by the square, and lit: its border or a light quadrant.)
+        let sample = |px: f64, py: f64| {
             let (dx, dy) = (px - at[0], py - at[1]);
             let (u, v) = (c * dx + s * dy, -s * dx + c * dy);
             if u.abs() > size || v.abs() > size {
-                return false;
+                return (false, false);
             }
-            u.abs() > size - border || v.abs() > size - border || (u < 0.0) == (v < 0.0)
+            (true, u.abs() > size - border || v.abs() > size - border || (u < 0.0) == (v < 0.0))
         };
         let reach = size * std::f64::consts::SQRT_2 + 1.0;
         let (x0, x1) = (((at[0] - reach).floor().max(0.0)) as usize, ((at[0] + reach).ceil().max(0.0) as usize).min(w));
         let (y0, y1) = (((at[1] - reach).floor().max(0.0)) as usize, ((at[1] + reach).ceil().max(0.0) as usize).min(h));
         for py in y0..y1 {
             for px in x0..x1 {
-                let mut n = 0;
+                let (mut inside, mut lit) = (0, 0);
                 for sy in 0..4 {
                     for sx in 0..4 {
-                        n += lit(px as f64 + (sx as f64 + 0.5) / 4.0, py as f64 + (sy as f64 + 0.5) / 4.0) as u32;
+                        let (i, l) = sample(px as f64 + (sx as f64 + 0.5) / 4.0, py as f64 + (sy as f64 + 0.5) / 4.0);
+                        (inside, lit) = (inside + i as u32, lit + l as u32);
                     }
                 }
-                let v = (n * 255 / 16) as u8;
-                let p = &mut y[py * w + px];
-                *p = (*p).max(v);
+                let k = py * w + px;
+                y[k] = y[k].max((lit * 255 / 16) as u8);
+                cover[k] = cover[k].max((inside * 255 / 16) as u8);
             }
         }
     }
@@ -557,6 +584,19 @@ fn draw_marker(y: &mut [u8], w: usize, h: usize, centre: [f64; 2], angle: f64, h
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The marker's black squares are covered (opaque) as much as its white
+    /// ones: on transparency it shows whole, its surroundings clear.
+    #[test]
+    fn the_marker_covers_its_black_squares_too() {
+        let (w, h) = (80usize, 60usize);
+        let (mut y, mut cover) = (vec![0u8; w * h], vec![0u8; w * h]);
+        draw_marker(&mut y, &mut cover, w, h, [30.0, 30.0], 0.0, 12.0);
+        let at = |x: usize, yy: usize| (y[yy * w + x], cover[yy * w + x]);
+        assert_eq!(at(25, 25), (255, 255), "a light quadrant (top left): white, covered");
+        assert_eq!(at(35, 25), (0, 255), "a dark one (top right): black, covered all the same");
+        assert_eq!(at(5, 5), (0, 0), "outside: nothing");
+    }
 
     #[test]
     fn a_warp_moves_and_turns_the_picture_sub_pixel() {
@@ -623,7 +663,7 @@ mod tests {
     fn the_marker_is_a_checker_where_it_is_told() {
         let (w, h) = (200usize, 120usize);
         let mut y = vec![0u8; w * h];
-        draw_marker(&mut y, w, h, [80.0, 60.0], 0.0, 20.0);
+        draw_marker(&mut y, &mut vec![0u8; w * h], w, h, [80.0, 60.0], 0.0, 20.0);
         let at = |x: usize, yy: usize| y[yy * w + x];
         assert!(at(74, 54) > 250 && at(86, 66) > 250, "top left and bottom right are light");
         assert!(at(86, 54) < 5 && at(74, 66) < 5, "the other two dark");
@@ -631,7 +671,7 @@ mod tests {
         assert!(at(20, 20) == 0, "the rest is black");
         // Turned a quarter: its partner goes below it (clockwise on screen, y down).
         let mut z = vec![0u8; w * h];
-        draw_marker(&mut z, w, h, [80.0, 40.0], std::f64::consts::FRAC_PI_2, 12.0);
+        draw_marker(&mut z, &mut vec![0u8; w * h], w, h, [80.0, 40.0], std::f64::consts::FRAC_PI_2, 12.0);
         // (Its partner's centre is (80, 76); a light quadrant, turned, is up and right of it.)
         assert!(z[73 * w + 83] > 250, "partner below, turned with it");
         assert_eq!(z[40 * w + 116], 0, "not on the right any more");

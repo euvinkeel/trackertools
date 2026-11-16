@@ -31,11 +31,15 @@ pub struct Look {
     /// `job::cursor`). Shift+brush starts another.
     #[reflect(default)]
     pub pattern: u32,
+    /// A paint's dots along its strokes (source px), one a brush radius
+    /// (`tool::brush`): what a paint tracker set to use them tracks.
+    #[reflect(default)]
+    pub dots: Vec<[f32; 2]>,
 }
 
 impl Look {
     pub fn new(frame: FrameIndex, center: [f64; 2], half: [f64; 2]) -> Self {
-        Self { frame, x: center[0] as f32, y: center[1] as f32, half_w: half[0].max(1.0) as f32, half_h: half[1].max(1.0) as f32, mask: Vec::new(), pattern: 0 }
+        Self { frame, x: center[0] as f32, y: center[1] as f32, half_w: half[0].max(1.0) as f32, half_h: half[1].max(1.0) as f32, mask: Vec::new(), pattern: 0, dots: Vec::new() }
     }
 
     pub fn center(&self) -> [f64; 2] {
@@ -55,6 +59,18 @@ impl Look {
     /// The mask, if one is painted (at least one cell on).
     pub fn painted(&self) -> Option<&[u8]> {
         (self.mask.len() == MASK_N * MASK_N && self.mask.iter().any(|c| *c > 0)).then_some(&self.mask[..])
+    }
+
+    /// What a job reads of it; `paints`: a paint (its mask can be finer than a look's: `tool::brush_paint`).
+    pub fn spec(&self, paints: bool) -> crate::job::LookSpec {
+        crate::job::LookSpec {
+            frame: self.frame,
+            center: self.center(),
+            half: self.half(),
+            mask: self.painted().map(<[u8]>::to_vec).or_else(|| (paints && crate::job::paint::mask_side(&self.mask).is_some() && self.mask.iter().any(|c| *c > 0)).then(|| self.mask.clone())),
+            pattern: self.pattern,
+            dots: self.dots.iter().map(|d| [d[0] as f64, d[1] as f64]).collect(),
+        }
     }
 }
 

@@ -31,7 +31,13 @@ fn trackers_menu(ui: &mut egui::Ui, world: &mut World, selection: &[Entity], cho
     let trackers: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e) && !tt_track::human::is_manual(world, *e)).collect();
     let all: Vec<Entity> = crate::panels::tracks::list(world).into_iter().map(|(e, _)| e).filter(|e| running(world, *e)).collect();
     let running_now: Vec<Entity> = if trackers.is_empty() { all } else { trackers.iter().copied().filter(|e| running(world, *e)).collect() };
-    let switchable: Vec<Entity> = selection.iter().copied().filter(|e| tt_track::is_tracker(world, *e)).collect();
+    // Trackers and sketches (a stroke: its sketch) switch off and on.
+    let mut switchable: Vec<Entity> = Vec::new();
+    for e in selection {
+        if let Some(s) = tt_core::off::switchable(world, *e).filter(|s| !switchable.contains(s)) {
+            switchable.push(s);
+        }
+    }
     if trackers.is_empty() && running_now.is_empty() && switchable.is_empty() {
         return;
     }
@@ -54,20 +60,21 @@ fn trackers_menu(ui: &mut egui::Ui, world: &mut World, selection: &[Entity], cho
         ui.close();
     }
     if !switchable.is_empty() {
-        let off_here = switchable.iter().any(|t| !tt_track::off::is_off(world, *t, f));
-        let any_off = switchable.iter().any(|t| world.get::<tt_track::off::TrackerOff>(*t).is_some_and(tt_track::off::TrackerOff::any_off));
-        let here = if off_here { format!("Switch {} off from frame {f}", n(switchable.len())) } else { format!("Switch {} on again from frame {f}", n(switchable.len())) };
+        let off_here = switchable.iter().any(|t| !tt_core::off::is_off(world, *t, f));
+        let any_off = switchable.iter().any(|t| world.get::<tt_core::off::Off>(*t).is_some_and(tt_core::off::Off::any_off));
+        let them = if switchable.len() == 1 { "it".to_string() } else { format!("these {}", switchable.len()) };
+        let here = if off_here { format!("Switch {them} off from frame {f}") } else { format!("Switch {them} on again from frame {f}") };
         if ui
             .button(format!("{here}{}", chord(Action::SwitchTracker)))
-            .on_hover_text("Where a tracker is off, subjects and exports go on with the others (as where it is lost). Its results stay: switch it on again and they count again.")
+            .on_hover_text("Where a tracker or sketch is off, subjects and exports go on with the others (as where a tracker is lost). Nothing is deleted: switch it on again and it counts again.")
             .clicked()
         {
-            tt_track::off::switch_from(world, &switchable, f, off_here);
+            tt_core::off::switch_from(world, &switchable, f, off_here);
             ui.close();
         }
         let every = if any_off { "on everywhere" } else { "off everywhere" };
-        if ui.button(format!("Switch {} {every}{}", n(switchable.len()), chord(Action::SwitchTrackerEverywhere))).clicked() {
-            tt_track::off::switch_everywhere(world, &switchable, !any_off);
+        if ui.button(format!("Switch {them} {every}{}", chord(Action::SwitchTrackerEverywhere))).clicked() {
+            tt_core::off::switch_everywhere(world, &switchable, !any_off);
             ui.close();
         }
     }
@@ -133,7 +140,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
         if layer.is_some()
             && ui.button("Export layers\u{2026}").on_hover_text("The video with the layers on top, the layers alone on transparency, or their motion as JSON").clicked()
         {
-            crate::panels::layer_export::open(world);
+            crate::panels::layer_export::open(world, crate::panels::layer_export::What::Over);
             ui.close();
         }
         if let Some(l) = layer {
@@ -301,6 +308,50 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
             tt_core::subject::make_subject(world, &points, here);
             ui.close();
         }
+        // Into or out of a subject that exists, without selecting it too.
+        let all: Vec<Entity> = crate::tree::tree(world).into_iter().filter(|(_, _, k)| *k == crate::tree::Node::Subject).map(|(s, _, _)| s).collect();
+        let joins: Vec<Entity> = all.iter().copied().filter(|s| points.iter().any(|p| tt_core::subject::can_join(world, *s, *p))).collect();
+        let has: Vec<Entity> = all.iter().copied().filter(|s| tt_core::subject::members_of(world, *s).iter().any(|m| points.contains(m))).collect();
+        if !joins.is_empty() {
+            ui.menu_button(format!("Add {them} to a subject"), |ui| {
+                for s in joins {
+                    if ui.button(name_of(world, s)).clicked() {
+                        tt_core::subject::add_members(world, s, &points);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        if !has.is_empty() {
+            ui.menu_button(format!("Take {them} out of a subject"), |ui| {
+                for s in has {
+                    if ui.button(name_of(world, s)).clicked() {
+                        tt_core::subject::remove_members(world, s, &points);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        ui.separator();
+    }
+    // Bake: each into a manual dot of its own (a path drawn on every frame it has a point).
+    let mut bakeable: Vec<Entity> = Vec::new();
+    for e in &selection {
+        let p = if tt_track::is_tracker(world, *e) || tt_core::subject::is_subject(world, *e) || tt_core::focus::is_focus(world, *e) { Some(*e) } else { sketch_of(world, *e) };
+        if let Some(p) = p.filter(|p| !bakeable.contains(p)) {
+            bakeable.push(p);
+        }
+    }
+    if !bakeable.is_empty() {
+        let text = if bakeable.len() == 1 { "Bake into a manual dot".to_string() } else { format!("Bake these {} into manual dots", bakeable.len()) };
+        if ui
+            .button(text)
+            .on_hover_text("A manual dot drawn where it is on every frame (in its lifetime, not where it is switched off): its path on its own, which stays as it is when what it came from changes. Edit it with the Draw tool (M).")
+            .clicked()
+        {
+            tt_track::human::bake(world, &bakeable);
+            ui.close();
+        }
         ui.separator();
     }
     if let [subject] = subjects[..] {
@@ -320,7 +371,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
                 world.resource_mut::<Selection>().entities = members.clone();
                 ui.close();
             }
-            let offsets = world.get::<tt_core::subject::Subject>(subject).map(|s| s.offsets.clone()).unwrap_or_default();
+            let (offsets, ease) = world.get::<tt_core::subject::Subject>(subject).map(|s| (s.offsets.clone(), s.ease)).unwrap_or_default();
             if offsets.iter().any(|k| k.frame == here) {
                 if ui.button(format!("Remove its key on frame {here}")).clicked() {
                     tt_core::subject::remove_offset_key(world, subject, here);
@@ -331,7 +382,7 @@ pub fn entity_menu(ui: &mut egui::Ui, world: &mut World) {
                 .on_hover_text("Pins where it is on this frame, so keys made elsewhere don't move it here (a drag keys it too)")
                 .clicked()
             {
-                let [x, y, a] = tt_core::subject::offset_at(&offsets, here);
+                let [x, y, a] = tt_core::subject::offset_at(&offsets, here, ease);
                 tt_core::subject::set_offset_key(world, subject, tt_core::subject::OffsetKey { frame: here, x: x as f32, y: y as f32, angle: a.to_degrees() as f32 });
                 ui.close();
             }

@@ -792,11 +792,26 @@ impl Doctor {
     }
 }
 
+/// `P`: the paint tool, as its button in the top bar does; with CoTracker
+/// not set up, the doctor (which says what it needs) instead.
+fn paint_tool(world: &mut World) {
+    if world.resource_mut::<tt_core::input::PendingActions>().take(|a| a == tt_core::input::Action::PaintTool).is_empty() {
+        return;
+    }
+    match tt_track::job::cotracker_availability() {
+        Ok(()) => tt_track::toggle_track_kind(world, tt_track::Method::Paint),
+        Err(why) => {
+            world.resource_mut::<crate::media::StatusLine>().0 = Some((format!("Paint trackers need CoTracker. {why}"), true));
+            world.resource_mut::<Doctor>().show();
+        }
+    }
+}
+
 pub struct SetupModule;
 
 impl Module for SetupModule {
     fn build(&self, app: &mut AppBuilder) {
-        app.declare::<Doctor>(Class::Derived).init_resource::<Doctor>();
+        app.declare::<Doctor>(Class::Derived).init_resource::<Doctor>().add_systems(paint_tool.in_set(tt_core::Set::Intents));
         app.declare::<crate::cotracker::EarlyStart>(Class::Derived).init_resource::<crate::cotracker::EarlyStart>();
     }
 }
