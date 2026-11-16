@@ -571,3 +571,43 @@ fn baking_makes_a_manual_dot_of_the_path_on_its_own() {
     undo(&mut core.world);
     assert!(core.world.get::<bevy_ecs::entity_disabling::Disabled>(baked).is_some());
 }
+
+/// Bending a manual dot's path (on request: "drag and edit the path
+/// similarly of a subject to a manual path as well"): selected, a press on
+/// its path at another frame than the shown one and a drag move that frame
+/// with the pointer, its neighbours less, nothing beyond the reach; one undo step.
+#[test]
+fn a_manual_dots_path_bends_where_it_is_dragged() {
+    let mut core = core(200);
+    core.world.resource_mut::<ActiveTool>().0 = Tool::Select;
+    let mut dot = None;
+    edit(&mut core.world, "Draw", |tx| {
+        let d = tt_track::human::spawn_manual_dot(tx, "Manual dot 1".into(), 0);
+        write_drawn(tx, d, &(0..100).map(|f| (f, Some([100.0 + 3.0 * f as f64, 200.0]))).collect::<Vec<_>>());
+        dot = Some(d);
+    });
+    let dot = dot.expect("a dot");
+    core.world.resource_mut::<Selection>().select_only(dot);
+    core.world.resource_mut::<Transport>().seek(40);
+    for _ in 0..2 {
+        core.run_pre_ui();
+    }
+    let before: Vec<Option<[f64; 2]>> = (0..100).map(|f| drawn_at(&core.world, dot, f)).collect();
+    // Frame 60's point, 20 frames ahead of the shown one; drag it 30 px down.
+    let at = [100.0 + 3.0 * 60.0, 200.0];
+    pointer(&mut core, 1.0, at, true, true, false);
+    for k in 1..=10 {
+        pointer(&mut core, 1.0 + 0.01 * k as f64, [at[0], at[1] + 3.0 * k as f64], false, true, false);
+    }
+    pointer(&mut core, 1.2, [at[0], at[1] + 30.0], false, false, true);
+    let w = &core.world;
+    let reach = (0.5 * w.resource::<Transport>().fps.as_f64()).round() as i64;
+    assert_eq!(drawn_at(w, dot, 60), Some([at[0], at[1] + 30.0]), "the grabbed frame follows the pointer");
+    assert!(drawn_at(w, dot, 60 - reach / 2).expect("a point")[1] > 200.0, "its neighbours bend too");
+    for f in (0..60 - reach).chain(61 + reach..100) {
+        assert_eq!(drawn_at(w, dot, f), before[f as usize], "frame {f} is beyond the reach");
+    }
+    assert_eq!(w.resource::<History>().undo_label(), Some("Bend Manual dot 1"), "one undo step");
+    undo(&mut core.world);
+    assert_eq!(drawn_at(&core.world, dot, 60), before[60]);
+}

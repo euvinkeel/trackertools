@@ -449,14 +449,16 @@ impl SubjectReach {
     }
 }
 
-/// The frame of `subject`'s drawn path whose point is nearest `at` (the
+/// The frame of `e`'s drawn path (a subject's, or any producer's point) whose point is nearest `at` (the
 /// shown space's pixels, `view`'s), within `radius` of them: each frame's
 /// point through the view's framing on that frame, as the path is drawn,
 /// over [`PATH_FRAMES`] either side of `frame`. Ties go to the frame nearer `frame`.
-pub fn path_frame(world: &World, subject: Entity, view: Option<Entity>, frame: FrameIndex, at: [f64; 2], radius: f64) -> Option<FrameIndex> {
+pub fn path_frame(world: &World, e: Entity, view: Option<Entity>, frame: FrameIndex, at: [f64; 2], radius: f64) -> Option<FrameIndex> {
+    let sig = crate::span::output(world, e)?;
     (frame - PATH_FRAMES..=frame + PATH_FRAMES)
         .filter_map(|f| {
-            let v = value_at(world, subject, f)?;
+            let v = sig.get(f).filter(|v| v.len() >= 2)?;
+            let v = [v[0] as f64, v[1] as f64];
             let p = map_at(world, view, f).from_source([v[0], v[1]]);
             let d = (p[0] - at[0]).hypot(p[1] - at[1]);
             (d <= radius).then_some((f, d))

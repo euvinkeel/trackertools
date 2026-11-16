@@ -147,9 +147,16 @@ pub enum PressOn {
     Layer(Entity, crate::layer::Handle),
     /// A subject's point on the shown frame, or the selected subject's drawn path on this frame.
     Subject(Entity, crate::time::FrameIndex),
+    /// The selected bendable path's ([`BendablePath`]: a manual dot's) point on this frame.
+    Path(Entity, crate::time::FrameIndex),
     /// Nothing a drag takes: a click selects what is under it.
     Nothing,
 }
+
+/// A path its owner's drag can bend on any of its frames (tt_track puts it on
+/// manual dots: their path is only what was drawn). Derived, never saved.
+#[derive(Component, Debug, Default, Clone, Copy)]
+pub struct BendablePath;
 
 /// The last press (kept until the next one: its click reads it on the release).
 #[derive(Resource, Debug, Default)]
@@ -161,6 +168,7 @@ pub struct Press(pub Option<PressOn>);
 /// 3. the top layer's picture;
 /// 4. any subject's point on the shown frame;
 /// 5. the selected subject's drawn path (the frame of it under the press);
+/// 6. the selected bendable path ([`BendablePath`], a manual dot's): its frame under the press;
 ///
 /// else nothing. Reaches are in screen points ([`crate::layer::HANDLE_REACH`], [`crate::layer::POINT_REACH`]).
 fn route_press(world: &mut World) {
@@ -190,8 +198,11 @@ fn route_press(world: &mut World) {
         if let Some(s) = subject {
             break 'on PressOn::Subject(s, frame);
         }
-        match selected.filter(|e| is_subject(world, *e)).and_then(|s| Some((s, path_frame(world, s, view, frame, at, POINT_REACH / scale)?))) {
-            Some((s, f)) => PressOn::Subject(s, f),
+        if let Some((s, f)) = selected.filter(|e| is_subject(world, *e)).and_then(|s| Some((s, path_frame(world, s, view, frame, at, POINT_REACH / scale)?))) {
+            break 'on PressOn::Subject(s, f);
+        }
+        match selected.filter(|e| world.get::<BendablePath>(*e).is_some()).and_then(|e| Some((e, path_frame(world, e, view, frame, at, POINT_REACH / scale)?))) {
+            Some((e, f)) => PressOn::Path(e, f),
             None => PressOn::Nothing,
         }
     };
@@ -221,6 +232,8 @@ fn select_on_click(world: &mut World) {
             world.resource_mut::<crate::selection::Selection>().select_only(l);
             return;
         }
+        // The selected bendable path: it stays selected (its drag bends it).
+        Some(PressOn::Path(e, _)) if Some(e) == selected => return,
         Some(PressOn::Subject(s, _)) if Some(s) == selected => {
             if world.resource::<crate::input::KeysHeld>().mods.alt {
                 let reach = crate::layer::POINT_REACH / scale;
@@ -268,6 +281,7 @@ impl Module for ToolModule {
             .init_resource::<ClickTracker>()
             .init_resource::<PointerTrail>()
             .declare::<Press>(Class::Derived)
+            .declare::<BendablePath>(Class::Derived)
             .init_resource::<Press>()
             .add_systems(((detect_clicks, route_press).chain(), keep_trail).in_set(Set::Input))
             .add_systems((apply_tool_actions, crate::capture::sketch_tool, select_on_click).chain().in_set(Set::Tools));

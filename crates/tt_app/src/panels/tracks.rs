@@ -103,7 +103,8 @@ fn dashed(painter: &Painter, a: Pos2, b: Pos2, stroke: Stroke) {
 /// ±90 frames, others a short tail), in the visual language (module docs).
 /// A selected tracker's looks or reset points show on the path, and in full
 /// on their own frame.
-pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(Entity, SignalId)], frame: FrameIndex, space: &dyn Fn(FrameIndex) -> SpaceMap) {
+/// `focus`: a tracker whose path's chosen point isn't the shown frame's (a manual dot being bent: overlay).
+pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(Entity, SignalId)], frame: FrameIndex, space: &dyn Fn(FrameIndex) -> SpaceMap, focus: Option<(Entity, FrameIndex)>) {
     let selected = &world.resource::<Selection>().entities;
     let store = world.resource::<SignalStore>();
     let now = world.resource::<tt_core::time::WallClock>().now;
@@ -211,7 +212,8 @@ pub fn draw(painter: &Painter, map: &ViewportMapping, world: &World, list: &[(En
         }
         // The selected tracker's: its edges by the shown frame's point glow (overlay::glow).
         if lit {
-            super::overlay::glow(painter, frame, &|f| at(f).map(|(p, _)| p), found);
+            let chosen = focus.filter(|(t, _)| *t == e).map_or(frame, |(_, f)| f);
+            super::overlay::glow(painter, chosen, &|f| at(f).map(|(p, _)| p), found);
         }
 
         // Its looks or reset points: small marks along the path, in full on their own frame.

@@ -552,6 +552,132 @@ pub fn draw_tool(world: &mut World) {
     *world.resource_mut::<DrawTool>() = tool;
 }
 
+/// The drawn points after a drag moves frame `f`'s by `d`, bending the path
+/// only within `reach` frames of it (None: moving all of it): each point
+/// there moves by `d`, eased off toward the reach's edges (smoothstep), so
+/// the path bends smoothly and nothing beyond the reach moves. `drawn`: the
+/// points as they were when the drag began. Returns the points that move.
+pub fn bent(drawn: &[(FrameIndex, [f64; 2])], f: FrameIndex, d: [f64; 2], reach: Option<FrameIndex>) -> Vec<(FrameIndex, [f64; 2])> {
+    drawn
+        .iter()
+        .filter_map(|(g, p)| {
+            let w = match reach {
+                None => 1.0,
+                Some(r) => {
+                    let u = 1.0 - (g - f).abs() as f64 / (r.max(1) + 1) as f64;
+                    if u <= 0.0 {
+                        return None;
+                    }
+                    u * u * (3.0 - 2.0 * u)
+                }
+            };
+            Some((*g, [p[0] + d[0] * w, p[1] + d[1] * w]))
+        })
+        .collect()
+}
+
+/// The Select tool's drag of a manual dot's path (`tt_core::tool::route_press`
+/// gives it the press), from the press on.
+#[derive(Clone, Debug)]
+struct Bend {
+    dot: Entity,
+    /// The frame taken hold of, and the shown space's framing on it.
+    frame: FrameIndex,
+    map: tt_core::view::SpaceMap,
+    /// The press (shown px), and from it to the point there (source px).
+    from: [f64; 2],
+    hold: [f64; 2],
+    /// Its drawn points when the press began.
+    drawn: Vec<(FrameIndex, [f64; 2])>,
+    /// Once it moved: its undo step, open until the release.
+    gesture: Option<Gesture>,
+}
+
+/// A manual dot's path being bent (*on request: "drag and edit the path
+/// similarly of a subject to a manual path as well"*).
+#[derive(Resource, Debug, Default)]
+pub struct BendDrag(Option<Bend>);
+
+impl BendDrag {
+    /// The dot being bent and the frame of it taken hold of.
+    pub fn grabbed(&self) -> Option<(Entity, FrameIndex)> {
+        self.0.as_ref().filter(|b| b.gesture.is_some()).map(|b| (b.dot, b.frame))
+    }
+}
+
+/// Manual dots' paths can be bent (`tt_core::tool::BendablePath`): their path is only what was drawn.
+pub fn mark_bendable(world: &mut World) {
+    let mut q = world.query_filtered::<(Entity, &Tracker), Without<tt_core::tool::BendablePath>>();
+    let manual: Vec<Entity> = q.iter(world).filter(|(_, t)| t.method == Method::Manual).map(|(e, _)| e).collect();
+    for e in manual {
+        world.entity_mut(e).insert(tt_core::tool::BendablePath);
+    }
+}
+
+/// `Set::Tools`: in the Select tool, a drag on the selected manual dot's
+/// path bends it there ([`bent`]), as a subject's path bends: within the
+/// reach (`tt_core::subject::SubjectReach`, the wheel while dragging), one
+/// undo step a drag; undone or cancelled (Esc) while it goes on, it stops.
+pub fn bend_drawn(world: &mut World) {
+    if world.resource::<ActiveTool>().0 != Tool::Select {
+        if let Some(g) = world.resource_mut::<BendDrag>().0.take().and_then(|b| b.gesture) {
+            world.resource_mut::<History>().end(g);
+        }
+        return;
+    }
+    let p = world.resource::<PointerFrame>().clone();
+    let scale = if p.scale > 0.0 { p.scale } else { 1.0 };
+    if let Some(t) = p.pressed
+        && let Some(at) = p.samples.iter().find(|s| s[0] >= t).map(|s| [s[1], s[2]]).or(p.hover)
+        && let Some(tt_core::tool::PressOn::Path(dot, f)) = world.resource::<tt_core::tool::Press>().0
+        && let Some(here) = drawn_at(world, dot, f)
+    {
+        let map = map_at(world, world.resource::<ActiveView>().0, f);
+        let src = map.to_source(at);
+        let drawn = human_signal(world, dot)
+            .and_then(|s| Some((s, s.present_hull()?)))
+            .map(|(s, (lo, hi))| (lo..=hi).filter_map(|g| s.get(g).map(|v| (g, [v[0] as f64, v[1] as f64]))).collect())
+            .unwrap_or_default();
+        world.resource_mut::<BendDrag>().0 = Some(Bend { dot, frame: f, map, from: at, hold: [here[0] - src[0], here[1] - src[1]], drawn, gesture: None });
+    }
+    let Some(b) = world.resource::<BendDrag>().0.clone() else { return };
+    if b.gesture.is_some_and(|g| !world.resource::<History>().is_open(g)) {
+        world.resource_mut::<BendDrag>().0 = None;
+        return;
+    }
+    let start = b.map.to_source(b.from);
+    tt_core::view::HoldViews::ask(world, Some([start[0] + b.hold[0], start[1] + b.hold[1]]));
+    if p.wheel != 0.0 {
+        let mut reach = world.resource_mut::<tt_core::subject::SubjectReach>();
+        reach.0 = (reach.0 + p.wheel).clamp(0.0, tt_core::subject::REACHES.len() as f32);
+        world.resource_mut::<PointerFrame>().wheel_taken = true;
+    }
+    if let Some(now) = p.samples.last().map(|s| [s[1], s[2]]).or(p.hover)
+        && (b.gesture.is_some() || (now[0] - b.from[0]).hypot(now[1] - b.from[1]) * scale >= tt_core::tool::CLICK_MOVE)
+        && let Some(was) = b.drawn.iter().find(|(g, _)| *g == b.frame).map(|(_, q)| *q)
+    {
+        let gesture = b.gesture.unwrap_or_else(|| {
+            let name = world.get::<Name>(b.dot).map_or("the dot".to_string(), |n| n.to_string());
+            world.resource_mut::<History>().begin(format!("Bend {name}"))
+        });
+        if let Some(d) = world.resource_mut::<BendDrag>().0.as_mut() {
+            d.gesture = Some(gesture);
+        }
+        let src = b.map.to_source(now);
+        let d = [src[0] + b.hold[0] - was[0], src[1] + b.hold[1] - was[1]];
+        let fps = world.resource::<Transport>().fps.as_f64();
+        let reach = world.resource::<tt_core::subject::SubjectReach>().seconds().map(|s| (s as f64 * fps).round() as FrameIndex);
+        let points: Vec<(FrameIndex, Option<[f64; 2]>)> = bent(&b.drawn, b.frame, d, reach).into_iter().map(|(g, q)| (g, Some(q))).collect();
+        let dot = b.dot;
+        owning(world, gesture, |w| edit(w, "Bend", |tx| write_drawn(tx, dot, &points)));
+    }
+    if (p.released.is_some() || !p.down)
+        && let Some(g) = world.resource_mut::<BendDrag>().0.take().and_then(|b| b.gesture)
+    {
+        world.resource_mut::<History>().end(g);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,4 +710,19 @@ mod tests {
         // A manual dot: its drawing alone.
         assert_eq!(composed(5, None, Some(&human), half, None, None), None);
     }
+
+    /// A bend moves the grabbed frame by all of it, its neighbours less the
+    /// further they are, and nothing beyond the reach; with no reach, all of it.
+    #[test]
+    fn a_bend_eases_off_to_the_reach_and_stops_there() {
+        let drawn: Vec<(FrameIndex, [f64; 2])> = (0..40).map(|f| (f, [f as f64, 0.0])).collect();
+        let moved = bent(&drawn, 20, [0.0, 10.0], Some(5));
+        let dy = |f: FrameIndex| moved.iter().find(|(g, _)| *g == f).map(|(_, p)| p[1]);
+        assert_eq!(dy(20), Some(10.0), "the grabbed frame: all of it");
+        assert!(dy(18).unwrap() > dy(23).unwrap() && dy(23).unwrap() > 0.0, "less further off");
+        assert_eq!((dy(14), dy(26)), (None, None), "nothing beyond the reach");
+        assert_eq!(dy(15).zip(dy(25)).map(|(a, b)| (a - b).abs() < 1e-9), Some(true), "the same both ways");
+        assert_eq!(bent(&drawn, 20, [3.0, 0.0], None).len(), 40, "no reach: all of it");
+    }
+
 }
