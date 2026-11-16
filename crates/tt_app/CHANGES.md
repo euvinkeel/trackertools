@@ -1,4 +1,4 @@
-## Not released yet
+## 0.5.0
 - Subjects: drag the selected subject's path anywhere on the video to bend it there. Only the frames near it move; the wheel while dragging sets how far (its last step moves the whole path). The pins you make show on the path; Alt+click a pin removes it. New subjects ease in and out of their pins.
 - Subjects: Smooth its path (Inspector) smooths the subject's motion over the whole path. Your pins stay where you put them.
 - Subjects: the Inspector lists the members, each with a button to take it out, and Add member. Right-click a tracker or sketch: Add to a subject, Take out of a subject.
