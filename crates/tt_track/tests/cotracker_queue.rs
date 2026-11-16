@@ -320,6 +320,8 @@ fn a_job_that_panics_reports_a_failure() {
         icon_sizes: Vec::new(),
         jev: Default::default(),
         paint_dots: tt_track::job::paint::POINTS_PER_PAINT,
+        dots_on_strokes: false,
+        cuts: Arc::new(Vec::new()),
     };
     let (threads, workers) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -561,6 +563,64 @@ fn a_paint_gives_as_many_dots_as_its_tracker_says() {
         let points = core.world.get::<tt_track::runner::PaintPoints>(op).expect("its points");
         assert_eq!(points.0.get(&605).map(Vec::len), Some(n as usize), "{n} dots a paint");
     }
+    quiet(&mut core);
+}
+
+/// Dots along the strokes, and cutting some of them for a stretch (Alt+brush
+/// between paints): only from the paint before the cut is tracked again,
+/// the dots cut show as cut there and nowhere else, and the tracker still
+/// follows the sprite with the others.
+#[test]
+fn cutting_dots_tracks_again_from_the_paint_before_and_marks_them() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((mut core, guide)) = setup(TrackRun::Both) else { return };
+    core.world.resource_mut::<NewTrackers>().method = Method::Paint;
+    let paint = |f: i64, at: [f64; 2]| {
+        let path = [at, [at[0] + 12.0, at[1] + 4.0]];
+        let (c, h, mask) = tt_track::tool::paint_look(&path, 9.0);
+        let mut look = Look::new(f, c, h);
+        (look.mask, look.dots) = (mask, tt_track::tool::stroke_dots(&path, 3.0));
+        look
+    };
+    let op = tt_track::add_tracker_with_look(&mut core.world, guide, paint(600, truth(600))).expect("tracker");
+    set_span(&mut core.world, op, Span::new(595, 625));
+    tt_track::add_look(&mut core.world, op, paint(612, truth(612))).expect("a reset paint");
+    run(&mut core, &[op], |_| {});
+    let marks = |w: &World, f: i64| w.get::<tt_track::runner::PaintPoints>(op).and_then(|p| p.0.get(&f).cloned()).unwrap_or_default();
+    let on_606 = marks(&core.world, 606);
+    assert_eq!(on_606.len(), 5, "the first paint's dots along its stroke (13 px at 3 px apart)");
+    // Cut two of them from 604 to the next paint (612).
+    let cut: Vec<_> = on_606.iter().take(2).map(|m| m.id).collect();
+    tt_core::history::edit(&mut core.world, "Cut dots", |tx| {
+        tx.insert(op, tt_track::DotCuts(cut.iter().map(|d| tt_track::job::paint::DotCut { dot: *d, from: 604, to: 612 }).collect()));
+    });
+    let mut froms = Vec::new();
+    run(&mut core, &[op], |w| {
+        if let Some(f) = status(w, op).forward {
+            froms.push(f.from);
+        }
+        let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+        for f in [596, 600] {
+            assert_eq!(sig.state(f), tt_core::signal::FrameState::Valid, "frame {f} kept");
+        }
+    });
+    froms.dedup();
+    assert_eq!(froms, vec![600], "from the paint before the cut");
+    let w = &core.world;
+    let is_cut = |f: i64| marks(w, f).iter().filter(|m| m.cut).map(|m| m.id).collect::<Vec<_>>();
+    assert_eq!(is_cut(606), cut, "cut on 606");
+    assert!(is_cut(603).is_empty() && is_cut(612).is_empty(), "not before the cut, nor from the next paint on");
+    let sig = w.resource::<SignalStore>().get(w.get::<Output>(op).expect("output").0).expect("signal");
+    let first = paint(600, truth(600)).center();
+    for f in [604, 608, 611] {
+        let v = sig.get(f).expect("a result");
+        let want = [first[0] + truth(f)[0] - truth(600)[0], first[1] + truth(f)[1] - truth(600)[1]];
+        assert!((v[0] as f64 - want[0]).hypot(v[1] as f64 - want[1]) < 1.5, "frame {f}: with the sprite on the other dots: {v:?} vs {want:?}");
+    }
+    // Undone (the cuts' component goes): they count again.
+    tt_core::history::undo(&mut core.world);
+    run(&mut core, &[op], |_| {});
+    assert!(marks(&core.world, 606).iter().all(|m| !m.cut), "uncut after the undo");
     quiet(&mut core);
 }
 

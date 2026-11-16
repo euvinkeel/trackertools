@@ -679,7 +679,7 @@ mod tests {
 
     fn square_paint() -> LookSpec {
         // A 10 × 10 px square, painted whole, at (100, 100).
-        LookSpec { frame: 0, center: [100.0, 100.0], half: [5.0, 5.0], mask: Some(vec![255; 32 * 32]), pattern: 0 }
+        LookSpec { frame: 0, center: [100.0, 100.0], half: [5.0, 5.0], mask: Some(vec![255; 32 * 32]), pattern: 0, dots: Vec::new() }
     }
 
     fn crop_of(colour: u8) -> Vec<u8> {

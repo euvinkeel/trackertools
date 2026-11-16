@@ -2006,7 +2006,7 @@ mod tests {
 
     /// A loose paint: a 70 px square around a point a few px off the arrow.
     fn paint(f: FrameIndex, tip: [usize; 2]) -> LookSpec {
-        LookSpec { frame: f, center: [tip[0] as f64 + 9.0, tip[1] as f64 + 4.0], half: [35.0, 35.0], mask: None, pattern: 0 }
+        LookSpec { frame: f, center: [tip[0] as f64 + 9.0, tip[1] as f64 + 4.0], half: [35.0, 35.0], mask: None, pattern: 0, dots: Vec::new() }
     }
 
     /// A paint on a frame of background `seed` with the arrow at `tip`, as
@@ -2120,7 +2120,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(k, (white, seed, tip, spinner))| {
-                let look = LookSpec { frame: k as i64 * 10, center: [tip[0] as f64 + 12.0, tip[1] as f64 + 12.0], half: [36.0, 36.0], mask: None, pattern: 0 };
+                let look = LookSpec { frame: k as i64 * 10, center: [tip[0] as f64 + 12.0, tip[1] as f64 + 12.0], half: [36.0, 36.0], mask: None, pattern: 0, dots: Vec::new() };
                 let mut shot = Shot::of_paint(&look, [1.0, 1.0], &Frame::grey(make(*white, *seed, *tip, *spinner))).expect("shot");
                 let near: Vec<Shot> = [[14i64, 7i64], [-15, -9]]
                     .iter()

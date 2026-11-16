@@ -410,6 +410,8 @@ struct Plan {
     /// A template tracker's cursor icons (`icons::CursorIcons`).
     icons: Arc<Vec<crate::icons::Icon>>,
     icon_sizes: Vec<(String, f64)>,
+    /// A paint tracker's dots cut for a stretch (`crate::DotCuts`).
+    cuts: Arc<Vec<crate::job::paint::DotCut>>,
 }
 
 impl Plan {
@@ -480,7 +482,7 @@ impl Plan {
             && (p.feature, p.search, p.adapt, p.min_score, p.fuse) == (q.feature, q.search, q.adapt, q.min_score, q.fuse)
             && p.matching == q.matching
             && p.method == q.method
-            && (p.centred, &p.pattern_scores, p.paint_dots) == (q.centred, &q.pattern_scores, q.paint_dots)
+            && (p.centred, &p.pattern_scores, p.paint_dots, p.dots_on_strokes) == (q.centred, &q.pattern_scores, q.paint_dots, q.dots_on_strokes)
             && self.icons == old.icons
             && self.icon_sizes == old.icon_sizes
             && self.root == old.root;
@@ -519,7 +521,9 @@ impl Plan {
         let mut frames: Vec<FrameIndex> = self.looks.iter().chain(old.looks.iter()).map(|l| l.frame).collect();
         frames.sort_unstable();
         frames.dedup();
-        let changed: Vec<FrameIndex> = frames.iter().copied().filter(|f| at(&self.looks, *f) != at(&old.looks, *f)).collect();
+        let mut changed: Vec<FrameIndex> = frames.iter().copied().filter(|f| at(&self.looks, *f) != at(&old.looks, *f)).collect();
+        // A dot cut that came, went or changed: as a paint changed where the cut starts.
+        changed.extend(self.cuts.iter().filter(|c| !old.cuts.contains(c)).chain(old.cuts.iter().filter(|c| !self.cuts.contains(c))).map(|c| c.from));
         let paint = self.params.method == Method::Paint;
         let (lo, hi) = (self.lo.min(old.lo), self.hi.max(old.hi) + 1);
         // A cursor tracker learns its shapes from all its paints: any change is every frame's.
@@ -1074,6 +1078,8 @@ fn job_spec(plan: &Plan, side: Side, from: FrameIndex, to: FrameIndex, resume: O
         },
         jev: p.jev.clone(),
         paint_dots: p.paint_dots.clamp(1, 512) as usize,
+        dots_on_strokes: p.dots_on_strokes,
+        cuts: plan.cuts.clone(),
     }
 }
 
@@ -1270,14 +1276,7 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         .iter()
         .filter_map(|e| world.get::<Look>(*e))
         .filter(|l| (lo..=hi).contains(&l.frame))
-        .map(|l| LookSpec {
-            frame: l.frame,
-            center: l.center(),
-            half: l.half(),
-            // (A paint's mask can be finer than a look's: `tool::brush_paint`.)
-            mask: l.painted().map(<[u8]>::to_vec).or_else(|| (params.method.paints() && crate::job::paint::mask_side(&l.mask).is_some() && l.mask.iter().any(|c| *c > 0)).then(|| l.mask.clone())),
-            pattern: l.pattern,
-        })
+        .map(|l| l.spec(params.method.paints()))
         .collect();
     // It starts on its anchor frame, from the look there (a painted one
     // first); with no look there (it was deleted), from its first look.
@@ -1368,9 +1367,20 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
         [l.frame as f64, l.center[0], l.center[1], l.half[0], l.half[1]].iter().for_each(|x| put(*x));
         l.mask.iter().flatten().for_each(|c| put(*c as f64));
     }
-    // A paint tracker's dots a paint (only when not the default: saved stamps stay what they were).
+    // A paint tracker's dots a paint, where they come from, and its cut dots
+    // (only when not as before these existed: saved stamps stay what they were).
+    let cuts: Vec<crate::job::paint::DotCut> = world.get::<crate::DotCuts>(op).filter(|_| params.method == Method::Paint).map(|c| c.0.clone()).unwrap_or_default();
     if params.method == Method::Paint && params.paint_dots as usize != crate::job::paint::POINTS_PER_PAINT {
         put(params.paint_dots as f64);
+    }
+    if params.method == Method::Paint && params.dots_on_strokes && looks.iter().any(|l| !l.dots.is_empty()) {
+        put(-2.0);
+        for l in &looks {
+            l.dots.iter().for_each(|d| d.iter().for_each(|x| put(*x)));
+        }
+    }
+    for c in &cuts {
+        [c.dot.paint as f64, c.dot.k as f64, c.from as f64, c.to as f64].iter().for_each(|x| put(*x));
     }
     // (Only when there is no guide, so a guided tracker's stamp stays what it was.)
     let root = guide_of(world, op).is_none();
@@ -1397,7 +1407,7 @@ fn plan(world: &World, op: Entity, footage: &Footage, prev: Option<&Plan>) -> Re
     let stamp = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"));
 
     let span = tt_core::span::span_of(world, op).range();
-    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed, root, icons: Arc::new(icons), icon_sizes })
+    Ok(Plan { lo, hi, span, anchor, params, guide: Arc::new(guide_boxes), maps: Arc::new(maps), scale, video, k, stamp, looks: Arc::new(looks), seed, root, icons: Arc::new(icons), icon_sizes, cuts: Arc::new(cuts) })
 }
 
 /// Fill gaps by linear interpolation; ends hold the nearest value.

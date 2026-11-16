@@ -18,10 +18,13 @@
 //!
 //! - **Paint** trackers: hold and brush over the subject (the brush is the
 //!   click's size: Ctrl+wheel). Let go: the area brushed is a paint (a look
-//!   with that mask): a new paint tracker, or with one selected, added to
-//!   its paint on this frame (anywhere on the picture: patches with gaps
-//!   between them are one paint), or a new paint on this frame
-//!   ([`crate::job::paint`]). Alt+brush erases from its paint here.
+//!   with that mask, and a dot every brush radius along the stroke): a new
+//!   paint tracker, or with one selected, added to its paint on this frame
+//!   (anywhere on the picture: patches with gaps between them are one
+//!   paint), or a new paint on this frame ([`crate::job::paint`]).
+//!   Alt+brush on a paint's frame erases from it (its area and its dots);
+//!   between paints, it **cuts** the dots brushed over from there to the
+//!   next paint ([`crate::DotCuts`]).
 //!
 //! - **Cursor** trackers paint the same way ([`crate::job::cursor`]), each
 //!   paint teaching one of its *patterns* (an arrow, a hand …): a brush
@@ -133,19 +136,7 @@ pub fn brush_paint(old: Option<([f64; 2], [f64; 2], &[u8])>, path: &[[f64; 2]], 
     let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0];
     // Cells about a third of the brush's radius, 32 to 128 a side.
     let n = ((2.0 * half[0].max(half[1]) / (r / 3.0).max(1.0)).ceil() as usize).clamp(crate::look::MASK_N, 128);
-    // Distance from a point to the stroke (a dot: its first point).
-    let near = |q: [f64; 2]| -> f64 {
-        let Some(first) = path.first() else { return f64::INFINITY };
-        let mut best = (q[0] - first[0]).hypot(q[1] - first[1]);
-        for w in path.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            let d = [b[0] - a[0], b[1] - a[1]];
-            let len2 = d[0] * d[0] + d[1] * d[1];
-            let t = if len2 > 0.0 { (((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / len2).clamp(0.0, 1.0) } else { 0.0 };
-            best = best.min((q[0] - a[0] - t * d[0]).hypot(q[1] - a[1] - t * d[1]));
-        }
-        best
-    };
+    let near = |q: [f64; 2]| distance_to(path, q);
     // Whether the old paint covers a point (its nearest cell).
     let was = |q: [f64; 2]| -> bool {
         let Some((c, h, mask)) = old else { return false };
@@ -167,6 +158,41 @@ pub fn brush_paint(old: Option<([f64; 2], [f64; 2], &[u8])>, path: &[[f64; 2]], 
         }
     }
     any.then_some((centre, half, mask))
+}
+
+/// How far `q` is from the stroke `path` (a dot: its first point).
+fn distance_to(path: &[[f64; 2]], q: [f64; 2]) -> f64 {
+    let Some(first) = path.first() else { return f64::INFINITY };
+    let mut best = (q[0] - first[0]).hypot(q[1] - first[1]);
+    for w in path.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let len2 = d[0] * d[0] + d[1] * d[1];
+        let t = if len2 > 0.0 { (((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        best = best.min((q[0] - a[0] - t * d[0]).hypot(q[1] - a[1] - t * d[1]));
+    }
+    best
+}
+
+/// The dots a brush stroke lays down: one every `spacing` along `path`, from its start (a dot: one).
+pub fn stroke_dots(path: &[[f64; 2]], spacing: f64) -> Vec<[f32; 2]> {
+    let Some(first) = path.first() else { return Vec::new() };
+    let spacing = spacing.max(0.5);
+    let mut dots = vec![[first[0] as f32, first[1] as f32]];
+    // (How far along the path past the last dot.)
+    let mut since = 0.0;
+    for w in path.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+        let mut t = spacing - since;
+        while t <= len {
+            let u = t / len;
+            dots.push([(a[0] + (b[0] - a[0]) * u) as f32, (a[1] + (b[1] - a[1]) * u) as f32]);
+            t += spacing;
+        }
+        since = (since + len) % spacing;
+    }
+    dots
 }
 
 /// The paint a brush stroke makes on its own (`brush_paint` with nothing before it).
@@ -270,8 +296,11 @@ pub fn track_tool(world: &mut World) {
 
 /// A brush stroke (source px, radius `r`) on frame `f`: added to the
 /// selected paint tracker's paint on this frame (a cursor tracker's of
-/// `pattern`), or, `erase`, taken out of it: a paint left empty goes; else
-/// a new paint (of `pattern`; with no tracker, `place`). Err = why not.
+/// `pattern`), or, `erase`, taken out of it (its area and its dots): a
+/// paint left empty goes; erasing where it has no paint, a paint tracker's
+/// dots under the stroke are cut from here to its next paint; else a new
+/// paint (of `pattern`; with no tracker, `place`). Its dots: one every `r`
+/// along the stroke. Err = why not.
 #[allow(clippy::too_many_arguments)]
 fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool, erase: bool, reseed: Option<Entity>, pattern: Option<u32>) -> Result<(), String> {
     let tracker = paint_tracker(world).filter(|_| !new);
@@ -282,12 +311,18 @@ fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool,
         (Some(l), _) => {
             let old = world.get::<Look>(l).cloned().expect("a look");
             let made = brush_paint(Some((old.center(), old.half(), &old.mask)), path, r, erase);
+            let dots: Vec<[f32; 2]> = if erase {
+                old.dots.iter().copied().filter(|d| distance_to(path, [d[0] as f64, d[1] as f64]) > r).collect()
+            } else {
+                old.dots.iter().copied().chain(stroke_dots(path, r)).collect()
+            };
             match made {
                 Some((c, h, mask)) => {
                     tt_core::history::edit(world, if erase { "Erase paint" } else { "Paint" }, |tx| {
                         tx.modify::<Look>(l, |look| {
                             (look.x, look.y, look.half_w, look.half_h) = (c[0] as f32, c[1] as f32, h[0] as f32, h[1] as f32);
                             look.mask = mask;
+                            look.dots = dots;
                         });
                     });
                 }
@@ -295,6 +330,28 @@ fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool,
                     tt_core::commands::delete(world, &[l]);
                 }
             }
+            Ok(())
+        }
+        // Between a paint tracker's paints: its dots under the stroke are cut from here to its next paint.
+        (None, true) if let Some(t) = tracker.filter(|t| world.get::<Tracker>(*t).is_some_and(|p| p.method == Method::Paint)) => {
+            let under: Vec<crate::job::paint::DotId> = world
+                .get::<crate::runner::PaintPoints>(t)
+                .and_then(|p| p.0.get(&f))
+                .into_iter()
+                .flatten()
+                .filter(|m| !m.cut && distance_to(path, [m.at[0] as f64, m.at[1] as f64]) <= r)
+                .map(|m| m.id)
+                .collect();
+            if under.is_empty() {
+                return Err("No dots under the brush on this frame to cut (they show once it has tracked here)".into());
+            }
+            let to = crate::look::looks_of(world, t).iter().filter_map(|l| world.get::<Look>(*l)).map(|l| l.frame).filter(|g| *g > f).min().unwrap_or(FrameIndex::MAX);
+            let n = under.len();
+            tt_core::history::edit(world, if n == 1 { "Cut a dot" } else { "Cut dots" }, |tx| {
+                let mut cuts = tx.world().get::<crate::DotCuts>(t).cloned().unwrap_or_default();
+                cuts.0.extend(under.into_iter().map(|dot| crate::job::paint::DotCut { dot, from: f, to }));
+                tx.insert(t, cuts);
+            });
             Ok(())
         }
         (None, true) => Err(match pattern {
@@ -305,6 +362,7 @@ fn brush(world: &mut World, f: FrameIndex, path: &[[f64; 2]], r: f64, new: bool,
             let (c, h, mask) = paint_look(path, r);
             let mut look = Look::new(f, c, h);
             look.mask = mask;
+            look.dots = stroke_dots(path, r);
             look.pattern = pattern.unwrap_or(0);
             match tracker.filter(|t| reseed != Some(*t)) {
                 Some(t) => {
@@ -374,7 +432,7 @@ mod tests {
     use crate::job::paint::on;
 
     fn spec(made: &([f64; 2], [f64; 2], Vec<u8>)) -> LookSpec {
-        LookSpec { frame: 0, center: made.0, half: made.1, mask: Some(made.2.clone()), pattern: 0 }
+        LookSpec { frame: 0, center: made.0, half: made.1, mask: Some(made.2.clone()), pattern: 0, dots: Vec::new() }
     }
 
     /// Strokes far apart are one paint (the gap stays unpainted, with fine
@@ -392,4 +450,13 @@ mod tests {
         assert!(on(&s, [110.0, 100.0]) && !on(&s, [900.0, 500.0]), "the second patch erased");
         assert!(brush_paint(Some((c.0, c.1, &c.2)), &[[90.0, 100.0], [130.0, 100.0]], 15.0, true).is_none(), "all erased: none left");
     }
+
+    /// A stroke lays a dot every `spacing` along it, from its start.
+    #[test]
+    fn a_stroke_lays_a_dot_every_spacing() {
+        let dots = stroke_dots(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]], 4.0);
+        assert_eq!(dots, vec![[0.0, 0.0], [4.0, 0.0], [8.0, 0.0], [10.0, 2.0], [10.0, 6.0], [10.0, 10.0]]);
+        assert_eq!(stroke_dots(&[[5.0, 5.0]], 4.0), vec![[5.0, 5.0]], "a click: one");
+    }
+
 }

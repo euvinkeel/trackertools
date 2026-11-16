@@ -314,7 +314,18 @@ pub struct Tracker {
     /// spread evenly over what was painted (`job::paint`).
     #[reflect(default = "paint_dots")]
     pub paint_dots: u32,
+    /// A paint tracker: its paints' dots are the ones their strokes laid
+    /// down (new paint trackers), not spread over what they painted (`job::paint::dots`).
+    #[reflect(default)]
+    pub dots_on_strokes: bool,
 }
+
+/// A paint tracker's dots cut for a stretch (`job::paint::DotCut`): Alt+brush
+/// over its dots on a frame between paints cuts them from there to the next
+/// paint. Document state (saved, undone); clearing them tracks again.
+#[derive(Component, Reflect, Clone, Debug, Default, PartialEq)]
+#[reflect(Component)]
+pub struct DotCuts(pub Vec<job::paint::DotCut>);
 
 fn paint_dots() -> u32 {
     job::paint::POINTS_PER_PAINT as u32
@@ -443,6 +454,7 @@ impl Tracker {
             pattern_scores: Vec::new(),
             jev: JevSettings::default(),
             paint_dots: paint_dots(),
+            dots_on_strokes: true,
         }
     }
 
@@ -854,6 +866,14 @@ pub fn track_from(world: &mut World, trackers: &[Entity], f: FrameIndex, run: Tr
     (trackers.len(), reseed.len())
 }
 
+/// Dots cut or uncut (an undo can take the component away): the tracker
+/// plans again, and tracks again from the paint before what changed (`runner::Plan::touched`).
+fn cuts_changed(changed: Query<Entity, Changed<DotCuts>>, mut removed: RemovedComponents<DotCuts>, mut inv: ResMut<tt_core::op::Invalidations>, t: Res<Transport>) {
+    for e in changed.iter().chain(removed.read()) {
+        inv.recompute(e, 0..t.frame_count);
+    }
+}
+
 /// A look edited (moved, resized, its mask painted): its trackers re-track.
 fn look_changed(changed: Query<Entity, Changed<Look>>, mut inv: ResMut<tt_core::op::Invalidations>, t: Res<Transport>) {
     for e in &changed {
@@ -873,6 +893,12 @@ impl Module for TrackModule {
             .component::<human::AutoOutput>(Class::Document)
             .component::<human::HumanLayer>(Class::Document)
             .component::<icons::CursorIcons>(Class::Document)
+            .component::<DotCuts>(Class::Document)
+            .register_type::<job::paint::DotCut>()
+            .register_type::<job::paint::DotId>()
+            .register_type::<Vec<job::paint::DotCut>>()
+            .register_type::<[f32; 2]>()
+            .register_type::<Vec<[f32; 2]>>()
             .declare::<runner::PaintPoints>(Class::Derived)
             .declare::<runner::CursorShapes>(Class::Derived)
             .declare::<icons::IconFit>(Class::Derived)
@@ -905,7 +931,7 @@ impl Module for TrackModule {
             .declare::<runner::TrackJobs>(Class::Derived)
             .declare::<Footage>(Class::Derived)
             .init_resource::<runner::TrackJobs>()
-            .add_systems((apply_track_actions, look_changed).in_set(Set::Intents))
+            .add_systems((apply_track_actions, look_changed, cuts_changed).in_set(Set::Intents))
             .add_systems((tool::track_tool, human::draw_tool).in_set(Set::Tools))
             .add_systems((runner::run_trackers, human::compose_trackers).chain().in_set(Set::Jobs));
     }

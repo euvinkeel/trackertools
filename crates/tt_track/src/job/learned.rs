@@ -781,9 +781,9 @@ impl Worker {
             let mut paints: Vec<(usize, LookSpec)> = Vec::new();
             // Resuming: the cohort as it was on the paint's frame, first (`PaintFit::resume`).
             if let Some(state) = &s.paint_resume {
-                for (_, at) in &state.points {
+                for (id, _, at) in &state.points {
                     queries.push((0, crop_point(start, self.map(start).from_source(*at))));
-                    pq.push(super::paint::PaintQuery { i: 0, reference: None });
+                    pq.push(super::paint::PaintQuery { i: 0, reference: None, id: *id });
                 }
             }
             for i in 0..n {
@@ -792,13 +792,17 @@ impl Worker {
                 if i == 0 && s.paint_resume.is_some() {
                     continue;
                 }
+                // (Each dot's name: its paint's frame and its number there, the same in every job.)
+                let mut k = 0u32;
                 for l in s.looks.iter().filter(|l| l.frame == f) {
                     paints.push((i, l.clone()));
-                    for p in super::paint::sample(l, s.paint_dots) {
+                    for p in super::paint::dots(l, s.paint_dots, s.dots_on_strokes) {
+                        let id = super::paint::DotId { paint: f, k };
+                        k += 1;
                         let c = crop_point(f, self.map(f).from_source(p));
                         if (0.0..CROP_W as f64).contains(&c[0]) && (0.0..CROP_H as f64).contains(&c[1]) {
                             queries.push((i, c));
-                            pq.push(super::paint::PaintQuery { i, reference: None });
+                            pq.push(super::paint::PaintQuery { i, reference: None, id });
                         }
                     }
                 }
@@ -809,10 +813,12 @@ impl Worker {
             let a = self.map(anchor).a;
             let half = first_paint.as_ref().map_or(self.half, |l| l.half.map(|h| (h / a * s.scale).max(2.0)));
             // (Outliers: further than 1.5 crop px from where the motion puts them, at least.)
-            self.paint = Some(match &s.paint_resume {
+            let mut fit = match &s.paint_resume {
                 Some(state) => super::paint::PaintFit::resume(state, pq, paints, s.settings.min_score as f64, 1.5 / scale),
                 None => super::paint::PaintFit::new(pq, paints, seed, half, s.settings.min_score as f64, 1.5 / scale),
-            });
+            };
+            fit.cuts = s.cuts.to_vec();
+            self.paint = Some(fit);
         } else {
             queries.push((0usize, crop_point(start, first_seed)));
             for i in 1..n {
@@ -950,7 +956,7 @@ impl Worker {
                 self.emit(o.f, o.at, o.score, o.lost);
             }
             let map = *self.map(o.f);
-            let marks = o.marks.iter().map(|m| super::PointMark { id: m.id, at: map.to_source(m.at).map(|v| v as f32), seen: m.seen, kept: m.kept }).collect();
+            let marks = o.marks.iter().map(|m| super::PointMark { id: m.id, at: map.to_source(m.at).map(|v| v as f32), seen: m.seen, kept: m.kept, cut: m.cut }).collect();
             self.marks.push((o.f, marks));
         }
         self.half = base;
@@ -973,7 +979,7 @@ impl Worker {
             // Its states on the paints passed: for a job tracking again from one of them.
             for (g, motion, cohort) in fit.take_states() {
                 let map = *self.map(g);
-                let points = cohort.into_iter().map(|(r, p)| (r, map.to_source(p))).collect();
+                let points = cohort.into_iter().map(|(id, r, p)| (id, r, map.to_source(p))).collect();
                 self.states.push(super::paint::PaintState { frame: g, motion, target, half, points });
             }
             self.paint = Some(fit);
